@@ -1,0 +1,29 @@
+.board {
+  display: block;
+  width: 100%;
+  height: auto;
+  user-select: none;
+}
+
+.square.light {
+  fill: #f0d9b5;
+}
+
+.square.dark {
+  fill: #b58863;
+}
+
+.coordinate {
+  font-family: system-ui, sans-serif;
+  font-size: 20px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+.coordinate.on-light {
+  fill: #b58863;
+}
+
+.coordinate.on-dark {
+  fill: #f0d9b5;
+}
