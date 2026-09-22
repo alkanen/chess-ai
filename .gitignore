@@ -1,2 +1,16 @@
 # Local Claude Code configuration
 .claude/
+
+# Local configuration (see chess-ai.example.toml)
+chess-ai.toml
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+src/chess_ai/web/static/
