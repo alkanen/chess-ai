@@ -1,0 +1,134 @@
+{
+  "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+  "turn": "white",
+  "pieces": {
+    "h8": {
+      "color": "black",
+      "type": "rook"
+    },
+    "g8": {
+      "color": "black",
+      "type": "knight"
+    },
+    "f8": {
+      "color": "black",
+      "type": "bishop"
+    },
+    "e8": {
+      "color": "black",
+      "type": "king"
+    },
+    "d8": {
+      "color": "black",
+      "type": "queen"
+    },
+    "c8": {
+      "color": "black",
+      "type": "bishop"
+    },
+    "b8": {
+      "color": "black",
+      "type": "knight"
+    },
+    "a8": {
+      "color": "black",
+      "type": "rook"
+    },
+    "h7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "g7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "f7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "e7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "d7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "c7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "b7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "a7": {
+      "color": "black",
+      "type": "pawn"
+    },
+    "h2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "g2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "f2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "e2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "d2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "c2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "b2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "a2": {
+      "color": "white",
+      "type": "pawn"
+    },
+    "h1": {
+      "color": "white",
+      "type": "rook"
+    },
+    "g1": {
+      "color": "white",
+      "type": "knight"
+    },
+    "f1": {
+      "color": "white",
+      "type": "bishop"
+    },
+    "e1": {
+      "color": "white",
+      "type": "king"
+    },
+    "d1": {
+      "color": "white",
+      "type": "queen"
+    },
+    "c1": {
+      "color": "white",
+      "type": "bishop"
+    },
+    "b1": {
+      "color": "white",
+      "type": "knight"
+    },
+    "a1": {
+      "color": "white",
+      "type": "rook"
+    }
+  }
+}
