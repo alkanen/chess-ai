@@ -1,0 +1,741 @@
+[
+  {
+    "type": "state",
+    "game": {
+      "white": "Scripted",
+      "black": "Scripted",
+      "moves": [],
+      "position": {
+        "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "turn": "white",
+        "pieces": {
+          "h8": {
+            "color": "black",
+            "type": "rook"
+          },
+          "g8": {
+            "color": "black",
+            "type": "knight"
+          },
+          "f8": {
+            "color": "black",
+            "type": "bishop"
+          },
+          "e8": {
+            "color": "black",
+            "type": "king"
+          },
+          "d8": {
+            "color": "black",
+            "type": "queen"
+          },
+          "c8": {
+            "color": "black",
+            "type": "bishop"
+          },
+          "b8": {
+            "color": "black",
+            "type": "knight"
+          },
+          "a8": {
+            "color": "black",
+            "type": "rook"
+          },
+          "h7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "g7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "f7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "e7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "d7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "c7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "b7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "a7": {
+            "color": "black",
+            "type": "pawn"
+          },
+          "h2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "g2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "f2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "e2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "d2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "c2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "b2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "a2": {
+            "color": "white",
+            "type": "pawn"
+          },
+          "h1": {
+            "color": "white",
+            "type": "rook"
+          },
+          "g1": {
+            "color": "white",
+            "type": "knight"
+          },
+          "f1": {
+            "color": "white",
+            "type": "bishop"
+          },
+          "e1": {
+            "color": "white",
+            "type": "king"
+          },
+          "d1": {
+            "color": "white",
+            "type": "queen"
+          },
+          "c1": {
+            "color": "white",
+            "type": "bishop"
+          },
+          "b1": {
+            "color": "white",
+            "type": "knight"
+          },
+          "a1": {
+            "color": "white",
+            "type": "rook"
+          }
+        },
+        "last_move": null,
+        "game_over": null
+      }
+    }
+  },
+  {
+    "type": "move",
+    "ply": 1,
+    "move": {
+      "uci": "f2f3",
+      "san": "f3",
+      "thoughts": null
+    },
+    "position": {
+      "fen": "rnbqkbnr/pppppppp/8/8/8/5P2/PPPPP1PP/RNBQKBNR b KQkq - 0 1",
+      "turn": "black",
+      "pieces": {
+        "h8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "g8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "f8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "e8": {
+          "color": "black",
+          "type": "king"
+        },
+        "d8": {
+          "color": "black",
+          "type": "queen"
+        },
+        "c8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "b8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "a8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "h7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "g7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "f7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "e7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "d7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "c7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "b7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "a7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "f3": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "g2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "e2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "d2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "c2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "b2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "a2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h1": {
+          "color": "white",
+          "type": "rook"
+        },
+        "g1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "f1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "e1": {
+          "color": "white",
+          "type": "king"
+        },
+        "d1": {
+          "color": "white",
+          "type": "queen"
+        },
+        "c1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "b1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "a1": {
+          "color": "white",
+          "type": "rook"
+        }
+      },
+      "last_move": {
+        "from_square": "f2",
+        "to_square": "f3"
+      },
+      "game_over": null
+    }
+  },
+  {
+    "type": "move",
+    "ply": 2,
+    "move": {
+      "uci": "e7e5",
+      "san": "e5",
+      "thoughts": null
+    },
+    "position": {
+      "fen": "rnbqkbnr/pppp1ppp/8/4p3/8/5P2/PPPPP1PP/RNBQKBNR w KQkq - 0 2",
+      "turn": "white",
+      "pieces": {
+        "h8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "g8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "f8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "e8": {
+          "color": "black",
+          "type": "king"
+        },
+        "d8": {
+          "color": "black",
+          "type": "queen"
+        },
+        "c8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "b8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "a8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "h7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "g7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "f7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "d7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "c7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "b7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "a7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "e5": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "f3": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "g2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "e2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "d2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "c2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "b2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "a2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h1": {
+          "color": "white",
+          "type": "rook"
+        },
+        "g1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "f1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "e1": {
+          "color": "white",
+          "type": "king"
+        },
+        "d1": {
+          "color": "white",
+          "type": "queen"
+        },
+        "c1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "b1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "a1": {
+          "color": "white",
+          "type": "rook"
+        }
+      },
+      "last_move": {
+        "from_square": "e7",
+        "to_square": "e5"
+      },
+      "game_over": null
+    }
+  },
+  {
+    "type": "move",
+    "ply": 3,
+    "move": {
+      "uci": "g2g4",
+      "san": "g4",
+      "thoughts": null
+    },
+    "position": {
+      "fen": "rnbqkbnr/pppp1ppp/8/4p3/6P1/5P2/PPPPP2P/RNBQKBNR b KQkq - 0 2",
+      "turn": "black",
+      "pieces": {
+        "h8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "g8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "f8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "e8": {
+          "color": "black",
+          "type": "king"
+        },
+        "d8": {
+          "color": "black",
+          "type": "queen"
+        },
+        "c8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "b8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "a8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "h7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "g7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "f7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "d7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "c7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "b7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "a7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "e5": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "g4": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "f3": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "e2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "d2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "c2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "b2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "a2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h1": {
+          "color": "white",
+          "type": "rook"
+        },
+        "g1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "f1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "e1": {
+          "color": "white",
+          "type": "king"
+        },
+        "d1": {
+          "color": "white",
+          "type": "queen"
+        },
+        "c1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "b1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "a1": {
+          "color": "white",
+          "type": "rook"
+        }
+      },
+      "last_move": {
+        "from_square": "g2",
+        "to_square": "g4"
+      },
+      "game_over": null
+    }
+  },
+  {
+    "type": "move",
+    "ply": 4,
+    "move": {
+      "uci": "d8h4",
+      "san": "Qh4#",
+      "thoughts": null
+    },
+    "position": {
+      "fen": "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3",
+      "turn": "white",
+      "pieces": {
+        "h8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "g8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "f8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "e8": {
+          "color": "black",
+          "type": "king"
+        },
+        "c8": {
+          "color": "black",
+          "type": "bishop"
+        },
+        "b8": {
+          "color": "black",
+          "type": "knight"
+        },
+        "a8": {
+          "color": "black",
+          "type": "rook"
+        },
+        "h7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "g7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "f7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "d7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "c7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "b7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "a7": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "e5": {
+          "color": "black",
+          "type": "pawn"
+        },
+        "h4": {
+          "color": "black",
+          "type": "queen"
+        },
+        "g4": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "f3": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "e2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "d2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "c2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "b2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "a2": {
+          "color": "white",
+          "type": "pawn"
+        },
+        "h1": {
+          "color": "white",
+          "type": "rook"
+        },
+        "g1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "f1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "e1": {
+          "color": "white",
+          "type": "king"
+        },
+        "d1": {
+          "color": "white",
+          "type": "queen"
+        },
+        "c1": {
+          "color": "white",
+          "type": "bishop"
+        },
+        "b1": {
+          "color": "white",
+          "type": "knight"
+        },
+        "a1": {
+          "color": "white",
+          "type": "rook"
+        }
+      },
+      "last_move": {
+        "from_square": "d8",
+        "to_square": "h4"
+      },
+      "game_over": {
+        "result": "0-1",
+        "reason": "checkmate"
+      }
+    }
+  }
+]

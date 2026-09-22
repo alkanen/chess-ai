@@ -10,3 +10,9 @@ def isolated_config(tmp_path, monkeypatch):
         if name.startswith("CHESS_AI_"):
             monkeypatch.delenv(name)
     monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture
+def anyio_backend():
+    """Run ``@pytest.mark.anyio`` tests on asyncio only, as the server does."""
+    return "asyncio"

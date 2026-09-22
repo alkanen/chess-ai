@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place; the data pipeline, models and training come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, and the server can play live games between random movers; the data pipeline, models and training come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -101,7 +101,9 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 uv run chess-ai serve
 ```
 
-Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets and the API (`…/api/`, with interactive docs at `…/api/docs`) are all served under the prefix.
+Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets, the API (`…/api/`, with interactive docs at `…/api/docs`) and the WebSocket that streams the game (`…/api/game/ws`) are all served under the prefix.
+
+The server holds one game, which every open browser shows. Start a game between two random movers from the page, with a delay between moves so it can be followed; starting another game replaces it for everyone.
 
 ## Development
 
@@ -113,7 +115,7 @@ uv run ruff check . && uv run ruff format --check .
 npm --prefix frontend test
 ```
 
-For frontend work with hot reload, run the server with an empty prefix and the Vite dev server next to it. Vite forwards `/api` requests to the server:
+For frontend work with hot reload, run the server with an empty prefix and the Vite dev server next to it. Vite forwards `/api` requests and WebSockets to the server:
 
 ```sh
 CHESS_AI_SERVER_PATH_PREFIX= uv run chess-ai serve
@@ -122,7 +124,7 @@ npm --prefix frontend run dev
 
 ## Deployment notes
 
-The web app serves everything (pages, assets, API and, later, WebSockets) under the configured path prefix, so nginx can forward requests unchanged: set `path_prefix = "/chess"` and pass the path through as is, without a URI part in `proxy_pass`. The WebSocket upgrade headers must be forwarded for the live features to work. For example:
+The web app serves everything (pages, assets, API and WebSockets) under the configured path prefix, so nginx can forward requests unchanged: set `path_prefix = "/chess"` and pass the path through as is, without a URI part in `proxy_pass`. The WebSocket upgrade headers must be forwarded for the live features to work. For example:
 
 ```nginx
 location /chess/ {

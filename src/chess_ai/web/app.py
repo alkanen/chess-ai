@@ -5,28 +5,56 @@ unchanged. The frontend build uses relative URLs only; the server tells the brow
 the prefix at runtime by adding a ``<base href="{prefix}/">`` tag to ``index.html``.
 """
 
+import asyncio
 import html
 import re
+from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 import chess
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, Field
 
 from chess_ai.config import Config
+from chess_ai.game_session import GameSession, GameState
+from chess_ai.players import Player, RandomPlayer
 from chess_ai.position_view import PositionSnapshot, snapshot
+from chess_ai.web.game_channel import GameChannel, GameChannelClosedError
 
 STATIC_DIR = Path(__file__).parent / "static"
 """Where ``scripts/build-frontend.sh`` puts the built frontend."""
 
 _HEAD_TAG = re.compile(r"<head(?:\s[^>]*)?>", re.IGNORECASE)
 
+PlayerKind = Literal["random"]
+_PLAYERS: dict[PlayerKind, Callable[[], Player]] = {"random": RandomPlayer}
+
+
+class NewGameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    white: PlayerKind
+    black: PlayerKind
+    move_delay: float = Field(default=0.5, ge=0, le=10)
+    """The least number of seconds between two moves."""
+
 
 def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     prefix = config.server.path_prefix
+    game_channel = GameChannel()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        yield
+        await game_channel.close()
+
     app = FastAPI(
         title="chess-ai",
+        lifespan=lifespan,
         docs_url=f"{prefix}/api/docs",
         redoc_url=None,
         openapi_url=f"{prefix}/api/openapi.json",
@@ -40,6 +68,33 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     @api.get("/start-position")
     def start_position() -> PositionSnapshot:
         return snapshot(chess.Board())
+
+    @api.post("/game")
+    async def new_game(request: NewGameRequest) -> GameState:
+        """Start a new game, replacing the current one for every viewer."""
+        session = GameSession(
+            _PLAYERS[request.white](), _PLAYERS[request.black](), move_delay=request.move_delay
+        )
+        try:
+            game_channel.start(session)
+        except GameChannelClosedError as closed:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "the server is shutting down"
+            ) from closed
+        return session.state
+
+    @api.websocket("/game/ws")
+    async def follow_game(websocket: WebSocket) -> None:
+        """Send the current game's full state, then every move, and every new game."""
+        await websocket.accept()
+        # Either side can end the connection: the viewer goes away, or the channel
+        # closes and has nothing left to send.
+        async with asyncio.TaskGroup() as tasks:
+            sending = tasks.create_task(_send_game_events(websocket, game_channel))
+            waiting = tasks.create_task(_wait_for_disconnect(websocket))
+            await asyncio.wait({sending, waiting}, return_when=asyncio.FIRST_COMPLETED)
+            sending.cancel()
+            waiting.cancel()
 
     app.include_router(api, prefix=prefix)
 
@@ -65,6 +120,22 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     app.mount(prefix or "/", _FrontendFiles(directory=static_dir, check_dir=False), name="static")
 
     return app
+
+
+async def _wait_for_disconnect(websocket: WebSocket) -> None:
+    while (await websocket.receive())["type"] != "websocket.disconnect":
+        pass  # Viewers have nothing to say yet.
+
+
+async def _send_game_events(websocket: WebSocket, game_channel: GameChannel) -> None:
+    """Send the game channel's events until it closes, then let the viewer go."""
+    try:
+        async with aclosing(game_channel.events()) as events:
+            async for event in events:
+                await websocket.send_text(event.model_dump_json())
+        await websocket.close(status.WS_1001_GOING_AWAY)
+    except WebSocketDisconnect:
+        pass  # The viewer has already gone.
 
 
 class _FrontendFiles(StaticFiles):

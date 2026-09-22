@@ -1,7 +1,9 @@
 import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import type { PositionSnapshot } from '../api';
+import { lastMoveSquares } from '../test/boardQueries';
 import startPosition from '../test/fixtures/start-position.json';
+import { foolsMateMoves } from '../test/foolsMate';
 import { Board } from './Board';
 
 function pieceLabels(): string[] {
@@ -32,6 +34,8 @@ describe('Board', () => {
         e4: { color: 'white', type: 'pawn' },
         e8: { color: 'black', type: 'king' },
       },
+      last_move: null,
+      game_over: null,
     };
 
     render(<Board snapshot={snapshot} />);
@@ -51,6 +55,8 @@ describe('Board', () => {
         a1: { color: 'white', type: 'king' },
         h8: { color: 'black', type: 'king' },
       },
+      last_move: null,
+      game_over: null,
     };
 
     render(<Board snapshot={snapshot} />);
@@ -59,5 +65,20 @@ describe('Board', () => {
     const h8 = screen.getByRole('img', { name: 'black king on h8' });
     expect([a1.getAttribute('x'), a1.getAttribute('y')]).toEqual(['0', '700']);
     expect([h8.getAttribute('x'), h8.getAttribute('y')]).toEqual(['700', '0']);
+  });
+
+  it('highlights the squares of the last move', () => {
+    const mate = foolsMateMoves[3];
+
+    const { container } = render(<Board snapshot={mate.position} />);
+
+    expect(lastMoveSquares(container)).toEqual(['d8', 'h4']);
+    expect(screen.getByRole('img', { name: 'black queen on h4' })).toBeInTheDocument();
+  });
+
+  it('highlights nothing before the first move', () => {
+    const { container } = render(<Board snapshot={startPosition as PositionSnapshot} />);
+
+    expect(lastMoveSquares(container)).toEqual([]);
   });
 });

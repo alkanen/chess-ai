@@ -27,3 +27,7 @@
 .coordinate.on-dark {
   fill: #f0d9b5;
 }
+
+.last-move {
+  fill: rgb(155 199 0 / 41%);
+}
