@@ -30,32 +30,68 @@ interface BoardProps {
 
 /** The chessboard as an SVG that scales to the width of its container. */
 export function Board({ snapshot }: BoardProps) {
+  const { last_move: lastMove } = snapshot;
+  const lastMoveSquares = lastMove ? [lastMove.from_square, lastMove.to_square] : [];
   return (
     <svg className="board" viewBox={`0 0 ${8 * SQUARE} ${8 * SQUARE}`} aria-label="Chessboard">
-      {SQUARES.map(({ name, file, rank, light }) => {
+      {SQUARES.map(({ name, light }) => {
         const { x, y } = squarePosition(name);
         const shade = light ? 'light' : 'dark';
         return (
-          <g key={name}>
-            <rect className={`square ${shade}`} x={x} y={y} width={SQUARE} height={SQUARE} />
-            {file === 0 && (
-              <text className={`coordinate on-${shade}`} x={x + 4} y={y + 4} dominantBaseline="hanging">
-                {rank + 1}
-              </text>
-            )}
-            {rank === 0 && (
-              <text
-                className={`coordinate on-${shade}`}
-                x={x + SQUARE - 4}
-                y={y + SQUARE - 4}
-                textAnchor="end"
-              >
-                {FILES[file]}
-              </text>
-            )}
-          </g>
+          <rect
+            key={name}
+            className={`square ${shade}`}
+            x={x}
+            y={y}
+            width={SQUARE}
+            height={SQUARE}
+          />
         );
       })}
+      {lastMoveSquares.map((square) => {
+        const { x, y } = squarePosition(square);
+        return (
+          <rect
+            key={`last-move-${square}`}
+            className="last-move"
+            data-square={square}
+            x={x}
+            y={y}
+            width={SQUARE}
+            height={SQUARE}
+          />
+        );
+      })}
+      {SQUARES.filter(({ file, rank }) => file === 0 || rank === 0).map(
+        ({ name, file, rank, light }) => {
+          const { x, y } = squarePosition(name);
+          const shade = light ? 'light' : 'dark';
+          return (
+            <g key={`coordinates-${name}`}>
+              {file === 0 && (
+                <text
+                  className={`coordinate on-${shade}`}
+                  x={x + 4}
+                  y={y + 4}
+                  dominantBaseline="hanging"
+                >
+                  {rank + 1}
+                </text>
+              )}
+              {rank === 0 && (
+                <text
+                  className={`coordinate on-${shade}`}
+                  x={x + SQUARE - 4}
+                  y={y + SQUARE - 4}
+                  textAnchor="end"
+                >
+                  {FILES[file]}
+                </text>
+              )}
+            </g>
+          );
+        },
+      )}
       {Object.entries(snapshot.pieces).map(([square, piece]) => {
         const { x, y } = squarePosition(square);
         return (

@@ -12,10 +12,10 @@ export default defineConfig({
     emptyOutDir: true,
   },
   server: {
-    // For `npm run dev`: forward API calls to `chess-ai serve` running with an empty
-    // path prefix.
+    // For `npm run dev`: forward API calls and WebSockets to `chess-ai serve` running
+    // with an empty path prefix.
     proxy: {
-      '/api': 'http://127.0.0.1:8000',
+      '/api': { target: 'http://127.0.0.1:8000', ws: true },
     },
   },
   test: {

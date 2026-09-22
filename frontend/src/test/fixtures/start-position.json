@@ -130,5 +130,7 @@
       "color": "white",
       "type": "rook"
     }
-  }
+  },
+  "last_move": null,
+  "game_over": null
 }
