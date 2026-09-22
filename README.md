@@ -105,9 +105,19 @@ Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `pa
 
 The server holds one game, which every open browser shows. Start a game between two random movers from the page, with a delay between moves so it can be followed; starting another game replaces it for everyone.
 
+### Shortcuts with make
+
+With `make` installed, one command builds the frontend if it is out of date and then serves the app:
+
+```sh
+make
+```
+
+`make build` only builds, `make check` runs the tests and the linter, and `make clean` removes the built frontend and the installed npm packages.
+
 ## Development
 
-Run the tests and the linter:
+Run the tests and the linter (`make check` runs all three):
 
 ```sh
 uv run pytest
