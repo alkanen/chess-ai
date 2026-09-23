@@ -586,6 +586,153 @@
     },
     "game_over": null
   },
+  "blackPromotion": {
+    "fen": "4k3/8/8/8/8/8/1p6/R3K3 b - - 0 1",
+    "turn": "black",
+    "pieces": {
+      "e8": {
+        "color": "black",
+        "type": "king"
+      },
+      "b2": {
+        "color": "black",
+        "type": "pawn"
+      },
+      "e1": {
+        "color": "white",
+        "type": "king"
+      },
+      "a1": {
+        "color": "white",
+        "type": "rook"
+      }
+    },
+    "last_move": null,
+    "legal_moves": {
+      "b2": [
+        {
+          "uci": "b2a1b",
+          "to_square": "a1",
+          "capture": true,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "bishop",
+          "check": false
+        },
+        {
+          "uci": "b2a1n",
+          "to_square": "a1",
+          "capture": true,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "knight",
+          "check": false
+        },
+        {
+          "uci": "b2a1q",
+          "to_square": "a1",
+          "capture": true,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "queen",
+          "check": true
+        },
+        {
+          "uci": "b2a1r",
+          "to_square": "a1",
+          "capture": true,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "rook",
+          "check": true
+        },
+        {
+          "uci": "b2b1b",
+          "to_square": "b1",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "bishop",
+          "check": false
+        },
+        {
+          "uci": "b2b1n",
+          "to_square": "b1",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "knight",
+          "check": false
+        },
+        {
+          "uci": "b2b1q",
+          "to_square": "b1",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "queen",
+          "check": true
+        },
+        {
+          "uci": "b2b1r",
+          "to_square": "b1",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": "rook",
+          "check": true
+        }
+      ],
+      "e8": [
+        {
+          "uci": "e8d7",
+          "to_square": "d7",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        },
+        {
+          "uci": "e8d8",
+          "to_square": "d8",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        },
+        {
+          "uci": "e8e7",
+          "to_square": "e7",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        },
+        {
+          "uci": "e8f7",
+          "to_square": "f7",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        },
+        {
+          "uci": "e8f8",
+          "to_square": "f8",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        }
+      ]
+    },
+    "game_over": null
+  },
   "drawnByFiftyMoves": {
     "fen": "8/8/4k3/8/8/4K3/4R3/8 w - - 100 80",
     "turn": "white",

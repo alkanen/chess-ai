@@ -105,7 +105,7 @@ Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `pa
 
 The server holds one game, which every open browser shows. Start a game from the page, choosing a human player or a random mover for each colour, with a delay between moves so that a game between random movers can be followed; starting another game replaces it for everyone.
 
-On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. Promotions become queens until the promotion picker is built.
+On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. A pawn reaching the last rank asks which piece to promote it to, and nothing is submitted until you pick one, by clicking it or with Enter or Space on the choice the picker opens on. Clicking elsewhere on the board, or pressing Escape, puts the pawn back.
 
 ### Shortcuts with make
 

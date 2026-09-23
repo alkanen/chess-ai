@@ -22,6 +22,32 @@ export function originSquare(container: HTMLElement): string | null {
   return container.querySelector('.origin')?.getAttribute('data-square') ?? null;
 }
 
+/** The pieces the promotion picker is offering, in the order it shows them. */
+export function promotionChoices(container: HTMLElement): string[] {
+  return Array.from(
+    container.querySelectorAll('.promotion-choice'),
+    (choice) => choice.getAttribute('data-piece') ?? '',
+  );
+}
+
+/** One piece on offer in the promotion picker. */
+export function promotionChoice(container: HTMLElement, piece: string): Element {
+  const choice = container.querySelector(`.promotion-choice[data-piece="${piece}"]`);
+  if (choice === null) {
+    throw new Error(`the promotion picker is not offering a ${piece}`);
+  }
+  return choice;
+}
+
+/** Everything around the promotion picker, clicking which calls the move off. */
+export function promotionBackdrop(container: HTMLElement): Element {
+  const backdrop = container.querySelector('.promotion-backdrop');
+  if (backdrop === null) {
+    throw new Error('the promotion picker is not open');
+  }
+  return backdrop;
+}
+
 /** The hit target of a square, which takes the hovering and the clicks. */
 export function square(container: HTMLElement, name: string): Element {
   const target = container.querySelector(`.interaction[data-square="${name}"]`);

@@ -1,30 +1,17 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import type { LegalMove, Piece, PositionSnapshot } from '../api';
+import {
+  BOARD,
+  FILES,
+  SQUARE,
+  SQUARES,
+  boardPoint,
+  squareCentre,
+  squarePosition,
+} from './geometry';
 import { pieceImage } from './pieces';
+import { PromotionPicker } from './PromotionPicker';
 import './Board.css';
-
-const FILES = 'abcdefgh';
-/** Side of one square in SVG user units. */
-const SQUARE = 100;
-const BOARD = 8 * SQUARE;
-
-interface SquarePosition {
-  x: number;
-  y: number;
-}
-
-/** Top-left corner of a square, with White at the bottom. */
-function squarePosition(square: string): SquarePosition {
-  const file = FILES.indexOf(square[0]);
-  const rank = Number(square[1]) - 1;
-  return { x: file * SQUARE, y: (7 - rank) * SQUARE };
-}
-
-const SQUARES = Array.from({ length: 64 }, (_, index) => {
-  const file = index % 8;
-  const rank = Math.floor(index / 8);
-  return { name: `${FILES[file]}${rank + 1}`, file, rank, light: (file + rank) % 2 === 1 };
-});
 
 /** How a legal destination is drawn, so that the special moves stand out. */
 export type DestinationKind = 'quiet' | 'capture' | 'castling' | 'en-passant';
@@ -61,26 +48,6 @@ interface Drag {
   y: number;
 }
 
-/** Where a mouse event is on the board, or null when the board has no size to measure. */
-function boardPoint(
-  svg: SVGSVGElement | null,
-  event: { clientX: number; clientY: number },
-): SquarePosition | null {
-  const box = svg?.getBoundingClientRect();
-  if (box === undefined || box.width === 0 || box.height === 0) {
-    return null;
-  }
-  return {
-    x: ((event.clientX - box.left) / box.width) * BOARD,
-    y: ((event.clientY - box.top) / box.height) * BOARD,
-  };
-}
-
-function squareCentre(square: string): SquarePosition {
-  const { x, y } = squarePosition(square);
-  return { x: x + SQUARE / 2, y: y + SQUARE / 2 };
-}
-
 interface BoardProps {
   snapshot: PositionSnapshot;
   /** Whether the side to move is played from this browser, so its moves can be made. */
@@ -93,18 +60,22 @@ interface BoardProps {
  * The chessboard as an SVG that scales to the width of its container.
  *
  * On an interactive turn, hovering a piece shows the legal destinations the snapshot
- * came with, and a move is made by clicking origin and destination or by dragging.
+ * came with, and a move is made by clicking origin and destination or by dragging. A
+ * move onto the last rank waits for the promotion picker before it is submitted.
  */
 export function Board({ snapshot, interactive = false, onMove }: BoardProps) {
   const svg = useRef<SVGSVGElement>(null);
   const [hovered, setHovered] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
+  /** The promotions on offer while the picker is open: one move per piece. */
+  const [promoting, setPromoting] = useState<LegalMove[] | null>(null);
 
   // A new position, or the turn passing to someone else, calls off any move being made.
   useEffect(() => {
     setSelected(null);
     setDrag(null);
+    setPromoting(null);
   }, [snapshot, interactive]);
 
   // Letting go anywhere outside the board drops the piece back where it came from.
@@ -114,20 +85,45 @@ export function Board({ snapshot, interactive = false, onMove }: BoardProps) {
     return () => window.removeEventListener('mouseup', drop);
   }, []);
 
+  // Escape calls off a promotion, as a click outside the picker does.
+  useEffect(() => {
+    const dismiss = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setPromoting(null);
+      }
+    };
+    window.addEventListener('keydown', dismiss);
+    return () => window.removeEventListener('keydown', dismiss);
+  }, []);
+
   const legalMoves = interactive ? snapshot.legal_moves : {};
-  const origin = drag?.from ?? selected ?? hovered;
+  // The picker covers the board, so nothing underneath is highlighted while it is open.
+  const origin = promoting !== null ? null : (drag?.from ?? selected ?? hovered);
   const destinations = perDestination(origin === null ? [] : (legalMoves[origin] ?? []));
 
-  /** The move between two squares, auto-queening until the promotion picker lands. */
-  function moveBetween(from: string, to: string): LegalMove | undefined {
+  /**
+   * Make the move between two squares, if there is one: submit it, or ask which piece
+   * the pawn becomes. Returns whether the two squares are a move at all.
+   */
+  function makeMove(from: string, to: string): boolean {
     const candidates = (legalMoves[from] ?? []).filter((move) => move.to_square === to);
-    return candidates.find((move) => move.promotion === 'queen') ?? candidates[0];
-  }
-
-  function submit(move: LegalMove) {
+    if (candidates.length === 0) {
+      return false;
+    }
     setSelected(null);
     setDrag(null);
-    onMove?.(move.uci);
+    // The promotions of one pawn onto one square differ only in the piece it becomes.
+    if (candidates[0].promotion !== null) {
+      setPromoting(candidates);
+    } else {
+      onMove?.(candidates[0].uci);
+    }
+    return true;
+  }
+
+  function promote(chosen: LegalMove) {
+    setPromoting(null);
+    onMove?.(chosen.uci);
   }
 
   function press(square: string, event: ReactMouseEvent) {
@@ -141,9 +137,7 @@ export function Board({ snapshot, interactive = false, onMove }: BoardProps) {
       setDrag(null);
       return;
     }
-    const move = selected === null ? undefined : moveBetween(selected, square);
-    if (move !== undefined) {
-      submit(move);
+    if (selected !== null && makeMove(selected, square)) {
       return;
     }
     if (legalMoves[square] === undefined) {
@@ -163,11 +157,8 @@ export function Board({ snapshot, interactive = false, onMove }: BoardProps) {
     if (square === from) {
       return; // A click rather than a drag: the destination comes with the next click.
     }
-    const move = moveBetween(from, square);
-    if (move === undefined) {
+    if (!makeMove(from, square)) {
       setSelected(null);
-    } else {
-      submit(move);
     }
   }
 
@@ -317,6 +308,15 @@ export function Board({ snapshot, interactive = false, onMove }: BoardProps) {
           />
         );
       })}
+      {/* Above the hit targets, so the board takes nothing while the picker is open. */}
+      {promoting !== null && (
+        <PromotionPicker
+          moves={promoting}
+          color={snapshot.turn}
+          onChoose={promote}
+          onCancel={() => setPromoting(null)}
+        />
+      )}
     </svg>
   );
 }

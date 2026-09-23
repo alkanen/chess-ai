@@ -1,0 +1,28 @@
+/* Dims the game behind the picker, and takes the click that calls the move off. */
+.promotion-backdrop {
+  fill: rgb(20 20 20 / 55%);
+}
+
+.promotion-choice {
+  cursor: pointer;
+}
+
+.promotion-choice .choice-square {
+  fill: #f0f0f0;
+  stroke: rgb(20 20 20 / 45%);
+  stroke-width: 3;
+}
+
+.promotion-choice:hover .choice-square {
+  fill: #ffd27f;
+}
+
+/* The choice the keyboard is on, which Enter and Space take. */
+.promotion-choice:focus {
+  outline: none;
+}
+
+.promotion-choice:focus .choice-square {
+  stroke: rgb(40 90 200 / 80%);
+  stroke-width: 6;
+}
