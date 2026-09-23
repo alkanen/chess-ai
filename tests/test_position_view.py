@@ -257,6 +257,13 @@ def test_frontend_position_fixtures_are_what_the_server_sends():
     """The Vitest fixtures must stay the snapshots of the positions they name."""
     fixtures = json.loads((FRONTEND_FIXTURES / "positions.json").read_text(encoding="utf-8"))
 
-    assert set(fixtures) == {"castling", "drawnByFiftyMoves", "enPassant", "pin", "promotion"}
+    assert set(fixtures) == {
+        "blackPromotion",
+        "castling",
+        "drawnByFiftyMoves",
+        "enPassant",
+        "pin",
+        "promotion",
+    }
     for name, view in fixtures.items():
         assert view == snapshot(chess.Board(view["fen"])).model_dump(mode="json"), name

@@ -1,11 +1,20 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { PositionSnapshot } from '../api';
-import { destinations, lastMoveSquares, originSquare, square } from '../test/boardQueries';
+import {
+  destinations,
+  lastMoveSquares,
+  originSquare,
+  promotionBackdrop,
+  promotionChoice,
+  promotionChoices,
+  square,
+} from '../test/boardQueries';
 import startPosition from '../test/fixtures/start-position.json';
 import { foolsMateMoves } from '../test/foolsMate';
-import { castling, enPassant, pin, promotion } from '../test/positions';
+import { blackPromotion, castling, enPassant, pin, promotion } from '../test/positions';
 import { Board } from './Board';
+import { pieceImage } from './pieces';
 
 function pieceLabels(): string[] {
   return screen.getAllByRole('img').map((piece) => piece.getAttribute('aria-label') ?? '');
@@ -192,17 +201,6 @@ describe('Board', () => {
       expect(destinations(container)).toContain('g1 castling');
     });
 
-    it('auto-queens a promotion until the promotion picker lands', () => {
-      const onMove = vi.fn();
-      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
-
-      fireEvent.mouseDown(square(container, 'b7'));
-      fireEvent.mouseUp(square(container, 'b7'));
-      fireEvent.mouseDown(square(container, 'a8'));
-
-      expect(onMove).toHaveBeenCalledExactlyOnceWith('b7a8q');
-    });
-
     it('submits nothing for a piece dragged onto a square it may not reach', () => {
       const onMove = vi.fn();
       const { container } = render(<Board snapshot={castling} interactive onMove={onMove} />);
@@ -260,6 +258,182 @@ describe('Board', () => {
       fireEvent.mouseUp(square(container, 'e4'));
 
       expect(onMove).not.toHaveBeenCalled();
+      expect(originSquare(container)).toBeNull();
+    });
+  });
+
+  describe('promotion', () => {
+    /** Moves the b7 pawn to b8 by clicking both squares, which promotes it. */
+    function clickToLastRank(container: HTMLElement) {
+      fireEvent.mouseDown(square(container, 'b7'));
+      fireEvent.mouseUp(square(container, 'b7'));
+      fireEvent.mouseDown(square(container, 'b8'));
+      fireEvent.mouseUp(square(container, 'b8'));
+    }
+
+    it('asks which piece the pawn becomes instead of submitting a move', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+
+      clickToLastRank(container);
+
+      expect(promotionChoices(container)).toEqual(['queen', 'rook', 'bishop', 'knight']);
+      expect(screen.getByRole('button', { name: 'Promote to knight' })).toBeInTheDocument();
+      expect(onMove).not.toHaveBeenCalled();
+    });
+
+    it('submits the piece that is chosen', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+      clickToLastRank(container);
+
+      fireEvent.mouseDown(promotionChoice(container, 'knight'));
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('b7b8n');
+      expect(promotionChoices(container)).toEqual([]);
+    });
+
+    it('asks on a capture-promotion too', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+
+      fireEvent.mouseDown(square(container, 'b7'));
+      fireEvent.mouseUp(square(container, 'a8'));
+
+      expect(promotionChoices(container)).toEqual(['queen', 'rook', 'bishop', 'knight']);
+
+      fireEvent.mouseDown(promotionChoice(container, 'rook'));
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('b7a8r');
+    });
+
+    it('offers Black the same choice, in Black\'s pieces', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={blackPromotion} interactive onMove={onMove} />);
+
+      fireEvent.mouseDown(square(container, 'b2'));
+      fireEvent.mouseUp(square(container, 'b1'));
+
+      expect(promotionChoices(container)).toEqual(['queen', 'rook', 'bishop', 'knight']);
+      const queen = promotionChoice(container, 'queen').querySelector('image');
+      expect(queen?.getAttribute('href')).toBe(pieceImage({ color: 'black', type: 'queen' }));
+
+      fireEvent.mouseDown(promotionChoice(container, 'bishop'));
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('b2b1b');
+    });
+
+    it('stacks the choices from the promotion square towards the mover', () => {
+      const { container } = render(<Board snapshot={promotion} interactive />);
+      clickToLastRank(container);
+
+      const ys = ['queen', 'rook', 'bishop', 'knight'].map((piece) =>
+        promotionChoice(container, piece).querySelector('image')?.getAttribute('y'),
+      );
+
+      // b8 is the top rank, so the choices hang down the b-file and stay on the board.
+      expect(ys).toEqual(['0', '100', '200', '300']);
+    });
+
+    it('submits nothing and returns the pawn when the picker is dismissed', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+      clickToLastRank(container);
+
+      fireEvent.mouseDown(promotionBackdrop(container));
+
+      expect(onMove).not.toHaveBeenCalled();
+      expect(promotionChoices(container)).toEqual([]);
+      expect(screen.getByRole('img', { name: 'white pawn on b7' })).toBeInTheDocument();
+      expect(originSquare(container)).toBeNull();
+    });
+
+    it('makes no promotion with a button other than the primary one', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+      clickToLastRank(container);
+
+      fireEvent.mouseDown(promotionChoice(container, 'queen'), { button: 2 });
+
+      // The board calls a move off on the other buttons, and so does the picker.
+      expect(onMove).not.toHaveBeenCalled();
+      expect(promotionChoices(container)).toEqual([]);
+    });
+
+    it('submits the choice Enter lands on', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+      clickToLastRank(container);
+
+      fireEvent.keyDown(promotionChoice(container, 'rook'), { key: 'Enter' });
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('b7b8r');
+      expect(promotionChoices(container)).toEqual([]);
+    });
+
+    it('submits the choice Space lands on', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+      clickToLastRank(container);
+
+      fireEvent.keyDown(promotionChoice(container, 'knight'), { key: ' ' });
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('b7b8n');
+    });
+
+    it('puts the choices in the tab order and starts on the queen', () => {
+      const { container } = render(<Board snapshot={promotion} interactive />);
+
+      clickToLastRank(container);
+
+      for (const piece of ['queen', 'rook', 'bishop', 'knight']) {
+        expect(promotionChoice(container, piece)).toHaveAttribute('tabindex', '0');
+      }
+      expect(document.activeElement).toBe(promotionChoice(container, 'queen'));
+    });
+
+    it('lets Escape call the promotion off', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+      clickToLastRank(container);
+
+      fireEvent.keyDown(window, { key: 'Escape' });
+
+      expect(promotionChoices(container)).toEqual([]);
+      expect(onMove).not.toHaveBeenCalled();
+    });
+
+    it('takes the next move once a dismissed promotion is behind it', () => {
+      const onMove = vi.fn();
+      const { container } = render(<Board snapshot={promotion} interactive onMove={onMove} />);
+      clickToLastRank(container);
+      fireEvent.mouseDown(promotionBackdrop(container));
+
+      fireEvent.mouseDown(square(container, 'e1'));
+      fireEvent.mouseUp(square(container, 'e1'));
+      fireEvent.mouseDown(square(container, 'e2'));
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('e1e2');
+    });
+
+    it('calls the promotion off when the position moves on', () => {
+      const onMove = vi.fn();
+      const { container, rerender } = render(
+        <Board snapshot={promotion} interactive onMove={onMove} />,
+      );
+      clickToLastRank(container);
+
+      rerender(<Board snapshot={castling} interactive onMove={onMove} />);
+
+      expect(promotionChoices(container)).toEqual([]);
+      expect(onMove).not.toHaveBeenCalled();
+    });
+
+    it('shows no highlights under the picker', () => {
+      const { container } = render(<Board snapshot={promotion} interactive />);
+      clickToLastRank(container);
+
+      expect(destinations(container)).toEqual([]);
       expect(originSquare(container)).toBeNull();
     });
   });

@@ -224,6 +224,33 @@ async def test_a_human_plays_the_move_that_is_submitted():
     assert [move.uci for move in session.state.moves] == ["e2e4", "e7e5"]
 
 
+async def test_a_submitted_underpromotion_makes_the_piece_it_asks_for():
+    """The promotion piece in the UCI is the one that lands on the board.
+
+    The four promotions of a pawn share a destination square, so the last letter of the
+    UCI the browser's promotion picker submits is all that tells them apart.
+    """
+    # 1. h4 g5 2. hxg5 Na6 3. g6 Nb8 4. gxh7 Na6, and the h-pawn takes on g8.
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["g7g5", "b8a6", "a6b8", "b8a6"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        for uci in ["h2h4", "h4g5", "g5g6", "g6h7"]:
+            session.submit_move(uci)
+            played, replied = await anext(events), await anext(events)
+            assert (played.type, replied.type) == ("move", "move")
+
+        session.submit_move("h7g8n")
+        promotion = await anext(events)
+
+    assert promotion.type == "move"
+    assert promotion.move.uci == "h7g8n" and promotion.move.san == "hxg8=N"
+    assert session.state.position.pieces["g8"].model_dump() == {
+        "color": "white",
+        "type": "knight",
+    }
+
+
 async def test_both_sides_can_be_human():
     session = GameSession(HumanPlayer(), HumanPlayer())
 

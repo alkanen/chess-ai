@@ -2,11 +2,11 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PlayerKind, PositionSnapshot } from './api';
 import { App } from './App';
-import { destinations, lastMoveSquares, square } from './test/boardQueries';
+import { destinations, lastMoveSquares, promotionChoice, square } from './test/boardQueries';
 import { FakeWebSocket } from './test/fakeWebSocket';
 import startPosition from './test/fixtures/start-position.json';
 import { foolsMateMoves, foolsMateStart, type StateEvent } from './test/foolsMate';
-import { castling, drawnByFiftyMoves } from './test/positions';
+import { castling, drawnByFiftyMoves, promotion } from './test/positions';
 
 const PLAYERS = {
   human: { name: 'Human', accepts_moves: true },
@@ -217,6 +217,21 @@ describe('App', () => {
       fireEvent.mouseDown(square(container, 'g1'));
 
       expect(socket.sent).toEqual([JSON.stringify({ type: 'move', uci: 'e1g1' })]);
+    });
+
+    it('sends the piece chosen for a promotion, and nothing before it is chosen', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', promotion));
+
+      fireEvent.mouseDown(square(container, 'b7'));
+      fireEvent.mouseUp(square(container, 'b8'));
+      expect(socket.sent).toEqual([]);
+
+      fireEvent.mouseDown(promotionChoice(container, 'knight'));
+
+      expect(socket.sent).toEqual([JSON.stringify({ type: 'move', uci: 'b7b8n' })]);
     });
 
     it('takes no second move while the first is still on its way to the server', () => {
