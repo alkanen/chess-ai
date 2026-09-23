@@ -1,6 +1,6 @@
 import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { Color, LegalMove, PieceType } from '../api';
-import { BOARD, SQUARE, squarePosition } from './geometry';
+import { BOARD, SQUARE, squarePosition, type Orientation } from './geometry';
 import { pieceImage } from './pieces';
 import './PromotionPicker.css';
 
@@ -12,6 +12,8 @@ interface PromotionPickerProps {
   moves: LegalMove[];
   /** The colour of the promoting pawn, so the choices are drawn in its pieces. */
   color: Color;
+  /** Which side is at the bottom of the board, so the stack runs the right way. */
+  orientation?: Orientation;
   onChoose: (move: LegalMove) => void;
   /** Called when the picker is dismissed, leaving the pawn where it was. */
   onCancel: () => void;
@@ -21,7 +23,13 @@ interface PromotionPickerProps {
  * The pieces a promoting pawn may become, stacked on the promotion square's file and
  * running into the board, over a backdrop that calls the move off when it is clicked.
  */
-export function PromotionPicker({ moves, color, onChoose, onCancel }: PromotionPickerProps) {
+export function PromotionPicker({
+  moves,
+  color,
+  orientation = 'white',
+  onChoose,
+  onCancel,
+}: PromotionPickerProps) {
   const first = useRef<SVGGElement>(null);
   // The picker has the board to itself, so it takes the keyboard too: it opens on the
   // queen, Enter or Space takes the choice the keyboard is on, and Escape (handled by
@@ -33,8 +41,9 @@ export function PromotionPicker({ moves, color, onChoose, onCancel }: PromotionP
     const move = byPiece.get(piece);
     return move === undefined ? [] : [{ piece, move }];
   });
-  const { x, y } = squarePosition(moves[0].to_square);
-  // The stack hangs down from the eighth rank and up from the first, so it always fits.
+  const { x, y } = squarePosition(moves[0].to_square, orientation);
+  // The stack hangs down from the top of the board and up from the bottom, whichever
+  // way round it is, so it always fits.
   const step = y === 0 ? SQUARE : -SQUARE;
 
   return (

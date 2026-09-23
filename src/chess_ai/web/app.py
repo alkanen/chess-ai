@@ -11,7 +11,7 @@ import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import chess
 from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
@@ -22,9 +22,9 @@ from starlette.types import Message
 from starlette.websockets import WebSocketState
 
 from chess_ai.config import Config
-from chess_ai.game_session import GameSession, GameState
+from chess_ai.game_session import ActionRejectedError, GameSession, GameState
 from chess_ai.players import HumanPlayer, MoveRejectedError, Player, RandomPlayer
-from chess_ai.position_view import PositionSnapshot, snapshot
+from chess_ai.position_view import Color, PositionSnapshot, snapshot
 from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -52,16 +52,40 @@ class NewGameRequest(BaseModel):
     played as soon as it arrives."""
 
 
-class SubmitMove(BaseModel):
-    """A viewer plays a move for the human side to move."""
+class ViewerAction(BaseModel):
+    """Something a viewer asks of the game their browser is showing them.
 
-    model_config = ConfigDict(extra="forbid")
+    Every one of these names that game, because a new game can replace it in the moment
+    before the message arrives, and the server acts on the game the viewer meant.
+    """
+
+    model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
+
+    game: str
+    """The ``id`` of the game this is meant for, as its state gave it."""
+
+
+class SubmitMove(ViewerAction):
+    """A viewer plays a move for the human side to move."""
 
     type: Literal["move"]
     uci: str
 
 
-ViewerMessage = SubmitMove
+class Resign(ViewerAction):
+    """A viewer resigns on behalf of one side, which must be a side they play."""
+
+    type: Literal["resign"]
+    color: Color
+
+
+class Abort(ViewerAction):
+    """A viewer ends the game with no result."""
+
+    type: Literal["abort"]
+
+
+ViewerMessage = Annotated[SubmitMove | Resign | Abort, Field(discriminator="type")]
 """What a viewer may send over the game WebSocket."""
 
 _VIEWER_MESSAGE = TypeAdapter(ViewerMessage)
@@ -120,14 +144,14 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
 
     @api.websocket("/game/ws")
     async def follow_game(websocket: WebSocket) -> None:
-        """Send the current game's full state, then every move, and play submitted moves."""
+        """Send the current game's full state and every event after it, and act on replies."""
         await websocket.accept()
         connection = _Connection(websocket)
         # Either side can end the connection: the viewer goes away, or the channel
         # closes and has nothing left to send.
         async with asyncio.TaskGroup() as tasks:
             sending = tasks.create_task(_send_game_events(connection, game_channel))
-            receiving = tasks.create_task(_play_submitted_moves(connection, game_channel))
+            receiving = tasks.create_task(_act_on_viewer_messages(connection, game_channel))
             await asyncio.wait({sending, receiving}, return_when=asyncio.FIRST_COMPLETED)
             sending.cancel()
             receiving.cancel()
@@ -179,25 +203,35 @@ class _Connection:
                 await self._websocket.close(code)
 
 
-async def _play_submitted_moves(connection: _Connection, game_channel: GameChannel) -> None:
-    """Play the moves the viewer submits, until the viewer goes away.
+async def _act_on_viewer_messages(connection: _Connection, game_channel: GameChannel) -> None:
+    """Do what the viewer asks of the game, until the viewer goes away.
 
-    A move the game will not take is reported to the viewer who submitted it and to
-    nobody else, and the game plays on.
+    Anything the game will not do is reported to the viewer who asked and to nobody
+    else, and the game goes on.
     """
     try:
         while (message := await connection.receive())["type"] != "websocket.disconnect":
             try:
-                submitted = _VIEWER_MESSAGE.validate_json(message.get("text") or "")
+                asked = _VIEWER_MESSAGE.validate_json(message.get("text") or "")
             except ValidationError:
                 await connection.send(ErrorEvent(message="the server cannot read that message"))
                 continue
             try:
-                game_channel.submit_move(submitted.uci)
-            except MoveRejectedError as rejected:
+                _act(game_channel, asked)
+            except (ActionRejectedError, MoveRejectedError) as rejected:
                 await connection.send(ErrorEvent(message=str(rejected)))
     except WebSocketDisconnect:
         pass  # The viewer has already gone.
+
+
+def _act(game_channel: GameChannel, asked: ViewerMessage) -> None:
+    match asked:
+        case SubmitMove():
+            game_channel.submit_move(asked.game, asked.uci)
+        case Resign():
+            game_channel.resign(asked.game, asked.color)
+        case Abort():
+            game_channel.abort(asked.game)
 
 
 async def _send_game_events(connection: _Connection, game_channel: GameChannel) -> None:

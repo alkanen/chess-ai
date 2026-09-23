@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import {
   gameChannelUrl,
+  type Color,
   type GameEvent,
   type GameState,
   type PositionSnapshot,
-  type SubmitMove,
+  type ViewerMessage,
 } from './api';
 
 /** What the game view shows. */
@@ -32,6 +33,10 @@ export interface GameChannel extends ChannelState {
   movePending: boolean;
   /** Plays a move, in UCI, for the side to move. The server has the final say. */
   submitMove: (uci: string) => void;
+  /** Resigns the game for one side, ending it for every viewer. */
+  resign: (color: Color) => void;
+  /** Ends the game with no result, for every viewer. */
+  abort: () => void;
 }
 
 const MAX_RETRY_DELAY_MS = 10_000;
@@ -69,6 +74,14 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
       };
       return { view: { game, position: game.position }, error: null };
     }
+    case 'game_over': {
+      if (state.view === null) {
+        return { ...state, error: null };
+      }
+      const game =
+        state.view.game === null ? null : { ...state.view.game, position: event.position };
+      return { view: { game, position: event.position }, error: null };
+    }
     case 'error':
       return { ...state, error: event.message };
   }
@@ -81,6 +94,9 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
  */
 export function useGameChannel(): GameChannel {
   const [{ view, error }, dispatch] = useReducer(applyEvent, DISCONNECTED);
+  // Everything a viewer asks names the game they are looking at, so that a new game
+  // starting in the meantime takes none of it.
+  const game = view?.game?.id ?? null;
   const [connected, setConnected] = useState(false);
   const [movePending, setMovePending] = useState(false);
   const socket = useRef<WebSocket | null>(null);
@@ -130,16 +146,23 @@ export function useGameChannel(): GameChannel {
     };
   }, [stopWaiting]);
 
+  /** Sends a message, and says whether the connection was there to take it. */
+  const send = useCallback((message: ViewerMessage): boolean => {
+    const open = socket.current;
+    // A socket that is closing or closed throws nothing and reports nothing: it
+    // discards what it is given. Waiting for an answer to that would never end.
+    if (open === null || open.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    open.send(JSON.stringify(message));
+    return true;
+  }, []);
+
   const submitMove = useCallback(
     (uci: string) => {
-      const open = socket.current;
-      // A socket that is closing or closed throws nothing and reports nothing: it
-      // discards what it is given. Waiting for an answer to that would never end.
-      if (open === null || open.readyState !== WebSocket.OPEN) {
+      if (game === null || !send({ game, type: 'move', uci })) {
         return;
       }
-      const message: SubmitMove = { type: 'move', uci };
-      open.send(JSON.stringify(message));
       setMovePending(true);
       clearTimeout(answer.current);
       answer.current = setTimeout(() => {
@@ -147,8 +170,24 @@ export function useGameChannel(): GameChannel {
         dispatch({ type: 'error', message: NO_ANSWER });
       }, ANSWER_TIMEOUT_MS);
     },
-    [stopWaiting],
+    [game, send, stopWaiting],
   );
 
-  return { view, error, connected, movePending, submitMove };
+  // Ending a game holds nothing up on the board, so neither waits for an answer.
+  const resign = useCallback(
+    (color: Color) => {
+      if (game !== null) {
+        send({ game, type: 'resign', color });
+      }
+    },
+    [game, send],
+  );
+
+  const abort = useCallback(() => {
+    if (game !== null) {
+      send({ game, type: 'abort' });
+    }
+  }, [game, send]);
+
+  return { view, error, connected, movePending, submitMove, resign, abort };
 }

@@ -1,18 +1,28 @@
-import type { GameOver, GameOverReason, PositionSnapshot } from './api';
+import type { GameOver, GameOverReason, PositionSnapshot, Result } from './api';
 import { TurnIndicator } from './TurnIndicator';
 import './GameStatus.css';
 
-const REASONS: Record<GameOverReason, string> = {
+/** An abort is described on its own, so it is the one reason with nothing to say here. */
+const REASONS: Record<Exclude<GameOverReason, 'abort'>, string> = {
   checkmate: 'checkmate',
   stalemate: 'stalemate',
   insufficient_material: 'insufficient material',
   threefold_repetition: 'threefold repetition',
   fifty_move_rule: 'the fifty-move rule',
+  resignation: 'resignation',
 };
 
-const SCORES = { '1-0': '1–0', '0-1': '0–1', '1/2-1/2': '½–½' } as const;
+const SCORES: Record<Exclude<Result, '*'>, string> = {
+  '1-0': '1–0',
+  '0-1': '0–1',
+  '1/2-1/2': '½–½',
+};
 
 export function describeGameOver({ result, reason }: GameOver): string {
+  // An abort is the one ending that leaves no result, so there is nothing to score.
+  if (result === '*' || reason === 'abort') {
+    return 'Game aborted';
+  }
   const outcome =
     result === '1-0' ? 'White wins by' : result === '0-1' ? 'Black wins by' : 'Draw by';
   return `${outcome} ${REASONS[reason]} (${SCORES[result]})`;

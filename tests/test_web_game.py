@@ -37,6 +37,18 @@ def receive(websocket: WebSocketTestSession) -> ViewerEvent:
     return EVENT.validate_python(websocket.receive_json())
 
 
+def start_game(chess_client, players=HUMAN_GAME, **changes) -> str:
+    """Start a game and return the id a viewer quotes back when acting on it."""
+    response = chess_client.post("/chess/api/game", json={**players, **changes})
+    assert response.status_code == 200
+    return response.json()["id"]
+
+
+def ask(websocket: WebSocketTestSession, game: str, **message) -> None:
+    """Send what a viewer asks of ``game``, which every message has to name."""
+    websocket.send_json({**message, "game": game})
+
+
 def receive_game(websocket: WebSocketTestSession) -> list[GameEvent]:
     """Receive a game's events, from its state until a move ends the game."""
     first = receive(websocket)
@@ -158,7 +170,7 @@ def test_a_human_move_submitted_over_the_websocket_is_played(chess_client):
         response = chess_client.post("/chess/api/game", json=HUMAN_GAME)
         assert receive(websocket).type == "state"
 
-        websocket.send_json({"type": "move", "uci": "e2e4"})
+        ask(websocket, response.json()["id"], type="move", uci="e2e4")
         played, answered = receive(websocket), receive(websocket)
 
     assert response.json()["white"] == {"name": "Human", "accepts_moves": True}
@@ -171,12 +183,12 @@ def test_a_human_move_submitted_over_the_websocket_is_played(chess_client):
 def test_human_against_human_takes_both_sides_moves(chess_client):
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "no_game"
-        chess_client.post("/chess/api/game", json={**HUMAN_GAME, "black": "human"})
+        game = start_game(chess_client, black="human")
         assert receive(websocket).type == "state"
 
-        websocket.send_json({"type": "move", "uci": "e2e4"})
+        ask(websocket, game, type="move", uci="e2e4")
         white = receive(websocket)
-        websocket.send_json({"type": "move", "uci": "e7e5"})
+        ask(websocket, game, type="move", uci="e7e5")
         black = receive(websocket)
 
     assert white.type == black.type == "move"
@@ -184,16 +196,16 @@ def test_human_against_human_takes_both_sides_moves(chess_client):
 
 
 def test_an_illegal_submission_is_rejected_and_the_game_is_unchanged(chess_client):
-    chess_client.post("/chess/api/game", json=HUMAN_GAME)
+    game = start_game(chess_client)
 
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         state = receive(websocket)
 
-        websocket.send_json({"type": "move", "uci": "e2e5"})
+        ask(websocket, game, type="move", uci="e2e5")
         rejection = receive(websocket)
 
         # The game went on waiting for a move, so the next legal one is still the first.
-        websocket.send_json({"type": "move", "uci": "e2e4"})
+        ask(websocket, game, type="move", uci="e2e4")
         played = receive(websocket)
 
     assert state.type == "state" and state.game.position.fen == chess.STARTING_FEN
@@ -204,7 +216,7 @@ def test_an_illegal_submission_is_rejected_and_the_game_is_unchanged(chess_clien
 
 
 def test_a_rejection_reaches_only_the_viewer_who_submitted_it(chess_client):
-    chess_client.post("/chess/api/game", json=HUMAN_GAME)
+    game = start_game(chess_client)
 
     with (
         chess_client.websocket_connect("/chess/api/game/ws") as submitter,
@@ -212,10 +224,10 @@ def test_a_rejection_reaches_only_the_viewer_who_submitted_it(chess_client):
     ):
         assert receive(submitter).type == receive(watcher).type == "state"
 
-        submitter.send_json({"type": "move", "uci": "e2e5"})
+        ask(submitter, game, type="move", uci="e2e5")
         assert receive(submitter).type == "error"
 
-        submitter.send_json({"type": "move", "uci": "e2e4"})
+        ask(submitter, game, type="move", uci="e2e4")
         seen_by_watcher = receive(watcher)
 
     assert seen_by_watcher.type == "move"
@@ -223,11 +235,11 @@ def test_a_rejection_reaches_only_the_viewer_who_submitted_it(chess_client):
 
 
 def test_a_move_submitted_for_a_player_that_plays_its_own_is_refused(chess_client):
-    chess_client.post("/chess/api/game", json={**RANDOM_GAME, "move_delay": 10})
+    game = start_game(chess_client, RANDOM_GAME, move_delay=10)
 
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "state"
-        websocket.send_json({"type": "move", "uci": "e2e4"})
+        ask(websocket, game, type="move", uci="e2e4")
         rejection = receive(websocket)
 
     assert rejection.type == "error"
@@ -237,7 +249,7 @@ def test_a_move_submitted_for_a_player_that_plays_its_own_is_refused(chess_clien
 def test_a_move_submitted_before_any_game_is_refused(chess_client):
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "no_game"
-        websocket.send_json({"type": "move", "uci": "e2e4"})
+        ask(websocket, "a game that never was", type="move", uci="e2e4")
         rejection = receive(websocket)
 
     assert rejection.type == "error"
@@ -246,7 +258,20 @@ def test_a_move_submitted_before_any_game_is_refused(chess_client):
 
 @pytest.mark.parametrize(
     "message",
-    ['{"type": "move"}', '{"type": "takeback"}', '{"uci": "e2e4"}', "not json at all", ""],
+    [
+        '{"type": "move"}',
+        '{"type": "takeback"}',
+        '{"uci": "e2e4"}',
+        '{"type": "resign"}',
+        '{"type": "resign", "color": "green"}',
+        '{"type": "abort", "color": "white"}',
+        # Every message has to name the game it is meant for.
+        '{"type": "move", "uci": "e2e4"}',
+        '{"type": "resign", "color": "white"}',
+        '{"type": "abort"}',
+        "not json at all",
+        "",
+    ],
 )
 def test_a_message_the_server_cannot_read_is_reported_back(chess_client, message):
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
@@ -256,6 +281,180 @@ def test_a_message_the_server_cannot_read_is_reported_back(chess_client, message
 
     assert rejection.type == "error"
     assert rejection.message == "the server cannot read that message"
+
+
+def test_a_resignation_ends_the_game_for_every_viewer(chess_client):
+    game = start_game(chess_client)
+
+    with (
+        chess_client.websocket_connect("/chess/api/game/ws") as resigner,
+        chess_client.websocket_connect("/chess/api/game/ws") as watcher,
+    ):
+        assert receive(resigner).type == receive(watcher).type == "state"
+
+        ask(resigner, game, type="resign", color="white")
+        ended, seen_by_watcher = receive(resigner), receive(watcher)
+
+    assert ended.type == seen_by_watcher.type == "game_over"
+    assert ended.position == seen_by_watcher.position
+    assert ended.position.game_over is not None
+    assert (ended.position.game_over.result, ended.position.game_over.reason) == (
+        "0-1",
+        "resignation",
+    )
+
+
+def test_black_resigning_hands_the_game_to_white(chess_client):
+    game = start_game(chess_client, black="human")
+
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "state"
+        ask(websocket, game, type="resign", color="black")
+        ended = receive(websocket)
+
+    assert ended.type == "game_over"
+    assert ended.position.game_over is not None
+    assert (ended.position.game_over.result, ended.position.game_over.reason) == (
+        "1-0",
+        "resignation",
+    )
+
+
+def test_a_resignation_keeps_the_moves_already_played(chess_client):
+    game = start_game(chess_client)
+
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        events = [receive(websocket)]
+        ask(websocket, game, type="move", uci="e2e4")
+        events += receive_moves(websocket, 2)
+
+        ask(websocket, game, type="resign", color="white")
+        events.append(receive(websocket))
+
+    game = replay(events)
+    assert [move.san for move in game.moves] == [events[1].move.san, events[2].move.san]
+    assert game.position.game_over is not None
+    assert game.position.game_over.reason == "resignation"
+    assert game.position.legal_moves == {}
+
+
+def test_an_abort_ends_the_game_with_no_result_for_every_viewer(chess_client):
+    game = start_game(chess_client, RANDOM_GAME, move_delay=10)
+
+    with (
+        chess_client.websocket_connect("/chess/api/game/ws") as aborter,
+        chess_client.websocket_connect("/chess/api/game/ws") as watcher,
+    ):
+        assert receive(aborter).type == receive(watcher).type == "state"
+
+        ask(aborter, game, type="abort")
+        ended, seen_by_watcher = receive(aborter), receive(watcher)
+
+    assert ended.type == seen_by_watcher.type == "game_over"
+    assert ended.position.game_over is not None
+    assert (ended.position.game_over.result, ended.position.game_over.reason) == ("*", "abort")
+
+
+def test_a_reconnecting_viewer_is_told_the_game_was_resigned(chess_client):
+    game = start_game(chess_client)
+
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "state"
+        ask(websocket, game, type="resign", color="white")
+        assert receive(websocket).type == "game_over"
+    with chess_client.websocket_connect("/chess/api/game/ws") as rejoined:
+        arrived = receive(rejoined)
+
+    assert arrived.type == "state"
+    assert arrived.game.position.game_over is not None
+    assert arrived.game.position.game_over.reason == "resignation"
+
+
+def test_a_side_that_plays_its_own_moves_cannot_be_resigned(chess_client):
+    game = start_game(chess_client, move_delay=10)
+
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "state"
+        ask(websocket, game, type="resign", color="black")
+        rejection = receive(websocket)
+
+        # The game is untouched, so it still takes White's move.
+        ask(websocket, game, type="move", uci="e2e4")
+        played = receive(websocket)
+
+    assert rejection.type == "error"
+    assert rejection.message == "Random mover is not yours to resign"
+    assert played.type == "move" and played.move.uci == "e2e4"
+
+
+@pytest.mark.parametrize("ending", [{"type": "resign", "color": "white"}, {"type": "abort"}])
+def test_ending_a_game_that_is_already_over_is_refused(chess_client, ending):
+    game = start_game(chess_client)
+
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "state"
+        ask(websocket, game, type="abort")
+        assert receive(websocket).type == "game_over"
+
+        ask(websocket, game, **ending)
+        rejection = receive(websocket)
+
+    assert rejection.type == "error"
+    assert rejection.message == "the game is over"
+
+
+@pytest.mark.parametrize("ending", [{"type": "resign", "color": "white"}, {"type": "abort"}])
+def test_ending_a_game_before_any_has_started_is_refused(chess_client, ending):
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "no_game"
+        ask(websocket, "a game that never was", **ending)
+        rejection = receive(websocket)
+
+    assert rejection.type == "error"
+    assert rejection.message == "no game is in progress"
+
+
+def test_a_new_game_can_be_started_after_a_resignation(chess_client):
+    game = start_game(chess_client)
+
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "state"
+        ask(websocket, game, type="resign", color="white")
+        assert receive(websocket).type == "game_over"
+
+        chess_client.post("/chess/api/game", json=RANDOM_GAME)
+        events = receive_game(websocket)
+
+    assert events[0].type == "state" and events[0].game.moves == []
+    assert_legal(events)
+
+
+@pytest.mark.parametrize(
+    "stale",
+    [{"type": "move", "uci": "e2e4"}, {"type": "resign", "color": "white"}, {"type": "abort"}],
+)
+def test_what_a_viewer_asks_of_a_replaced_game_never_reaches_its_replacement(chess_client, stale):
+    """A click lands on the game the viewer was shown, or on nothing at all.
+
+    Another viewer can start a new game in the moment between the board being drawn and
+    the click arriving, and the replacement is a game this viewer has never seen.
+    """
+    watched = start_game(chess_client, move_delay=10)
+
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "state"
+        replacement = start_game(chess_client, move_delay=10)
+        ask(websocket, watched, **stale)
+        seen = [receive(websocket), receive(websocket)]
+
+        # The replacement is untouched, and still takes what is asked of it by name.
+        ask(websocket, replacement, type="move", uci="e2e4")
+        played = receive(websocket)
+
+    rejection = next(event for event in seen if event.type == "error")
+    assert rejection.message == "that game has been replaced"
+    assert next(event for event in seen if event.type == "state").game.moves == []
+    assert played.type == "move" and played.move.uci == "e2e4"
 
 
 def test_game_routes_are_not_served_outside_the_prefix(chess_client):

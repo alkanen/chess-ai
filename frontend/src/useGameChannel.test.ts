@@ -6,6 +6,7 @@ import startPosition from './test/fixtures/start-position.json';
 import { useGameChannel } from './useGameChannel';
 
 const GAME = {
+  id: 'a-game',
   white: { name: 'Human', accepts_moves: true },
   black: { name: 'Random mover', accepts_moves: false },
   moves: [],
@@ -42,7 +43,9 @@ describe('useGameChannel', () => {
 
     act(() => channel.result.current.submitMove('e2e4'));
 
-    expect(socket.sent).toEqual([JSON.stringify({ type: 'move', uci: 'e2e4' })]);
+    expect(socket.sent.map((message) => JSON.parse(message))).toEqual([
+      { game: 'a-game', type: 'move', uci: 'e2e4' },
+    ]);
     expect(channel.result.current.movePending).toBe(true);
   });
 

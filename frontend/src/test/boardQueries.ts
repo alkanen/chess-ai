@@ -17,6 +17,17 @@ export function destinations(container: HTMLElement): string[] {
   ).sort();
 }
 
+/** The square of the king the board is highlighting as in check, if any. */
+export function checkSquare(container: HTMLElement): string | null {
+  return container.querySelector('.check')?.getAttribute('data-square') ?? null;
+}
+
+/** Where a square's hit target sits on the board, as "x,y" in SVG user units. */
+export function squareAt(container: HTMLElement, name: string): string {
+  const target = square(container, name);
+  return `${target.getAttribute('x')},${target.getAttribute('y')}`;
+}
+
 /** The square whose legal moves the board is showing, if any. */
 export function originSquare(container: HTMLElement): string | null {
   return container.querySelector('.origin')?.getAttribute('data-square') ?? null;

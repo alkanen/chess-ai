@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { PositionSnapshot } from '../api';
 import {
+  checkSquare,
   destinations,
   lastMoveSquares,
   originSquare,
@@ -9,15 +10,32 @@ import {
   promotionChoice,
   promotionChoices,
   square,
+  squareAt,
 } from '../test/boardQueries';
 import startPosition from '../test/fixtures/start-position.json';
 import { foolsMateMoves } from '../test/foolsMate';
-import { blackPromotion, castling, enPassant, pin, promotion } from '../test/positions';
+import {
+  blackPromotion,
+  castling,
+  check,
+  enPassant,
+  pin,
+  promotion,
+} from '../test/positions';
 import { Board } from './Board';
 import { pieceImage } from './pieces';
 
 function pieceLabels(): string[] {
   return screen.getAllByRole('img').map((piece) => piece.getAttribute('aria-label') ?? '');
+}
+
+/** The rank numbers and file letters around the board, in the order they are drawn. */
+function coordinates(container: HTMLElement) {
+  const texts = Array.from(container.querySelectorAll('.coordinate'));
+  return {
+    ranks: texts.filter((text) => /^[1-8]$/.test(text.textContent ?? '')),
+    files: texts.filter((text) => /^[a-h]$/.test(text.textContent ?? '')),
+  };
 }
 
 describe('Board', () => {
@@ -45,6 +63,7 @@ describe('Board', () => {
         e8: { color: 'black', type: 'king' },
       },
       last_move: null,
+      check_square: null,
       legal_moves: {},
       game_over: null,
     };
@@ -67,6 +86,7 @@ describe('Board', () => {
         h8: { color: 'black', type: 'king' },
       },
       last_move: null,
+      check_square: null,
       legal_moves: {},
       game_over: null,
     };
@@ -435,6 +455,128 @@ describe('Board', () => {
 
       expect(destinations(container)).toEqual([]);
       expect(originSquare(container)).toBeNull();
+    });
+  });
+  describe('the king in check', () => {
+    it('highlights the square of the king that is in check', () => {
+      const { container } = render(<Board snapshot={check} />);
+
+      expect(checkSquare(container)).toBe('e8');
+    });
+
+    it('highlights the mated king too', () => {
+      const { container } = render(<Board snapshot={foolsMateMoves[3].position} />);
+
+      expect(checkSquare(container)).toBe('e1');
+    });
+
+    it('highlights nothing when no king is in check', () => {
+      const { container } = render(<Board snapshot={startPosition as PositionSnapshot} />);
+
+      expect(checkSquare(container)).toBeNull();
+    });
+
+    it('follows the king to the other end of a flipped board', () => {
+      const { container } = render(<Board snapshot={check} orientation="black" />);
+
+      expect(checkSquare(container)).toBe('e8');
+      // The eighth rank is at the bottom of the screen with Black at the bottom.
+      expect(container.querySelector('.check')?.getAttribute('y')).toBe('700');
+    });
+  });
+
+  describe('flipped, with Black at the bottom', () => {
+    it('places Black at the bottom and White at the top', () => {
+      const snapshot: PositionSnapshot = {
+        fen: '7k/8/8/8/8/8/8/K7 w - - 0 1',
+        turn: 'white',
+        pieces: {
+          a1: { color: 'white', type: 'king' },
+          h8: { color: 'black', type: 'king' },
+        },
+        last_move: null,
+        check_square: null,
+        legal_moves: {},
+        game_over: null,
+      };
+
+      render(<Board snapshot={snapshot} orientation="black" />);
+
+      const a1 = screen.getByRole('img', { name: 'white king on a1' });
+      const h8 = screen.getByRole('img', { name: 'black king on h8' });
+      expect([a1.getAttribute('x'), a1.getAttribute('y')]).toEqual(['700', '0']);
+      expect([h8.getAttribute('x'), h8.getAttribute('y')]).toEqual(['0', '700']);
+    });
+
+    it('turns the squares that take the clicks round with the board', () => {
+      const { container } = render(<Board snapshot={castling} orientation="black" />);
+
+      expect(squareAt(container, 'a1')).toBe('700,0');
+      expect(squareAt(container, 'h8')).toBe('0,700');
+      expect(squareAt(container, 'e1')).toBe('300,0');
+    });
+
+    it('keeps the coordinates down the left edge and along the bottom', () => {
+      const { container } = render(<Board snapshot={castling} orientation="black" />);
+
+      const { ranks, files } = coordinates(container);
+      expect(ranks.map((text) => text.textContent).sort().join('')).toBe('12345678');
+      expect(files.map((text) => text.textContent).sort().join('')).toBe('abcdefgh');
+      // The leftmost column is the h-file once flipped, and the bottom row the eighth rank.
+      expect(ranks.map((text) => text.getAttribute('x'))).toEqual(Array(8).fill('4'));
+      expect(files.map((text) => text.getAttribute('y'))).toEqual(Array(8).fill('796'));
+      // Within those, the first rank is at the top of the board and the a-file at its right.
+      const rankY = Object.fromEntries(ranks.map((t) => [t.textContent, t.getAttribute('y')]));
+      const fileX = Object.fromEntries(files.map((t) => [t.textContent, t.getAttribute('x')]));
+      expect([rankY['1'], rankY['8']]).toEqual(['4', '704']);
+      expect([fileX['a'], fileX['h']]).toEqual(['796', '96']);
+    });
+
+    it('shows the legal destinations of a hovered piece', () => {
+      const { container } = render(<Board snapshot={castling} orientation="black" interactive />);
+
+      fireEvent.mouseEnter(square(container, 'e1'));
+
+      expect(destinations(container)).toContain('g1 castling');
+      expect(originSquare(container)).toBe('e1');
+    });
+
+    it('submits the move of two clicks, as it does the right way up', () => {
+      const onMove = vi.fn();
+      const { container } = render(
+        <Board snapshot={castling} orientation="black" interactive onMove={onMove} />,
+      );
+
+      fireEvent.mouseDown(square(container, 'e1'));
+      fireEvent.mouseUp(square(container, 'e1'));
+      fireEvent.mouseDown(square(container, 'c1'));
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('e1c1');
+    });
+
+    it('submits the move of a dragged piece', () => {
+      const onMove = vi.fn();
+      const { container } = render(
+        <Board snapshot={castling} orientation="black" interactive onMove={onMove} />,
+      );
+
+      fireEvent.mouseDown(square(container, 'e1'));
+      fireEvent.mouseUp(square(container, 'g1'));
+
+      expect(onMove).toHaveBeenCalledExactlyOnceWith('e1g1');
+    });
+
+    it('stacks the promotion choices from the promotion square towards the mover', () => {
+      const { container } = render(<Board snapshot={promotion} orientation="black" interactive />);
+
+      fireEvent.mouseDown(square(container, 'b7'));
+      fireEvent.mouseUp(square(container, 'b8'));
+
+      const ys = ['queen', 'rook', 'bishop', 'knight'].map((piece) =>
+        promotionChoice(container, piece).querySelector('image')?.getAttribute('y'),
+      );
+      // Flipped, b8 is at the bottom of the screen, so the choices climb the board.
+      expect(ys).toEqual(['700', '600', '500', '400']);
     });
   });
 });

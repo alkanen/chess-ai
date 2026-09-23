@@ -31,10 +31,21 @@ describe('GameStatus', () => {
     ],
     [{ result: '1/2-1/2', reason: 'threefold_repetition' }, 'Draw by threefold repetition (½–½)'],
     [{ result: '1/2-1/2', reason: 'fifty_move_rule' }, 'Draw by the fifty-move rule (½–½)'],
+    [{ result: '0-1', reason: 'resignation' }, 'Black wins by resignation (0–1)'],
+    [{ result: '1-0', reason: 'resignation' }, 'White wins by resignation (1–0)'],
   ])('shows the result and reason of a finished game: %o', (gameOver, text) => {
     render(<GameStatus position={position({ game_over: gameOver })} inGame />);
 
     expect(screen.getByRole('status')).toHaveTextContent(text);
     expect(screen.getByRole('status')).not.toHaveTextContent('to move');
+  });
+
+  it('shows an aborted game as having no result at all', () => {
+    const aborted = position({ game_over: { result: '*', reason: 'abort' } });
+
+    render(<GameStatus position={aborted} inGame />);
+
+    expect(screen.getByRole('status')).toHaveTextContent('Game aborted');
+    expect(screen.getByRole('status')).not.toHaveTextContent('Draw');
   });
 });

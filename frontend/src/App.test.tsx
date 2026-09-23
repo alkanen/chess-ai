@@ -2,23 +2,42 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PlayerKind, PositionSnapshot } from './api';
 import { App } from './App';
-import { destinations, lastMoveSquares, promotionChoice, square } from './test/boardQueries';
+import {
+  checkSquare,
+  destinations,
+  lastMoveSquares,
+  promotionChoice,
+  square,
+  squareAt,
+} from './test/boardQueries';
 import { FakeWebSocket } from './test/fakeWebSocket';
 import startPosition from './test/fixtures/start-position.json';
 import { foolsMateMoves, foolsMateStart, type StateEvent } from './test/foolsMate';
-import { castling, drawnByFiftyMoves, promotion } from './test/positions';
+import { castling, check, drawnByFiftyMoves, promotion } from './test/positions';
 
 const PLAYERS = {
   human: { name: 'Human', accepts_moves: true },
   random: { name: 'Random mover', accepts_moves: false },
 } satisfies Record<PlayerKind, { name: string; accepts_moves: boolean }>;
 
+const GAME = 'the-game';
+
 /** A game at the given position, between the given kinds of player. */
-function gameOf(white: PlayerKind, black: PlayerKind, position: PositionSnapshot): StateEvent {
+function gameOf(
+  white: PlayerKind,
+  black: PlayerKind,
+  position: PositionSnapshot,
+  id = GAME,
+): StateEvent {
   return {
     type: 'state',
-    game: { white: PLAYERS[white], black: PLAYERS[black], moves: [], position },
+    game: { id, white: PLAYERS[white], black: PLAYERS[black], moves: [], position },
   };
+}
+
+/** Everything the app has sent to the server, as the server would read it. */
+function sent(socket: FakeWebSocket): unknown[] {
+  return socket.sent.map((message) => JSON.parse(message));
 }
 
 /** The state a viewer who connects after `count` moves receives. */
@@ -216,7 +235,7 @@ describe('App', () => {
       fireEvent.mouseUp(square(container, 'e1'));
       fireEvent.mouseDown(square(container, 'g1'));
 
-      expect(socket.sent).toEqual([JSON.stringify({ type: 'move', uci: 'e1g1' })]);
+      expect(sent(socket)).toEqual([{ game: GAME, type: 'move', uci: 'e1g1' }]);
     });
 
     it('sends the piece chosen for a promotion, and nothing before it is chosen', () => {
@@ -227,11 +246,11 @@ describe('App', () => {
 
       fireEvent.mouseDown(square(container, 'b7'));
       fireEvent.mouseUp(square(container, 'b8'));
-      expect(socket.sent).toEqual([]);
+      expect(sent(socket)).toEqual([]);
 
       fireEvent.mouseDown(promotionChoice(container, 'knight'));
 
-      expect(socket.sent).toEqual([JSON.stringify({ type: 'move', uci: 'b7b8n' })]);
+      expect(sent(socket)).toEqual([{ game: GAME, type: 'move', uci: 'b7b8n' }]);
     });
 
     it('takes no second move while the first is still on its way to the server', () => {
@@ -249,7 +268,7 @@ describe('App', () => {
       fireEvent.mouseDown(square(container, 'b1'));
 
       expect(destinations(container)).toEqual([]);
-      expect(socket.sent).toEqual([JSON.stringify({ type: 'move', uci: 'e1g1' })]);
+      expect(sent(socket)).toEqual([{ game: GAME, type: 'move', uci: 'e1g1' }]);
     });
 
     it('takes moves again once the server has answered', () => {
@@ -347,7 +366,7 @@ describe('App', () => {
       fireEvent.mouseDown(square(container, 'g1'));
 
       expect(destinations(container)).toEqual([]);
-      expect(socket.sent).toEqual([]);
+      expect(sent(socket)).toEqual([]);
     });
 
     it('takes no move once the game is over, moves or no moves', () => {
@@ -362,7 +381,7 @@ describe('App', () => {
 
       expect(screen.getByRole('status')).toHaveTextContent('Draw by the fifty-move rule');
       expect(destinations(container)).toEqual([]);
-      expect(socket.sent).toEqual([]);
+      expect(sent(socket)).toEqual([]);
     });
 
     it('takes no move while the connection is down', () => {
@@ -379,7 +398,253 @@ describe('App', () => {
       fireEvent.mouseDown(square(container, 'g1'));
 
       expect(destinations(container)).toEqual([]);
-      expect(socket.sent).toEqual([]);
+      expect(sent(socket)).toEqual([]);
+    });
+  });
+  describe('the game view', () => {
+    it('lists the moves in algebraic notation as they arrive', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(foolsMateStart);
+
+      expect(screen.getByText('No moves yet.')).toBeInTheDocument();
+
+      socket.deliver(foolsMateMoves[0]);
+      socket.deliver(foolsMateMoves[1]);
+
+      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual(['f3e5']);
+
+      for (const move of foolsMateMoves.slice(2)) {
+        socket.deliver(move);
+      }
+
+      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+        'f3e5',
+        'g4Qh4#',
+      ]);
+    });
+
+    it('keeps the moves a reconnecting viewer had missed', () => {
+      vi.useFakeTimers();
+      render(<App />);
+      FakeWebSocket.latest.open();
+      FakeWebSocket.latest.deliver(foolsMateStart);
+      FakeWebSocket.latest.disconnect();
+
+      act(() => vi.advanceTimersByTime(1000));
+      FakeWebSocket.latest.open();
+      FakeWebSocket.latest.deliver(stateAfter(3));
+
+      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+        'f3e5',
+        'g4',
+      ]);
+    });
+
+    it('highlights the king that is in check', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+
+      socket.deliver(gameOf('human', 'random', castling));
+      expect(checkSquare(container)).toBeNull();
+
+      socket.deliver(gameOf('random', 'human', check));
+
+      expect(checkSquare(container)).toBe('e8');
+    });
+  });
+
+  describe('turning the board round', () => {
+    it('starts with White at the bottom', () => {
+      const { container } = render(<App />);
+      FakeWebSocket.latest.open();
+      FakeWebSocket.latest.deliver(gameOf('human', 'random', castling));
+
+      expect(squareAt(container, 'a1')).toBe('0,700');
+    });
+
+    it('puts Black at the bottom when the viewer plays Black', () => {
+      const { container } = render(<App />);
+      FakeWebSocket.latest.open();
+
+      FakeWebSocket.latest.deliver(gameOf('random', 'human', castling));
+
+      expect(squareAt(container, 'a1')).toBe('700,0');
+      expect(screen.getByRole('button', { name: 'Flip to White' })).toBeInTheDocument();
+    });
+
+    it('leaves a viewer who plays both sides behind White', () => {
+      const { container } = render(<App />);
+      FakeWebSocket.latest.open();
+
+      FakeWebSocket.latest.deliver(gameOf('human', 'human', castling));
+
+      expect(squareAt(container, 'a1')).toBe('0,700');
+    });
+
+    it('turns the board round when the viewer asks', () => {
+      const { container } = render(<App />);
+      FakeWebSocket.latest.open();
+      FakeWebSocket.latest.deliver(gameOf('human', 'random', castling));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Flip to Black' }));
+
+      expect(squareAt(container, 'a1')).toBe('700,0');
+      expect(screen.getByRole('img', { name: 'white king on e1' })).toHaveAttribute('x', '300');
+    });
+
+    it('plays a move the same way round once the board has been flipped', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', castling));
+      fireEvent.click(screen.getByRole('button', { name: 'Flip to Black' }));
+
+      fireEvent.mouseEnter(square(container, 'e1'));
+      expect(destinations(container)).toContain('g1 castling');
+
+      fireEvent.mouseDown(square(container, 'e1'));
+      fireEvent.mouseUp(square(container, 'e1'));
+      fireEvent.mouseDown(square(container, 'g1'));
+
+      expect(sent(socket)).toEqual([{ game: GAME, type: 'move', uci: 'e1g1' }]);
+    });
+
+    it('turns the board back to face the side a new game gives the viewer', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', castling));
+      fireEvent.click(screen.getByRole('button', { name: 'Flip to Black' }));
+      expect(squareAt(container, 'a1')).toBe('700,0');
+
+      socket.deliver(gameOf('random', 'human', castling));
+      expect(squareAt(container, 'a1')).toBe('700,0');
+
+      socket.deliver(gameOf('human', 'random', castling));
+
+      expect(squareAt(container, 'a1')).toBe('0,700');
+    });
+
+    it('keeps the board where the viewer put it while the game goes on', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(foolsMateStart);
+      fireEvent.click(screen.getByRole('button', { name: 'Flip to Black' }));
+
+      socket.deliver(foolsMateMoves[0]);
+
+      expect(squareAt(container, 'a1')).toBe('700,0');
+    });
+  });
+
+  describe('ending a game', () => {
+    it('resigns the side the viewer plays', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('random', 'human', castling));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Resign' }));
+
+      expect(sent(socket)).toEqual([{ game: GAME, type: 'resign', color: 'black' }]);
+    });
+
+    it('aborts the game', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('random', 'random', castling));
+
+      fireEvent.click(screen.getByRole('button', { name: 'Abort' }));
+
+      expect(sent(socket)).toEqual([{ game: GAME, type: 'abort' }]);
+    });
+
+    it('names the game on screen, so a click cannot land on the one that replaced it', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', castling, 'the-first-game'));
+
+      // Another viewer starts a new game, which the server sends to everyone.
+      socket.deliver(gameOf('human', 'random', castling, 'the-second-game'));
+      fireEvent.click(screen.getByRole('button', { name: 'Resign' }));
+
+      expect(sent(socket)).toEqual([
+        { game: 'the-second-game', type: 'resign', color: 'white' },
+      ]);
+    });
+
+    it('shows the resignation the server sends back, to players and watchers alike', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', castling));
+
+      socket.deliver({
+        type: 'game_over',
+        position: {
+          ...castling,
+          legal_moves: {},
+          game_over: { result: '0-1', reason: 'resignation' },
+        },
+      });
+
+      expect(screen.getByRole('status')).toHaveTextContent('Black wins by resignation (0–1)');
+      // The board is left as it stood, and takes nothing further.
+      expect(screen.getByRole('img', { name: 'white king on e1' })).toBeInTheDocument();
+      fireEvent.mouseEnter(square(container, 'e1'));
+      expect(destinations(container)).toEqual([]);
+    });
+
+    it('shows an abort as a game with no result', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(foolsMateStart);
+      socket.deliver(foolsMateMoves[0]);
+
+      socket.deliver({
+        type: 'game_over',
+        position: {
+          ...foolsMateMoves[0].position,
+          legal_moves: {},
+          game_over: { result: '*', reason: 'abort' },
+        },
+      });
+
+      expect(screen.getByRole('status')).toHaveTextContent('Game aborted');
+      // The moves that were played are still there to look over.
+      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual(['f3']);
+    });
+
+    it('offers nothing to end once the game is over', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+
+      socket.deliver(gameOf('human', 'random', drawnByFiftyMoves));
+
+      expect(screen.queryByRole('button', { name: 'Resign' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Abort' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Flip to Black' })).toBeInTheDocument();
+    });
+
+    it('offers nothing to end before any game has started', () => {
+      render(<App />);
+      FakeWebSocket.latest.open();
+
+      FakeWebSocket.latest.deliver({
+        type: 'no_game',
+        position: startPosition as PositionSnapshot,
+      });
+
+      expect(screen.queryByRole('button', { name: 'Abort' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Flip to Black' })).toBeInTheDocument();
     });
   });
 });
