@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, and the server can play live games between random movers; the data pipeline, models and training come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, and the server plays live games between random movers and human players, with legal moves shown on hover; the data pipeline, models and training come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -103,7 +103,9 @@ uv run chess-ai serve
 
 Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets, the API (`…/api/`, with interactive docs at `…/api/docs`) and the WebSocket that streams the game (`…/api/game/ws`) are all served under the prefix.
 
-The server holds one game, which every open browser shows. Start a game between two random movers from the page, with a delay between moves so it can be followed; starting another game replaces it for everyone.
+The server holds one game, which every open browser shows. Start a game from the page, choosing a human player or a random mover for each colour, with a delay between moves so that a game between random movers can be followed; starting another game replaces it for everyone.
+
+On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. Promotions become queens until the promotion picker is built.
 
 ### Shortcuts with make
 

@@ -17,30 +17,65 @@ import chess
 from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from starlette.types import Message
+from starlette.websockets import WebSocketState
 
 from chess_ai.config import Config
 from chess_ai.game_session import GameSession, GameState
-from chess_ai.players import Player, RandomPlayer
+from chess_ai.players import HumanPlayer, MoveRejectedError, Player, RandomPlayer
 from chess_ai.position_view import PositionSnapshot, snapshot
-from chess_ai.web.game_channel import GameChannel, GameChannelClosedError
+from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
 
 STATIC_DIR = Path(__file__).parent / "static"
 """Where ``scripts/build-frontend.sh`` puts the built frontend."""
 
 _HEAD_TAG = re.compile(r"<head(?:\s[^>]*)?>", re.IGNORECASE)
 
-PlayerKind = Literal["random"]
-_PLAYERS: dict[PlayerKind, Callable[[], Player]] = {"random": RandomPlayer}
+PlayerKind = Literal["human", "random"]
+_PLAYERS: dict[PlayerKind, Callable[[], Player]] = {
+    "human": HumanPlayer,
+    "random": RandomPlayer,
+}
 
 
 class NewGameRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # The field docstrings below describe the request in the API docs, which is the
+    # only place someone choosing a move delay has to go on.
+    model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
     white: PlayerKind
     black: PlayerKind
     move_delay: float = Field(default=0.5, ge=0, le=10)
-    """The least number of seconds between two moves."""
+    """The least number of seconds before a move a player works out for itself, so that a
+    game between players that move instantly can be followed. A move a human submits is
+    played as soon as it arrives."""
+
+
+class SubmitMove(BaseModel):
+    """A viewer plays a move for the human side to move."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["move"]
+    uci: str
+
+
+ViewerMessage = SubmitMove
+"""What a viewer may send over the game WebSocket."""
+
+_VIEWER_MESSAGE = TypeAdapter(ViewerMessage)
+
+
+class ErrorEvent(BaseModel):
+    """The server would not act on what a viewer sent, and nothing has changed."""
+
+    type: Literal["error"] = "error"
+    message: str
+
+
+ViewerEvent = ChannelEvent | ErrorEvent
+"""What the game WebSocket sends: the game's events, plus this viewer's own errors."""
 
 
 def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
@@ -85,16 +120,17 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
 
     @api.websocket("/game/ws")
     async def follow_game(websocket: WebSocket) -> None:
-        """Send the current game's full state, then every move, and every new game."""
+        """Send the current game's full state, then every move, and play submitted moves."""
         await websocket.accept()
+        connection = _Connection(websocket)
         # Either side can end the connection: the viewer goes away, or the channel
         # closes and has nothing left to send.
         async with asyncio.TaskGroup() as tasks:
-            sending = tasks.create_task(_send_game_events(websocket, game_channel))
-            waiting = tasks.create_task(_wait_for_disconnect(websocket))
-            await asyncio.wait({sending, waiting}, return_when=asyncio.FIRST_COMPLETED)
+            sending = tasks.create_task(_send_game_events(connection, game_channel))
+            receiving = tasks.create_task(_play_submitted_moves(connection, game_channel))
+            await asyncio.wait({sending, receiving}, return_when=asyncio.FIRST_COMPLETED)
             sending.cancel()
-            waiting.cancel()
+            receiving.cancel()
 
     app.include_router(api, prefix=prefix)
 
@@ -122,18 +158,55 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     return app
 
 
-async def _wait_for_disconnect(websocket: WebSocket) -> None:
-    while (await websocket.receive())["type"] != "websocket.disconnect":
-        pass  # Viewers have nothing to say yet.
+class _Connection:
+    """One viewer's WebSocket, which the two tasks serving it take turns to write to."""
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        self._sending = asyncio.Lock()
+
+    async def receive(self) -> Message:
+        return await self._websocket.receive()
+
+    async def send(self, event: ViewerEvent) -> None:
+        async with self._sending:
+            if self._websocket.application_state is WebSocketState.CONNECTED:
+                await self._websocket.send_text(event.model_dump_json())
+
+    async def close(self, code: int) -> None:
+        async with self._sending:
+            if self._websocket.application_state is WebSocketState.CONNECTED:
+                await self._websocket.close(code)
 
 
-async def _send_game_events(websocket: WebSocket, game_channel: GameChannel) -> None:
+async def _play_submitted_moves(connection: _Connection, game_channel: GameChannel) -> None:
+    """Play the moves the viewer submits, until the viewer goes away.
+
+    A move the game will not take is reported to the viewer who submitted it and to
+    nobody else, and the game plays on.
+    """
+    try:
+        while (message := await connection.receive())["type"] != "websocket.disconnect":
+            try:
+                submitted = _VIEWER_MESSAGE.validate_json(message.get("text") or "")
+            except ValidationError:
+                await connection.send(ErrorEvent(message="the server cannot read that message"))
+                continue
+            try:
+                game_channel.submit_move(submitted.uci)
+            except MoveRejectedError as rejected:
+                await connection.send(ErrorEvent(message=str(rejected)))
+    except WebSocketDisconnect:
+        pass  # The viewer has already gone.
+
+
+async def _send_game_events(connection: _Connection, game_channel: GameChannel) -> None:
     """Send the game channel's events until it closes, then let the viewer go."""
     try:
         async with aclosing(game_channel.events()) as events:
             async for event in events:
-                await websocket.send_text(event.model_dump_json())
-        await websocket.close(status.WS_1001_GOING_AWAY)
+                await connection.send(event)
+        await connection.close(status.WS_1001_GOING_AWAY)
     except WebSocketDisconnect:
         pass  # The viewer has already gone.
 

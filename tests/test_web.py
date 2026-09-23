@@ -46,6 +46,15 @@ def chess_client(static_dir):
     return client("/chess", static_dir)
 
 
+def test_the_api_docs_describe_what_the_move_delay_paces(chess_client):
+    """The schema is all someone choosing a delay through the API has to go on."""
+    schema = chess_client.get("/chess/api/openapi.json").json()
+
+    delay = schema["components"]["schemas"]["NewGameRequest"]["properties"]["move_delay"]
+    assert "works out for itself" in delay["description"]
+    assert "submits is played as soon as it arrives" in " ".join(delay["description"].split())
+
+
 def test_start_position_under_prefix(chess_client):
     response = chess_client.get("/chess/api/start-position")
 

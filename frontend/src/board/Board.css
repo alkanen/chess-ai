@@ -31,3 +31,49 @@
 .last-move {
   fill: rgb(155 199 0 / 41%);
 }
+
+/* The hit targets sit above everything, so the pieces never swallow a click. */
+.interaction {
+  fill: transparent;
+}
+
+.interaction.movable {
+  cursor: pointer;
+}
+
+.piece.dragged {
+  cursor: grabbing;
+}
+
+.origin {
+  fill: rgb(20 85 30 / 28%);
+}
+
+.destination {
+  pointer-events: none;
+}
+
+.destination.quiet {
+  fill: rgb(20 20 20 / 28%);
+}
+
+/* Castling is the one quiet move that needs telling apart from an ordinary king step. */
+.destination.castling {
+  fill: rgb(40 90 200 / 45%);
+}
+
+.destination.capture,
+.destination.en-passant {
+  fill: none;
+  stroke-width: 10;
+}
+
+.destination.capture {
+  stroke: rgb(190 40 40 / 60%);
+}
+
+/* En passant takes a piece that is not on the destination square, so it gets its own mark. */
+.destination.en-passant {
+  stroke: rgb(220 140 20 / 80%);
+  stroke-dasharray: 18 12;
+}

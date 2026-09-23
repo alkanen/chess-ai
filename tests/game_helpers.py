@@ -1,10 +1,12 @@
 """Players and event-stream helpers for tests of game sessions."""
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 
 import chess
 
-from chess_ai.game_session import GameEvent, GameState
+from chess_ai.game_session import GameEvent, GameSession, GameState
 from chess_ai.players import GameContext, PlayerMove, Thoughts
 
 
@@ -28,6 +30,23 @@ def scripted_players(moves: str) -> tuple[ScriptedPlayer, ScriptedPlayer]:
 
 async def collect(events: AsyncIterator[GameEvent]) -> list[GameEvent]:
     return [event async for event in events]
+
+
+@asynccontextmanager
+async def playing(session: GameSession) -> AsyncIterator[AsyncIterator[GameEvent]]:
+    """Play ``session`` in the background, yielding its events, and stop it at the end.
+
+    The game has already asked its first player for a move when the events are yielded,
+    so a move can be submitted to a human player straight away.
+    """
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await asyncio.sleep(0)
+        try:
+            yield events
+        finally:
+            game.cancel()
+            await asyncio.gather(game, return_exceptions=True)
 
 
 def replay(events: Sequence[GameEvent]) -> GameState:

@@ -13,6 +13,7 @@ import chess
 from pydantic import BaseModel
 
 from chess_ai.game_session import GameEvent, GameSession
+from chess_ai.players import MoveRejectedError
 from chess_ai.position_view import PositionSnapshot, snapshot
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,17 @@ class GameChannel:
         self._task.add_done_callback(_log_failure)
         self._new_game.set()
         self._new_game = asyncio.Event()
+
+    def submit_move(self, uci: str) -> None:
+        """Play ``uci`` in the current game, for the side to move.
+
+        Raises:
+            MoveRejectedError: no game is running, the player to move plays its own
+                moves, or the move is not legal. The game is unchanged either way.
+        """
+        if self._session is None:
+            raise MoveRejectedError("no game is in progress")
+        self._session.submit_move(uci)
 
     async def close(self) -> None:
         """Stop the current game and end every viewer's events, as when the server shuts down."""

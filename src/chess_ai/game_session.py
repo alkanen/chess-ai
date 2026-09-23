@@ -14,7 +14,14 @@ from typing import Literal
 import chess
 from pydantic import BaseModel
 
-from chess_ai.players import GameContext, Player, PlayerMove, Thoughts
+from chess_ai.players import (
+    GameContext,
+    MoveRejectedError,
+    Player,
+    PlayerMove,
+    SubmittedMovePlayer,
+    Thoughts,
+)
 from chess_ai.position_view import PositionSnapshot, snapshot
 
 
@@ -28,11 +35,18 @@ class MoveRecord(BaseModel):
     thoughts: Thoughts | None = None
 
 
+class PlayerInfo(BaseModel):
+    name: str
+    """Shown to viewers, such as "Random mover"."""
+    accepts_moves: bool
+    """Whether this side's moves are submitted by a viewer rather than played by itself."""
+
+
 class GameState(BaseModel):
-    white: str
-    """The name of the player with the white pieces."""
-    black: str
-    """The name of the player with the black pieces."""
+    white: PlayerInfo
+    """The player with the white pieces."""
+    black: PlayerInfo
+    """The player with the black pieces."""
     moves: list[MoveRecord]
     """Every move played so far."""
     position: PositionSnapshot
@@ -61,8 +75,10 @@ class GameSession:
     def __init__(self, white: Player, black: Player, *, move_delay: float = 0.0) -> None:
         """A game from the starting position.
 
-        ``move_delay`` is the least number of seconds between two moves, so that viewers
-        can follow a game between players that move instantly.
+        ``move_delay`` is the least number of seconds before a move a player worked out
+        for itself, so that viewers can follow a game between players that move
+        instantly. A move submitted from outside the game is played as soon as it
+        arrives, so two submitted moves can follow each other at once.
         """
         self._players = {chess.WHITE: white, chess.BLACK: black}
         self._move_delay = move_delay
@@ -76,11 +92,25 @@ class GameSession:
     @property
     def state(self) -> GameState:
         return GameState(
-            white=self._players[chess.WHITE].name,
-            black=self._players[chess.BLACK].name,
+            white=_describe(self._players[chess.WHITE]),
+            black=_describe(self._players[chess.BLACK]),
             moves=list(self._moves),
             position=self._position,
         )
+
+    def submit_move(self, uci: str) -> None:
+        """Play ``uci`` for the side to move, on behalf of a viewer.
+
+        Raises:
+            MoveRejectedError: the game has ended, the player to move plays its own
+                moves, or the move is not legal. The game is unchanged either way.
+        """
+        if self._position.game_over is not None:
+            raise MoveRejectedError("the game is over")
+        player = self._players[self._board.turn]
+        if not isinstance(player, SubmittedMovePlayer):
+            raise MoveRejectedError(f"{player.name} plays this move")
+        player.submit(uci)
 
     async def play(self) -> None:
         """Play the game to its end, asking each player for a move in turn.
@@ -100,9 +130,12 @@ class GameSession:
             while not self._closed and self._position.game_over is None:
                 player = self._players[self._board.turn]
                 choice = await player.choose_move(GameContext(self._board.copy()))
-                # Also yields to the event loop when there is no delay left, so that a
+                # The delay paces players that move instantly. Someone who submits a move
+                # has already taken as long as they took, so their move is played at once.
+                # Sleeping with nothing left to wait still yields to the event loop, so a
                 # game between instant players doesn't hold up everything else.
-                await asyncio.sleep(max(0.0, earliest - loop.time()))
+                pause = 0.0 if isinstance(player, SubmittedMovePlayer) else earliest - loop.time()
+                await asyncio.sleep(max(0.0, pause))
                 if self._closed:
                     break
                 self._make_move(choice)
@@ -149,6 +182,10 @@ class GameSession:
         event = MoveEvent(ply=len(self._moves), move=record, position=self._position)
         for queue in self._subscribers:
             queue.put_nowait(event)
+
+
+def _describe(player: Player) -> PlayerInfo:
+    return PlayerInfo(name=player.name, accepts_moves=isinstance(player, SubmittedMovePlayer))
 
 
 async def _events_until_closed(

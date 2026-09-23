@@ -32,6 +32,22 @@ class LastMove(BaseModel):
     """Where the moving piece landed; for castling, the king's destination ("g1")."""
 
 
+class LegalMove(BaseModel):
+    """One legal move, with what the browser needs to draw it without knowing the rules."""
+
+    uci: str
+    """The move in UCI, including the promotion piece ("e7e8q")."""
+    to_square: str
+    """Where the moving piece lands; for castling, the king's destination ("g1")."""
+    capture: bool
+    castling: bool
+    en_passant: bool
+    promotion: PieceType | None
+    """What a promoting pawn becomes; one legal move per choice, so four per destination."""
+    check: bool
+    """Whether the move gives check."""
+
+
 class GameOver(BaseModel):
     result: Result
     reason: GameOverReason
@@ -45,6 +61,8 @@ class PositionSnapshot(BaseModel):
     """Occupied squares, keyed by square name ("e4")."""
     last_move: LastMove | None
     """The move that led to this position, if the board's history has one."""
+    legal_moves: dict[str, list[LegalMove]]
+    """Every legal move for the side to move, keyed by its origin square ("e2")."""
     game_over: GameOver | None
     """Set when the rules end the game in this position."""
 
@@ -74,8 +92,33 @@ def snapshot(board: chess.Board) -> PositionSnapshot:
         turn=_color(board.turn),
         pieces=pieces,
         last_move=last_move,
+        legal_moves=_legal_moves(board),
         game_over=_game_over(board),
     )
+
+
+def _legal_moves(board: chess.Board) -> dict[str, list[LegalMove]]:
+    """Every legal move, grouped by origin square and ordered by UCI within a group."""
+    moves: dict[str, list[LegalMove]] = {}
+    for move in sorted(board.legal_moves, key=lambda move: move.uci()):
+        moves.setdefault(chess.square_name(move.from_square), []).append(
+            LegalMove(
+                uci=move.uci(),
+                to_square=chess.square_name(move.to_square),
+                capture=board.is_capture(move),
+                castling=board.is_castling(move),
+                en_passant=board.is_en_passant(move),
+                promotion=_promotion(move),
+                check=board.gives_check(move),
+            )
+        )
+    return moves
+
+
+def _promotion(move: chess.Move) -> PieceType | None:
+    if move.promotion is None:
+        return None
+    return chess.piece_name(move.promotion)  # type: ignore[return-value]
 
 
 def _game_over(board: chess.Board) -> GameOver | None:

@@ -2,8 +2,14 @@
   {
     "type": "state",
     "game": {
-      "white": "Scripted",
-      "black": "Scripted",
+      "white": {
+        "name": "Scripted",
+        "accepts_moves": false
+      },
+      "black": {
+        "name": "Scripted",
+        "accepts_moves": false
+      },
       "moves": [],
       "position": {
         "fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -139,6 +145,208 @@
           }
         },
         "last_move": null,
+        "legal_moves": {
+          "a2": [
+            {
+              "uci": "a2a3",
+              "to_square": "a3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "a2a4",
+              "to_square": "a4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "b1": [
+            {
+              "uci": "b1a3",
+              "to_square": "a3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "b1c3",
+              "to_square": "c3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "b2": [
+            {
+              "uci": "b2b3",
+              "to_square": "b3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "b2b4",
+              "to_square": "b4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "c2": [
+            {
+              "uci": "c2c3",
+              "to_square": "c3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "c2c4",
+              "to_square": "c4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "d2": [
+            {
+              "uci": "d2d3",
+              "to_square": "d3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "d2d4",
+              "to_square": "d4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "e2": [
+            {
+              "uci": "e2e3",
+              "to_square": "e3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "e2e4",
+              "to_square": "e4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "f2": [
+            {
+              "uci": "f2f3",
+              "to_square": "f3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "f2f4",
+              "to_square": "f4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "g1": [
+            {
+              "uci": "g1f3",
+              "to_square": "f3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "g1h3",
+              "to_square": "h3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "g2": [
+            {
+              "uci": "g2g3",
+              "to_square": "g3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "g2g4",
+              "to_square": "g4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ],
+          "h2": [
+            {
+              "uci": "h2h3",
+              "to_square": "h3",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            },
+            {
+              "uci": "h2h4",
+              "to_square": "h4",
+              "capture": false,
+              "castling": false,
+              "en_passant": false,
+              "promotion": null,
+              "check": false
+            }
+          ]
+        },
         "game_over": null
       }
     }
@@ -288,6 +496,208 @@
         "from_square": "f2",
         "to_square": "f3"
       },
+      "legal_moves": {
+        "a7": [
+          {
+            "uci": "a7a5",
+            "to_square": "a5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "a7a6",
+            "to_square": "a6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "b7": [
+          {
+            "uci": "b7b5",
+            "to_square": "b5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "b7b6",
+            "to_square": "b6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "b8": [
+          {
+            "uci": "b8a6",
+            "to_square": "a6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "b8c6",
+            "to_square": "c6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "c7": [
+          {
+            "uci": "c7c5",
+            "to_square": "c5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "c7c6",
+            "to_square": "c6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "d7": [
+          {
+            "uci": "d7d5",
+            "to_square": "d5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "d7d6",
+            "to_square": "d6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "e7": [
+          {
+            "uci": "e7e5",
+            "to_square": "e5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "e7e6",
+            "to_square": "e6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "f7": [
+          {
+            "uci": "f7f5",
+            "to_square": "f5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "f7f6",
+            "to_square": "f6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "g7": [
+          {
+            "uci": "g7g5",
+            "to_square": "g5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "g7g6",
+            "to_square": "g6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "g8": [
+          {
+            "uci": "g8f6",
+            "to_square": "f6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "g8h6",
+            "to_square": "h6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "h7": [
+          {
+            "uci": "h7h5",
+            "to_square": "h5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "h7h6",
+            "to_square": "h6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ]
+      },
       "game_over": null
     }
   },
@@ -435,6 +845,201 @@
       "last_move": {
         "from_square": "e7",
         "to_square": "e5"
+      },
+      "legal_moves": {
+        "a2": [
+          {
+            "uci": "a2a3",
+            "to_square": "a3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "a2a4",
+            "to_square": "a4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "b1": [
+          {
+            "uci": "b1a3",
+            "to_square": "a3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "b1c3",
+            "to_square": "c3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "b2": [
+          {
+            "uci": "b2b3",
+            "to_square": "b3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "b2b4",
+            "to_square": "b4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "c2": [
+          {
+            "uci": "c2c3",
+            "to_square": "c3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "c2c4",
+            "to_square": "c4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "d2": [
+          {
+            "uci": "d2d3",
+            "to_square": "d3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "d2d4",
+            "to_square": "d4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "e1": [
+          {
+            "uci": "e1f2",
+            "to_square": "f2",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "e2": [
+          {
+            "uci": "e2e3",
+            "to_square": "e3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "e2e4",
+            "to_square": "e4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "f3": [
+          {
+            "uci": "f3f4",
+            "to_square": "f4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "g1": [
+          {
+            "uci": "g1h3",
+            "to_square": "h3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "g2": [
+          {
+            "uci": "g2g3",
+            "to_square": "g3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "g2g4",
+            "to_square": "g4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "h2": [
+          {
+            "uci": "h2h3",
+            "to_square": "h3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "h2h4",
+            "to_square": "h4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ]
       },
       "game_over": null
     }
@@ -584,6 +1189,304 @@
         "from_square": "g2",
         "to_square": "g4"
       },
+      "legal_moves": {
+        "a7": [
+          {
+            "uci": "a7a5",
+            "to_square": "a5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "a7a6",
+            "to_square": "a6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "b7": [
+          {
+            "uci": "b7b5",
+            "to_square": "b5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "b7b6",
+            "to_square": "b6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "b8": [
+          {
+            "uci": "b8a6",
+            "to_square": "a6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "b8c6",
+            "to_square": "c6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "c7": [
+          {
+            "uci": "c7c5",
+            "to_square": "c5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "c7c6",
+            "to_square": "c6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "d7": [
+          {
+            "uci": "d7d5",
+            "to_square": "d5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "d7d6",
+            "to_square": "d6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "d8": [
+          {
+            "uci": "d8e7",
+            "to_square": "e7",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "d8f6",
+            "to_square": "f6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "d8g5",
+            "to_square": "g5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "d8h4",
+            "to_square": "h4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": true
+          }
+        ],
+        "e5": [
+          {
+            "uci": "e5e4",
+            "to_square": "e4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "e8": [
+          {
+            "uci": "e8e7",
+            "to_square": "e7",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "f7": [
+          {
+            "uci": "f7f5",
+            "to_square": "f5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "f7f6",
+            "to_square": "f6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "f8": [
+          {
+            "uci": "f8a3",
+            "to_square": "a3",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "f8b4",
+            "to_square": "b4",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "f8c5",
+            "to_square": "c5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "f8d6",
+            "to_square": "d6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "f8e7",
+            "to_square": "e7",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "g7": [
+          {
+            "uci": "g7g5",
+            "to_square": "g5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "g7g6",
+            "to_square": "g6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "g8": [
+          {
+            "uci": "g8e7",
+            "to_square": "e7",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "g8f6",
+            "to_square": "f6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "g8h6",
+            "to_square": "h6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ],
+        "h7": [
+          {
+            "uci": "h7h5",
+            "to_square": "h5",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          },
+          {
+            "uci": "h7h6",
+            "to_square": "h6",
+            "capture": false,
+            "castling": false,
+            "en_passant": false,
+            "promotion": null,
+            "check": false
+          }
+        ]
+      },
       "game_over": null
     }
   },
@@ -732,6 +1635,7 @@
         "from_square": "d8",
         "to_square": "h4"
       },
+      "legal_moves": {},
       "game_over": {
         "result": "0-1",
         "reason": "checkmate"

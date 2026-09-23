@@ -24,6 +24,21 @@ export interface GameOver {
   reason: GameOverReason;
 }
 
+/** One legal move, with what the board needs to draw it without knowing the rules. */
+export interface LegalMove {
+  /** The move in UCI, including the promotion piece ("e7e8q"). */
+  uci: string;
+  /** Where the moving piece lands; for castling, the king's destination ("g1"). */
+  to_square: string;
+  capture: boolean;
+  castling: boolean;
+  en_passant: boolean;
+  /** What a promoting pawn becomes; one legal move per choice, so four per destination. */
+  promotion: PieceType | null;
+  /** Whether the move gives check. */
+  check: boolean;
+}
+
 /** A position as the server describes it; mirrors chess_ai.position_view.PositionSnapshot. */
 export interface PositionSnapshot {
   fen: string;
@@ -33,6 +48,8 @@ export interface PositionSnapshot {
   pieces: Record<string, Piece>;
   /** The move that led to this position, if there is one. */
   last_move: LastMove | null;
+  /** Every legal move for the side to move, keyed by its origin square ("e2"). */
+  legal_moves: Record<string, LegalMove[]>;
   /** Set when the rules end the game in this position. */
   game_over: GameOver | null;
 }
@@ -61,29 +78,56 @@ export interface MoveRecord {
   thoughts: Thoughts | null;
 }
 
+export interface PlayerInfo {
+  /** Shown to viewers, such as "Random mover". */
+  name: string;
+  /** Whether this side's moves are submitted by a viewer rather than played by itself. */
+  accepts_moves: boolean;
+}
+
 /** Mirrors chess_ai.game_session.GameState. */
 export interface GameState {
-  /** The name of the player with the white pieces. */
-  white: string;
-  /** The name of the player with the black pieces. */
-  black: string;
+  /** The player with the white pieces. */
+  white: PlayerInfo;
+  /** The player with the black pieces. */
+  black: PlayerInfo;
   /** Every move played so far. */
   moves: MoveRecord[];
   position: PositionSnapshot;
 }
 
-/** What the game channel sends: the full state first, then every move. */
+/**
+ * What the game channel sends: the full state first, then every move. An error answers
+ * something this viewer sent, and reaches nobody else.
+ */
 export type GameEvent =
   | { type: 'no_game'; position: PositionSnapshot }
   | { type: 'state'; game: GameState }
-  | { type: 'move'; ply: number; move: MoveRecord; position: PositionSnapshot };
+  | { type: 'move'; ply: number; move: MoveRecord; position: PositionSnapshot }
+  | { type: 'error'; message: string };
 
-export type PlayerKind = 'random';
+/** What a viewer sends: a move for the human side to move. */
+export interface SubmitMove {
+  type: 'move';
+  uci: string;
+}
+
+export type PlayerKind = 'human' | 'random';
+
+/** What each player kind is called in the new-game form. */
+export const PLAYER_NAMES: Record<PlayerKind, string> = {
+  human: 'Human',
+  random: 'Random mover',
+};
 
 export interface NewGameRequest {
   white: PlayerKind;
   black: PlayerKind;
-  /** The least number of seconds between two moves. */
+  /**
+   * The least number of seconds before a move a player works out for itself, so that a
+   * game between players that move instantly can be followed. A move a human submits is
+   * played as soon as it arrives.
+   */
   move_delay: number;
 }
 

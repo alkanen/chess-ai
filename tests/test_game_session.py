@@ -5,10 +5,17 @@ from pathlib import Path
 
 import chess
 import pytest
-from game_helpers import ScriptedPlayer, collect, replay, scripted_players
+from game_helpers import ScriptedPlayer, collect, playing, replay, scripted_players
 
 from chess_ai.game_session import GameSession, IllegalMoveError
-from chess_ai.players import CandidateMove, RandomPlayer, Thoughts, WinDrawLoss
+from chess_ai.players import (
+    CandidateMove,
+    HumanPlayer,
+    MoveRejectedError,
+    RandomPlayer,
+    Thoughts,
+    WinDrawLoss,
+)
 from chess_ai.position_view import snapshot
 
 pytestmark = pytest.mark.anyio
@@ -48,10 +55,12 @@ async def test_frontend_fixture_matches_a_subscribers_events():
     assert received == json.loads(fixture)
 
 
-async def test_state_names_the_players():
-    session = GameSession(RandomPlayer(), ScriptedPlayer([]))
+async def test_state_names_the_players_and_says_who_takes_submitted_moves():
+    session = GameSession(RandomPlayer(), HumanPlayer())
 
-    assert (session.state.white, session.state.black) == ("Random mover", "Scripted")
+    state = session.state
+    assert state.white.model_dump() == {"name": "Random mover", "accepts_moves": False}
+    assert state.black.model_dump() == {"name": "Human", "accepts_moves": True}
 
 
 @pytest.mark.parametrize("seed", range(10))
@@ -201,3 +210,153 @@ async def test_a_session_closed_before_it_starts_makes_no_moves():
 
     assert session.state.moves == []
     assert [event.type for event in received] == ["state"]
+
+
+async def test_a_human_plays_the_move_that_is_submitted():
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        played = [await anext(events), await anext(events)]
+
+    assert [event.move.san for event in played] == ["e4", "e5"]
+    assert [move.uci for move in session.state.moves] == ["e2e4", "e7e5"]
+
+
+async def test_both_sides_can_be_human():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        session.submit_move("e7e5")
+        assert (await anext(events)).type == "move"
+
+    assert [move.san for move in session.state.moves] == ["e4", "e5"]
+
+
+@pytest.mark.parametrize(
+    ("uci", "problem"),
+    [
+        ("e2e5", "not a legal move"),  # too far
+        ("e7e5", "not a legal move"),  # the opponent's piece
+        ("e1g1", "not a legal move"),  # castling through pieces
+        ("0000", "not a legal move"),  # a null move
+        ("hello", "is not a move"),
+        ("", "is not a move"),
+    ],
+)
+async def test_an_illegal_submission_is_rejected_and_the_game_waits_on(uci, problem):
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+
+        with pytest.raises(MoveRejectedError, match=problem):
+            session.submit_move(uci)
+
+        assert session.state.moves == []
+        assert session.state.position == snapshot(chess.Board())
+        session.submit_move("e2e4")
+        played = [await anext(events), await anext(events)]
+
+    assert [event.move.uci for event in played] == ["e2e4", "e7e5"]
+    assert [move.uci for move in session.state.moves] == ["e2e4", "e7e5"]
+
+
+async def test_a_move_cannot_be_submitted_for_a_player_that_plays_its_own():
+    session = GameSession(ScriptedPlayer(["e2e4"]), HumanPlayer())
+
+    async with playing(session):
+        with pytest.raises(MoveRejectedError, match="Scripted plays this move"):
+            session.submit_move("e2e4")
+
+
+async def test_a_second_submission_out_of_turn_is_rejected():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+
+        with pytest.raises(MoveRejectedError, match="it is not your turn"):
+            session.submit_move("d2d4")
+
+        assert (await anext(events)).type == "move"
+
+    assert [move.uci for move in session.state.moves] == ["e2e4"]
+
+
+async def test_no_move_can_be_submitted_once_the_game_is_over():
+    session = GameSession(*scripted_players(FOOLS_MATE))
+    await session.play()
+
+    with pytest.raises(MoveRejectedError, match="the game is over"):
+        session.submit_move("e2e4")
+
+
+async def test_a_submitted_move_is_not_held_back_by_the_move_delay():
+    """The delay paces players that move instantly; a person is already slow enough."""
+    delay = 0.5
+    session = GameSession(HumanPlayer(), HumanPlayer(), move_delay=delay)
+    loop = asyncio.get_running_loop()
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        submitted = loop.time()
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        waited = loop.time() - submitted
+
+    assert waited < delay / 2, waited
+
+
+async def test_a_rejection_does_not_put_the_position_in_its_message():
+    """The message reaches the person who submitted the move, so it carries no FEN."""
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+
+    async with playing(session):
+        with pytest.raises(MoveRejectedError) as rejected:
+            session.submit_move("e2e5")
+
+    assert str(rejected.value) == "e2e5 is not a legal move here"
+
+
+async def test_the_move_delay_still_paces_the_opponent_that_moves_instantly():
+    delay = 0.2
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]), move_delay=delay)
+    loop = asyncio.get_running_loop()
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        submitted = loop.time()
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        human = loop.time() - submitted
+        assert (await anext(events)).type == "move"
+        opponent = loop.time() - submitted
+
+    assert human < delay / 2, human
+    # Timer resolution can wake a sleeper a hair early.
+    assert opponent >= delay * 0.9, opponent
+
+
+async def test_two_submitted_moves_are_not_kept_the_move_delay_apart():
+    """The delay paces players that move instantly, not the people using the board."""
+    delay = 0.5
+    session = GameSession(HumanPlayer(), HumanPlayer(), move_delay=delay)
+    loop = asyncio.get_running_loop()
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        started = loop.time()
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        session.submit_move("e7e5")
+        assert (await anext(events)).type == "move"
+        waited = loop.time() - started
+
+    assert [move.san for move in session.state.moves] == ["e4", "e5"]
+    assert waited < delay / 2, waited

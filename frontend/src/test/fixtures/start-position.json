@@ -132,5 +132,207 @@
     }
   },
   "last_move": null,
+  "legal_moves": {
+    "a2": [
+      {
+        "uci": "a2a3",
+        "to_square": "a3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "a2a4",
+        "to_square": "a4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "b1": [
+      {
+        "uci": "b1a3",
+        "to_square": "a3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "b1c3",
+        "to_square": "c3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "b2": [
+      {
+        "uci": "b2b3",
+        "to_square": "b3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "b2b4",
+        "to_square": "b4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "c2": [
+      {
+        "uci": "c2c3",
+        "to_square": "c3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "c2c4",
+        "to_square": "c4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "d2": [
+      {
+        "uci": "d2d3",
+        "to_square": "d3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "d2d4",
+        "to_square": "d4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "e2": [
+      {
+        "uci": "e2e3",
+        "to_square": "e3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "e2e4",
+        "to_square": "e4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "f2": [
+      {
+        "uci": "f2f3",
+        "to_square": "f3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "f2f4",
+        "to_square": "f4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "g1": [
+      {
+        "uci": "g1f3",
+        "to_square": "f3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "g1h3",
+        "to_square": "h3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "g2": [
+      {
+        "uci": "g2g3",
+        "to_square": "g3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "g2g4",
+        "to_square": "g4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ],
+    "h2": [
+      {
+        "uci": "h2h3",
+        "to_square": "h3",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      },
+      {
+        "uci": "h2h4",
+        "to_square": "h4",
+        "capture": false,
+        "castling": false,
+        "en_passant": false,
+        "promotion": null,
+        "check": false
+      }
+    ]
+  },
   "game_over": null
 }

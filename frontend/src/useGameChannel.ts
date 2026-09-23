@@ -1,5 +1,11 @@
-import { useEffect, useReducer, useState } from 'react';
-import { gameChannelUrl, type GameEvent, type GameState, type PositionSnapshot } from './api';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
+import {
+  gameChannelUrl,
+  type GameEvent,
+  type GameState,
+  type PositionSnapshot,
+  type SubmitMove,
+} from './api';
 
 /** What the game view shows. */
 export interface GameView {
@@ -9,65 +15,104 @@ export interface GameView {
   position: PositionSnapshot;
 }
 
-export interface GameChannel {
+interface ChannelState {
   /** Null until the server has sent the first state. */
   view: GameView | null;
+  /** Why the server would not act on what we last sent, until the game moves on. */
+  error: string | null;
+}
+
+export interface GameChannel extends ChannelState {
   /** Whether the current connection has delivered the game, so the view is live. */
   connected: boolean;
+  /**
+   * Whether a submitted move is still waiting for the server's answer. The wait is
+   * bounded, so the board never stays shut for longer than {@link ANSWER_TIMEOUT_MS}.
+   */
+  movePending: boolean;
+  /** Plays a move, in UCI, for the side to move. The server has the final say. */
+  submitMove: (uci: string) => void;
 }
 
 const MAX_RETRY_DELAY_MS = 10_000;
+
+/**
+ * How long the board waits for the server's answer to a submitted move before taking
+ * input again. A connection can stay open long after it has stopped carrying anything,
+ * and there is no heartbeat to notice, so the wait has to end by itself.
+ */
+const ANSWER_TIMEOUT_MS = 5_000;
+
+const NO_ANSWER = 'The server has not answered. Your move may not have arrived.';
+
+const DISCONNECTED: ChannelState = { view: null, error: null };
 
 /** How long to wait before reconnecting after the given number of failed attempts. */
 function retryDelayMs(failures: number): number {
   return Math.min(1000 * 2 ** failures, MAX_RETRY_DELAY_MS);
 }
 
-function applyEvent(view: GameView | null, event: GameEvent): GameView | null {
+function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
   switch (event.type) {
     case 'no_game':
-      return { game: null, position: event.position };
+      return { view: { game: null, position: event.position }, error: null };
     case 'state':
-      return { game: event.game, position: event.game.position };
+      return { view: { game: event.game, position: event.game.position }, error: null };
     case 'move': {
-      if (view?.game == null) {
-        return view;
+      if (state.view?.game == null) {
+        return { ...state, error: null };
       }
       const game = {
-        ...view.game,
-        moves: [...view.game.moves, event.move],
+        ...state.view.game,
+        moves: [...state.view.game.moves, event.move],
         position: event.position,
       };
-      return { game, position: game.position };
+      return { view: { game, position: game.position }, error: null };
     }
+    case 'error':
+      return { ...state, error: event.message };
   }
 }
 
 /**
  * Follows the server's current game over a WebSocket, reconnecting when the connection
- * drops. The server sends the full state on every connection, so nothing is lost.
+ * drops. The server sends the full state on every connection, so nothing is lost, and
+ * it is the only judge of the moves submitted through it.
  */
 export function useGameChannel(): GameChannel {
-  const [view, dispatch] = useReducer(applyEvent, null);
+  const [{ view, error }, dispatch] = useReducer(applyEvent, DISCONNECTED);
   const [connected, setConnected] = useState(false);
+  const [movePending, setMovePending] = useState(false);
+  const socket = useRef<WebSocket | null>(null);
+  const answer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+
+  /** Stop waiting for an answer to a submitted move, so the board takes input again. */
+  const stopWaiting = useCallback(() => {
+    clearTimeout(answer.current);
+    setMovePending(false);
+  }, []);
 
   useEffect(() => {
-    let socket: WebSocket;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     let stopped = false;
 
     function connect() {
-      socket = new WebSocket(gameChannelUrl());
-      socket.onmessage = (message: MessageEvent<string>) => {
+      const opened = new WebSocket(gameChannelUrl());
+      socket.current = opened;
+      opened.onmessage = (message: MessageEvent<string>) => {
         // The server starts every connection with the game's state, so a message (rather
         // than the socket opening) shows that a connection works.
         failures = 0;
         setConnected(true);
+        // Whatever the server has to say, it has answered any move we submitted.
+        stopWaiting();
         dispatch(JSON.parse(message.data) as GameEvent);
       };
-      socket.onclose = () => {
+      opened.onclose = () => {
         setConnected(false);
+        // Nothing can arrive on this socket now, least of all an answer.
+        stopWaiting();
         if (!stopped) {
           retryTimer = setTimeout(connect, retryDelayMs(failures));
           failures += 1;
@@ -79,9 +124,31 @@ export function useGameChannel(): GameChannel {
     return () => {
       stopped = true;
       clearTimeout(retryTimer);
-      socket.close();
+      clearTimeout(answer.current);
+      socket.current?.close();
+      socket.current = null;
     };
-  }, []);
+  }, [stopWaiting]);
 
-  return { view, connected };
+  const submitMove = useCallback(
+    (uci: string) => {
+      const open = socket.current;
+      // A socket that is closing or closed throws nothing and reports nothing: it
+      // discards what it is given. Waiting for an answer to that would never end.
+      if (open === null || open.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const message: SubmitMove = { type: 'move', uci };
+      open.send(JSON.stringify(message));
+      setMovePending(true);
+      clearTimeout(answer.current);
+      answer.current = setTimeout(() => {
+        stopWaiting();
+        dispatch({ type: 'error', message: NO_ANSWER });
+      }, ANSWER_TIMEOUT_MS);
+    },
+    [stopWaiting],
+  );
+
+  return { view, error, connected, movePending, submitMove };
 }
