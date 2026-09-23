@@ -29,6 +29,7 @@
       }
     },
     "last_move": null,
+    "check_square": null,
     "legal_moves": {
       "a1": [
         {
@@ -295,6 +296,7 @@
       }
     },
     "last_move": null,
+    "check_square": null,
     "legal_moves": {
       "e1": [
         {
@@ -388,6 +390,7 @@
       }
     },
     "last_move": null,
+    "check_square": null,
     "legal_moves": {
       "e1": [
         {
@@ -461,6 +464,7 @@
       }
     },
     "last_move": null,
+    "check_square": null,
     "legal_moves": {
       "b7": [
         {
@@ -608,6 +612,7 @@
       }
     },
     "last_move": null,
+    "check_square": null,
     "legal_moves": {
       "b2": [
         {
@@ -751,6 +756,7 @@
       }
     },
     "last_move": null,
+    "check_square": null,
     "legal_moves": {
       "e2": [
         {
@@ -896,5 +902,66 @@
       "result": "1/2-1/2",
       "reason": "fifty_move_rule"
     }
+  },
+  "check": {
+    "fen": "4k3/8/8/8/8/8/8/K3R3 b - - 0 1",
+    "turn": "black",
+    "pieces": {
+      "e8": {
+        "color": "black",
+        "type": "king"
+      },
+      "e1": {
+        "color": "white",
+        "type": "rook"
+      },
+      "a1": {
+        "color": "white",
+        "type": "king"
+      }
+    },
+    "last_move": null,
+    "check_square": "e8",
+    "legal_moves": {
+      "e8": [
+        {
+          "uci": "e8d7",
+          "to_square": "d7",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        },
+        {
+          "uci": "e8d8",
+          "to_square": "d8",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        },
+        {
+          "uci": "e8f7",
+          "to_square": "f7",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        },
+        {
+          "uci": "e8f8",
+          "to_square": "f8",
+          "capture": false,
+          "castling": false,
+          "en_passant": false,
+          "promotion": null,
+          "check": false
+        }
+      ]
+    },
+    "game_over": null
   }
 }

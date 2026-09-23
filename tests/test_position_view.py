@@ -58,6 +58,20 @@ def test_castling_last_move_is_the_kings_two_square_move():
     assert (last_move.from_square, last_move.to_square) == ("e1", "g1")
 
 
+@pytest.mark.parametrize(
+    ("fen", "square"),
+    [
+        (chess.STARTING_FEN, None),
+        ("4k3/8/8/8/8/8/8/K3R3 b - - 0 1", "e8"),  # Rook check down the e-file.
+        ("4k3/8/8/8/8/8/8/K3R3 w - - 0 1", None),  # The same board, but White to move.
+        ("rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3", "e1"),  # Fool's mate.
+        ("7k/5Q2/6K1/8/8/8/8/8 b - - 0 1", None),  # Stalemate is not check.
+    ],
+)
+def test_check_names_the_square_of_the_king_in_check(fen, square):
+    assert snapshot(chess.Board(fen)).check_square == square
+
+
 def test_a_game_in_progress_is_not_over():
     assert snapshot(chess.Board()).game_over is None
     assert snapshot(play(chess.Board(), "e4 e5 Qh5 Nc6 Bc4 Nf6")).game_over is None
@@ -260,6 +274,7 @@ def test_frontend_position_fixtures_are_what_the_server_sends():
     assert set(fixtures) == {
         "blackPromotion",
         "castling",
+        "check",
         "drawnByFiftyMoves",
         "enPassant",
         "pin",

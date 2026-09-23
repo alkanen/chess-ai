@@ -7,7 +7,7 @@ import chess
 import pytest
 from game_helpers import ScriptedPlayer, collect, playing, replay, scripted_players
 
-from chess_ai.game_session import GameSession, IllegalMoveError
+from chess_ai.game_session import ActionRejectedError, GameSession, IllegalMoveError
 from chess_ai.players import (
     CandidateMove,
     HumanPlayer,
@@ -22,6 +22,8 @@ pytestmark = pytest.mark.anyio
 
 FOOLS_MATE = "f2f3 e7e5 g2g4 d8h4"
 FRONTEND_FIXTURES = Path(__file__).parents[1] / "frontend" / "src" / "test" / "fixtures"
+FIXTURE_GAME_ID = "fools-mate"
+"""The id the fixture game is given, since a real one is made up afresh every time."""
 
 
 async def test_scripted_game_plays_to_checkmate():
@@ -45,7 +47,7 @@ async def test_scripted_game_plays_to_checkmate():
 
 async def test_frontend_fixture_matches_a_subscribers_events():
     """The Vitest fixture must stay what the server actually sends."""
-    session = GameSession(*scripted_players(FOOLS_MATE))
+    session = GameSession(*scripted_players(FOOLS_MATE), id=FIXTURE_GAME_ID)
 
     with session.subscribe() as events:
         await session.play()
@@ -82,7 +84,8 @@ async def test_random_games_end_legally_at_the_first_game_over(seed):
 
 
 async def test_seeded_random_games_are_reproducible():
-    games = [GameSession(RandomPlayer(1), RandomPlayer(2)) for _ in range(2)]
+    # Two runs of one game, so they are named alike; only their play is under test.
+    games = [GameSession(RandomPlayer(1), RandomPlayer(2), id="seeded") for _ in range(2)]
 
     for game in games:
         await game.play()
@@ -387,3 +390,131 @@ async def test_two_submitted_moves_are_not_kept_the_move_delay_apart():
 
     assert [move.san for move in session.state.moves] == ["e4", "e5"]
     assert waited < delay / 2, waited
+
+
+async def test_a_resignation_ends_the_game_and_reaches_every_subscriber():
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.resign("white")
+        ended = [event async for event in events]
+        with session.subscribe() as late:
+            late_events = await collect(late)
+
+    game_over = session.state.position.game_over
+    assert game_over is not None
+    assert (game_over.result, game_over.reason) == ("0-1", "resignation")
+    assert [event.type for event in ended] == ["game_over"]
+    assert ended[0].position == session.state.position
+    # Someone who arrives after the resignation is told the same as everyone else.
+    assert replay(late_events) == session.state
+
+
+async def test_black_resigning_hands_the_game_to_white():
+    session = GameSession(RandomPlayer(1), HumanPlayer(), move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        # Black resigns while it is White's move, which is a thing people do.
+        session.resign("black")
+
+    game_over = session.state.position.game_over
+    assert game_over is not None
+    assert (game_over.result, game_over.reason) == ("1-0", "resignation")
+
+
+async def test_an_abort_ends_the_game_with_no_result():
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.abort()
+        ended = [event async for event in events]
+
+    game_over = session.state.position.game_over
+    assert game_over is not None
+    assert (game_over.result, game_over.reason) == ("*", "abort")
+    assert [event.type for event in ended] == ["game_over"]
+
+
+async def test_a_game_ended_off_the_board_keeps_its_position_but_offers_no_moves():
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        played = session.state.position
+        session.abort()
+
+    stopped = session.state.position
+    assert stopped.fen == played.fen
+    assert stopped.pieces == played.pieces
+    assert stopped.last_move == played.last_move
+    assert played.legal_moves != {}
+    assert stopped.legal_moves == {}
+
+
+async def test_no_move_is_taken_after_a_resignation():
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.resign("white")
+
+        with pytest.raises(MoveRejectedError, match="the game is over"):
+            session.submit_move("e2e4")
+
+    assert session.state.moves == []
+
+
+@pytest.mark.parametrize("ending", ["resign", "abort"])
+async def test_a_game_that_has_ended_cannot_end_again(ending):
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.abort()
+
+        with pytest.raises(ActionRejectedError, match="the game is over"):
+            session.resign("white") if ending == "resign" else session.abort()
+
+    game_over = session.state.position.game_over
+    assert game_over is not None and game_over.reason == "abort"
+
+
+async def test_a_finished_game_is_neither_resigned_nor_aborted():
+    session = GameSession(*scripted_players(FOOLS_MATE))
+
+    await session.play()
+
+    for ending in [lambda: session.resign("white"), session.abort]:
+        with pytest.raises(ActionRejectedError, match="the game is over"):
+            ending()
+    game_over = session.state.position.game_over
+    assert game_over is not None and game_over.reason == "checkmate"
+
+
+async def test_a_side_that_plays_its_own_moves_is_nobody_s_to_resign():
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+
+        with pytest.raises(ActionRejectedError, match="Random mover is not yours to resign"):
+            session.resign("black")
+
+    assert session.state.position.game_over is None
+
+
+async def test_either_human_side_can_resign_for_itself():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.resign("black")
+
+    game_over = session.state.position.game_over
+    assert game_over is not None
+    assert (game_over.result, game_over.reason) == ("1-0", "resignation")

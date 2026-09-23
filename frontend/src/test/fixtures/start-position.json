@@ -132,6 +132,7 @@
     }
   },
   "last_move": null,
+  "check_square": null,
   "legal_moves": {
     "a2": [
       {

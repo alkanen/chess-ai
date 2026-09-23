@@ -54,7 +54,12 @@ def replay(events: Sequence[GameEvent]) -> GameState:
     first, *rest = events
     assert first.type == "state"
     game = first.game.model_copy(deep=True)
-    for event in rest:
+    for index, event in enumerate(rest):
+        if event.type == "game_over":
+            # Nothing happens in a game after it has been resigned or aborted.
+            assert index == len(rest) - 1
+            game.position = event.position
+            continue
         assert event.type == "move"
         assert event.ply == len(game.moves) + 1
         game.moves.append(event.move)

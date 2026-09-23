@@ -1,12 +1,15 @@
 export type Color = 'white' | 'black';
 export type PieceType = 'pawn' | 'knight' | 'bishop' | 'rook' | 'queen' | 'king';
-export type Result = '1-0' | '0-1' | '1/2-1/2';
+/** "*" is a game that reached no result, which only an abort leaves behind. */
+export type Result = '1-0' | '0-1' | '1/2-1/2' | '*';
 export type GameOverReason =
   | 'checkmate'
   | 'stalemate'
   | 'insufficient_material'
   | 'threefold_repetition'
-  | 'fifty_move_rule';
+  | 'fifty_move_rule'
+  | 'resignation'
+  | 'abort';
 
 export interface Piece {
   color: Color;
@@ -48,6 +51,11 @@ export interface PositionSnapshot {
   pieces: Record<string, Piece>;
   /** The move that led to this position, if there is one. */
   last_move: LastMove | null;
+  /**
+   * The square of the king in check ("e1"), which is the side to move's, or null. This
+   * is the position's check status too: a king is in check exactly when it is set.
+   */
+  check_square: string | null;
   /** Every legal move for the side to move, keyed by its origin square ("e2"). */
   legal_moves: Record<string, LegalMove[]>;
   /** Set when the rules end the game in this position. */
@@ -87,6 +95,8 @@ export interface PlayerInfo {
 
 /** Mirrors chess_ai.game_session.GameState. */
 export interface GameState {
+  /** Tells this game apart from the one that replaces it. */
+  id: string;
   /** The player with the white pieces. */
   white: PlayerInfo;
   /** The player with the black pieces. */
@@ -104,13 +114,18 @@ export type GameEvent =
   | { type: 'no_game'; position: PositionSnapshot }
   | { type: 'state'; game: GameState }
   | { type: 'move'; ply: number; move: MoveRecord; position: PositionSnapshot }
+  | { type: 'game_over'; position: PositionSnapshot }
   | { type: 'error'; message: string };
 
-/** What a viewer sends: a move for the human side to move. */
-export interface SubmitMove {
-  type: 'move';
-  uci: string;
-}
+/**
+ * What a viewer sends: a move for a side they play, or an end to the game. Each one
+ * names the game it is meant for, since a new game can replace it before it arrives.
+ */
+export type ViewerMessage = { game: string } & (
+  | { type: 'move'; uci: string }
+  | { type: 'resign'; color: Color }
+  | { type: 'abort' }
+);
 
 export type PlayerKind = 'human' | 'random';
 

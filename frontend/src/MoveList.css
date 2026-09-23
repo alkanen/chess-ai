@@ -1,0 +1,42 @@
+.move-list h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.move-list .note {
+  margin: 0;
+  opacity: 0.7;
+}
+
+.moves-scroller {
+  overflow-y: auto;
+  max-height: 16rem;
+  border: 1px solid rgb(128 128 128 / 35%);
+  border-radius: 4px;
+}
+
+.moves {
+  margin: 0;
+  padding: 0.25rem 0.25rem 0.25rem 2.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The move number is the list marker, which only a list item has, so the two moves are
+   laid out inside it rather than by making the item itself a grid. */
+.moves li {
+  padding: 0.1rem 0;
+}
+
+.moves li::marker {
+  color: rgb(128 128 128);
+}
+
+.moves li:nth-child(odd) {
+  background: rgb(128 128 128 / 10%);
+}
+
+.san {
+  display: inline-block;
+  min-width: 4.5rem;
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
+}

@@ -11,13 +11,16 @@ from pydantic import BaseModel
 
 Color = Literal["white", "black"]
 PieceType = Literal["pawn", "knight", "bishop", "rook", "queen", "king"]
-Result = Literal["1-0", "0-1", "1/2-1/2"]
+Result = Literal["1-0", "0-1", "1/2-1/2", "*"]
+""""*" is a game that reached no result, which only an abort leaves behind."""
 GameOverReason = Literal[
     "checkmate",
     "stalemate",
     "insufficient_material",
     "threefold_repetition",
     "fifty_move_rule",
+    "resignation",
+    "abort",
 ]
 
 
@@ -61,6 +64,11 @@ class PositionSnapshot(BaseModel):
     """Occupied squares, keyed by square name ("e4")."""
     last_move: LastMove | None
     """The move that led to this position, if the board's history has one."""
+    check_square: str | None
+    """The square of the king in check ("e1"), which is the side to move's, or null.
+
+    This is the position's check status too: a king is in check exactly when it is set.
+    """
     legal_moves: dict[str, list[LegalMove]]
     """Every legal move for the side to move, keyed by its origin square ("e2")."""
     game_over: GameOver | None
@@ -92,9 +100,16 @@ def snapshot(board: chess.Board) -> PositionSnapshot:
         turn=_color(board.turn),
         pieces=pieces,
         last_move=last_move,
+        check_square=_check_square(board),
         legal_moves=_legal_moves(board),
         game_over=_game_over(board),
     )
+
+
+def _check_square(board: chess.Board) -> str | None:
+    """Where the side to move's king stands, if it is in check."""
+    king = board.king(board.turn)
+    return chess.square_name(king) if board.is_check() and king is not None else None
 
 
 def _legal_moves(board: chess.Board) -> dict[str, list[LegalMove]]:

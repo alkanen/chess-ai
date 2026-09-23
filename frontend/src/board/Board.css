@@ -32,6 +32,11 @@
   fill: rgb(155 199 0 / 41%);
 }
 
+/* The king in check, glowing from the centre of its square. */
+.check {
+  fill: url("#check-glow");
+}
+
 /* The hit targets sit above everything, so the pieces never swallow a click. */
 .interaction {
   fill: transparent;

@@ -2,6 +2,7 @@
   {
     "type": "state",
     "game": {
+      "id": "fools-mate",
       "white": {
         "name": "Scripted",
         "accepts_moves": false
@@ -145,6 +146,7 @@
           }
         },
         "last_move": null,
+        "check_square": null,
         "legal_moves": {
           "a2": [
             {
@@ -496,6 +498,7 @@
         "from_square": "f2",
         "to_square": "f3"
       },
+      "check_square": null,
       "legal_moves": {
         "a7": [
           {
@@ -846,6 +849,7 @@
         "from_square": "e7",
         "to_square": "e5"
       },
+      "check_square": null,
       "legal_moves": {
         "a2": [
           {
@@ -1189,6 +1193,7 @@
         "from_square": "g2",
         "to_square": "g4"
       },
+      "check_square": null,
       "legal_moves": {
         "a7": [
           {
@@ -1635,6 +1640,7 @@
         "from_square": "d8",
         "to_square": "h4"
       },
+      "check_square": "e1",
       "legal_moves": {},
       "game_over": {
         "result": "0-1",
