@@ -101,6 +101,8 @@ export interface GameState {
   white: PlayerInfo;
   /** The player with the black pieces. */
   black: PlayerInfo;
+  /** The position the game began in, which says how its moves are numbered. */
+  start_fen: string;
   /** Every move played so far. */
   moves: MoveRecord[];
   position: PositionSnapshot;
@@ -114,6 +116,7 @@ export type GameEvent =
   | { type: 'no_game'; position: PositionSnapshot }
   | { type: 'state'; game: GameState }
   | { type: 'move'; ply: number; move: MoveRecord; position: PositionSnapshot }
+  | { type: 'takeback'; ply: number; position: PositionSnapshot }
   | { type: 'game_over'; position: PositionSnapshot }
   | { type: 'error'; message: string };
 
@@ -125,6 +128,7 @@ export type ViewerMessage = { game: string } & (
   | { type: 'move'; uci: string }
   | { type: 'resign'; color: Color }
   | { type: 'abort' }
+  | { type: 'takeback' }
 );
 
 export type PlayerKind = 'human' | 'random';
@@ -144,6 +148,11 @@ export interface NewGameRequest {
    * played as soon as it arrives.
    */
   move_delay: number;
+  /**
+   * The position to start from, which the side it gives the move opens from. Left out,
+   * or null, the game starts where games start.
+   */
+  fen?: string | null;
 }
 
 /**
@@ -161,6 +170,22 @@ export function gameChannelUrl(): string {
   return url.href;
 }
 
+/**
+ * Why the server would not do what was asked, in its own words where it gave any. It
+ * explains a FEN it would not start from, which is the one refusal a person can act on.
+ */
+async function refusal(response: Response): Promise<string> {
+  try {
+    const { detail } = (await response.json()) as { detail?: unknown };
+    if (typeof detail === 'string' && detail !== '') {
+      return detail;
+    }
+  } catch {
+    // No JSON body, or nothing useful in it; the status is all there is to go on.
+  }
+  return `${response.status} ${response.statusText}`;
+}
+
 /** Starts a new game, replacing the current one for every viewer. */
 export async function startGame(request: NewGameRequest): Promise<GameState> {
   const response = await fetch(apiUrl('game'), {
@@ -169,7 +194,7 @@ export async function startGame(request: NewGameRequest): Promise<GameState> {
     body: JSON.stringify(request),
   });
   if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
+    throw new Error(await refusal(response));
   }
   return (await response.json()) as GameState;
 }

@@ -36,7 +36,7 @@ describe('NewGameForm', () => {
     const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
     expect(url).toBe(new URL('/chess/api/game', window.location.href).href);
     expect(init.method).toBe('POST');
-    expect(posted).toEqual({ white: 'human', black: 'random', move_delay: 2 });
+    expect(posted).toEqual({ white: 'human', black: 'random', move_delay: 2, fen: null });
     expect(await screen.findByRole('button', { name: 'Start' })).toBeEnabled();
   });
 
@@ -58,7 +58,7 @@ describe('NewGameForm', () => {
     fireEvent.change(screen.getByLabelText('White'), { target: { value: white } });
     fireEvent.change(screen.getByLabelText('Black'), { target: { value: black } });
 
-    expect(await start(fetch)).toEqual({ white, black, move_delay: 0.5 });
+    expect(await start(fetch)).toEqual({ white, black, move_delay: 0.5, fen: null });
   });
 
   it('paces nothing when both sides are played by hand, and says so', () => {
@@ -87,7 +87,12 @@ describe('NewGameForm', () => {
     const delay = screen.getByLabelText('Delay between moves');
     expect(delay).toBeEnabled();
     expect(delay).toHaveDisplayValue('2 s');
-    expect(await start(fetch)).toEqual({ white: 'human', black: 'random', move_delay: 2 });
+    expect(await start(fetch)).toEqual({
+      white: 'human',
+      black: 'random',
+      move_delay: 2,
+      fen: null,
+    });
   });
 
   it('reports a server error', async () => {
@@ -97,5 +102,41 @@ describe('NewGameForm', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Start' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not start the game');
+  });
+
+  it('starts from a position typed into the FEN box', async () => {
+    const fen = 'rnbqkbnr/ppp1pppp/8/3P4/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 2';
+    render(<NewGameForm />);
+
+    fireEvent.change(screen.getByLabelText('Start from FEN'), { target: { value: ` ${fen} ` } });
+
+    expect(await start(fetch)).toEqual({
+      white: 'human',
+      black: 'random',
+      move_delay: 0.5,
+      // Typed-in positions come with whatever was pasted around them.
+      fen,
+    });
+  });
+
+  it('says why the server would not start from the FEN', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(Response.json({ detail: 'White has no king' }, { status: 400 })),
+    );
+    render(<NewGameForm />);
+
+    fireEvent.change(screen.getByLabelText('Start from FEN'), { target: { value: '8/8/8' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Start' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not start the game: White has no king',
+    );
+  });
+
+  it('keeps the FEN box empty for a game from the usual starting position', () => {
+    render(<NewGameForm />);
+
+    expect(screen.getByLabelText('Start from FEN')).toHaveValue('');
   });
 });

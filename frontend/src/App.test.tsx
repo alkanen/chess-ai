@@ -31,7 +31,14 @@ function gameOf(
 ): StateEvent {
   return {
     type: 'state',
-    game: { id, white: PLAYERS[white], black: PLAYERS[black], moves: [], position },
+    game: {
+      id,
+      white: PLAYERS[white],
+      black: PLAYERS[black],
+      start_fen: position.fen,
+      moves: [],
+      position,
+    },
   };
 }
 
@@ -645,6 +652,95 @@ describe('App', () => {
 
       expect(screen.queryByRole('button', { name: 'Abort' })).not.toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Flip to Black' })).toBeInTheDocument();
+    });
+  });
+
+  describe('taking a move back', () => {
+    it('asks for the last move back, naming the game it is looking at', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', startPosition as PositionSnapshot));
+      socket.deliver(foolsMateMoves[0]);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Take back' }));
+
+      expect(sent(socket)).toEqual([{ game: GAME, type: 'takeback' }]);
+    });
+
+    it('puts the board and the move list back as the server says they were', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'human', startPosition as PositionSnapshot));
+      for (const move of foolsMateMoves.slice(0, 3)) {
+        socket.deliver(move);
+      }
+      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+        'f3e5',
+        'g4',
+      ]);
+
+      // The server takes the game back to the position after the first move.
+      socket.deliver({ type: 'takeback', ply: 1, position: foolsMateMoves[0].position });
+
+      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual(['f3']);
+      expect(screen.getByRole('status')).toHaveTextContent('Black to move');
+      expect(lastMoveSquares(container)).toEqual(['f2', 'f3']);
+      expect(screen.queryByRole('img', { name: 'white pawn on g4' })).not.toBeInTheDocument();
+    });
+
+    it('plays on from the position a takeback went back to', () => {
+      const { container } = render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', startPosition as PositionSnapshot));
+      socket.deliver(foolsMateMoves[0]);
+
+      socket.deliver({ type: 'takeback', ply: 0, position: startPosition as PositionSnapshot });
+
+      // White is on move again, and the board takes a move for White.
+      fireEvent.mouseEnter(square(container, 'e2'));
+      expect(destinations(container)).toContain('e4 quiet');
+      fireEvent.mouseDown(square(container, 'e2'));
+      fireEvent.mouseUp(square(container, 'e2'));
+      fireEvent.mouseDown(square(container, 'e4'));
+      expect(sent(socket).at(-1)).toEqual({ game: GAME, type: 'move', uci: 'e2e4' });
+    });
+
+    it('offers no takeback in a game nobody plays by hand', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('random', 'random', startPosition as PositionSnapshot));
+      socket.deliver(foolsMateMoves[0]);
+
+      expect(screen.queryByRole('button', { name: 'Take back' })).not.toBeInTheDocument();
+    });
+
+    it('has nothing to take back before the first move, or once the game is over', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+
+      socket.deliver(gameOf('human', 'random', startPosition as PositionSnapshot));
+      expect(screen.getByRole('button', { name: 'Take back' })).toBeDisabled();
+
+      socket.deliver(gameOf('human', 'random', drawnByFiftyMoves));
+      expect(screen.queryByRole('button', { name: 'Take back' })).not.toBeInTheDocument();
+    });
+
+    it('shows the server refusing a takeback, and leaves the game alone', () => {
+      render(<App />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(gameOf('human', 'random', startPosition as PositionSnapshot));
+      socket.deliver(foolsMateMoves[0]);
+
+      socket.deliver({ type: 'error', message: 'no move has been played yet' });
+
+      expect(screen.getByRole('alert')).toHaveTextContent('no move has been played yet');
+      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual(['f3']);
     });
   });
 });

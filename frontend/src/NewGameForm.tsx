@@ -34,6 +34,7 @@ export function NewGameForm() {
   const [white, setWhite] = useState<PlayerKind>('human');
   const [black, setBlack] = useState<PlayerKind>('random');
   const [moveDelay, setMoveDelay] = useState(DEFAULT_MOVE_DELAY);
+  const [fen, setFen] = useState('');
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -46,9 +47,10 @@ export function NewGameForm() {
     setStarting(true);
     setError(null);
     try {
-      await startGame({ white, black, move_delay: moveDelay });
+      // An empty box is not a position: that game starts where games start.
+      await startGame({ white, black, move_delay: moveDelay, fen: fen.trim() || null });
     } catch (e: unknown) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setStarting(false);
     }
@@ -79,6 +81,16 @@ export function NewGameForm() {
           Both sides are played by hand, so there is nothing to pace.
         </p>
       )}
+      <label>
+        Start from FEN{' '}
+        <input
+          type="text"
+          value={fen}
+          placeholder="the usual starting position"
+          spellCheck={false}
+          onChange={(e) => setFen(e.target.value)}
+        />
+      </label>
       <button type="submit" disabled={starting}>
         Start
       </button>

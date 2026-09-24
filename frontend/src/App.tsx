@@ -47,7 +47,8 @@ function useOrientation(game: GameState | null): [Orientation, () => void] {
 }
 
 export function App() {
-  const { view, connected, error, movePending, submitMove, resign, abort } = useGameChannel();
+  const { view, connected, error, movePending, submitMove, resign, abort, takeBack } =
+    useGameChannel();
   const [orientation, flip] = useOrientation(view?.game ?? null);
 
   // A game that has ended is still there to look at, but there is nothing left to end.
@@ -88,8 +89,11 @@ export function App() {
                 disabled={!connected}
                 onResign={resign}
                 onAbort={abort}
+                onTakeBack={takeBack}
               />
-              {view.game !== null && <MoveList moves={view.game.moves} />}
+              {view.game !== null && (
+                <MoveList moves={view.game.moves} startFen={view.game.start_fen} />
+              )}
               <NewGameForm />
             </aside>
           </div>

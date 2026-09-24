@@ -75,6 +75,58 @@ class PositionSnapshot(BaseModel):
     """Set when the rules end the game in this position."""
 
 
+class InvalidFenError(ValueError):
+    """A FEN given for a game's starting position cannot be played from.
+
+    The message is shown to the person who gave the FEN, so it says what is wrong with
+    it in the words someone typing a position would use.
+    """
+
+
+_FEN_PROBLEMS: list[tuple[chess.Status, str]] = [
+    (chess.STATUS_EMPTY, "there are no pieces on the board"),
+    (chess.STATUS_NO_WHITE_KING, "White has no king"),
+    (chess.STATUS_NO_BLACK_KING, "Black has no king"),
+    (chess.STATUS_TOO_MANY_KINGS, "a side has more than one king"),
+    (chess.STATUS_TOO_MANY_WHITE_PIECES, "White has more than sixteen pieces"),
+    (chess.STATUS_TOO_MANY_BLACK_PIECES, "Black has more than sixteen pieces"),
+    (chess.STATUS_TOO_MANY_WHITE_PAWNS, "White has more than eight pawns"),
+    (chess.STATUS_TOO_MANY_BLACK_PAWNS, "Black has more than eight pawns"),
+    (chess.STATUS_PAWNS_ON_BACKRANK, "a pawn stands on a back rank"),
+    (chess.STATUS_BAD_CASTLING_RIGHTS, "the castling rights do not match the position"),
+    (chess.STATUS_INVALID_EP_SQUARE, "no pawn has just passed the en passant square"),
+    (chess.STATUS_OPPOSITE_CHECK, "the side that has just moved is left in check"),
+    (chess.STATUS_TOO_MANY_CHECKERS, "too many pieces give check at once"),
+    (chess.STATUS_IMPOSSIBLE_CHECK, "no move could have given this check"),
+]
+"""What is wrong with a position, in the order the problems are worth reporting."""
+
+
+def board_from_fen(fen: str) -> chess.Board:
+    """The position ``fen`` describes, ready for a game to start from.
+
+    Raises:
+        InvalidFenError: the FEN cannot be read, or it describes a position that is not
+            a position at all, such as one with nobody to checkmate.
+    """
+    try:
+        board = chess.Board(fen.strip())
+    except ValueError as unreadable:
+        raise InvalidFenError(f"that is not a FEN: {unreadable}") from unreadable
+    if (status := board.status()) != chess.STATUS_VALID:
+        raise InvalidFenError(f"that position cannot be played: {_first_problem(status)}")
+    return board
+
+
+def _first_problem(status: chess.Status) -> str:
+    """The most worth reporting of a position's problems, of which it may have several."""
+    for flag, problem in _FEN_PROBLEMS:
+        if status & flag:
+            return problem
+    # Every flag chess.Board.status() raises is named above; the rest belong to variants.
+    return "it is not a position this game can be played from"
+
+
 def _color(color: chess.Color) -> Color:
     return "white" if color == chess.WHITE else "black"
 

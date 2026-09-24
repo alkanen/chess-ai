@@ -1,11 +1,22 @@
 import asyncio
+import gc
 import json
+from contextlib import suppress
 from itertools import pairwise
 from pathlib import Path
 
 import chess
 import pytest
-from game_helpers import ScriptedPlayer, collect, playing, replay, scripted_players
+from game_helpers import (
+    BrokenPlayer,
+    PlayerBroke,
+    ScriptedPlayer,
+    collect,
+    playing,
+    replay,
+    scripted_players,
+    settled,
+)
 
 from chess_ai.game_session import ActionRejectedError, GameSession, IllegalMoveError
 from chess_ai.players import (
@@ -16,7 +27,7 @@ from chess_ai.players import (
     Thoughts,
     WinDrawLoss,
 )
-from chess_ai.position_view import snapshot
+from chess_ai.position_view import InvalidFenError, snapshot
 
 pytestmark = pytest.mark.anyio
 
@@ -518,3 +529,435 @@ async def test_either_human_side_can_resign_for_itself():
     game_over = session.state.position.game_over
     assert game_over is not None
     assert (game_over.result, game_over.reason) == ("1-0", "resignation")
+
+
+async def test_a_takeback_gives_the_person_their_move_back():
+    """Against a player that moves for itself, its reply goes back with your move."""
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5", "b8c6"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+
+        session.take_back()
+        taken_back = await anext(events)
+        # The move the takeback gave back can be played again, differently this time.
+        await settled()
+        session.submit_move("d2d4")
+        played, replied = await anext(events), await anext(events)
+
+    assert taken_back.type == "takeback"
+    assert (taken_back.ply, taken_back.position) == (0, snapshot(chess.Board()))
+    assert (played.type, replied.type) == ("move", "move")
+    assert [move.san for move in session.state.moves] == ["d4", "Nc6"]
+
+
+async def test_a_takeback_between_two_people_undoes_the_one_move_last_played():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        session.submit_move("e7e5")
+        assert (await anext(events)).type == "move"
+
+        session.take_back()
+        taken_back = await anext(events)
+        await settled()
+        # It is Black's move again, so White's move is not theirs to play.
+        with pytest.raises(MoveRejectedError, match="not a legal move"):
+            session.submit_move("d2d4")
+        session.submit_move("c7c5")
+        assert (await anext(events)).type == "move"
+
+    assert taken_back.type == "takeback"
+    assert taken_back.ply == 1
+    assert [move.san for move in session.state.moves] == ["e4", "c5"]
+
+
+async def test_a_takeback_restores_castling_rights_and_the_clocks_exactly():
+    """Everything a position is judged by comes back, not just where the pieces stand."""
+    # 1. Nf3 Nf6 2. Rg1 Rg8, which spends White's kingside castling rights and four
+    # moves of the fifty-move clock without moving a pawn or taking anything.
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["g8f6", "h8g8"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("g1f3")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        before = session.state.position
+        assert before.fen.split()[2:] == ["KQkq", "-", "2", "2"]
+        session.submit_move("h1g1")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        assert session.state.position.fen.split()[2:] == ["Qq", "-", "4", "3"]
+
+        session.take_back()
+        assert (await anext(events)).type == "takeback"
+
+    assert session.state.position == before
+
+
+async def test_a_takeback_restores_the_en_passant_square():
+    # 1. e4 e6 2. e5 d5, and the pawn on e5 may take on d6 in passing.
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e6", "d7d5", "g8f6"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        await settled()
+        session.submit_move("e4e5")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        with_capture = session.state.position
+        assert any(move.en_passant for move in with_capture.legal_moves["e5"])
+
+        # Declining the capture spends it, and taking the decline back offers it again.
+        await settled()
+        session.submit_move("g1f3")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        declined = session.state.position.legal_moves
+        assert not any(move.en_passant for move in declined.get("e5", []))
+        session.take_back()
+        assert (await anext(events)).type == "takeback"
+
+    assert session.state.position == with_capture
+
+
+async def test_a_takeback_leaves_the_repetitions_of_the_moves_that_are_left():
+    """The moves that are gone are gone from the repetition count as well."""
+    # The knights shuffle back to the starting position twice over; the third time it
+    # stands is a draw, which is still there to be claimed after a takeback. White is
+    # asked once more the moment Black declines the draw, and the takeback throws that
+    # answer away, but a player with nothing left to say fails rather than waits.
+    session = GameSession(ScriptedPlayer(["g1f3", "f3g1", "g1f3", "f3g1", "d2d4"]), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        for uci in ["g8f6", "f6g8", "g8f6"]:
+            assert (await anext(events)).type == "move"
+            await settled()
+            session.submit_move(uci)
+            assert (await anext(events)).type == "move"
+        assert (await anext(events)).type == "move"
+
+        # Ng8 now would be the starting position a third time. This is not that.
+        await settled()
+        session.submit_move("b8c6")
+        assert (await anext(events)).type == "move"
+        assert session.state.position.game_over is None
+        session.take_back()
+        assert (await anext(events)).type == "takeback"
+
+        # The repetitions the taken-back move was counted against are still counted.
+        await settled()
+        session.submit_move("f6g8")
+        assert (await anext(events)).type == "move"
+
+    game_over = session.state.position.game_over
+    assert game_over is not None
+    assert (game_over.result, game_over.reason) == ("1/2-1/2", "threefold_repetition")
+
+
+async def test_a_takeback_reaches_every_subscriber_and_whoever_arrives_after_it():
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        with session.subscribe() as watching:
+            session.take_back()
+            seen = [await anext(events), await anext(watching), await anext(watching)]
+        with session.subscribe() as late:
+            arrived = await anext(late)
+
+    assert [event.type for event in seen] == ["takeback", "state", "takeback"]
+    assert seen[0] == seen[2]
+    assert arrived.type == "state"
+    assert arrived.game == session.state
+    assert session.state.moves == []
+
+
+async def test_a_takeback_drops_the_move_a_player_was_still_working_out():
+    """A move chosen in a position that has been taken back is never played."""
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=0.05)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        # Black is working its reply out; taking back now must leave nothing behind.
+        session.take_back()
+        assert (await anext(events)).type == "takeback"
+        await asyncio.sleep(0.15)
+
+        assert session.state.moves == []
+        session.submit_move("d2d4")
+        assert (await anext(events)).type == "move"
+
+    assert session.state.moves[0].san == "d4"
+
+
+async def test_a_move_submitted_in_the_same_breath_as_a_takeback_is_refused():
+    """The game has stopped waiting on the person, so their move is nobody's to play."""
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        session.take_back()
+
+        with pytest.raises(MoveRejectedError, match="it is not your turn"):
+            session.submit_move("d2d4")
+
+        # The game comes round to asking again, and takes the move then.
+        await settled()
+        session.submit_move("d2d4")
+        assert (await anext(events)).type == "takeback"
+        assert (await anext(events)).type == "move"
+
+    assert [move.san for move in session.state.moves] == ["d4"]
+
+
+async def test_a_takeback_puts_the_person_who_is_now_on_move_back_in_play():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+
+        session.take_back()
+        assert (await anext(events)).type == "takeback"
+        # White is to move again, and the game has to be waiting on White to take it.
+        await settled()
+        session.submit_move("d2d4")
+        played = await anext(events)
+
+    assert played.type == "move" and played.move.san == "d4"
+
+
+@pytest.mark.parametrize("colors", [(HumanPlayer, RandomPlayer), (RandomPlayer, HumanPlayer)])
+async def test_a_game_with_no_moves_has_nothing_to_take_back(colors):
+    white, black = colors
+    session = GameSession(white(), black(), move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+
+        with pytest.raises(ActionRejectedError, match="no move has been played yet"):
+            session.take_back()
+
+
+async def test_the_opening_move_of_a_player_you_only_watch_can_be_taken_back():
+    """Playing Black, there is no move of your own to come back to until you have one."""
+    session = GameSession(ScriptedPlayer(["e2e4", "d2d4"]), HumanPlayer())
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        assert (await anext(events)).type == "move"
+
+        session.take_back()
+        taken_back = await anext(events)
+        # White is asked again, and opens differently this time.
+        opened = await anext(events)
+
+    assert taken_back.type == "takeback" and taken_back.ply == 0
+    assert opened.type == "move" and opened.move.san == "d4"
+
+
+async def test_a_game_nobody_plays_by_hand_has_no_takebacks():
+    session = GameSession(RandomPlayer(1), RandomPlayer(2), move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        assert (await anext(events)).type == "move"
+
+        with pytest.raises(ActionRejectedError, match="neither side is played by hand"):
+            session.take_back()
+
+    assert len(session.state.moves) == 1
+
+
+@pytest.mark.parametrize("ending", ["resign", "abort"])
+async def test_a_game_that_has_ended_cannot_be_taken_back(ending):
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+        session.resign("white") if ending == "resign" else session.abort()
+
+        with pytest.raises(ActionRejectedError, match="the game is over"):
+            session.take_back()
+
+    assert len(session.state.moves) == 2
+
+
+async def test_a_game_can_start_from_a_position_given_as_a_fen():
+    # Black to move in the Scandinavian, with the queen ready to take on d5.
+    fen = "rnbqkbnr/ppp1pppp/8/3P4/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 2"
+    session = GameSession(RandomPlayer(1), HumanPlayer(), fen=fen, move_delay=10)
+
+    async with playing(session) as events:
+        state = await anext(events)
+        session.submit_move("d8d5")
+        played = await anext(events)
+
+    assert state.type == "state"
+    assert state.game.start_fen == fen
+    assert state.game.position.fen == fen
+    assert state.game.position.turn == "black"
+    assert state.game.moves == []
+    assert played.type == "move" and played.move.san == "Qxd5"
+
+
+async def test_a_game_from_a_fen_takes_back_to_the_position_it_started_from():
+    fen = "rnbqkbnr/ppp1pppp/8/3P4/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 2"
+    session = GameSession(RandomPlayer(1), HumanPlayer(), fen=fen, move_delay=10)
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("d8d5")
+        assert (await anext(events)).type == "move"
+
+        session.take_back()
+        taken_back = await anext(events)
+
+    assert taken_back.type == "takeback"
+    assert (taken_back.ply, taken_back.position) == (0, snapshot(chess.Board(fen)))
+    assert taken_back.position.last_move is None
+    assert session.state.start_fen == fen
+
+
+async def test_a_game_from_a_fen_is_over_before_it_starts_if_the_position_is():
+    """Nothing is played from a position the rules have already finished with."""
+    mate = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3"
+    session = GameSession(HumanPlayer(), RandomPlayer(1), fen=mate)
+
+    await session.play()
+
+    state = session.state
+    assert state.moves == []
+    assert state.position.game_over is not None
+    assert state.position.game_over.reason == "checkmate"
+
+
+async def test_a_fen_that_cannot_be_played_from_starts_no_game():
+    with pytest.raises(InvalidFenError):
+        GameSession(HumanPlayer(), RandomPlayer(1), fen="not a fen at all")
+
+
+async def test_a_player_that_fails_is_not_lost_to_a_takeback_landing_at_once():
+    """A stale answer is thrown away; a stale failure is still a failure.
+
+    The question a takeback leaves behind is dropped unread, so a player that failed
+    rather than answered would have nobody to report it: asyncio would notice the
+    unretrieved exception at garbage collection, long after the game had moved on.
+    """
+    broken = BrokenPlayer()
+    session = GameSession(HumanPlayer(), broken)
+
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await asyncio.sleep(0)
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+
+        # The player fails, and the takeback lands before the game has read the failure.
+        broken.fail()
+        await asyncio.sleep(0)
+        session.take_back()
+
+        with pytest.raises(PlayerBroke):
+            async with asyncio.timeout(2):
+                await game
+
+
+async def test_a_player_that_fails_stops_the_game():
+    broken = BrokenPlayer()
+    session = GameSession(broken, HumanPlayer())
+
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await asyncio.sleep(0)
+        assert (await anext(events)).type == "state"
+
+        broken.fail()
+
+        with pytest.raises(PlayerBroke):
+            async with asyncio.timeout(2):
+                await game
+
+    assert session.state.moves == []
+
+
+async def test_a_player_that_fails_as_the_game_is_stopped_is_still_reported():
+    """Stopping the game must not mark a failure nobody has read as handled.
+
+    A game is stopped from outside on a resignation, a new game or a shutdown. A player
+    that failed in the moment before that is never read by the game at all, so asyncio's
+    own report of it is the last thing standing between the failure and silence.
+    """
+    reported: list[BaseException | None] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context.get("exception")))
+    broken = BrokenPlayer()
+    session = GameSession(HumanPlayer(), broken)
+
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await asyncio.sleep(0)
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+
+        # The player fails, and the game is stopped before it has read the failure.
+        broken.fail()
+        await asyncio.sleep(0)
+        game.cancel()
+        # Nothing may hold the traceback afterwards, or the question it names stays alive.
+        with suppress(asyncio.CancelledError):
+            await game
+
+    gc.collect()
+    await asyncio.sleep(0)
+    assert [type(failure) for failure in reported] == [PlayerBroke]
+
+
+async def test_a_takeback_does_not_silence_a_failure_the_game_never_reads():
+    """Taking back leaves an unread failure for whoever reads it next, or for asyncio.
+
+    A takeback stops the question the game was waiting on, which for a turn or two is a
+    question that has already been answered or has already failed. Stopping a failed one
+    must not be what marks it read, because the game may be stopped before it reads it.
+    """
+    reported: list[BaseException | None] = []
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context.get("exception")))
+    broken = BrokenPlayer()
+    session = GameSession(HumanPlayer(), broken)
+
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await asyncio.sleep(0)
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+
+        # The player fails; the takeback and the stop both land before the game reads it.
+        broken.fail()
+        await asyncio.sleep(0)
+        session.take_back()
+        game.cancel()
+        with suppress(asyncio.CancelledError):
+            await game
+
+    gc.collect()
+    await asyncio.sleep(0)
+    assert [type(failure) for failure in reported] == [PlayerBroke]

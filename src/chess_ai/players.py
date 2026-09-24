@@ -120,7 +120,10 @@ class HumanPlayer:
             self._position, self._move = None, None
 
     def submit(self, uci: str) -> None:
-        if self._position is None or self._move is None:
+        # A question the game has stopped waiting on, as a takeback makes it do, leaves
+        # its move cancelled until the player is asked again. Whoever was on move in the
+        # position the game has left is nobody, so their move is nothing to play.
+        if self._position is None or self._move is None or self._move.done():
             raise MoveRejectedError("it is not your turn")
         try:
             move = chess.Move.from_uci(uci)
