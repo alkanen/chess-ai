@@ -1,18 +1,22 @@
 import asyncio
 import json
+import re
 from collections.abc import Iterator
+from pathlib import Path
 
 import chess
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
 from game_helpers import replay
+from pgn_helpers import replayed
 from pydantic import TypeAdapter
 from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 
-from chess_ai.config import Config, ServerConfig
+from chess_ai.config import Config, PathsConfig, ServerConfig
 from chess_ai.game_session import GameEvent, MoveEvent
+from chess_ai.pgn import game_pgn
 from chess_ai.web import create_app
 from chess_ai.web.app import ViewerEvent
 
@@ -21,9 +25,20 @@ RANDOM_GAME = {"white": "random", "black": "random", "move_delay": 0}
 HUMAN_GAME = {"white": "human", "black": "random", "move_delay": 0}
 
 
+PGN_FILE = re.compile(r'attachment; filename="\d{8}-\d{6}-[0-9a-f]{8}\.pgn"')
+"""What the server calls the file it hands the browser: when, and which game."""
+
+
 def serve(prefix: str, tmp_path) -> TestClient:
-    config = Config(server=ServerConfig(path_prefix=prefix))
+    config = Config(
+        server=ServerConfig(path_prefix=prefix), paths=PathsConfig(games=tmp_path / "games")
+    )
     return TestClient(create_app(config, static_dir=tmp_path / "static"))
+
+
+def saved_games(tmp_path) -> list[Path]:
+    """The games the server has saved, in the order it played them."""
+    return sorted((tmp_path / "games").glob("*.pgn"))
 
 
 @pytest.fixture
@@ -459,6 +474,7 @@ def test_what_a_viewer_asks_of_a_replaced_game_never_reaches_its_replacement(che
 
 def test_game_routes_are_not_served_outside_the_prefix(chess_client):
     assert chess_client.post("/api/game", json=RANDOM_GAME).status_code == 404
+    assert chess_client.get("/api/game/pgn").status_code == 404
     with pytest.raises(WebSocketDisconnect), chess_client.websocket_connect("/api/game/ws"):
         pass
 
@@ -661,3 +677,153 @@ def test_a_game_started_without_a_fen_starts_where_games_start(chess_client):
 
     assert response.status_code == 200
     assert response.json()["start_fen"] == chess.STARTING_FEN
+
+
+def test_a_game_in_progress_is_downloaded_as_far_as_it_has_been_played(chess_client):
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "no_game"
+        game = start_game(chess_client)
+        state = receive(websocket)
+        ask(websocket, game, type="move", uci="e2e4")
+        played = receive_moves(websocket, 2)
+
+        response = chess_client.get("/chess/api/game/pgn")
+
+    assert response.status_code == 200
+    # Served as a file to save, not as a page to look at.
+    assert response.headers["content-type"] == "application/x-chess-pgn"
+    assert PGN_FILE.fullmatch(response.headers["content-disposition"])
+    assert '[White "Human"]' in response.text
+    assert '[Black "Random mover"]' in response.text
+    assert '[Result "*"]' in response.text
+    assert replayed(response.text) == replay([state, *played]).position.fen
+
+
+def test_a_finished_game_is_downloaded_with_the_result_it_reached(chess_client):
+    with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
+        assert receive(websocket).type == "no_game"
+        chess_client.post("/chess/api/game", json=RANDOM_GAME)
+        events = receive_game(websocket)
+
+        response = chess_client.get("/chess/api/game/pgn")
+
+    game = replay(events)
+    assert game.position.game_over is not None
+    assert response.status_code == 200
+    assert f'[Result "{game.position.game_over.result}"]' in response.text
+    assert replayed(response.text) == game.position.fen
+
+
+def test_the_pgn_of_a_game_that_has_not_started_cannot_be_downloaded(chess_client):
+    response = chess_client.get("/chess/api/game/pgn")
+
+    assert response.status_code == 404
+    assert "no game" in response.json()["detail"]
+
+
+def test_the_pgn_is_downloaded_under_an_empty_prefix(tmp_path):
+    with serve("", tmp_path) as client:
+        client.post("/api/game", json=HUMAN_GAME)
+
+        response = client.get("/api/game/pgn")
+
+    assert response.status_code == 200
+    assert '[Event "chess-ai game"]' in response.text
+    assert PGN_FILE.fullmatch(response.headers["content-disposition"])
+
+
+def test_a_finished_game_is_saved_in_the_games_directory(tmp_path):
+    """Nobody asks for this: a game that reaches a result is kept as it ends."""
+    with (
+        serve("/chess", tmp_path) as client,
+        client.websocket_connect("/chess/api/game/ws") as websocket,
+    ):
+        assert receive(websocket).type == "no_game"
+        client.post("/chess/api/game", json=RANDOM_GAME)
+        events = receive_game(websocket)
+
+    # Shutting the server down waits for the game it was playing, so the file is there.
+    [saved] = saved_games(tmp_path)
+    game = replay(events)
+    assert game.position.game_over is not None
+    assert replayed(saved.read_text(encoding="utf-8")) == game.position.fen
+    assert f'[Result "{game.position.game_over.result}"]' in saved.read_text(encoding="utf-8")
+
+
+def test_an_aborted_game_is_not_saved(tmp_path):
+    with (
+        serve("/chess", tmp_path) as client,
+        client.websocket_connect("/chess/api/game/ws") as websocket,
+    ):
+        assert receive(websocket).type == "no_game"
+        response = client.post("/chess/api/game", json=HUMAN_GAME)
+        assert receive(websocket).type == "state"
+
+        ask(websocket, response.json()["id"], type="abort")
+        assert receive(websocket).type == "game_over"
+
+    assert saved_games(tmp_path) == []
+
+
+def test_the_pgn_is_read_on_the_event_loop_the_game_is_played_on(chess_client, monkeypatch):
+    """Only a reader on the loop sees a whole game, because that is where moves are made.
+
+    ``GameSession.state`` collects its fields one at a time, and a move appends to the
+    moves before it sets the position. A reader preempted between those two reads writes
+    out a game whose result is a checkmate that is not among its moves.
+    """
+    on_the_loop: list[bool] = []
+
+    def note_where_it_runs(game, *, now=None):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_the_loop.append(False)
+        else:
+            on_the_loop.append(True)
+        return game_pgn(game, now=now)
+
+    monkeypatch.setattr("chess_ai.web.app.game_pgn", note_where_it_runs)
+    start_game(chess_client)
+
+    assert chess_client.get("/chess/api/game/pgn").status_code == 200
+    assert on_the_loop == [True]
+
+
+def test_the_pgn_of_a_game_that_has_been_replaced_is_refused(chess_client):
+    """A viewer downloads the game their browser is showing them, not its replacement."""
+    watched = start_game(chess_client)
+    replacement = start_game(chess_client)
+
+    response = chess_client.get("/chess/api/game/pgn", params={"game": watched})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "that game has been replaced"
+    assert chess_client.get("/chess/api/game/pgn", params={"game": replacement}).status_code == 200
+
+
+def test_the_pgn_of_the_game_a_viewer_names_is_the_one_they_are_given(chess_client):
+    game = start_game(chess_client)
+
+    response = chess_client.get("/chess/api/game/pgn", params={"game": game})
+
+    assert response.status_code == 200
+    assert '[Event "chess-ai game"]' in response.text
+
+
+def test_nothing_the_pgn_route_answers_is_ever_cached(chess_client):
+    """One URL with a different game behind it after every move, and a proxy in front.
+
+    The refusals matter as much as the file. A 404 may be kept by a cache of its own
+    accord, and a stored "no game has been started" would go on being served to everyone
+    after a game has started, which is exactly when the route has something to say.
+    """
+    before_any_game = chess_client.get("/chess/api/game/pgn")
+    watched = start_game(chess_client)
+    replacement = start_game(chess_client)
+    refused = chess_client.get("/chess/api/game/pgn", params={"game": watched})
+    downloaded = chess_client.get("/chess/api/game/pgn", params={"game": replacement})
+
+    answers = [before_any_game, refused, downloaded]
+    assert [answer.status_code for answer in answers] == [404, 409, 200]
+    assert [answer.headers.get("cache-control") for answer in answers] == ["no-store"] * 3

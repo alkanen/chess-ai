@@ -5,16 +5,18 @@ from contextlib import aclosing
 import pytest
 from game_helpers import ScriptedPlayer, replay, scripted_players, settled
 
-from chess_ai.game_session import ActionRejectedError, GameSession
+from chess_ai.game_session import ActionRejectedError, GameSession, GameState
 from chess_ai.players import HumanPlayer, RandomPlayer
 from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
 
 pytestmark = pytest.mark.anyio
 
+FOOLS_MATE = "f2f3 e7e5 g2g4 d8h4"
+
 
 async def test_viewers_follow_each_new_game_after_the_last_one_ended():
     channel = GameChannel()
-    first = GameSession(*scripted_players("f2f3 e7e5 g2g4 d8h4"))
+    first = GameSession(*scripted_players(FOOLS_MATE))
     second = GameSession(RandomPlayer(1), RandomPlayer(2), move_delay=10)
 
     async with asyncio.timeout(5), aclosing(channel.events()) as events:
@@ -82,7 +84,7 @@ async def test_close_ends_the_events_of_a_viewer_waiting_for_the_first_game():
 
 async def test_close_ends_the_events_of_a_viewer_waiting_after_a_finished_game():
     channel = GameChannel()
-    channel.start(GameSession(*scripted_players("f2f3 e7e5 g2g4 d8h4")))
+    channel.start(GameSession(*scripted_players(FOOLS_MATE)))
 
     async with asyncio.timeout(5), aclosing(channel.events()) as events:
         finished_game = [await anext(events) for _ in range(5)]
@@ -173,7 +175,7 @@ async def test_a_new_game_starts_after_the_last_one_was_resigned():
         assert (await anext(events)).type == "state"
         channel.resign(session.id, "white")
         assert (await anext(events)).type == "game_over"
-        channel.start(GameSession(*scripted_players("f2f3 e7e5 g2g4 d8h4")))
+        channel.start(GameSession(*scripted_players(FOOLS_MATE)))
         second = [await anext(events) for _ in range(5)]
         await channel.close()
 
@@ -276,3 +278,112 @@ async def test_a_game_with_nothing_to_take_back_is_left_alone():
 
     assert session.state.moves == []
     assert session.state.position.game_over is None
+
+
+async def played_to_the_end(channel: GameChannel, session: GameSession) -> None:
+    """Wait for the game ``channel`` has been given to end, and see the channel through it.
+
+    Closing waits for the task driving the game, so whatever the channel does with a
+    finished game is done by the time this returns.
+    """
+    async with asyncio.timeout(5):
+        while session.state.position.game_over is None:
+            await asyncio.sleep(0)
+    await channel.close()
+
+
+async def test_before_the_first_game_there_is_no_game_to_look_at():
+    assert GameChannel().current_game is None
+
+
+async def test_the_game_on_show_is_the_one_being_played_and_stays_when_it_ends():
+    channel = GameChannel()
+    session = GameSession(*scripted_players(FOOLS_MATE))
+
+    channel.start(session)
+    while_playing = channel.current_game
+
+    await played_to_the_end(channel, session)
+
+    assert while_playing is not None and while_playing.id == session.id
+    # A game that has ended is still the game on show, so it can still be exported.
+    assert channel.current_game == session.state
+
+
+async def test_a_game_played_to_a_result_is_kept():
+    kept: list[GameState] = []
+    channel = GameChannel(on_finished=kept.append)
+    session = GameSession(*scripted_players(FOOLS_MATE))
+
+    channel.start(session)
+    await played_to_the_end(channel, session)
+
+    assert kept == [session.state]
+    assert kept[0].position.game_over is not None
+
+
+async def test_a_resigned_game_is_kept():
+    kept: list[GameState] = []
+    channel = GameChannel(on_finished=kept.append)
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+    channel.start(session)
+    await settled()
+
+    channel.resign(session.id, "white")
+    await channel.close()
+
+    assert [game.position.game_over for game in kept] == [session.state.position.game_over]
+    assert kept[0].position.game_over is not None
+    assert kept[0].position.game_over.result == "0-1"
+
+
+async def test_an_aborted_game_is_not_kept():
+    """A game given up reached no result, so it is not a game that was played."""
+    kept: list[GameState] = []
+    channel = GameChannel(on_finished=kept.append)
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+    channel.start(session)
+    await settled()
+
+    channel.abort(session.id)
+    await channel.close()
+
+    assert session.state.position.game_over is not None
+    assert kept == []
+
+
+async def test_a_game_the_next_one_replaced_is_not_kept():
+    kept: list[GameState] = []
+    channel = GameChannel(on_finished=kept.append)
+    first = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+    second = GameSession(HumanPlayer(), RandomPlayer(2), move_delay=10)
+    channel.start(first)
+    await settled()
+
+    channel.start(second)
+    await channel.close()
+
+    assert first.state.position.game_over is None
+    assert kept == []
+
+
+async def test_a_game_that_cannot_be_kept_is_reported_and_the_next_game_still_plays(caplog):
+    tried: list[GameState] = []
+
+    def refuse(game: GameState) -> None:
+        tried.append(game)
+        raise OSError("the disk is full")
+
+    channel = GameChannel(on_finished=refuse)
+    channel.start(GameSession(*scripted_players(FOOLS_MATE)))
+    async with asyncio.timeout(5):
+        while not tried:
+            await asyncio.sleep(0)
+
+    second = GameSession(*scripted_players(FOOLS_MATE))
+    channel.start(second)
+    await played_to_the_end(channel, second)
+
+    assert second.state.position.game_over is not None
+    assert "Could not keep the finished game" in caplog.text
+    assert "the disk is full" in caplog.text

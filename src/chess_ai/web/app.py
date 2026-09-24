@@ -7,14 +7,24 @@ the prefix at runtime by adding a ``<base href="{prefix}/">`` tag to ``index.htm
 
 import asyncio
 import html
+import logging
 import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing, asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
 
 import chess
-from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    HTTPException,
+    Query,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -23,14 +33,26 @@ from starlette.websockets import WebSocketState
 
 from chess_ai.config import Config
 from chess_ai.game_session import ActionRejectedError, GameSession, GameState
+from chess_ai.pgn import MEDIA_TYPE as PGN_MEDIA_TYPE
+from chess_ai.pgn import game_pgn, pgn_filename, save_game
 from chess_ai.players import HumanPlayer, MoveRejectedError, Player, RandomPlayer
 from chess_ai.position_view import Color, InvalidFenError, PositionSnapshot, snapshot
 from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 """Where ``scripts/build-frontend.sh`` puts the built frontend."""
 
 _HEAD_TAG = re.compile(r"<head(?:\s[^>]*)?>", re.IGNORECASE)
+
+NO_STORE = {"Cache-Control": "no-store"}
+"""Kept by nobody, for a URL that means something else after every move.
+
+Every answer the PGN route gives carries this, not only the file: a 404 is one of the
+statuses a cache may keep of its own accord, and a stored "no game has been started"
+would go on being served long after a game had started.
+"""
 
 PlayerKind = Literal["human", "random"]
 _PLAYERS: dict[PlayerKind, Callable[[], Player]] = {
@@ -113,7 +135,12 @@ ViewerEvent = ChannelEvent | ErrorEvent
 
 def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     prefix = config.server.path_prefix
-    game_channel = GameChannel()
+
+    def save_finished_game(game: GameState) -> None:
+        """Keep a finished game, so that it can be looked at again or trained on."""
+        logger.info("Saved the finished game to %s", save_game(game, config.paths.games))
+
+    game_channel = GameChannel(on_finished=save_finished_game)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -160,6 +187,53 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
                 status.HTTP_503_SERVICE_UNAVAILABLE, "the server is shutting down"
             ) from closed
         return session.state
+
+    @api.get(
+        "/game/pgn",
+        response_class=Response,
+        responses={
+            200: {"content": {PGN_MEDIA_TYPE: {}}, "description": "The game as a PGN file"},
+            404: {"description": "No game has been started yet"},
+            409: {"description": "The game asked for has been replaced by another"},
+        },
+    )
+    async def game_pgn_file(
+        game: Annotated[
+            str | None,
+            Query(
+                description="The id of the game to download, as its state gives it. A game "
+                "that has been replaced since is refused rather than quietly swapped for "
+                "its replacement. Left out, whatever game is on show is served."
+            ),
+        ] = None,
+    ) -> Response:
+        """Download a game as PGN, whether it has finished or not.
+
+        A game in progress is described as far as it has been played, with the result "*"
+        that PGN gives a game that has not ended.
+        """
+        # Read here on the event loop, which a plain `def` would not be: FastAPI runs
+        # those in a worker thread, and a game read there while a move is being made can
+        # come out claiming a checkmate that is not among its moves.
+        current = game_channel.current_game
+        if current is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "no game has been started", headers=NO_STORE
+            )
+        if game is not None and game != current.id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "that game has been replaced", headers=NO_STORE
+            )
+        # One moment dates the file and names it, so that the two cannot disagree.
+        now = datetime.now()
+        return Response(
+            game_pgn(current, now=now),
+            media_type=PGN_MEDIA_TYPE,
+            headers={
+                "Content-Disposition": f'attachment; filename="{pgn_filename(current, now=now)}"',
+                **NO_STORE,
+            },
+        )
 
     @api.websocket("/game/ws")
     async def follow_game(websocket: WebSocket) -> None:

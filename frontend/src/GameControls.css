@@ -4,11 +4,30 @@
   gap: 0.5rem;
 }
 
-.game-controls button {
+.game-controls button,
+.game-controls .download {
   flex: 1 1 auto;
   padding: 0.4rem 0.75rem;
   font: inherit;
   cursor: pointer;
+}
+
+/* A link, but one that belongs in a row of buttons, so it is outlined as a control of
+   its own. Drawn in the inherited colour, which is at home in either colour scheme;
+   matching the browser's own button shading is not, since every browser shades its
+   own way. */
+.game-controls .download {
+  border: 1px solid color-mix(in srgb, currentcolor 40%, transparent);
+  border-radius: 0.2rem;
+  color: inherit;
+  text-align: center;
+  text-decoration: none;
+}
+
+/* Its own line under the controls, since a flex row is no place for a sentence. */
+.game-controls p[role='alert'] {
+  flex: 1 0 100%;
+  margin: 0;
 }
 
 .game-controls button:disabled {

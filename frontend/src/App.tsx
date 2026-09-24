@@ -85,6 +85,7 @@ export function App() {
               <GameControls
                 orientation={orientation}
                 onFlip={flip}
+                pgnGame={view.game?.id ?? null}
                 game={unfinished}
                 disabled={!connected}
                 onResign={resign}

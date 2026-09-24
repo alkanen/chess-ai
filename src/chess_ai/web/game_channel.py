@@ -6,13 +6,13 @@ viewers always see the same game, and a viewer who (re)connects gets its full st
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Literal
 
 import chess
 from pydantic import BaseModel
 
-from chess_ai.game_session import ActionRejectedError, GameEvent, GameSession
+from chess_ai.game_session import ActionRejectedError, GameEvent, GameSession, GameState
 from chess_ai.position_view import Color, PositionSnapshot, snapshot
 
 logger = logging.getLogger(__name__)
@@ -34,11 +34,25 @@ ChannelEvent = GameEvent | NoGameEvent
 
 
 class GameChannel:
-    def __init__(self) -> None:
+    def __init__(self, on_finished: Callable[[GameState], None] | None = None) -> None:
+        """The channel the game view follows, keeping every game that reaches a result.
+
+        ``on_finished`` is handed each game that reached a result, once it has stopped
+        being played, which is where the server saves it as PGN. A game that reached no
+        result of its own is not a game that was played to its end, so an aborted game
+        and a game replaced by the next one are both dropped rather than kept. Whatever
+        keeping a game raises is logged and the channel plays on.
+        """
+        self._on_finished = on_finished
         self._session: GameSession | None = None
         self._task: asyncio.Task[None] | None = None
         self._new_game = asyncio.Event()
         self._closed = False
+
+    @property
+    def current_game(self) -> GameState | None:
+        """The game the viewers are looking at, finished or not, or None before the first."""
+        return self._session.state if self._session is not None else None
 
     def start(self, session: GameSession) -> None:
         """Start playing ``session`` as the current game, stopping the previous one."""
@@ -46,7 +60,7 @@ class GameChannel:
             raise GameChannelClosedError("the game channel is closed")
         self._stop_current()
         self._session = session
-        self._task = asyncio.create_task(session.play())
+        self._task = asyncio.create_task(self._play(session))
         self._task.add_done_callback(_log_failure)
         self._new_game.set()
         self._new_game = asyncio.Event()
@@ -115,6 +129,31 @@ class GameChannel:
             with followed.subscribe() as events:
                 async for event in events:
                     yield event
+
+    async def _play(self, session: GameSession) -> None:
+        """Play ``session`` to wherever it stops, and keep the game if it was finished.
+
+        However the game stops, it comes past here: a game played out to a result returns
+        from ``play()``, and a game ended off the board, or replaced, has this cancelled.
+        """
+        try:
+            await session.play()
+        finally:
+            self._keep(session)
+
+    def _keep(self, session: GameSession) -> None:
+        """Hand a game that reached a result to whoever keeps the games."""
+        game = session.state
+        over = game.position.game_over
+        # "*" is a game that reached no result at all, which an abort leaves behind.
+        if self._on_finished is None or over is None or over.result == "*":
+            return
+        try:
+            self._on_finished(game)
+        except Exception:
+            # A game that cannot be kept is no reason to stop: the viewers are still
+            # looking at it, and the next game has to be playable regardless.
+            logger.exception("Could not keep the finished game")
 
     def _named(self, game: str) -> GameSession:
         """The current game, if it is the one the viewer meant.
