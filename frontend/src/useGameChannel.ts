@@ -37,6 +37,8 @@ export interface GameChannel extends ChannelState {
   resign: (color: Color) => void;
   /** Ends the game with no result, for every viewer. */
   abort: () => void;
+  /** Takes back the last move, or the last pair of moves, for every viewer. */
+  takeBack: () => void;
 }
 
 const MAX_RETRY_DELAY_MS = 10_000;
@@ -73,6 +75,19 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
         position: event.position,
       };
       return { view: { game, position: game.position }, error: null };
+    }
+    case 'takeback': {
+      // The moves after the takeback never happened, and the position is the one the
+      // game stood in before them.
+      if (state.view?.game == null) {
+        return { ...state, error: null };
+      }
+      const game = {
+        ...state.view.game,
+        moves: state.view.game.moves.slice(0, event.ply),
+        position: event.position,
+      };
+      return { view: { game, position: event.position }, error: null };
     }
     case 'game_over': {
       if (state.view === null) {
@@ -189,5 +204,13 @@ export function useGameChannel(): GameChannel {
     }
   }, [game, send]);
 
-  return { view, error, connected, movePending, submitMove, resign, abort };
+  // A takeback answers itself with the position it goes back to, so like the endings it
+  // holds nothing up on the board while it is on its way.
+  const takeBack = useCallback(() => {
+    if (game !== null) {
+      send({ game, type: 'takeback' });
+    }
+  }, [game, send]);
+
+  return { view, error, connected, movePending, submitMove, resign, abort, takeBack };
 }

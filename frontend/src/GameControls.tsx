@@ -23,11 +23,13 @@ interface GameControlsProps {
   disabled: boolean;
   onResign: (color: Color) => void;
   onAbort: () => void;
+  onTakeBack: () => void;
 }
 
 /**
- * Turning the board round, which is this browser's business alone, and ending the game,
- * which is everyone's: a resignation or an abort reaches every viewer.
+ * Turning the board round, which is this browser's business alone, and what changes the
+ * game itself, which is everyone's: a takeback, a resignation and an abort all reach
+ * every viewer.
  */
 export function GameControls({
   orientation,
@@ -36,6 +38,7 @@ export function GameControls({
   disabled,
   onResign,
   onAbort,
+  onTakeBack,
 }: GameControlsProps) {
   const sides = resignable(game);
   return (
@@ -43,6 +46,16 @@ export function GameControls({
       <button type="button" onClick={onFlip}>
         {orientation === 'white' ? 'Flip to Black' : 'Flip to White'}
       </button>
+      {/* Only a game somebody is playing has a move to give back to them. */}
+      {sides.length > 0 && (
+        <button
+          type="button"
+          disabled={disabled || game === null || game.moves.length === 0}
+          onClick={onTakeBack}
+        >
+          Take back
+        </button>
+      )}
       {sides.map((color) => (
         <button key={color} type="button" disabled={disabled} onClick={() => onResign(color)}>
           {/* One side to resign needs no saying which; two do. */}

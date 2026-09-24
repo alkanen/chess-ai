@@ -24,7 +24,7 @@ from starlette.websockets import WebSocketState
 from chess_ai.config import Config
 from chess_ai.game_session import ActionRejectedError, GameSession, GameState
 from chess_ai.players import HumanPlayer, MoveRejectedError, Player, RandomPlayer
-from chess_ai.position_view import Color, PositionSnapshot, snapshot
+from chess_ai.position_view import Color, InvalidFenError, PositionSnapshot, snapshot
 from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -50,6 +50,9 @@ class NewGameRequest(BaseModel):
     """The least number of seconds before a move a player works out for itself, so that a
     game between players that move instantly can be followed. A move a human submits is
     played as soon as it arrives."""
+    fen: str | None = None
+    """The position to start the game from, which the side it gives the move opens from.
+    The standard starting position is used when this is left out."""
 
 
 class ViewerAction(BaseModel):
@@ -85,7 +88,13 @@ class Abort(ViewerAction):
     type: Literal["abort"]
 
 
-ViewerMessage = Annotated[SubmitMove | Resign | Abort, Field(discriminator="type")]
+class TakeBack(ViewerAction):
+    """A viewer takes back the last move, or the last pair of moves."""
+
+    type: Literal["takeback"]
+
+
+ViewerMessage = Annotated[SubmitMove | Resign | Abort | TakeBack, Field(discriminator="type")]
 """What a viewer may send over the game WebSocket."""
 
 _VIEWER_MESSAGE = TypeAdapter(ViewerMessage)
@@ -130,10 +139,20 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
 
     @api.post("/game")
     async def new_game(request: NewGameRequest) -> GameState:
-        """Start a new game, replacing the current one for every viewer."""
-        session = GameSession(
-            _PLAYERS[request.white](), _PLAYERS[request.black](), move_delay=request.move_delay
-        )
+        """Start a new game, replacing the current one for every viewer.
+
+        A game starts from the standard starting position unless a FEN says otherwise.
+        A FEN that cannot be played from is refused, and the current game plays on.
+        """
+        try:
+            session = GameSession(
+                _PLAYERS[request.white](),
+                _PLAYERS[request.black](),
+                move_delay=request.move_delay,
+                fen=request.fen,
+            )
+        except InvalidFenError as invalid:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(invalid)) from invalid
         try:
             game_channel.start(session)
         except GameChannelClosedError as closed:
@@ -232,6 +251,8 @@ def _act(game_channel: GameChannel, asked: ViewerMessage) -> None:
             game_channel.resign(asked.game, asked.color)
         case Abort():
             game_channel.abort(asked.game)
+        case TakeBack():
+            game_channel.take_back(asked.game)
 
 
 async def _send_game_events(connection: _Connection, game_channel: GameChannel) -> None:

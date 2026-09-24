@@ -71,6 +71,16 @@ class GameChannel:
         self._named(game).resign(color)
         self._stop_current()
 
+    def take_back(self, game: str) -> None:
+        """Undo the last move of ``game``, or the last pair of moves.
+
+        Raises:
+            ActionRejectedError: no game is running, ``game`` is not the one that is, it
+                has ended, no side is played by hand, or no move has been played yet.
+                The game is unchanged either way.
+        """
+        self._named(game).take_back()
+
     def abort(self, game: str) -> None:
         """End ``game`` with no result.
 

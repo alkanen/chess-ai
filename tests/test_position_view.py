@@ -4,7 +4,7 @@ from pathlib import Path
 import chess
 import pytest
 
-from chess_ai.position_view import snapshot
+from chess_ai.position_view import InvalidFenError, board_from_fen, snapshot
 
 FRONTEND_FIXTURES = Path(__file__).parents[1] / "frontend" / "src" / "test" / "fixtures"
 
@@ -282,3 +282,68 @@ def test_frontend_position_fixtures_are_what_the_server_sends():
     }
     for name, view in fixtures.items():
         assert view == snapshot(chess.Board(view["fen"])).model_dump(mode="json"), name
+
+
+@pytest.mark.parametrize(
+    "fen",
+    [
+        chess.STARTING_FEN,
+        "rnbqkbnr/ppp1pppp/8/3P4/8/8/PPPP1PPP/RNBQKBNR b KQkq - 0 2",  # black to move
+        "8/8/8/8/8/5k2/6q1/7K w - - 10 60",  # an endgame, with clocks well along
+        "rnbqkbnr/ppp2ppp/4p3/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3",  # en passant
+        "4k3/8/8/8/8/8/8/4K2R w K - 0 1",  # one castling right left
+    ],
+)
+def test_a_position_a_game_can_start_from_is_read_back_unchanged(fen):
+    assert board_from_fen(fen).fen() == fen
+
+
+def test_a_fen_is_read_with_the_spaces_around_it_trimmed():
+    """People paste FENs, and a pasted one brings whatever was around it."""
+    assert board_from_fen(f"  {chess.STARTING_FEN}\n").fen() == chess.STARTING_FEN
+
+
+def test_a_fen_without_its_clocks_is_given_the_ones_a_game_starts_with():
+    assert board_from_fen("4k3/8/8/8/8/8/8/4K3 w - -").fen() == "4k3/8/8/8/8/8/8/4K3 w - - 0 1"
+
+
+@pytest.mark.parametrize(
+    ("fen", "problem"),
+    [
+        ("", "not a FEN"),
+        ("hello", "not a FEN"),
+        ("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR x KQkq - 0 1", "not a FEN"),
+        ("rnbqkbnr/pppppppp/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", "not a FEN"),  # seven ranks
+        ("8/8/8/8/8/8/8/8 w - - 0 1", "no pieces on the board"),
+        ("4k3/8/8/8/8/8/8/8 w - - 0 1", "White has no king"),
+        ("8/8/8/8/8/8/8/4K3 w - - 0 1", "Black has no king"),
+        ("4k3/8/8/8/8/8/8/3KK3 w - - 0 1", "more than one king"),
+        ("4k3/8/8/8/8/8/8/P3K3 w - - 0 1", "pawn stands on a back rank"),
+        ("4k3/8/8/8/8/8/8/4K3 w K - 0 1", "castling rights do not match"),
+        ("4k3/8/8/8/8/8/8/4K3 w - e6 0 1", "no pawn has just passed"),
+        # Black is in check with White to move, so Black's last move was never legal.
+        ("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1", "has just moved is left in check"),
+    ],
+)
+def test_a_fen_that_cannot_be_played_from_says_what_is_wrong_with_it(fen, problem):
+    with pytest.raises(InvalidFenError, match=problem):
+        board_from_fen(fen)
+
+
+def test_a_position_that_is_already_over_can_still_be_started_from():
+    """A game from a finished position is a short game, not an invalid one."""
+    mate = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3"
+
+    assert snapshot(board_from_fen(mate)).game_over is not None
+
+
+def test_an_en_passant_square_no_pawn_can_take_on_is_dropped():
+    """python-chess keeps only the en passant squares that are worth something.
+
+    A game started from such a FEN reports the tidied one as the position it began in,
+    which is the same position by every rule that decides a game.
+    """
+    # 1. e4 c5: Black's pawn passed c6, but no white pawn is there to take it.
+    idle = "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2"
+
+    assert board_from_fen(idle).fen() == idle.replace(" c6 ", " - ")

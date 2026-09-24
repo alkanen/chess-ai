@@ -9,13 +9,17 @@ const PLAYERS = {
   random: { name: 'Random mover', accepts_moves: false },
 } satisfies Record<PlayerKind, { name: string; accepts_moves: boolean }>;
 
-function gameOf(white: PlayerKind, black: PlayerKind): GameState {
+const POSITION = startPosition as GameState['position'];
+
+function gameOf(white: PlayerKind, black: PlayerKind, moves = 0): GameState {
   return {
     id: 'a-game',
     white: PLAYERS[white],
     black: PLAYERS[black],
-    moves: [],
-    position: startPosition as GameState['position'],
+    start_fen: POSITION.fen,
+    // Only how many there are decides what can be taken back, not what they were.
+    moves: Array.from({ length: moves }, () => ({ uci: 'e2e4', san: 'e4', thoughts: null })),
+    position: POSITION,
   };
 }
 
@@ -23,10 +27,11 @@ function renderControls(overrides: Partial<Parameters<typeof GameControls>[0]> =
   const props = {
     orientation: 'white' as const,
     onFlip: vi.fn(),
-    game: gameOf('human', 'random'),
+    game: gameOf('human', 'random', 1),
     disabled: false,
     onResign: vi.fn(),
     onAbort: vi.fn(),
+    onTakeBack: vi.fn(),
     ...overrides,
   };
   render(<GameControls {...props} />);
@@ -70,9 +75,15 @@ describe('GameControls', () => {
   });
 
   it('asks which side resigns when the viewer plays both', () => {
-    const { onResign } = renderControls({ game: gameOf('human', 'human') });
+    const { onResign } = renderControls({ game: gameOf('human', 'human', 1) });
 
-    expect(buttons()).toEqual(['Flip to Black', 'White resigns', 'Black resigns', 'Abort']);
+    expect(buttons()).toEqual([
+      'Flip to Black',
+      'Take back',
+      'White resigns',
+      'Black resigns',
+      'Abort',
+    ]);
 
     fireEvent.click(screen.getByRole('button', { name: 'Black resigns' }));
 
@@ -80,9 +91,25 @@ describe('GameControls', () => {
   });
 
   it('offers no resignation in a game the viewer only watches, but still an abort', () => {
-    renderControls({ game: gameOf('random', 'random') });
+    renderControls({ game: gameOf('random', 'random', 1) });
 
+    // Nobody plays a game of two players that move for themselves, so nobody takes a
+    // move back in one either.
     expect(buttons()).toEqual(['Flip to Black', 'Abort']);
+  });
+
+  it('takes back the last move of a game the viewer plays', () => {
+    const { onTakeBack } = renderControls({ game: gameOf('human', 'random', 1) });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Take back' }));
+
+    expect(onTakeBack).toHaveBeenCalledOnce();
+  });
+
+  it('has nothing to take back before the first move', () => {
+    renderControls({ game: gameOf('human', 'random', 0) });
+
+    expect(screen.getByRole('button', { name: 'Take back' })).toBeDisabled();
   });
 
   it('aborts the game', () => {
@@ -107,5 +134,6 @@ describe('GameControls', () => {
     expect(onFlip).toHaveBeenCalledOnce();
     expect(screen.getByRole('button', { name: 'Resign' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Abort' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Take back' })).toBeDisabled();
   });
 });

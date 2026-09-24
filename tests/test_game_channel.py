@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from contextlib import aclosing
 
 import pytest
-from game_helpers import replay, scripted_players
+from game_helpers import ScriptedPlayer, replay, scripted_players, settled
 
 from chess_ai.game_session import ActionRejectedError, GameSession
 from chess_ai.players import HumanPlayer, RandomPlayer
@@ -156,12 +156,12 @@ async def test_a_viewer_who_arrives_after_a_resignation_is_told_how_it_ended():
     assert arrived.game.position.game_over.reason == "resignation"
 
 
-@pytest.mark.parametrize("ending", ["resign", "abort"])
-async def test_nothing_is_resigned_or_aborted_before_any_game(ending):
+@pytest.mark.parametrize("action", ["move", "resign", "abort", "takeback"])
+async def test_nothing_is_asked_of_a_game_before_any_has_started(action):
     channel = GameChannel()
 
     with pytest.raises(ActionRejectedError, match="no game is in progress"):
-        channel.resign("any game", "white") if ending == "resign" else channel.abort("any game")
+        act_on(channel, "any game", action)
 
 
 async def test_a_new_game_starts_after_the_last_one_was_resigned():
@@ -187,11 +187,13 @@ def act_on(channel: GameChannel, game: str, action: str) -> None:
         channel.submit_move(game, "e2e4")
     elif action == "resign":
         channel.resign(game, "white")
+    elif action == "takeback":
+        channel.take_back(game)
     else:
         channel.abort(game)
 
 
-@pytest.mark.parametrize("action", ["move", "resign", "abort"])
+@pytest.mark.parametrize("action", ["move", "resign", "abort", "takeback"])
 async def test_nothing_reaches_the_game_that_replaced_the_one_a_viewer_named(action):
     """A viewer acts on the game their browser is showing, not on whatever is current.
 
@@ -230,3 +232,47 @@ async def test_the_game_a_viewer_names_is_the_one_they_are_looking_at(action):
         await channel.close()
 
     assert happened.type == ("move" if action == "move" else "game_over")
+
+
+async def test_a_takeback_reaches_the_viewers_and_the_game_plays_on():
+    channel = GameChannel()
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5", "b8c6"]))
+    channel.start(session)
+
+    async with asyncio.timeout(5), aclosing(channel.events()) as events:
+        state = await anext(events)
+        assert state.type == "state"
+        await settled()
+        channel.submit_move(state.game.id, "e2e4")
+        played = [await anext(events) for _ in range(2)]
+
+        channel.take_back(state.game.id)
+        taken_back = await anext(events)
+        # The game is still the one it was, and still being played.
+        await settled()
+        channel.submit_move(state.game.id, "d2d4")
+        again = [await anext(events) for _ in range(2)]
+        await channel.close()
+
+    assert [event.type for event in played] == ["move", "move"]
+    assert taken_back.type == "takeback" and taken_back.ply == 0
+    assert [event.type for event in again] == ["move", "move"]
+    assert [move.san for move in session.state.moves] == ["d4", "Nc6"]
+    assert replay([state, *played, taken_back, *again]) == session.state
+
+
+async def test_a_game_with_nothing_to_take_back_is_left_alone():
+    channel = GameChannel()
+    session = GameSession(HumanPlayer(), RandomPlayer(1), move_delay=10)
+    channel.start(session)
+
+    async with asyncio.timeout(5), aclosing(channel.events()) as events:
+        assert (await anext(events)).type == "state"
+
+        with pytest.raises(ActionRejectedError, match="no move has been played yet"):
+            channel.take_back(session.id)
+
+        await channel.close()
+
+    assert session.state.moves == []
+    assert session.state.position.game_over is None
