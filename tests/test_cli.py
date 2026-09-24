@@ -1,8 +1,12 @@
+from pathlib import Path
+
 import pytest
 import uvicorn
+from dataset_helpers import FIXTURES, GOOD_GAMES, fixture
 from fastapi.testclient import TestClient
 
 from chess_ai.cli import main
+from chess_ai.dataset import load_manifest
 
 
 @pytest.fixture
@@ -40,5 +44,123 @@ def test_invalid_config_exits_with_message(tmp_path, served, capsys):
 def test_command_is_required(capsys):
     with pytest.raises(SystemExit) as exit_info:
         main([])
+
+    assert exit_info.value.code == 2
+
+
+def test_dataset_build_makes_a_dataset_in_the_data_directory(tmp_path, capsys):
+    assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+
+    out = capsys.readouterr().out
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert manifest.name == "games"
+    assert manifest.games == 4
+    assert f"{manifest.positions:,} positions" in out
+    assert "data/datasets/games" in out, "the build says where it put the dataset"
+
+
+def test_dataset_build_uses_the_configured_data_directory(tmp_path, capsys):
+    config = tmp_path / "custom.toml"
+    config.write_text(f'[paths]\ndata = "{tmp_path / "elsewhere"}"\n')
+
+    assert main(["--config", str(config), "dataset", "build", "games", str(FIXTURES)]) == 0
+
+    assert load_manifest(tmp_path / "elsewhere" / "datasets" / "games").games == GOOD_GAMES
+
+
+def test_dataset_build_takes_a_glob_the_shell_did_not_expand(tmp_path):
+    assert main(["dataset", "build", "games", str(FIXTURES / "*rated*.pgn")]) == 0
+
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert [Path(source.path).name for source in manifest.sources] == ["unrated.pgn"]
+
+
+def test_dataset_build_passes_on_the_options_it_is_given(tmp_path):
+    assert (
+        main(
+            [
+                "dataset",
+                "build",
+                "games",
+                str(FIXTURES),
+                "--validation-fraction",
+                "0.5",
+                "--rating-source",
+                "lichess",
+            ]
+        )
+        == 0
+    )
+
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert manifest.validation_fraction == 0.5
+    assert manifest.rating_source == "lichess"
+    assert manifest.statistics.rating_sources == {"lichess": GOOD_GAMES}
+    assert manifest.splits["validation"].games > 0
+
+
+def test_dataset_build_reports_progress_while_it_works(tmp_path, capsys):
+    assert main(["dataset", "build", "games", str(FIXTURES)]) == 0
+
+    assert "games/s" in capsys.readouterr().err
+
+
+def test_dataset_build_over_an_existing_dataset_needs_overwrite(tmp_path, capsys):
+    assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "build", "games", fixture("unrated.pgn")])
+
+    assert exit_info.value.code == 2
+    assert "already in" in capsys.readouterr().err
+
+    assert main(["dataset", "build", "games", fixture("unrated.pgn"), "--overwrite"]) == 0
+    assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 3
+
+
+def test_dataset_build_refuses_a_source_that_matches_nothing(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "build", "games", str(tmp_path / "nothing.pgn")])
+
+    assert exit_info.value.code == 2
+    assert "no such PGN file" in capsys.readouterr().err
+
+
+def test_dataset_stats_summarises_a_built_dataset(tmp_path, capsys):
+    main(["dataset", "build", "games", str(FIXTURES)])
+    capsys.readouterr()
+
+    assert main(["dataset", "stats", "games"]) == 0
+
+    out = capsys.readouterr().out
+    assert "dataset games" in out
+    assert "results" in out and "time controls" in out and "ratings" in out
+    assert "lichess.pgn" in out
+
+
+def test_dataset_stats_of_a_dataset_that_is_not_there_says_what_is(tmp_path, capsys):
+    main(["dataset", "build", "games", fixture("lichess.pgn")])
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "stats", "elsewhere"])
+
+    assert exit_info.value.code == 2
+    error = capsys.readouterr().err
+    assert "manifest.json is missing" in error
+    assert "datasets in data: games" in error
+
+
+def test_dataset_stats_with_no_datasets_at_all_says_how_to_make_one(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "stats", "games"])
+
+    assert exit_info.value.code == 2
+    assert "chess-ai dataset build" in capsys.readouterr().err
+
+
+def test_dataset_needs_a_command(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset"])
 
     assert exit_info.value.code == 2

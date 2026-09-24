@@ -60,8 +60,10 @@ class PathsConfig(BaseModel):
 
     games: Path = Path("games")
     """Directory the games played here are saved in, one PGN file per game."""
+    data: Path = Path("data")
+    """Directory the datasets built here are kept in, one directory per dataset."""
 
-    @field_validator("games")
+    @field_validator("games", "data")
     @classmethod
     def _expand_user(cls, value: Path) -> Path:
         """Expand a leading ``~``, which a path in a config file may well be written with."""

@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, and the server plays live games between random movers and human players, with legal moves shown on hover; the data pipeline, models and training come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, and the CLI builds training datasets out of PGN files; the models and the trainer come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -95,6 +95,7 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[server] port` | `CHESS_AI_SERVER_PORT` | `8000` |
 | `[server] path_prefix` | `CHESS_AI_SERVER_PATH_PREFIX` | empty (serve at `/`) |
 | `[paths] games` | `CHESS_AI_PATHS_GAMES` | `games`, in the working directory |
+| `[paths] data` | `CHESS_AI_PATHS_DATA` | `data`, in the working directory |
 
 ### Serve
 
@@ -109,6 +110,54 @@ The server holds one game, which every open browser shows. Start a game from the
 On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. A pawn reaching the last rank asks which piece to promote it to, and nothing is submitted until you pick one, by clicking it or with Enter or Space on the choice the picker opens on. Clicking elsewhere on the board, or pressing Escape, puts the pawn back.
 
 Every game that reaches a result is saved as PGN in the games directory, one file per game, named after the moment it ended: nothing has to be asked for, and the file replays in any other chess tool. A game that was aborted reached no result and is not kept. **Export PGN** downloads the game on show whenever you like, a game still being played included, with the moves played so far and the result `*` that PGN gives a game that has not ended.
+
+### Build a dataset
+
+A dataset is what a model is trained on: every position of every game, with the move that
+was actually played in it. Build one from any PGN files — a chess.com export, a Lichess
+dump, your own games — naming the dataset and the files, directories or glob patterns to
+read:
+
+```sh
+uv run chess-ai dataset build my-games games/*.pgn
+uv run chess-ai dataset build masters ~/pgn/lichess-2024-01.pgn
+```
+
+It streams, so the input's size is not limited by memory, and it reports throughput and
+time remaining as it goes. Games it cannot read — an illegal move, a position that is not a
+position, a variant that is not chess, a game with no result — are skipped and counted by
+reason rather than ending the build. Games whose ratings the file does not give are kept and
+marked as unrated, and the rating pool (Lichess, chess.com) is read from each game's headers,
+or given for every game with `--rating-source`.
+
+Each dataset lands in `<data>/datasets/<name>/`, as sharded record files that the trainer
+memory-maps, plus a `manifest.json` recording the sources, the counts, the statistics and
+when it was built. A share of the *games* — `--validation-fraction`, 2% by default — is held
+back for validation, chosen by a hash of each game, so no position of a game can be trained
+on and validated against. The hash is of the game itself, so the same game always lands on
+the same side, in every dataset it is ever built into.
+
+What a dataset holds:
+
+```sh
+uv run chess-ai dataset stats my-games
+```
+
+```
+dataset my-games
+  built      2024-05-17 09:30:00 UTC
+  format     version 1, move vocabulary 1968
+  games      9,631 (train 9,436, validation 195)
+  positions  742,905 (train 727,884, validation 15,021)
+...
+results
+  1-0      4,812  50.0%  ████████████████████████████
+  0-1      4,301  44.7%  █████████████████████████
+  1/2-1/2    518   5.4%  ███
+```
+
+`.pgn.zst` Lichess dumps, a command that downloads them, and filters on rating, time control,
+termination and date are next.
 
 ### Shortcuts with make
 

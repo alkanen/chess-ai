@@ -1,0 +1,56 @@
+This file starts with prose about chess, which is not a game. 1. e4 is a fine move.
+
+[Event "Illegal move"]
+[Site "?"]
+[Date "2024.03.01"]
+[White "Oz"]
+[Black "Pat"]
+[Result "1-0"]
+[WhiteElo "1500"]
+[BlackElo "1500"]
+[TimeControl "300+0"]
+
+1. e4 e5 2. Nf6 1-0
+
+[Event "Still being played"]
+[Site "?"]
+[Date "2024.03.02"]
+[White "Quinn"]
+[Black "Ray"]
+[Result "*"]
+[TimeControl "300+0"]
+
+1. e4 e5 2. Nf3 *
+
+[Event "No position"]
+[Site "?"]
+[Date "2024.03.03"]
+[White "Sam"]
+[Black "Tess"]
+[Result "1-0"]
+[FEN "not a position at all"]
+[SetUp "1"]
+[TimeControl "300+0"]
+
+1. e4 1-0
+
+[Event "Not chess"]
+[Site "https://lichess.org/qrst7890"]
+[Date "2024.03.04"]
+[White "Uma"]
+[Black "Vic"]
+[Result "1-0"]
+[Variant "Horde"]
+[TimeControl "300+0"]
+
+1. e4 d5 1-0
+
+[Event "Headers only"]
+[Site "?"]
+[Date "2024.03.05"]
+[White "Wes"]
+[Black "Xena"]
+[Result "1-0"]
+[TimeControl "300+0"]
+
+1-0

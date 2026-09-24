@@ -7,6 +7,12 @@ chess-ai.toml
 # Games saved by the server, in the default games directory (./games, and only there)
 /games/
 
+# Datasets built from PGN files, in the default data directory (./data, and only there)
+/data/
+
+# PGN files downloaded to work with, which are nobody else's business
+/downloaded_games/
+
 # Python
 .venv/
 __pycache__/
