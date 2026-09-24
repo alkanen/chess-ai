@@ -1,11 +1,11 @@
 import { useState } from 'react';
-import { type Color, fetchPgn, type GameState, type PgnFile, pgnUrl } from './api';
+import { type Color, fetchPgn, type GameState, type PgnFile, PGN_MEDIA_TYPE, pgnUrl } from './api';
 import type { Orientation } from './board/geometry';
 import './GameControls.css';
 
 /** Hands a file to the browser to save, which is what following a download link does. */
 function save({ name, text }: PgnFile): void {
-  const url = URL.createObjectURL(new Blob([text], { type: 'application/x-chess-pgn' }));
+  const url = URL.createObjectURL(new Blob([text], { type: PGN_MEDIA_TYPE }));
   const link = document.createElement('a');
   link.href = url;
   link.download = name;

@@ -131,6 +131,57 @@ export type ViewerMessage = { game: string } & (
   | { type: 'takeback' }
 );
 
+/** One move of a game being replayed, and the position it leads to. */
+export interface ReplayMove {
+  san: string;
+  uci: string;
+  /** The position the move leads to, which carries the move as its last move. */
+  position: PositionSnapshot;
+}
+
+/** One game's headers: enough to pick it out of a file, and not a move of it. */
+export interface GameSummary {
+  /** Which game of the file this is, counting from zero; how it is asked for. */
+  index: number;
+  event: string;
+  site: string;
+  /** As PGN writes it ("2000.11.04"), unknown parts and all ("2000.??.??"). */
+  date: string;
+  round: string;
+  white: string;
+  black: string;
+  result: Result;
+  /** How the game ended, where the file says; games saved here carry it. */
+  termination: string | null;
+  /** How many moves of the main line there are to step through. */
+  plies: number;
+}
+
+/** One game of a file, with the position before every move and after it. */
+export interface ReplayGame extends GameSummary {
+  /** The position the game began in, which says how its moves are numbered. */
+  start_fen: string;
+  start_position: PositionSnapshot;
+  moves: ReplayMove[];
+}
+
+/** What a PGN file holds: every game's headers, and one game to step through. */
+export interface ReplayFile {
+  games: GameSummary[];
+  selected: ReplayGame;
+}
+
+/** A game in the server's games directory, as the list of them describes it. */
+export interface SavedGame {
+  /** The file's name, which is what opens it. */
+  name: string;
+  event: string;
+  date: string;
+  white: string;
+  black: string;
+  result: Result;
+}
+
 export type PlayerKind = 'human' | 'random';
 
 /** What each player kind is called in the new-game form. */
@@ -175,6 +226,9 @@ export function pgnUrl(game: string): string {
   url.searchParams.set('game', game);
   return url.href;
 }
+
+/** What a PGN file is, to a browser that is being handed one or sent one. */
+export const PGN_MEDIA_TYPE = 'application/x-chess-pgn';
 
 /** A file the server has handed over, under the name the server gave it. */
 export interface PgnFile {
@@ -222,6 +276,47 @@ async function refusal(response: Response): Promise<string> {
     // No JSON body, or nothing useful in it; the status is all there is to go on.
   }
   return `${response.status} ${response.statusText}`;
+}
+
+/** Every game the server has saved, the most recently played first. */
+export async function fetchSavedGames(): Promise<SavedGame[]> {
+  const response = await fetch(apiUrl('replay/saved'));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as SavedGame[];
+}
+
+/** Opens a saved game, by the `name` the list of saved games gives it. */
+export async function openSavedGame(name: string, game = 0): Promise<ReplayFile> {
+  const url = new URL(apiUrl(`replay/saved/${encodeURIComponent(name)}`));
+  url.searchParams.set('game', String(game));
+  return await replayed(url);
+}
+
+/**
+ * Reads a PGN file, and replays one game of it.
+ *
+ * The server keeps nothing, so looking at a second game in the same file sends it up
+ * again. Files here are the size of a text file, and the answer is the larger of the two.
+ */
+export async function openPgn(pgn: string, game = 0): Promise<ReplayFile> {
+  const url = new URL(apiUrl('replay/pgn'));
+  url.searchParams.set('game', String(game));
+  return await replayed(url, {
+    method: 'POST',
+    headers: { 'Content-Type': PGN_MEDIA_TYPE },
+    body: pgn,
+  });
+}
+
+/** A file read back as the positions its games pass through, or why it could not be. */
+async function replayed(url: URL, init?: RequestInit): Promise<ReplayFile> {
+  const response = await fetch(url.href, init);
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as ReplayFile;
 }
 
 /** Starts a new game, replacing the current one for every viewer. */

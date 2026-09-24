@@ -21,6 +21,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
     status,
@@ -28,9 +29,12 @@ from fastapi import (
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 from starlette.types import Message
 from starlette.websockets import WebSocketState
 
+from chess_ai import replay
 from chess_ai.config import Config
 from chess_ai.game_session import ActionRejectedError, GameSession, GameState
 from chess_ai.pgn import MEDIA_TYPE as PGN_MEDIA_TYPE
@@ -53,6 +57,19 @@ Every answer the PGN route gives carries this, not only the file: a 404 is one o
 statuses a cache may keep of its own accord, and a stored "no game has been started"
 would go on being served long after a game had started.
 """
+
+CLIENT_GAVE_UP = 499
+"""What a request whose sender went away is answered with, as nginx answers one.
+
+No number of HTTP's own says it: the request was neither refused nor served, and the
+one asking is no longer there to read whichever was chosen. 499 is what the proxy in
+front of this server writes in its log for the same thing.
+"""
+
+_WHICH_GAME = (
+    "Which game of the file to replay, counting from zero. The headers of every game in "
+    "it are returned whichever one this is."
+)
 
 PlayerKind = Literal["human", "random"]
 _PLAYERS: dict[PlayerKind, Callable[[], Player]] = {
@@ -235,6 +252,66 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
             },
         )
 
+    # The reading of a PGN file happens in a worker thread, either because the route is
+    # a plain `def` or, where it has a body to take first, by being handed to one:
+    # reading a file of a few thousand games takes long enough to be felt by the game
+    # being played on the event loop meanwhile. It touches nothing that game touches.
+
+    @api.get("/replay/saved")
+    def saved_games(response: Response) -> list[replay.SavedGame]:
+        """Every game saved here, the most recently played first.
+
+        Kept by nobody: a game finishing adds to this list at a moment of its own.
+        """
+        response.headers.update(NO_STORE)
+        return replay.saved_games(config.paths.games)
+
+    @api.get("/replay/saved/{name}", responses={404: {"description": "No such saved game"}})
+    def saved_game(
+        name: str,
+        game: Annotated[int, Query(ge=0, description=_WHICH_GAME)] = 0,
+    ) -> replay.ReplayFile:
+        """Open a saved game, by the ``name`` the list of saved games gives it."""
+        try:
+            return _replayed(replay.saved_game(config.paths.games, name), game)
+        except replay.NoSuchGameError as missing:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
+
+    @api.post(
+        "/replay/pgn",
+        openapi_extra={
+            "requestBody": {
+                "description": "A PGN file.",
+                "required": True,
+                "content": {PGN_MEDIA_TYPE: {"schema": {"type": "string", "format": "binary"}}},
+            }
+        },
+        responses={
+            400: {"description": "The file holds no game, or one that cannot be read"},
+            404: {"description": "The file has no game with that number"},
+            413: {"description": "The file is larger than the server will read"},
+            499: {"description": "The upload was given up before it was all sent"},
+        },
+    )
+    async def replay_pgn(
+        request: Request,
+        game: Annotated[int, Query(ge=0, description=_WHICH_GAME)] = 0,
+    ) -> replay.ReplayFile:
+        """Read a PGN file, and replay one of the games in it.
+
+        The file itself is not kept: looking at a second game in it posts it again.
+
+        The body is taken as it arrives rather than declared as a parameter, because a
+        parameter is handed over whole: the body would be in memory before anything
+        here could say it was too large, which is the one thing the limit is for.
+        """
+        pgn = await _read_at_most(request.stream(), replay.MAX_BYTES)
+        # Back onto a worker thread for the reading itself, as the routes above, so that
+        # a file of a few thousand games is not felt by the game being played meanwhile.
+        # The bytes go over as they are: decoding them is part of that reading, and a
+        # file that is not UTF-8 is two passes over every byte of it.
+        return await run_in_threadpool(_replayed, pgn, game)
+
     @api.websocket("/game/ws")
     async def follow_game(websocket: WebSocket) -> None:
         """Send the current game's full state and every event after it, and act on replies."""
@@ -273,6 +350,51 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     app.mount(prefix or "/", _FrontendFiles(directory=static_dir, check_dir=False), name="static")
 
     return app
+
+
+async def _read_at_most(body: AsyncIterator[bytes], limit: int) -> bytes:
+    """The body being sent, refused the moment it passes ``limit`` bytes.
+
+    Taken a piece at a time and counted as it goes, so that a body larger than the
+    server will read costs the server the limit and not the size of the body: whoever
+    is sending it decides how large it is, and nobody here has to believe the length
+    they declared, or that they declared one at all.
+
+    Raises:
+        HTTPException: the body passed the limit, or whoever was sending it went away
+            before it was all here. Neither is a fault of this server's.
+    """
+    read = bytearray()
+    try:
+        async for piece in body:
+            read += piece
+            if len(read) > limit:
+                raise HTTPException(
+                    status.HTTP_413_CONTENT_TOO_LARGE,
+                    f"that file is larger than the {limit // 1024 // 1024} MB of PGN this "
+                    "server will read at once",
+                )
+    except ClientDisconnect as gone:
+        # Giving up on an upload is something people do on purpose, and at 8 MB over a
+        # slow line it is the ordinary way to end one. Answered like any other request
+        # the server will not act on, rather than raised through the server as a fault
+        # and logged with a traceback nobody can do anything about.
+        raise HTTPException(CLIENT_GAVE_UP, "the upload was given up") from gone
+    return bytes(read)
+
+
+def _replayed(pgn: str | bytes, selected: int) -> replay.ReplayFile:
+    """``pgn`` read back, with what is wrong with it told to whoever sent it.
+
+    A file that arrived as bytes is decoded here rather than by the caller, so that the
+    decoding goes wherever the reading goes.
+    """
+    try:
+        return replay.read(replay.decode(pgn) if isinstance(pgn, bytes) else pgn, selected=selected)
+    except replay.MalformedPgnError as malformed:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(malformed)) from malformed
+    except replay.NoSuchGameError as missing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
 
 
 class _Connection:

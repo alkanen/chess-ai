@@ -1,0 +1,32 @@
+.replay-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.replay-controls .steps {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.replay-controls .steps button {
+  flex: 1;
+  padding: 0.4rem 0;
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.replay-controls .steps button:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.replay-controls .ply {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.replay-controls .hint {
+  opacity: 0.7;
+}

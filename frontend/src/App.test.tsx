@@ -74,6 +74,52 @@ describe('App', () => {
     document.head.querySelector('base')?.remove();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+    // The view is in the address, and the next test starts wherever this one left it.
+    window.location.hash = '';
+  });
+
+  describe('the views', () => {
+    /** The replay viewer asks the server for the saved games as soon as it is shown. */
+    function noSavedGames() {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([])));
+    }
+
+    it('moves between the game and the replay viewer, and says which is on show', async () => {
+      noSavedGames();
+      render(<App />);
+      FakeWebSocket.latest.open();
+      const atTheStart = { type: 'no_game', position: startPosition as PositionSnapshot } as const;
+      FakeWebSocket.latest.deliver(atTheStart);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Replay' }));
+
+      expect(await screen.findByText('No games have been saved here yet.')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Replay' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Replay' })).toHaveAttribute(
+        'aria-current',
+        'page',
+      );
+      // The game view is gone, and with it the connection it was following.
+      expect(screen.queryByRole('img', { name: 'white king on e1' })).not.toBeInTheDocument();
+      expect(window.location.hash).toBe('#replay');
+
+      fireEvent.click(screen.getByRole('button', { name: 'Game' }));
+      FakeWebSocket.latest.open();
+      FakeWebSocket.latest.deliver(atTheStart);
+
+      expect(screen.getByRole('img', { name: 'white king on e1' })).toBeInTheDocument();
+      expect(window.location.hash).toBe('');
+    });
+
+    it('opens the view the address names, so that a reload stays where it was', async () => {
+      noSavedGames();
+      window.location.hash = '#replay';
+
+      render(<App />);
+
+      expect(await screen.findByText('No games have been saved here yet.')).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Replay' })).toBeInTheDocument();
+    });
   });
 
   it('follows the game channel under the path prefix', () => {

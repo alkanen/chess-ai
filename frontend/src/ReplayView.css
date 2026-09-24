@@ -1,0 +1,81 @@
+.replay h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.25rem;
+}
+
+.replay p[role='alert'] {
+  margin: 0.5rem 0;
+  font-weight: 600;
+  color: #c33;
+}
+
+.replay .note {
+  margin: 0;
+  opacity: 0.7;
+}
+
+/* There is more above the board here than in the game view, so it is given a little
+   less room: the panel beside it is what a game is stepped through with, and it belongs
+   next to the board rather than under the bottom of the window. */
+.replay .board-frame {
+  flex-basis: calc(100vh - 15rem);
+}
+
+/* No board to show yet: somewhere for one to go, rather than a board-sized hole that
+   pushes everything there is to open it off the bottom of the window. */
+.replay .board-frame.empty {
+  display: flex;
+  flex: 0 1 24rem;
+  align-items: center;
+  justify-content: center;
+  min-height: 8rem;
+  padding: 1rem;
+  border: 1px dashed rgb(128 128 128 / 50%);
+  border-radius: 4px;
+  box-shadow: none;
+  text-align: center;
+}
+
+/* Long names in the game chooser must not widen the panel: a file of grandmaster games
+   has options far wider than the panel, and the panel would be pushed under the board. */
+.replay .side-panel {
+  min-width: 0;
+}
+
+.open-pgn {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-weight: 600;
+}
+
+.open-pgn input {
+  font-weight: 400;
+}
+
+.opened {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.choose-game {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-weight: 600;
+}
+
+.choose-game select {
+  max-width: 100%;
+  /* Kept from taking its width from its widest option, which is a name and a half. */
+  width: 100%;
+  padding: 0.25rem;
+  font: inherit;
+  font-weight: 400;
+}
+
+.occasion {
+  margin: -0.75rem 0 0;
+  opacity: 0.7;
+}

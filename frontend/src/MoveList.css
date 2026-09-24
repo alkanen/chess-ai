@@ -40,3 +40,26 @@
   min-width: 4.5rem;
   font-family: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, monospace;
 }
+
+/* A move of a game being stepped through: a place to jump to, drawn like the rest. */
+/* Everything but the size comes from .san above, which a button takes as readily as a
+   span; the size is the one thing a browser's own button style would keep. */
+button.san {
+  padding: 0;
+  border: none;
+  color: inherit;
+  font-size: inherit;
+  text-align: left;
+  background: none;
+  cursor: pointer;
+}
+
+button.san:hover {
+  text-decoration: underline;
+}
+
+button.san[aria-current='step'] {
+  font-weight: 700;
+  border-radius: 3px;
+  background: rgb(128 128 128 / 35%);
+}
