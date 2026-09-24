@@ -1,0 +1,14 @@
+[Event "From a position"]
+[Site "https://lichess.org/uvwx1234"]
+[Date "2024.04.01"]
+[White "Yana"]
+[Black "Zed"]
+[Result "1-0"]
+[Variant "From Position"]
+[FEN "4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"]
+[SetUp "1"]
+[WhiteElo "1600"]
+[BlackElo "1600"]
+[TimeControl "300+3"]
+
+1. e4 Kf7 2. e5 Ke7 3. Ke2 Kd7 4. e6+ Kd6 5. e7 Kd7 6. e8=Q+ 1-0
