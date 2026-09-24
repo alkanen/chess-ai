@@ -58,6 +58,32 @@ def test_environment_variables_override_file(tmp_path):
     assert (server.host, server.port, server.path_prefix) == ("0.0.0.0", 9100, "")
 
 
+def test_games_are_saved_in_a_directory_of_the_working_directory_by_default():
+    assert load_config(environ={}).paths.games == Path("games")
+
+
+def test_reads_the_games_directory_from_file(tmp_path):
+    path = write(tmp_path / "custom.toml", '[paths]\ngames = "/srv/chess/games"\n')
+
+    assert load_config(path, environ={}).paths.games == Path("/srv/chess/games")
+
+
+def test_environment_variable_overrides_the_games_directory(tmp_path):
+    path = write(tmp_path / "custom.toml", '[paths]\ngames = "/srv/chess/games"\n')
+
+    config = load_config(path, environ={"CHESS_AI_PATHS_GAMES": "/mnt/big/games"})
+
+    assert config.paths.games == Path("/mnt/big/games")
+
+
+def test_expands_a_home_directory_in_the_games_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config = load_config(environ={"CHESS_AI_PATHS_GAMES": "~/chess/games"})
+
+    assert config.paths.games == tmp_path / "chess" / "games"
+
+
 @pytest.mark.parametrize(
     ("given", "normalized"),
     [

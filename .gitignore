@@ -4,6 +4,9 @@
 # Local configuration (see chess-ai.example.toml)
 chess-ai.toml
 
+# Games saved by the server, in the default games directory (./games, and only there)
+/games/
+
 # Python
 .venv/
 __pycache__/

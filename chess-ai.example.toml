@@ -17,3 +17,10 @@ port = 8000
 # https://example.com/chess/. Pages, assets and the API all live under it, so a
 # reverse proxy can forward requests unchanged. Empty serves at the root.
 path_prefix = ""
+
+[paths]
+# Where the games played here are saved, one PGN file per game. Every game that
+# reaches a result is saved as it ends; an aborted game reached none and is not
+# saved. A relative path is relative to the directory chess-ai runs in, and a
+# leading ~ is your home directory. The directory is made when it is first needed.
+games = "games"

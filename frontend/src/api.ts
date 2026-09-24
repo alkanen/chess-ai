@@ -163,6 +163,44 @@ export function apiUrl(path: string): string {
   return new URL(`api/${path}`, document.baseURI).href;
 }
 
+/**
+ * Where the game a viewer is looking at is downloaded as PGN, in progress or finished.
+ *
+ * The game is named, as in everything else a viewer sends, because a new game can replace
+ * it in the moment before the click: the server then refuses the download rather than
+ * handing over a game the viewer has never seen. The server names the file itself.
+ */
+export function pgnUrl(game: string): string {
+  const url = new URL(apiUrl('game/pgn'));
+  url.searchParams.set('game', game);
+  return url.href;
+}
+
+/** A file the server has handed over, under the name the server gave it. */
+export interface PgnFile {
+  name: string;
+  text: string;
+}
+
+const PGN_FILENAME = /filename="([^"]*)"/;
+
+/**
+ * The game's PGN, fetched rather than followed as a link.
+ *
+ * A link has nowhere to put a refusal, and this one can be refused: a game replaced in
+ * the moment before the click is turned down rather than swapped for its replacement.
+ * Left to the browser, that answer is either a download that fails out of sight or a
+ * file full of the error, so it is read here and the viewer is told.
+ */
+export async function fetchPgn(game: string): Promise<PgnFile> {
+  const response = await fetch(pgnUrl(game));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  const named = PGN_FILENAME.exec(response.headers.get('Content-Disposition') ?? '');
+  return { name: named?.[1] || 'game.pgn', text: await response.text() };
+}
+
 /** The WebSocket URL of the game channel, under the path prefix like every API URL. */
 export function gameChannelUrl(): string {
   const url = new URL(apiUrl('game/ws'));

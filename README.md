@@ -94,6 +94,7 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[server] host` | `CHESS_AI_SERVER_HOST` | `127.0.0.1` |
 | `[server] port` | `CHESS_AI_SERVER_PORT` | `8000` |
 | `[server] path_prefix` | `CHESS_AI_SERVER_PATH_PREFIX` | empty (serve at `/`) |
+| `[paths] games` | `CHESS_AI_PATHS_GAMES` | `games`, in the working directory |
 
 ### Serve
 
@@ -106,6 +107,8 @@ Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `pa
 The server holds one game, which every open browser shows. Start a game from the page, choosing a human player or a random mover for each colour, with a delay between moves so that a game between random movers can be followed; starting another game replaces it for everyone.
 
 On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. A pawn reaching the last rank asks which piece to promote it to, and nothing is submitted until you pick one, by clicking it or with Enter or Space on the choice the picker opens on. Clicking elsewhere on the board, or pressing Escape, puts the pawn back.
+
+Every game that reaches a result is saved as PGN in the games directory, one file per game, named after the moment it ended: nothing has to be asked for, and the file replays in any other chess tool. A game that was aborted reached no result and is not kept. **Export PGN** downloads the game on show whenever you like, a game still being played included, with the moves played so far and the result `*` that PGN gives a game that has not ended.
 
 ### Shortcuts with make
 

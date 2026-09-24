@@ -53,10 +53,26 @@ class ServerConfig(BaseModel):
         return "/" + "/".join(segments)
 
 
+class PathsConfig(BaseModel):
+    """Where the things the system keeps on disk live."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    games: Path = Path("games")
+    """Directory the games played here are saved in, one PGN file per game."""
+
+    @field_validator("games")
+    @classmethod
+    def _expand_user(cls, value: Path) -> Path:
+        """Expand a leading ``~``, which a path in a config file may well be written with."""
+        return value.expanduser()
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     server: ServerConfig = ServerConfig()
+    paths: PathsConfig = PathsConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> Config:

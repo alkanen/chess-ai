@@ -121,6 +121,39 @@ describe('App', () => {
     expect(lastMoveSquares(container)).toEqual(['d8', 'h4']);
   });
 
+  it('offers the game on show as a PGN download, named, under the path prefix', () => {
+    render(<App />);
+    FakeWebSocket.latest.open();
+
+    FakeWebSocket.latest.deliver(foolsMateStart);
+
+    // Named like every other message about the game, so that a game started in the
+    // meantime is refused rather than downloaded in place of the one on the screen.
+    const url = new URL('/chess/api/game/pgn?game=fools-mate', window.location.href);
+    expect(screen.getByRole('link', { name: 'Export PGN' })).toHaveAttribute('href', url.href);
+  });
+
+  it('names the game that replaced the one before it in the download', () => {
+    render(<App />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(foolsMateStart);
+
+    socket.deliver(gameOf('human', 'random', startPosition as PositionSnapshot, 'the-next-game'));
+
+    const url = new URL('/chess/api/game/pgn?game=the-next-game', window.location.href);
+    expect(screen.getByRole('link', { name: 'Export PGN' })).toHaveAttribute('href', url.href);
+  });
+
+  it('has no game to download before one has been started', () => {
+    render(<App />);
+    FakeWebSocket.latest.open();
+
+    FakeWebSocket.latest.deliver({ type: 'no_game', position: startPosition as PositionSnapshot });
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+  });
+
   it('names the players', () => {
     render(<App />);
     FakeWebSocket.latest.open();
