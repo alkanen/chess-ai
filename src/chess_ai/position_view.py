@@ -131,8 +131,13 @@ def _color(color: chess.Color) -> Color:
     return "white" if color == chess.WHITE else "black"
 
 
-def snapshot(board: chess.Board) -> PositionSnapshot:
-    """Describe ``board``, using its move history for the last move and repetitions."""
+def snapshot(board: chess.Board, *, legal_moves: bool = True) -> PositionSnapshot:
+    """Describe ``board``, using its move history for the last move and repetitions.
+
+    ``legal_moves`` is left out for a position nobody is to move in, such as one step of
+    a game being replayed: the moves are three quarters of a snapshot's size, and a
+    board that takes no input never draws them.
+    """
     pieces = {
         chess.square_name(square): Piece(
             color=_color(piece.color),
@@ -153,7 +158,7 @@ def snapshot(board: chess.Board) -> PositionSnapshot:
         pieces=pieces,
         last_move=last_move,
         check_square=_check_square(board),
-        legal_moves=_legal_moves(board),
+        legal_moves=_legal_moves(board) if legal_moves else {},
         game_over=_game_over(board),
     )
 

@@ -18,6 +18,11 @@ const SCORES: Record<Exclude<Result, '*'>, string> = {
   '1/2-1/2': '½–½',
 };
 
+/** What a game's result says on its own, for a game nobody is watching play out. */
+export function describeResult(result: Result): string {
+  return result === '*' ? 'unfinished' : SCORES[result];
+}
+
 export function describeGameOver({ result, reason }: GameOver): string {
   // An abort is the one ending that leaves no result, so there is nothing to score.
   if (result === '*' || reason === 'abort') {

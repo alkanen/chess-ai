@@ -1,0 +1,62 @@
+.saved-games h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.saved-games .note {
+  margin: 0;
+  opacity: 0.7;
+}
+
+.saved-games p[role='alert'] {
+  margin: 0;
+  font-weight: 600;
+  color: #c33;
+}
+
+.saved-games ul {
+  overflow-y: auto;
+  max-height: 14rem;
+  margin: 0;
+  padding: 0;
+  border: 1px solid rgb(128 128 128 / 35%);
+  border-radius: 4px;
+  list-style: none;
+}
+
+.saved-games li + li {
+  border-top: 1px solid rgb(128 128 128 / 25%);
+}
+
+.saved-games li button {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.5rem;
+  width: 100%;
+  padding: 0.35rem 0.5rem;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  background: none;
+  cursor: pointer;
+}
+
+.saved-games li button:hover {
+  background: rgb(128 128 128 / 15%);
+}
+
+.saved-games li button[aria-current] {
+  font-weight: 600;
+  background: rgb(128 128 128 / 25%);
+}
+
+.saved-games .date {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
+
+.saved-games .names {
+  flex: 1;
+  overflow-wrap: anywhere;
+}

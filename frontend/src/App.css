@@ -5,9 +5,38 @@
   padding: 1rem;
 }
 
-.app h1 {
-  margin: 0 0 1rem;
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.app-header h1 {
+  margin: 0;
   font-size: 1.5rem;
+}
+
+.app-header nav {
+  display: flex;
+  gap: 0.25rem;
+}
+
+.app-header nav button {
+  padding: 0.35rem 0.9rem;
+  border: 1px solid rgb(128 128 128 / 45%);
+  border-radius: 999px;
+  color: inherit;
+  font: inherit;
+  background: none;
+  cursor: pointer;
+}
+
+/* The page you are on: shown as chosen, and not offered again. */
+.app-header nav button[aria-current='page'] {
+  font-weight: 600;
+  background: rgb(128 128 128 / 25%);
 }
 
 .game-view {
