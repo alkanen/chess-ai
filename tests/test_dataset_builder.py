@@ -719,3 +719,98 @@ def test_an_interrupted_build_is_reported_as_interrupted(tmp_path):
             build(tmp_path, validation_fraction=0.0)
 
     assert list_datasets(tmp_path) == []
+
+
+def test_a_build_leaves_another_datasets_working_directory_alone(tmp_path):
+    # Dataset names may contain dots, so ".d.foo.…partial" is a build of "d.foo" and not a build
+    # of "d" with something after it. A build of "d" used to delete it while it was being written.
+    live = store.new_partial_path(tmp_path, "test.extra")
+    live.mkdir(parents=True)
+    (live / "train").mkdir()
+    mine = store.new_partial_path(tmp_path, "test")
+    mine.mkdir(parents=True)
+
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    assert live.is_dir(), "a build of 'test' must not touch a build of 'test.extra'"
+    assert (live / "train").is_dir()
+    assert mine.is_dir(), "nor anything it did not create itself"
+
+
+def test_a_working_directory_left_behind_is_reported(tmp_path, caplog):
+    # Whether it belongs to a build that was killed or to one running on another machine cannot
+    # be told from here, so it is named and left alone rather than guessed about and deleted.
+    left = store.new_partial_path(tmp_path, "test")
+    left.mkdir(parents=True)
+
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    assert str(left) in caplog.text
+    assert left.is_dir()
+
+
+def test_a_dataset_an_interrupted_build_set_aside_is_reported(tmp_path, caplog):
+    # A dataset the tool would otherwise never mention again: list_datasets and stats both skip
+    # a dot-prefixed directory, so without this the user has lost it as far as they can tell.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    aside = store.replaced_path(store.new_partial_path(tmp_path, "test"))
+    dataset_path(tmp_path, "test").rename(aside)
+
+    build(tmp_path, "unrated.pgn", validation_fraction=0.0)
+
+    assert str(aside) in caplog.text
+    assert load_manifest(aside).games == 4, "and it is still the dataset it was"
+
+
+@pytest.mark.skipif(store.fcntl is None, reason="builds are only serialised on POSIX")
+def test_a_filesystem_that_cannot_lock_does_not_block_every_build(tmp_path):
+    # ENOLCK is an NFS export with no lock daemon, and EOPNOTSUPP several FUSE mounts. Neither
+    # means a build is running, and turning them into that made the dataset unbuildable for good.
+    for code in (errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOSYS):
+        target = tmp_path / str(code)
+
+        def no_locks(fd, operation, code=code):
+            raise OSError(code, os.strerror(code))
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(store.fcntl, "flock", no_locks)
+
+            manifest = build(target, "lichess.pgn", validation_fraction=0.0)
+
+        assert manifest.games == 4, f"errno {code} should not stop a build"
+
+
+@pytest.mark.skipif(store.fcntl is None, reason="builds are only serialised on POSIX")
+def test_a_lock_another_build_holds_still_stops_this_one(tmp_path):
+    def held(fd, operation):
+        raise OSError(errno.EWOULDBLOCK, os.strerror(errno.EWOULDBLOCK))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store.fcntl, "flock", held)
+
+        with pytest.raises(DatasetError, match="already running"):
+            build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+
+def test_an_interrupt_between_the_two_renames_keeps_the_dataset(tmp_path):
+    # Ctrl-C is aimed at exactly this moment, and the cost of losing the window is a dataset the
+    # tool would never mention again: not in place, and hidden under a dot-prefixed name.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_replace = os.replace
+
+    def replace(source, target, **kwargs):
+        result = real_replace(source, target, **kwargs)
+        if str(target).endswith(store.REPLACED_SUFFIX):
+            # Delivered the instant the old dataset has been moved aside and before anything has
+            # taken its place, which is the moment a signal has to be survivable in.
+            raise KeyboardInterrupt
+        return result
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder.os, "replace", replace)
+
+        with pytest.raises(KeyboardInterrupt):
+            build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert list_datasets(tmp_path) == ["test"], "the dataset that was there is still there"
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 4

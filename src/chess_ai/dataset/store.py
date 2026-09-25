@@ -24,10 +24,11 @@ makes a leak impossible to write rather than merely tested for: nothing the trai
 from a split's directory can have come from the other.
 """
 
+import errno
 import itertools
+import logging
 import os
 import re
-import shutil
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
@@ -51,6 +52,8 @@ from chess_ai.dataset.records import (
     unpack_board,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 DATASETS_DIR: Final = "datasets"
 """Where datasets live inside the data directory."""
 
@@ -59,13 +62,20 @@ GAMES: Final = "games"
 MOVES: Final = "moves"
 
 PARTIAL_SUFFIX: Final = ".partial"
-"""What a dataset being built is called until it is finished; see :func:`partial_path`."""
+"""What a dataset being built is called until it is finished; see :func:`new_partial_path`."""
 
 REPLACED_SUFFIX: Final = ".replaced"
 """What the dataset being replaced is called for the moment between two renames."""
 
 LOCK_SUFFIX: Final = ".lock"
 """What the file a build holds while it runs is called; see :func:`dataset_lock`."""
+
+HELD_BY_ANOTHER: Final = frozenset(
+    code
+    for code in (getattr(errno, name, None) for name in ("EWOULDBLOCK", "EAGAIN", "EACCES"))
+    if code is not None
+)
+"""What locking answers when somebody else holds the lock, rather than when it cannot be done."""
 
 SHARD_SUFFIX: Final = ".bin"
 SHARD_DIGITS: Final = 5
@@ -127,8 +137,9 @@ def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
     a rule for telling a live build from a lock nobody released, and would leave a dataset
     unbuildable until someone deleted a file by hand.
 
-    Where this cannot be had — anything that is not POSIX — builds are not serialised, and
-    :func:`new_partial_path` is what keeps two of them from writing over each other.
+    Where this cannot be had — anything that is not POSIX, or a filesystem that does not do
+    locks — builds are not serialised, and :func:`new_partial_path` is what keeps two of them from
+    writing over each other.
     """
     if fcntl is None:
         yield
@@ -140,6 +151,19 @@ def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
+            if e.errno not in HELD_BY_ANOTHER:
+                # The filesystem does not do locks at all: an NFS export with no lock daemon, or
+                # one of several FUSE mounts. Taken at its word, for the same reason the flushing
+                # in files.py is — serialising builds is a convenience, not the dataset, and a
+                # mount that cannot do it must not make a dataset unbuildable for good.
+                LOGGER.warning(
+                    "chess-ai: %s cannot lock, so two builds of one dataset are not kept apart "
+                    "there: %s",
+                    root,
+                    e.strerror,
+                )
+                yield
+                return
             raise DatasetError(
                 f"a build of dataset {name!r} is already running in {root}; wait for it to finish"
             ) from e
@@ -160,8 +184,9 @@ def new_partial_path(data_dir: Path, name: str) -> Path:
     directory. They did once, and the result was not that one of them lost: each kept writing
     into files the other had deleted, and whichever finished first published its own manifest
     over the other's shards, with the counts and the records disagreeing and nothing raising.
-    The process id is in there so that a directory left behind can be matched to the process that
-    was filling it; see :func:`clear_abandoned_partials`.
+    The process id is in the name for whoever is reading it, and for nothing else: what it means is
+    a question only the machine that wrote it could answer, so no decision is taken on it. See
+    :func:`abandoned_partials`.
     """
     build = f"{os.getpid()}-{next(_BUILDS)}"
     return datasets_dir(data_dir) / f".{valid_name(name)}.{build}{PARTIAL_SUFFIX}"
@@ -176,45 +201,50 @@ def replaced_path(partial: Path) -> Path:
     return partial.with_name(partial.name[: -len(PARTIAL_SUFFIX)] + REPLACED_SUFFIX)
 
 
-def clear_abandoned_partials(data_dir: Path, name: str) -> None:
-    """Remove working directories left behind by builds of ``name`` that are no longer running.
+def abandoned_partials(data_dir: Path, name: str) -> list[Path]:
+    """Working directories of builds of ``name`` that are lying about, to be reported not removed.
 
-    A build clears up after itself, so what is left belongs to one that was killed outright, and
-    without this a killed build over a Lichess dump would leave tens of gigabytes nothing will
-    ever read. A directory whose process is still alive is left strictly alone: that is a build
-    in progress, and a build over a monthly dump runs for days.
+    A build clears up after itself, so one of these belongs either to a build that was killed
+    outright or to a build running somewhere this cannot see: another machine sharing the data
+    directory, or a filesystem where :func:`dataset_lock` could not serialise anything.
 
-    Nothing that might hold data is touched. A ``.replaced`` directory holds the dataset that was
-    in place when something died between two renames, and is left for whoever wants it back.
+    Which of the two it is cannot be told from here, and guessing wrong is expensive. A process id
+    means nothing on a machine other than the one that wrote it, and a build filling one open
+    shard for an hour does not touch its directory's timestamp, so neither a liveness check nor an
+    age check can answer it. Deleting one that turned out to be live is the worst outcome
+    available: the build carries on writing into files that are no longer there and then publishes
+    a manifest counting shards that have gone. So they are named for whoever is reading and left
+    exactly where they are.
+    """
+    return _leftovers(data_dir, name, PARTIAL_SUFFIX)
+
+
+def replaced_datasets(data_dir: Path, name: str) -> list[Path]:
+    """Datasets of this name set aside by a build that was interrupted while publishing.
+
+    A dataset in one of these is a dataset nothing else will ever mention: :func:`list_datasets`
+    and everything built on it skip dot-prefixed directories. Renaming one back is all it takes to
+    have it again, which is worth saying to whoever lost it.
+    """
+    return _leftovers(data_dir, name, REPLACED_SUFFIX)
+
+
+def _leftovers(data_dir: Path, name: str, suffix: str) -> list[Path]:
+    """Directories of ``name``'s that a build left behind, by what they are called.
+
+    Matched rather than sliced apart, because a dataset name may contain dots: ".d.foo.1-0.partial"
+    is a build of "d.foo", not a build of "d" with something on the end, and reading it as the
+    latter is how a build of one dataset came to delete the working directory of another.
     """
     root = datasets_dir(data_dir)
     if not root.is_dir():
-        return
-    for entry in root.glob(f".{name}.*{PARTIAL_SUFFIX}"):
-        # ".<name>.<pid>-<build>.partial", so the process that owns it comes first.
-        owner = entry.name[len(name) + 2 : -len(PARTIAL_SUFFIX)].partition("-")[0]
-        if entry.is_dir() and not _still_running(owner):
-            shutil.rmtree(entry, ignore_errors=True)
-
-
-def _still_running(pid: str) -> bool:
-    """Whether the process that made a working directory is still there.
-
-    Answers yes whenever there is no way to tell, because deleting a live build's work is worse
-    than leaving a dead one's behind. Only asked on POSIX: on Windows ``os.kill`` has no way to
-    ask this that does not risk terminating the process it is asking about.
-    """
-    if os.name != "posix":
-        return True
-    try:
-        os.kill(int(pid), 0)
-    except (ValueError, ProcessLookupError):
-        # Not a process id at all, or a process that has gone.
-        return False
-    except OSError:
-        # There, but somebody else's.
-        return True
-    return True
+        return []
+    named = re.compile(rf"\.{re.escape(valid_name(name))}\.\d+-\d+{re.escape(suffix)}\Z")
+    return sorted(
+        entry
+        for entry in root.glob(f".{name}.*{suffix}")
+        if entry.is_dir() and named.fullmatch(entry.name)
+    )
 
 
 def list_datasets(data_dir: Path) -> list[str]:

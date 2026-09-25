@@ -59,10 +59,11 @@ from chess_ai.dataset.store import (
     DEFAULT_SHARDS,
     DatasetError,
     DatasetWriter,
-    clear_abandoned_partials,
+    abandoned_partials,
     dataset_lock,
     dataset_path,
     new_partial_path,
+    replaced_datasets,
     replaced_path,
     valid_name,
 )
@@ -123,10 +124,10 @@ def build_dataset(
                 f"dataset {name!r} is already in {directory}; "
                 "build it with --overwrite to replace it"
             )
+        _report_leftovers(data_dir, name)
         # Built beside where it belongs and moved there when it is finished, so that a dataset
         # directory always holds a whole dataset: an interrupted build leaves nothing for a
         # reader to find, for the next build to trip over, or for anyone to wonder about.
-        clear_abandoned_partials(data_dir, name)
         partial = new_partial_path(data_dir, name)
 
         build = _Build(
@@ -165,37 +166,66 @@ def _publish(partial: Path, directory: Path, *, name: str, overwrite: bool) -> N
     the minutes it takes to unlink 50 GB — left neither the old dataset nor the new one.
     """
     aside: Path | None = None
-    if directory.exists():
-        if not overwrite:
-            # Another build of this name finished while this one was reading. This build was
-            # told not to replace a dataset, and that holds however late it finds out.
-            raise DatasetError(
-                f"dataset {name!r} appeared in {directory} while this build was running; "
-                "build it with --overwrite to replace it"
-            )
-        aside = replaced_path(partial)
-        shutil.rmtree(aside, ignore_errors=True)
-        try:
-            os.replace(directory, aside)
-        except FileNotFoundError:
-            # Gone between the look and the move. Only reachable where builds are not
-            # serialised, since dataset_lock is what stops two of them getting here at once.
-            aside = None
     try:
+        if directory.exists():
+            if not overwrite:
+                # Another build of this name finished while this one was reading. This build was
+                # told not to replace a dataset, and that holds however late it finds out.
+                raise DatasetError(
+                    f"dataset {name!r} appeared in {directory} while this build was running; "
+                    "build it with --overwrite to replace it"
+                )
+            aside = replaced_path(partial)
+            shutil.rmtree(aside, ignore_errors=True)
+            try:
+                os.replace(directory, aside)
+            except FileNotFoundError:
+                # Gone between the look and the move. Only reachable where builds are not
+                # serialised, since dataset_lock is what stops two of them getting here at once.
+                aside = None
+        # Inside the same guard as the move aside, so that nothing at all can land between them.
+        # An interrupt is aimed at exactly this moment, and the cost of losing that race is a
+        # dataset sitting under a name no command here would ever mention again.
         os.replace(partial, directory)
-    except OSError as e:
-        if aside is not None:
+    except BaseException as e:
+        if aside is not None and not directory.exists():
             # Put it back rather than leave the dataset under a name nothing looks for.
             os.replace(aside, directory)
-        raise DatasetError(f"could not put dataset {name!r} in {directory}: {e.strerror}") from e
-    except BaseException:
-        if aside is not None:
-            os.replace(aside, directory)
+        if isinstance(e, OSError):
+            raise DatasetError(
+                f"could not put dataset {name!r} in {directory}: {e.strerror}"
+            ) from e
         raise
     sync_directory(directory.parent)
     if aside is not None:
         # Past the point of no return: failing here leaves rubble rather than losing a dataset.
         shutil.rmtree(aside, ignore_errors=True)
+
+
+def _report_leftovers(data_dir: Path, name: str) -> None:
+    """Say what earlier builds of this dataset left lying about, since nothing else will.
+
+    Neither kind is removed: see :func:`~chess_ai.dataset.store.abandoned_partials` for why a
+    working directory cannot safely be told from a live build's, and a set-aside dataset is real
+    data that only its owner should decide about.
+    """
+    for path in abandoned_partials(data_dir, name):
+        LOGGER.warning(
+            "chess-ai: %s is a working directory of another build of %r — one that was killed, or "
+            "one running elsewhere. It is not a dataset and nothing will read it; remove it once "
+            "no build of %r is running.",
+            path,
+            name,
+            name,
+        )
+    for path in replaced_datasets(data_dir, name):
+        LOGGER.warning(
+            "chess-ai: %s is the dataset %r that an interrupted build set aside and never put "
+            "back. Nothing else will mention it: rename it to %s to have it again, or remove it.",
+            path,
+            name,
+            dataset_path(data_dir, name),
+        )
 
 
 class _Build:
