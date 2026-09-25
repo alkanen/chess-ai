@@ -1,6 +1,10 @@
 """Building datasets out of the fixture PGN files: what is kept, what is not, and the split."""
 
+import errno
+import os
+import shutil
 from datetime import UTC, datetime
+from pathlib import Path
 
 import chess
 import pytest
@@ -445,18 +449,23 @@ def test_a_board_read_back_out_of_a_dataset_plays(tmp_path):
     assert board.is_valid()
 
 
-def _failing_append(when: int):
-    """A ``_StreamWriter.append`` that fails the ``when``-th call, as a full disk would."""
+def _raising_append(when: int, error):
+    """A ``_StreamWriter.append`` that raises ``error`` on the ``when``-th call."""
     original = store._StreamWriter.append
     calls = {"n": 0}
 
     def append(self, records):
         calls["n"] += 1
         if calls["n"] == when:
-            raise OSError(28, "No space left on device")
+            raise error
         return original(self, records)
 
     return append
+
+
+def _failing_append(when: int):
+    """A ``_StreamWriter.append`` that fails the ``when``-th call, as a full disk would."""
+    return _raising_append(when, OSError(errno.ENOSPC, "No space left on device"))
 
 
 def test_a_write_that_fails_ends_the_build_rather_than_counting_a_broken_game(tmp_path):
@@ -472,21 +481,26 @@ def test_a_write_that_fails_ends_the_build_rather_than_counting_a_broken_game(tm
     assert list_datasets(tmp_path) == []
 
 
-def test_a_progress_report_that_fails_ends_the_build(tmp_path):
-    # What a piped command raises when the reader goes away; it is not a broken game either.
+def test_a_report_that_cannot_be_made_does_not_lose_the_build(tmp_path, caplog):
+    # What a piped build raises when the reader goes away, and what a closed terminal or a
+    # dropped ssh session raises at hour four. Reporting is not part of the dataset: a build
+    # nobody is watching any more is still a build worth finishing.
+    reports = []
+
     def broken_pipe(progress):
-        # Only while reading, so that the swallowed report is the one under test rather than
-        # the summary one, which was never inside the handler.
-        if not progress.done:
-            raise BrokenPipeError(32, "Broken pipe")
+        reports.append(progress)
+        raise BrokenPipeError(32, "Broken pipe")
 
     with pytest.MonkeyPatch.context() as patch:
-        # Reported per game, so that the report made while reading a file is the one that
-        # fails, rather than only the summary one after the last file.
         patch.setattr(builder, "REPORT_EVERY", 1)
 
-        with pytest.raises(BrokenPipeError):
-            build(tmp_path, validation_fraction=0.0, progress=broken_pipe)
+        manifest = build(tmp_path, validation_fraction=0.0, progress=broken_pipe)
+
+    assert manifest.games == GOOD_GAMES
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == GOOD_GAMES
+    assert len(reports) == 1, "having failed once, it stops trying"
+    warnings = [record for record in caplog.records if "progress" in record.message]
+    assert len(warnings) == 1, "and says so once"
 
 
 def test_a_build_that_fails_part_way_leaves_nothing_to_trip_over(tmp_path):
@@ -503,16 +517,22 @@ def test_a_build_that_fails_part_way_leaves_nothing_to_trip_over(tmp_path):
     assert list_datasets(tmp_path) == ["test"]
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can read a file of any mode"
+)
 def test_a_source_that_cannot_be_read_is_counted_rather_than_fatal(tmp_path):
     # The files are sized when the build starts and opened hours later, so one going away
     # mid-build must not throw away everything read before it.
     unreadable = tmp_path / "locked.pgn"
     unreadable.write_text('[Event "x"]\n[Result "1-0"]\n\n1. e4 e5 1-0\n')
     unreadable.chmod(0o000)
-
-    manifest = build(
-        tmp_path / "data", str(unreadable), fixture("lichess.pgn"), validation_fraction=0.0
-    )
+    try:
+        manifest = build(
+            tmp_path / "data", str(unreadable), fixture("lichess.pgn"), validation_fraction=0.0
+        )
+    finally:
+        # Not left behind at mode 000, which is a trap for anything that later walks the tree.
+        unreadable.chmod(0o600)
 
     assert manifest.games == 4, "the readable source is still read"
     locked, lichess = manifest.sources
@@ -545,3 +565,157 @@ def test_an_impossible_date_is_not_stored_as_a_date(tmp_path):
         20230000,  # PGN's own way of saying the day is unknown.
         20240517,
     ]
+
+
+def test_an_overwrite_keeps_both_datasets_until_the_new_one_is_in_place(tmp_path):
+    # Replacing a dataset used to delete the old one and then rename the new one over it, so a
+    # delete that died part-way — EACCES on one file, a Ctrl-C during the minutes it takes to
+    # unlink 50 GB — left a half-deleted old dataset and no new one.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    removed = []
+    real_rmtree = builder.shutil.rmtree
+
+    def rmtree(path, *args, **kwargs):
+        removed.append(Path(path).name)
+        if Path(path).name == "test":
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_rmtree(path, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder.shutil, "rmtree", rmtree)
+
+        replaced = build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert "test" not in removed, "the dataset in place is moved aside, never deleted under itself"
+    assert replaced.games == 3
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 3
+    assert list_datasets(tmp_path) == ["test"]
+
+
+def test_two_builds_of_one_name_do_not_share_a_working_directory(tmp_path):
+    # They used to: the second build wiped the first one's working directory, the first kept
+    # writing into files that were no longer there, and whichever finished first published its
+    # own manifest over the other's shards. Two builds in one process shared one too, which is
+    # why this is per build rather than per process.
+    paths = {store.new_partial_path(tmp_path, "test") for _ in range(3)}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "getpid", lambda: 4242)
+        paths.add(store.new_partial_path(tmp_path, "test"))
+
+    assert len(paths) == 4
+    # None of them can be read as a dataset, whatever a reader does with the directory listing.
+    assert all(path.name.startswith(".") for path in paths)
+    assert dataset_path(tmp_path, "test") not in paths
+
+
+def test_a_dataset_that_appears_while_a_build_runs_is_not_silently_replaced(tmp_path):
+    # Without --overwrite this build said it would not replace a dataset, and that holds however
+    # late it finds out — a dataset restored from a backup or copied in while it was reading.
+    build(tmp_path / "elsewhere", "lichess.pgn", validation_fraction=0.0)
+    arrived = dataset_path(tmp_path / "elsewhere", "test")
+
+    def let_it_appear(progress):
+        if not progress.done and not dataset_path(tmp_path, "test").exists():
+            shutil.copytree(arrived, dataset_path(tmp_path, "test"))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "REPORT_EVERY", 1)
+
+        with pytest.raises(DatasetError, match="appeared"):
+            build(tmp_path, "unrated.pgn", validation_fraction=0.0, progress=let_it_appear)
+
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 4, "the one that appeared"
+    assert list_datasets(tmp_path) == ["test"], "and no rubble beside it"
+
+
+@pytest.mark.skipif(store.fcntl is None, reason="builds are only serialised on POSIX")
+def test_a_second_build_of_one_dataset_refuses_to_start(tmp_path):
+    # Two builds of one dataset read the same files for hours and one of them then throws the
+    # work away. A cron overlap or a retry started too early should hear about it at the start.
+    refused = []
+
+    def build_it_again(progress):
+        if progress.done or refused:
+            return
+        try:
+            build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+        except DatasetError as e:
+            refused.append(str(e))
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "REPORT_EVERY", 1)
+
+        manifest = build(tmp_path, validation_fraction=0.0, progress=build_it_again)
+
+    assert refused, "the second build should have been turned away"
+    assert "already running" in refused[0]
+    assert manifest.games == GOOD_GAMES, "and the first one finishes"
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == GOOD_GAMES
+
+
+@pytest.mark.skipif(store.fcntl is None, reason="builds are only serialised on POSIX")
+def test_a_build_lets_go_of_its_lock_when_it_is_done(tmp_path):
+    # Held by the process rather than by a file that exists, so there is nothing to release by
+    # hand and nothing left over to block the next build.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    again = build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert again.games == 3
+
+
+def test_a_filesystem_that_refuses_to_flush_still_gets_a_dataset(tmp_path):
+    # Directory fsync answers EINVAL on several network and FUSE filesystems, and opening a
+    # directory at all is refused on Windows. A dataset staged on a NAS mount must not be
+    # destroyed by the durability that exists to protect it.
+    def unsupported(fd):
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fsync", unsupported)
+
+        manifest = build(tmp_path, validation_fraction=0.0)
+
+    assert manifest.games == GOOD_GAMES
+    assert len(open_dataset("test", data_dir=tmp_path)[TRAIN]) == manifest.positions
+
+
+def test_a_shard_that_cannot_be_flushed_ends_the_build(tmp_path):
+    # The other side of it: ENOSPC from fsync means the records never reached the disk, which
+    # is a lost dataset rather than a filesystem being fussy.
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fsync", out_of_space)
+
+        with pytest.raises(OSError, match="No space left"):
+            build(tmp_path, validation_fraction=0.0)
+
+    assert list_datasets(tmp_path) == []
+
+
+def test_an_interrupted_build_is_reported_as_interrupted(tmp_path):
+    # Closing the shards flushes them, and on a full disk the flush fails too. A failure while
+    # closing must not take the place of the exception already on its way out: a Ctrl-C that
+    # surfaces as a disk error sends whoever reads it looking for the wrong problem.
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def interrupted(self, records):
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as patch:
+        # Files are open by the time this bites, so closing them is what fails next.
+        patch.setattr(store._StreamWriter, "append", _failing_append(5))
+        with pytest.raises(OSError, match="No space left"):
+            build(tmp_path, validation_fraction=0.0)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fsync", out_of_space)
+        patch.setattr(store._StreamWriter, "append", _raising_append(5, KeyboardInterrupt))
+
+        with pytest.raises(KeyboardInterrupt):
+            build(tmp_path, validation_fraction=0.0)
+
+    assert list_datasets(tmp_path) == []

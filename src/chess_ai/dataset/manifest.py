@@ -20,6 +20,8 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from chess_ai.dataset.files import sync_directory, sync_file
+
 MANIFEST_FILE: Final = "manifest.json"
 
 TRAIN: Final = "train"
@@ -152,8 +154,7 @@ class Manifest(BaseModel):
         temporary = path.with_suffix(".json.tmp")
         with temporary.open("w", encoding="utf-8") as f:
             f.write(self.model_dump_json(indent=2) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+            sync_file(f)
         os.replace(temporary, path)
         sync_directory(directory)
         return path
@@ -192,19 +193,6 @@ def load_manifest(directory: Path) -> Manifest:
         return Manifest.model_validate(data)
     except ValueError as e:
         raise ManifestError(f"invalid manifest {path}: {e}") from e
-
-
-def sync_directory(directory: Path) -> None:
-    """Flush ``directory``'s own entries to the disk, which syncing a file in it does not do.
-
-    Without this, a rename can be durable while the file it renamed is not, or the other way
-    around, which is how a crash leaves a dataset whose manifest and records disagree.
-    """
-    fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def rating_bucket(rating: int) -> str:

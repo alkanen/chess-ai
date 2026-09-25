@@ -93,11 +93,26 @@ class PgnReader:
         self._file: TextIO | None = None
         self._bytes_read = 0
 
-    def __enter__(self) -> "PgnReader":
+    def open(self) -> None:
+        """Open the file, or raise :exc:`DatasetError` saying why it cannot be read.
+
+        Separate from the ``with`` block so that a caller can guard the opening of a file without
+        also guarding what it then does with the games: they fail for unrelated reasons and
+        deserve unrelated answers.
+        """
         try:
             self._file = self.source.path.open(encoding=ENCODING, errors="replace")
         except OSError as e:
             raise DatasetError(f"cannot read {self.source.path}: {e.strerror}") from e
+
+    def close(self) -> None:
+        """Let go of the file, whether or not it was read to the end."""
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def __enter__(self) -> "PgnReader":
+        self.open()
         return self
 
     def __exit__(
@@ -106,9 +121,7 @@ class PgnReader:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+        self.close()
 
     @property
     def bytes_read(self) -> int:

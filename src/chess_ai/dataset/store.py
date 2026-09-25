@@ -24,8 +24,12 @@ makes a leak impossible to write rather than merely tested for: nothing the trai
 from a split's directory can have come from the other.
 """
 
+import itertools
 import os
 import re
+import shutil
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, Final
@@ -33,6 +37,12 @@ from typing import BinaryIO, Final
 import chess
 import numpy as np
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX only, and this project runs on Linux
+    fcntl = None  # type: ignore[assignment]
+
+from chess_ai.dataset.files import sync_directory, sync_file
 from chess_ai.dataset.manifest import SPLITS, Shards, load_manifest
 from chess_ai.dataset.records import (
     GAME_DTYPE,
@@ -50,6 +60,12 @@ MOVES: Final = "moves"
 
 PARTIAL_SUFFIX: Final = ".partial"
 """What a dataset being built is called until it is finished; see :func:`partial_path`."""
+
+REPLACED_SUFFIX: Final = ".replaced"
+"""What the dataset being replaced is called for the moment between two renames."""
+
+LOCK_SUFFIX: Final = ".lock"
+"""What the file a build holds while it runs is called; see :func:`dataset_lock`."""
 
 SHARD_SUFFIX: Final = ".bin"
 SHARD_DIGITS: Final = 5
@@ -93,14 +109,112 @@ def dataset_path(data_dir: Path, name: str) -> Path:
     return datasets_dir(data_dir) / valid_name(name)
 
 
-def partial_path(data_dir: Path, name: str) -> Path:
-    """Where dataset ``name`` is built before it is moved into place.
+_BUILDS = itertools.count()
+"""Tells apart two builds in one process; see :func:`new_partial_path`."""
+
+
+@contextmanager
+def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
+    """Hold the right to build dataset ``name``, or refuse to start at all.
+
+    Two builds of one dataset are not worth running: they read the same files for hours and one
+    of them then throws its work away. A cron overlap, a retry started before the first was
+    really dead, or two shells should hear about it at the start rather than at the end.
+
+    The lock is a file the operating system holds for as long as the build's process lives, so a
+    build killed outright leaves nothing to clean up and nothing to explain: the unlock is the
+    process ending. That is why it is not a file whose existence means "locked", which would need
+    a rule for telling a live build from a lock nobody released, and would leave a dataset
+    unbuildable until someone deleted a file by hand.
+
+    Where this cannot be had — anything that is not POSIX — builds are not serialised, and
+    :func:`new_partial_path` is what keeps two of them from writing over each other.
+    """
+    if fcntl is None:
+        yield
+        return
+    root = datasets_dir(data_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(root / f".{valid_name(name)}{LOCK_SUFFIX}", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            raise DatasetError(
+                f"a build of dataset {name!r} is already running in {root}; wait for it to finish"
+            ) from e
+        yield
+    finally:
+        # Which releases the lock: it belongs to this open file, not to the file on disk.
+        os.close(fd)
+
+
+def new_partial_path(data_dir: Path, name: str) -> Path:
+    """A working directory for a build of dataset ``name``, to be moved into place when finished.
 
     Beside the finished dataset, so that moving it there is a rename within one filesystem, and
     named as no dataset can be — :func:`valid_name` refuses a leading dot — so that a build in
     progress can never be mistaken for a dataset.
+
+    A fresh path every time, because two builds of one dataset must not share a working
+    directory. They did once, and the result was not that one of them lost: each kept writing
+    into files the other had deleted, and whichever finished first published its own manifest
+    over the other's shards, with the counts and the records disagreeing and nothing raising.
+    The process id is in there so that a directory left behind can be matched to the process that
+    was filling it; see :func:`clear_abandoned_partials`.
     """
-    return datasets_dir(data_dir) / f".{valid_name(name)}{PARTIAL_SUFFIX}"
+    build = f"{os.getpid()}-{next(_BUILDS)}"
+    return datasets_dir(data_dir) / f".{valid_name(name)}.{build}{PARTIAL_SUFFIX}"
+
+
+def replaced_path(partial: Path) -> Path:
+    """Where the dataset being replaced by the build working in ``partial`` waits.
+
+    Named after that build, so that two builds replacing one dataset cannot choose the same place
+    to put the dataset they are replacing.
+    """
+    return partial.with_name(partial.name[: -len(PARTIAL_SUFFIX)] + REPLACED_SUFFIX)
+
+
+def clear_abandoned_partials(data_dir: Path, name: str) -> None:
+    """Remove working directories left behind by builds of ``name`` that are no longer running.
+
+    A build clears up after itself, so what is left belongs to one that was killed outright, and
+    without this a killed build over a Lichess dump would leave tens of gigabytes nothing will
+    ever read. A directory whose process is still alive is left strictly alone: that is a build
+    in progress, and a build over a monthly dump runs for days.
+
+    Nothing that might hold data is touched. A ``.replaced`` directory holds the dataset that was
+    in place when something died between two renames, and is left for whoever wants it back.
+    """
+    root = datasets_dir(data_dir)
+    if not root.is_dir():
+        return
+    for entry in root.glob(f".{name}.*{PARTIAL_SUFFIX}"):
+        # ".<name>.<pid>-<build>.partial", so the process that owns it comes first.
+        owner = entry.name[len(name) + 2 : -len(PARTIAL_SUFFIX)].partition("-")[0]
+        if entry.is_dir() and not _still_running(owner):
+            shutil.rmtree(entry, ignore_errors=True)
+
+
+def _still_running(pid: str) -> bool:
+    """Whether the process that made a working directory is still there.
+
+    Answers yes whenever there is no way to tell, because deleting a live build's work is worse
+    than leaving a dead one's behind. Only asked on POSIX: on Windows ``os.kill`` has no way to
+    ask this that does not risk terminating the process it is asking about.
+    """
+    if os.name != "posix":
+        return True
+    try:
+        os.kill(int(pid), 0)
+    except (ValueError, ProcessLookupError):
+        # Not a process id at all, or a process that has gone.
+        return False
+    except OSError:
+        # There, but somebody else's.
+        return True
+    return True
 
 
 def list_datasets(data_dir: Path) -> list[str]:
@@ -161,14 +275,22 @@ class _StreamWriter:
 
         Flushed all the way down rather than left to the operating system, because the manifest
         written after this is what says the build finished: a manifest that survives a power cut
-        while the records it counts do not would be a dataset that reads as corrupt.
+        while the records it counts do not would be a dataset that reads as corrupt. The shard's
+        directory is flushed as well, since a file's contents surviving is no use if its name
+        does not.
+
+        The file is let go of before anything that can fail, so that a shard is never left half
+        closed for a later close to trip over again — and flushing is exactly what fails on the
+        full disk this exists to protect against.
         """
         if self._file is None:
             return
-        self._file.flush()
-        os.fsync(self._file.fileno())
-        self._file.close()
-        self._file = None
+        file, self._file = self._file, None
+        try:
+            sync_file(file)
+        finally:
+            file.close()
+        sync_directory(self._directory)
 
 
 class SplitWriter:
@@ -180,6 +302,7 @@ class SplitWriter:
     """
 
     def __init__(self, directory: Path, shards: Shards) -> None:
+        self._directory = directory
         self._positions = _StreamWriter(
             directory / POSITIONS, POSITION_DTYPE, shards.positions_per_shard
         )
@@ -206,9 +329,15 @@ class SplitWriter:
         self._games.append(game)
 
     def close(self) -> None:
-        self._positions.close()
-        self._games.close()
-        self._moves.close()
+        """Close all three streams, whatever any one of them does on the way.
+
+        Closing flushes, and flushing is what fails when the disk fills up. One stream failing
+        must not leave the other two with their files open and unflushed.
+        """
+        with ExitStack() as stack:
+            for stream in (self._positions, self._games, self._moves):
+                stack.callback(stream.close)
+        sync_directory(self._directory)
 
 
 class DatasetWriter:
@@ -229,11 +358,20 @@ class DatasetWriter:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        self.close()
+        if exc_type is None:
+            self.close()
+            return
+        # Already failing. What closing has to say now is noise beside what went wrong, and
+        # letting it raise would put a disk error in the place of the Ctrl-C that caused it.
+        with suppress(Exception):
+            self.close()
 
     def close(self) -> None:
-        for writer in self.splits.values():
-            writer.close()
+        """Close every split, whatever any one of them does; see :meth:`SplitWriter.close`."""
+        with ExitStack() as stack:
+            for writer in self.splits.values():
+                stack.callback(writer.close)
+        sync_directory(self.directory)
 
 
 class _StreamReader:
