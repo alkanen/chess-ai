@@ -25,7 +25,6 @@ from a split's directory can have come from the other.
 """
 
 import errno
-import itertools
 import logging
 import os
 import re
@@ -34,6 +33,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, Final
+from uuid import uuid4
 
 import chess
 import numpy as np
@@ -66,6 +66,9 @@ PARTIAL_SUFFIX: Final = ".partial"
 
 REPLACED_SUFFIX: Final = ".replaced"
 """What the dataset being replaced is called for the moment between two renames."""
+
+BUILD_TOKEN: Final = 8
+"""Hex digits of randomness naming one build, which is plenty to never see twice."""
 
 LOCK_SUFFIX: Final = ".lock"
 """What the file a build holds while it runs is called; see :func:`dataset_lock`."""
@@ -119,10 +122,6 @@ def dataset_path(data_dir: Path, name: str) -> Path:
     return datasets_dir(data_dir) / valid_name(name)
 
 
-_BUILDS = itertools.count()
-"""Tells apart two builds in one process; see :func:`new_partial_path`."""
-
-
 @contextmanager
 def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
     """Hold the right to build dataset ``name``, or refuse to start at all.
@@ -145,8 +144,18 @@ def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
         yield
         return
     root = datasets_dir(data_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    fd = os.open(root / f".{valid_name(name)}{LOCK_SUFFIX}", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        # For reading only: flock does not mind, and a lock file that somebody else created in a
+        # data directory two people share can then still be locked by anyone who can read it.
+        fd = os.open(root / f".{valid_name(name)}{LOCK_SUFFIX}", os.O_CREAT | os.O_RDONLY, 0o644)
+    except OSError as e:
+        # No lock file, for the same kind of reason as no lock: a directory somebody else owns, or
+        # one mounted read-only. Whether the build itself can write is its own question to answer.
+        LOGGER.warning("chess-ai: cannot lock builds in %s: %s", root, e.strerror)
+        yield
+        return
+    unlocked: OSError | None = None
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -156,17 +165,21 @@ def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
                 # one of several FUSE mounts. Taken at its word, for the same reason the flushing
                 # in files.py is — serialising builds is a convenience, not the dataset, and a
                 # mount that cannot do it must not make a dataset unbuildable for good.
-                LOGGER.warning(
-                    "chess-ai: %s cannot lock, so two builds of one dataset are not kept apart "
-                    "there: %s",
-                    root,
-                    e.strerror,
-                )
-                yield
-                return
-            raise DatasetError(
-                f"a build of dataset {name!r} is already running in {root}; wait for it to finish"
-            ) from e
+                unlocked = e
+            else:
+                raise DatasetError(
+                    f"a build of dataset {name!r} is already running in {root}; "
+                    "wait for it to finish"
+                ) from e
+        if unlocked is not None:
+            LOGGER.warning(
+                "chess-ai: %s cannot lock, so two builds of one dataset are not kept apart "
+                "there: %s",
+                root,
+                unlocked.strerror,
+            )
+        # Outside the handler above, so that whatever the build raises is not chained onto the
+        # locking error and read by whoever sees the traceback as having been caused by it.
         yield
     finally:
         # Which releases the lock: it belongs to this open file, not to the file on disk.
@@ -184,11 +197,18 @@ def new_partial_path(data_dir: Path, name: str) -> Path:
     directory. They did once, and the result was not that one of them lost: each kept writing
     into files the other had deleted, and whichever finished first published its own manifest
     over the other's shards, with the counts and the records disagreeing and nothing raising.
+
+    Random rather than counted, because a count restarts with the process that holds it: a process
+    id and a counter come back together as soon as the operating system reuses the id, which on a
+    small ``pid_max`` or in a container takes minutes. A name that comes back is a name a later
+    build can walk into — a dead build's shards published inside a finished dataset, or a dataset
+    an interrupted build set aside deleted by the build after it.
+
     The process id is in the name for whoever is reading it, and for nothing else: what it means is
     a question only the machine that wrote it could answer, so no decision is taken on it. See
     :func:`abandoned_partials`.
     """
-    build = f"{os.getpid()}-{next(_BUILDS)}"
+    build = f"{os.getpid()}-{uuid4().hex[:BUILD_TOKEN]}"
     return datasets_dir(data_dir) / f".{valid_name(name)}.{build}{PARTIAL_SUFFIX}"
 
 
@@ -239,7 +259,7 @@ def _leftovers(data_dir: Path, name: str, suffix: str) -> list[Path]:
     root = datasets_dir(data_dir)
     if not root.is_dir():
         return []
-    named = re.compile(rf"\.{re.escape(valid_name(name))}\.\d+-\d+{re.escape(suffix)}\Z")
+    named = re.compile(rf"\.{re.escape(valid_name(name))}\.\d+-[0-9a-f]+{re.escape(suffix)}\Z")
     return sorted(
         entry
         for entry in root.glob(f".{name}.*{suffix}")
@@ -376,7 +396,10 @@ class DatasetWriter:
     def __init__(self, directory: Path, shards: Shards = DEFAULT_SHARDS) -> None:
         self.directory = directory
         self.shards = shards
-        directory.mkdir(parents=True, exist_ok=True)
+        # Never a directory that is already there: one that is belongs to another build, and
+        # writing into it publishes its shards inside this dataset. The builder checks first, so
+        # this is the invariant said where it belongs rather than a condition anyone should hit.
+        directory.mkdir(parents=True, exist_ok=False)
         self.splits = {split: SplitWriter(directory / split, shards) for split in SPLITS}
 
     def __enter__(self) -> "DatasetWriter":

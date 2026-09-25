@@ -129,16 +129,27 @@ def build_dataset(
         # directory always holds a whole dataset: an interrupted build leaves nothing for a
         # reader to find, for the next build to trip over, or for anyone to wonder about.
         partial = new_partial_path(data_dir, name)
-
-        build = _Build(
-            directory=partial,
-            shards=shards,
-            sources=sources,
-            rating_source=rating_source,
-            validation_fraction=validation_fraction,
-            progress=progress,
-        )
+        if partial.exists():
+            # Whatever is there belongs to another build, and nothing below may remove it. The
+            # name is random, so this is a sanity check rather than something anyone should meet.
+            raise DatasetError(f"the working directory {partial} for dataset {name!r} is taken")
         try:
+            # Inside the guard, because constructing the writer is what makes the working
+            # directory: an interrupt an instant later would otherwise leave it behind for good.
+            try:
+                build = _Build(
+                    directory=partial,
+                    shards=shards,
+                    sources=sources,
+                    rating_source=rating_source,
+                    validation_fraction=validation_fraction,
+                    progress=progress,
+                )
+            except OSError as e:
+                raise DatasetError(
+                    f"cannot make the working directory {partial} for dataset {name!r}: "
+                    f"{e.strerror}"
+                ) from e
             with build.writer, quiet_parser():
                 for index, source in enumerate(sources):
                     build.read_source(source, index)
@@ -146,7 +157,6 @@ def build_dataset(
                     name=name,
                     created=now if now is not None else datetime.now(UTC),
                 )
-                build.report(done=True)
             manifest.save(partial)
             _publish(partial, directory, name=name, overwrite=overwrite)
         except BaseException:
@@ -154,6 +164,10 @@ def build_dataset(
             # it behind would only be rubble for the next build to clear up.
             shutil.rmtree(partial, ignore_errors=True)
             raise
+        # Last of all, because everything above it can still fail: closing the shards flushes
+        # them, and publishing renames them. A summary printed before those would say the build
+        # was finished and then be followed by the reason it was not.
+        build.report(done=True)
     return manifest
 
 
@@ -175,8 +189,11 @@ def _publish(partial: Path, directory: Path, *, name: str, overwrite: bool) -> N
                     f"dataset {name!r} appeared in {directory} while this build was running; "
                     "build it with --overwrite to replace it"
                 )
+            # Named after this build, and never cleared first: a directory already at that
+            # name would be a dataset an earlier build set aside, and deleting it would throw
+            # away the very thing _report_leftovers offers back. The rename below refuses
+            # instead, which is what it should do for a name that cannot be free.
             aside = replaced_path(partial)
-            shutil.rmtree(aside, ignore_errors=True)
             try:
                 os.replace(directory, aside)
             except FileNotFoundError:

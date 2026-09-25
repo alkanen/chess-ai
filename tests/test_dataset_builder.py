@@ -3,6 +3,8 @@
 import errno
 import os
 import shutil
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from chess_ai.dataset import (
 )
 from chess_ai.dataset.builder import DEFAULT_VALIDATION_FRACTION
 from chess_ai.dataset.games import split_of, time_control_class
+from chess_ai.dataset.records import POSITION_DTYPE
 from chess_ai.dataset.store import dataset_path
 from chess_ai.move_codec import VOCABULARY_SIZE, move_at
 
@@ -814,3 +817,156 @@ def test_an_interrupt_between_the_two_renames_keeps_the_dataset(tmp_path):
 
     assert list_datasets(tmp_path) == ["test"], "the dataset that was there is still there"
     assert open_dataset("test", data_dir=tmp_path).manifest.games == 4
+
+
+def test_a_build_never_deletes_a_dataset_an_earlier_one_set_aside(tmp_path):
+    # The name a build puts the old dataset under used to be a process id and a counter that
+    # restarts at 0, so pid reuse made a later build compute the same name and delete what was
+    # there — the dataset it had just told the user how to get back.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    stranded = store.datasets_dir(tmp_path) / f".test.stranded{store.REPLACED_SUFFIX}"
+    shutil.copytree(dataset_path(tmp_path, "test"), stranded)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store, "replaced_path", lambda partial: stranded)
+        patch.setattr(builder, "replaced_path", lambda partial: stranded)
+
+        with pytest.raises(DatasetError):
+            build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert load_manifest(stranded).games == 4, "the dataset set aside is still there, whole"
+
+
+def test_a_build_refuses_a_working_directory_that_is_already_there(tmp_path):
+    # Also a pid-reuse collision: the build used to make its working directory with
+    # exist_ok=True and publish whatever it found in it, so a killed build's shards ended up
+    # inside a finished dataset that counted none of them.
+    occupied = store.datasets_dir(tmp_path) / f".test.occupied{store.PARTIAL_SUFFIX}"
+    (occupied / "train" / "positions").mkdir(parents=True)
+    stale = occupied / "train" / "positions" / "00007.bin"
+    stale.write_bytes(b"\0" * POSITION_DTYPE.itemsize)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "new_partial_path", lambda data_dir, name: occupied)
+
+        with pytest.raises(DatasetError, match="working directory"):
+            build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    assert list_datasets(tmp_path) == [], "nothing published out of a directory it did not make"
+    assert stale.is_file(), "and what was there is left for whoever it belongs to"
+
+
+def test_a_working_directory_name_is_not_reused_by_a_later_process(tmp_path):
+    # Two fresh interpreters must not agree on a name, which a process id and a per-process
+    # counter do as soon as the process id comes round again.
+    code = (
+        "from pathlib import Path\n"
+        "from chess_ai.dataset.store import new_partial_path\n"
+        "import os\n"
+        "os.getpid = lambda: 4242\n"  # The same process id, as pid reuse gives.
+        "print(new_partial_path(Path('/data'), 'test').name)\n"
+    )
+    names = {
+        subprocess.run(
+            [sys.executable, "-c", code], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        for _ in range(3)
+    }
+
+    assert len(names) == 3, f"the same name came back in another process: {names}"
+
+
+def test_nothing_says_the_build_is_done_until_it_is(tmp_path):
+    # The summary line used to be printed inside the writer's with block, so a build that then
+    # failed to flush, publish or rename had already told the user it was built.
+    reports = []
+
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "REPORT_EVERY", 1)
+        patch.setattr(os, "fsync", out_of_space)
+
+        with pytest.raises(OSError, match="No space left"):
+            build(tmp_path, validation_fraction=0.0, progress=reports.append)
+
+    assert reports, "it should have reported while reading"
+    assert not any(report.done for report in reports), "but never that it had finished"
+
+
+def test_a_build_interrupted_before_it_starts_leaves_no_working_directory(tmp_path):
+    # The working directory is made while the writer is constructed, which used to happen just
+    # outside the block that removes it again.
+    real_init = builder._Build.__init__
+
+    def interrupted(self, **kwargs):
+        real_init(self, **kwargs)
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder._Build, "__init__", interrupted)
+
+        with pytest.raises(KeyboardInterrupt):
+            build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    assert store.abandoned_partials(tmp_path, "test") == []
+
+
+@pytest.mark.skipif(store.fcntl is None, reason="builds are only serialised on POSIX")
+def test_a_lock_file_that_cannot_be_opened_does_not_stop_the_build(tmp_path):
+    # A data directory shared between users: whoever built first owns the lock file, and the
+    # next user cannot open it. Locking is a convenience, so this is not the dataset's problem.
+    real_open = os.open
+
+    def refuse_the_lock(path, flags, *args, **kwargs):
+        if str(path).endswith(store.LOCK_SUFFIX):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "open", refuse_the_lock)
+
+        manifest = build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    assert manifest.games == 4
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can write a directory of any mode"
+)
+def test_a_data_directory_that_cannot_be_written_is_said_plainly(tmp_path):
+    # Not a traceback: this is a thing the person running the command can fix.
+    datasets = store.datasets_dir(tmp_path)
+    datasets.mkdir(parents=True)
+    datasets.chmod(0o500)
+    try:
+        with pytest.raises(DatasetError, match="working directory"):
+            build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    finally:
+        datasets.chmod(0o700)
+
+
+@pytest.mark.skipif(store.fcntl is None, reason="builds are only serialised on POSIX")
+def test_a_build_that_fails_unserialised_is_not_blamed_on_the_lock(tmp_path):
+    # The fallback used to yield from inside the handler for the locking error, so every failure
+    # in the build came out chained to "No locks available" and sent the reader after that.
+    def no_locks(fd, operation):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store.fcntl, "flock", no_locks)
+        patch.setattr(os, "fsync", out_of_space)
+
+        with pytest.raises(OSError, match="No space left") as failure:
+            build(tmp_path, validation_fraction=0.0)
+
+    chained = []
+    cause = failure.value.__context__
+    while cause is not None:
+        chained.append(str(cause))
+        cause = cause.__context__
+    assert not any("No locks available" in text for text in chained), chained
