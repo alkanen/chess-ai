@@ -129,10 +129,14 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
         )
     except DatasetError as e:
         raise _UserError(e) from e
+    unread = [source.path for source in manifest.sources if source.error is not None]
     print(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
         f"{manifest.games:,} games, {manifest.positions:,} positions, "
-        f"{manifest.games_skipped:,} skipped",
+        f"{manifest.games_skipped:,} skipped"
+        # A source that could not be read leaves the dataset short of its games, which is not
+        # something to leave to whoever thinks to run "dataset stats" afterwards.
+        + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else ""),
         flush=True,
     )
     return 0

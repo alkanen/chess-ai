@@ -13,6 +13,7 @@ partway leaves records nothing will read, because there is no manifest pointing 
 """
 
 import logging
+import os
 import shutil
 import time
 from collections import Counter
@@ -43,6 +44,7 @@ from chess_ai.dataset.manifest import (
     SplitCounts,
     Statistics,
     rating_bucket,
+    sync_directory,
 )
 from chess_ai.dataset.progress import Progress
 from chess_ai.dataset.records import (
@@ -58,6 +60,7 @@ from chess_ai.dataset.store import (
     DatasetError,
     DatasetWriter,
     dataset_path,
+    partial_path,
     valid_name,
 )
 from chess_ai.move_codec import VOCABULARY_SIZE
@@ -96,35 +99,57 @@ def build_dataset(
 
     Raises :exc:`~chess_ai.dataset.store.DatasetError` for a name or a source that is not
     usable, or for a dataset that is already there and ``overwrite`` not asked for. Anything
-    wrong with a *game* is counted instead, and the manifest that comes back says what was.
+    wrong with a *game* is counted instead, and the manifest that comes back says what was. A
+    failure in *writing* the dataset is neither: it ends the build and leaves nothing behind.
+
+    ``overwrite`` replaces the dataset only once the new one is finished, so the old one survives
+    a build that fails — at the cost of both existing at once while it runs. That way round
+    because a disk with room for only one copy is exactly the disk that fills up part-way
+    through, and deleting first would leave neither.
     """
     valid_name(name)
     if not 0.0 <= validation_fraction <= 1.0:
         raise DatasetError(f"validation fraction {validation_fraction} is not between 0 and 1")
     sources = resolve_sources(patterns)
     directory = dataset_path(data_dir, name)
-    if directory.exists():
-        if not overwrite:
-            raise DatasetError(f"dataset {name!r} is already in {directory}")
-        shutil.rmtree(directory)
+    if directory.exists() and not overwrite:
+        raise DatasetError(
+            f"dataset {name!r} is already in {directory}; build it with --overwrite to replace it"
+        )
+    # Built beside where it belongs and moved there when it is finished, so that a dataset
+    # directory always holds a whole dataset: an interrupted build leaves nothing for a reader
+    # to find, for the next build to trip over, or for anyone to wonder about. Anything left
+    # by a build that died before it could clean up is rubble, and goes now.
+    partial = partial_path(data_dir, name)
+    shutil.rmtree(partial, ignore_errors=True)
 
     build = _Build(
-        directory=directory,
+        directory=partial,
         shards=shards,
         sources=sources,
         rating_source=rating_source,
         validation_fraction=validation_fraction,
         progress=progress,
     )
-    with build.writer, quiet_parser():
-        for index, source in enumerate(sources):
-            build.read_source(source, index)
-        manifest = build.manifest(
-            name=name,
-            created=now if now is not None else datetime.now(UTC),
-        )
-        build.report(done=True)
-    manifest.save(directory)
+    try:
+        with build.writer, quiet_parser():
+            for index, source in enumerate(sources):
+                build.read_source(source, index)
+            manifest = build.manifest(
+                name=name,
+                created=now if now is not None else datetime.now(UTC),
+            )
+            build.report(done=True)
+        manifest.save(partial)
+        if directory.exists():
+            shutil.rmtree(directory)
+        os.replace(partial, directory)
+        sync_directory(directory.parent)
+    except BaseException:
+        # Including a Ctrl-C: what was written is unreadable without a manifest, so leaving it
+        # behind would only be rubble for the next build to clear up.
+        shutil.rmtree(partial, ignore_errors=True)
+        raise
     return manifest
 
 
@@ -166,27 +191,56 @@ class _Build:
         self._noted_failure = False
 
     def read_source(self, source: Source, index: int) -> None:
-        """Read every game in one file into the dataset, whatever the file turns out to hold."""
+        """Read every game in one file into the dataset, whatever the file turns out to hold.
+
+        What goes wrong in the *file* is counted and the rest of the file given up on. What goes
+        wrong in writing the dataset — a full disk, a write error — is not a broken game and is
+        not this method's to forgive: it ends the build, because counting it as one skipped game
+        would abandon the rest of the file and then report a clean build over what was lost.
+        """
         read = 0
         kept = 0
-        with PgnReader(source) as reader:
-            try:
-                for record in reader.games():
+        error: str | None = None
+        try:
+            with PgnReader(source) as reader:
+                games = reader.games()
+                while True:
+                    # Only the parsing of the next game is guarded here. Everything the loop
+                    # body does is outside it on purpose.
+                    try:
+                        record = next(games)
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        # The file stopped making sense, mid-game. What was read is kept, the
+                        # rest of the file is not, and the count says a game was lost.
+                        self._note_failure(e)
+                        self.skipped[SkipReason.UNREADABLE] += 1
+                        error = f"stopped reading after {read} games: {_described(e)}"
+                        break
                     read += 1
                     self.games_read += 1
                     self._bytes_read = self._bytes_before + reader.bytes_read
                     kept += self._add_game(record, index)
                     if read % REPORT_EVERY == 0:
                         self.report()
-            except Exception as e:
-                # The file itself stopped making sense, mid-game. What was read is kept, the
-                # rest of the file is not, and the count says a game was lost.
-                self._note_failure(e)
-                self.skipped[SkipReason.UNREADABLE] += 1
+        except DatasetError as e:
+            # The file could not be opened at all. Its size was taken when the build started
+            # and it is opened hours later, so this is a file that went away or changed hands
+            # rather than one that was never there: resolve_sources refuses those up front.
+            # Hours of reading is not worth throwing away over one file of a hundred.
+            error = str(e)
+            LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
         self._bytes_before += source.bytes
         self._bytes_read = self._bytes_before
         self.sources.append(
-            SourceInfo(path=str(source.path), bytes=source.bytes, games_read=read, games_kept=kept)
+            SourceInfo(
+                path=str(source.path),
+                bytes=source.bytes,
+                games_read=read,
+                games_kept=kept,
+                error=error,
+            )
         )
 
     def _add_game(self, record: chess.pgn.Game, index: int) -> int:
@@ -301,6 +355,11 @@ class _Build:
                 ratings_unknown=self.ratings_unknown,
             ),
         )
+
+
+def _described(error: Exception) -> str:
+    """One line naming what went wrong, for the manifest to record against a source."""
+    return f"{type(error).__name__}: {error}"
 
 
 def _by_name(counts: Counter) -> dict[str, int]:

@@ -24,6 +24,7 @@ makes a leak impossible to write rather than merely tested for: nothing the trai
 from a split's directory can have come from the other.
 """
 
+import os
 import re
 from pathlib import Path
 from types import TracebackType
@@ -46,6 +47,9 @@ DATASETS_DIR: Final = "datasets"
 POSITIONS: Final = "positions"
 GAMES: Final = "games"
 MOVES: Final = "moves"
+
+PARTIAL_SUFFIX: Final = ".partial"
+"""What a dataset being built is called until it is finished; see :func:`partial_path`."""
 
 SHARD_SUFFIX: Final = ".bin"
 SHARD_DIGITS: Final = 5
@@ -89,6 +93,16 @@ def dataset_path(data_dir: Path, name: str) -> Path:
     return datasets_dir(data_dir) / valid_name(name)
 
 
+def partial_path(data_dir: Path, name: str) -> Path:
+    """Where dataset ``name`` is built before it is moved into place.
+
+    Beside the finished dataset, so that moving it there is a rename within one filesystem, and
+    named as no dataset can be — :func:`valid_name` refuses a leading dot — so that a build in
+    progress can never be mistaken for a dataset.
+    """
+    return datasets_dir(data_dir) / f".{valid_name(name)}{PARTIAL_SUFFIX}"
+
+
 def list_datasets(data_dir: Path) -> list[str]:
     """The names of the datasets in ``data_dir``, in order, ignoring anything else there."""
     root = datasets_dir(data_dir)
@@ -99,7 +113,7 @@ def list_datasets(data_dir: Path) -> list[str]:
     return sorted(
         entry.name
         for entry in root.iterdir()
-        if entry.is_dir() and (entry / MANIFEST_FILE).is_file()
+        if entry.is_dir() and not entry.name.startswith(".") and (entry / MANIFEST_FILE).is_file()
     )
 
 
@@ -138,15 +152,23 @@ class _StreamWriter:
             written += len(chunk)
 
     def _next_shard(self) -> None:
-        if self._file is not None:
-            self._file.close()
+        self.close()
         self._directory.mkdir(parents=True, exist_ok=True)
         self._file = shard_path(self._directory, self._count // self._per_shard).open("wb")
 
     def close(self) -> None:
-        if self._file is not None:
-            self._file.close()
-            self._file = None
+        """Finish the current shard, with what was written actually on the disk.
+
+        Flushed all the way down rather than left to the operating system, because the manifest
+        written after this is what says the build finished: a manifest that survives a power cut
+        while the records it counts do not would be a dataset that reads as corrupt.
+        """
+        if self._file is None:
+            return
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        self._file.close()
+        self._file = None
 
 
 class SplitWriter:
@@ -287,8 +309,26 @@ class _StreamReader:
                 mapped = np.memmap(path, dtype=self._dtype, mode="r")
             except OSError as e:
                 raise DatasetError(f"cannot read dataset shard {path}: {e.strerror}") from e
+            except ValueError as e:
+                # A file that is not a whole number of records, which is what a truncated copy
+                # or a build that ran out of disk leaves behind. numpy raises ValueError for it
+                # rather than OSError, and a traceback is no way to report a damaged dataset.
+                raise DatasetError(f"cannot read dataset shard {path}: {e}") from e
             self._shards[number] = mapped
         return mapped
+
+    def close(self) -> None:
+        """Let go of every shard this has mapped.
+
+        Each mapping holds a file descriptor for as long as it is kept, so a process that reads
+        one dataset after another — a sweep over configs, or the web server — would otherwise
+        collect one per shard it ever touched and never give any back.
+
+        The mappings are dropped rather than closed, because a record handed out is a view into
+        one: closing a mapping out from under a caller's record would be a way to crash the
+        process, while dropping the last reference to it cannot be.
+        """
+        self._shards.clear()
 
 
 class SplitReader:
@@ -344,6 +384,11 @@ class SplitReader:
         """Position ``index`` as a board, for looking at a dataset rather than training on it."""
         return unpack_board(self.position(index))
 
+    def close(self) -> None:
+        """Let go of the shards this split has mapped; see :meth:`_StreamReader.close`."""
+        for stream in (self._positions, self._games, self._moves):
+            stream.close()
+
 
 class Dataset:
     """A built dataset: its manifest, and its splits to read records from."""
@@ -364,6 +409,26 @@ class Dataset:
     @property
     def splits(self) -> list[str]:
         return list(self._splits)
+
+    def __enter__(self) -> "Dataset":
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Let go of every shard of every split, and of the file descriptors they hold.
+
+        A dataset read to the end of a training run does not need this — the process is ending —
+        but anything long-lived that opens datasets in turn does.
+        """
+        for split in self._splits.values():
+            split.close()
 
     def __getitem__(self, split: str) -> SplitReader:
         try:

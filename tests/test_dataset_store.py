@@ -1,10 +1,15 @@
 """Sharded storage: that the records come back out the way they went in, in any order."""
 
+import json
+import os
+from pathlib import Path
+
 import numpy as np
 import pytest
 from dataset_helpers import TINY_SHARDS, build
 
 from chess_ai.dataset import (
+    FORMAT_VERSION,
     GAME_DTYPE,
     POSITION_DTYPE,
     SPLITS,
@@ -188,3 +193,64 @@ def test_the_datasets_in_a_data_directory_are_listed(tmp_path):
     (tmp_path / "datasets" / "stray.txt").write_text("hello")
 
     assert list_datasets(tmp_path) == ["test"]
+
+
+def test_a_truncated_shard_is_reported_as_a_dataset_problem(tmp_path):
+    # What an interrupted build, a truncated copy or a full disk leaves behind. numpy raises
+    # ValueError rather than OSError for a file that is not a whole number of records, which
+    # used to escape as a traceback.
+    built(tmp_path)
+    shard = shard_path(dataset_path(tmp_path, "test") / TRAIN / POSITIONS, 0)
+    shard.write_bytes(shard.read_bytes()[:-7])
+
+    with pytest.raises(DatasetError, match="cannot read dataset shard"):
+        open_dataset("test", data_dir=tmp_path)[TRAIN].position(0)
+
+
+def test_a_manifest_from_a_format_with_new_fields_says_to_rebuild(tmp_path):
+    # A newer format is exactly the one carrying fields this code has never heard of, so the
+    # version has to be read before the manifest is validated against this version's shape.
+    built(tmp_path)
+    path = dataset_path(tmp_path, "test") / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["format_version"] = FORMAT_VERSION + 1
+    manifest["something_added_later"] = {"a": 1}
+    path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ManifestError, match=f"format version {FORMAT_VERSION + 1}"):
+        open_dataset("test", data_dir=tmp_path)
+
+
+def test_a_manifest_of_this_format_with_unknown_fields_is_still_refused(tmp_path):
+    # Not a version thing: a manifest claiming this format has to match this format.
+    built(tmp_path)
+    path = dataset_path(tmp_path, "test") / "manifest.json"
+    manifest = json.loads(path.read_text())
+    manifest["something_unexpected"] = 1
+    path.write_text(json.dumps(manifest))
+
+    with pytest.raises(ManifestError, match="invalid manifest"):
+        open_dataset("test", data_dir=tmp_path)
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc to count open files")
+def test_a_dataset_gives_back_the_shards_it_mapped(tmp_path):
+    # Every mapped shard holds a file descriptor, so a process that opens dataset after
+    # dataset — a sweep over configs, or the web server — must be able to hand them back.
+    built(tmp_path, shards=TINY_SHARDS)
+    before = _open_files()
+
+    with open_dataset("test", data_dir=tmp_path) as dataset:
+        split = dataset[TRAIN]
+        for index in range(len(split)):
+            split.position(index)
+        for index in range(split.games):
+            split.move_sequence(index)
+        while_open = _open_files()
+
+    assert while_open > before, "the shards were mapped at all"
+    assert _open_files() == before
+
+
+def _open_files() -> int:
+    return len(os.listdir("/proc/self/fd"))

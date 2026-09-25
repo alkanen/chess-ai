@@ -19,8 +19,10 @@ from chess_ai.dataset import (
     SkipReason,
     TimeControl,
     builder,
+    list_datasets,
     load_manifest,
     open_dataset,
+    store,
     unpack_board,
 )
 from chess_ai.dataset.builder import DEFAULT_VALIDATION_FRACTION
@@ -441,3 +443,105 @@ def test_a_board_read_back_out_of_a_dataset_plays(tmp_path):
 
     assert isinstance(board, chess.Board)
     assert board.is_valid()
+
+
+def _failing_append(when: int):
+    """A ``_StreamWriter.append`` that fails the ``when``-th call, as a full disk would."""
+    original = store._StreamWriter.append
+    calls = {"n": 0}
+
+    def append(self, records):
+        calls["n"] += 1
+        if calls["n"] == when:
+            raise OSError(28, "No space left on device")
+        return original(self, records)
+
+    return append
+
+
+def test_a_write_that_fails_ends_the_build_rather_than_counting_a_broken_game(tmp_path):
+    # A shard that cannot be written is not a broken game: counting it as one and carrying on
+    # abandons the rest of the file and then reports a clean build over what was lost.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store._StreamWriter, "append", _failing_append(5))
+
+        with pytest.raises(OSError, match="No space left"):
+            build(tmp_path, validation_fraction=0.0)
+
+    assert not dataset_path(tmp_path, "test").exists(), "a build that failed leaves no dataset"
+    assert list_datasets(tmp_path) == []
+
+
+def test_a_progress_report_that_fails_ends_the_build(tmp_path):
+    # What a piped command raises when the reader goes away; it is not a broken game either.
+    def broken_pipe(progress):
+        # Only while reading, so that the swallowed report is the one under test rather than
+        # the summary one, which was never inside the handler.
+        if not progress.done:
+            raise BrokenPipeError(32, "Broken pipe")
+
+    with pytest.MonkeyPatch.context() as patch:
+        # Reported per game, so that the report made while reading a file is the one that
+        # fails, rather than only the summary one after the last file.
+        patch.setattr(builder, "REPORT_EVERY", 1)
+
+        with pytest.raises(BrokenPipeError):
+            build(tmp_path, validation_fraction=0.0, progress=broken_pipe)
+
+
+def test_a_build_that_fails_part_way_leaves_nothing_to_trip_over(tmp_path):
+    # An interrupted build used to leave a manifest-less directory that list_datasets and
+    # stats both denied existed, and that blocked the obvious retry.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(store._StreamWriter, "append", _failing_append(5))
+        with pytest.raises(OSError, match="No space left"):
+            build(tmp_path, validation_fraction=0.0)
+
+    retried = build(tmp_path, validation_fraction=0.0)
+
+    assert retried.games == GOOD_GAMES
+    assert list_datasets(tmp_path) == ["test"]
+
+
+def test_a_source_that_cannot_be_read_is_counted_rather_than_fatal(tmp_path):
+    # The files are sized when the build starts and opened hours later, so one going away
+    # mid-build must not throw away everything read before it.
+    unreadable = tmp_path / "locked.pgn"
+    unreadable.write_text('[Event "x"]\n[Result "1-0"]\n\n1. e4 e5 1-0\n')
+    unreadable.chmod(0o000)
+
+    manifest = build(
+        tmp_path / "data", str(unreadable), fixture("lichess.pgn"), validation_fraction=0.0
+    )
+
+    assert manifest.games == 4, "the readable source is still read"
+    locked, lichess = manifest.sources
+    assert locked.games_read == 0
+    assert locked.error is not None and "cannot read" in locked.error
+    assert lichess.games_kept == 4 and lichess.error is None
+
+
+def test_an_impossible_date_is_not_stored_as_a_date(tmp_path):
+    # Scraped PGN carries these, and a filter or a chart that reads the field as yyyymmdd
+    # has no way to tell 20249999 from a date.
+    dated = tmp_path / "dates.pgn"
+    dated.write_text(
+        "".join(
+            f'[Event "x"]\n[Site "s{n}"]\n[Date "{date}"]\n[White "a"]\n[Black "b"]\n'
+            f'[Result "1-0"]\n\n1. e4 e5 1-0\n\n'
+            for n, date in enumerate(
+                ("2024.99.99", "2024.02.30", "2024.13.01", "2023.??.??", "2024.05.17")
+            )
+        )
+    )
+
+    build(tmp_path / "data", str(dated), validation_fraction=0.0)
+    split = open_dataset("test", data_dir=tmp_path / "data")["train"]
+
+    assert [int(split.game(index)["date"]) for index in range(split.games)] == [
+        20240000,  # No month or day it could mean.
+        20240200,  # February has no 30th, but the month is real.
+        20240000,  # There is no thirteenth month.
+        20230000,  # PGN's own way of saying the day is unknown.
+        20240517,
+    ]

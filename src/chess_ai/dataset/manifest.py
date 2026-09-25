@@ -44,6 +44,13 @@ class SourceInfo(BaseModel):
     bytes: int
     games_read: int
     games_kept: int
+    error: str | None = None
+    """What stopped this file being read whole, if anything did.
+
+    A file that could not be opened, or that stopped making sense part-way through, leaves the
+    dataset short of its games. The dataset is still usable, and this is what says it is not
+    the dataset the sources asked for.
+    """
 
 
 class Filters(BaseModel):
@@ -135,14 +142,20 @@ class Manifest(BaseModel):
     def save(self, directory: Path) -> Path:
         """Write the manifest into ``directory``, replacing any manifest already there.
 
-        Written beside itself and moved into place, so a reader either sees the whole
-        manifest of the build before or the whole manifest of this one, never half of
-        either.
+        Written beside itself and moved into place, so a reader either sees the whole manifest
+        of the build before or the whole manifest of this one, never half of either. Both the
+        file and the directory entry are flushed to the disk, because the manifest is what says
+        a build finished: a manifest that survives a power cut while the records it counts do
+        not is worse than no manifest at all.
         """
         path = directory / MANIFEST_FILE
         temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(self.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        with temporary.open("w", encoding="utf-8") as f:
+            f.write(self.model_dump_json(indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(temporary, path)
+        sync_directory(directory)
         return path
 
 
@@ -164,16 +177,34 @@ def load_manifest(directory: Path) -> Manifest:
         raise ManifestError(f"cannot read {path}: {e.strerror}") from e
     except json.JSONDecodeError as e:
         raise ManifestError(f"invalid JSON in {path}: {e}") from e
+    if not isinstance(data, dict):
+        raise ManifestError(f"invalid manifest {path}: it is not a JSON object")
+    # Before validating, because a manifest of a later format is exactly the one carrying
+    # fields this version has never heard of, and "extra inputs are not permitted" is not the
+    # answer to "why can this not be read?".
+    version = data.get("format_version")
+    if version != FORMAT_VERSION:
+        raise ManifestError(
+            f"{path} is dataset format version {version!r}, and this is version "
+            f"{FORMAT_VERSION}; rebuild the dataset"
+        )
     try:
-        manifest = Manifest.model_validate(data)
+        return Manifest.model_validate(data)
     except ValueError as e:
         raise ManifestError(f"invalid manifest {path}: {e}") from e
-    if manifest.format_version != FORMAT_VERSION:
-        raise ManifestError(
-            f"{path} is dataset format version {manifest.format_version}, "
-            f"and this is version {FORMAT_VERSION}; rebuild the dataset"
-        )
-    return manifest
+
+
+def sync_directory(directory: Path) -> None:
+    """Flush ``directory``'s own entries to the disk, which syncing a file in it does not do.
+
+    Without this, a rename can be durable while the file it renamed is not, or the other way
+    around, which is how a crash leaves a dataset whose manifest and records disagree.
+    """
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def rating_bucket(rating: int) -> str:

@@ -40,6 +40,10 @@ def summarize(manifest: Manifest) -> str:
             f"  {source.path}  {format_bytes(source.bytes)}, "
             f"{source.games_read:,} games read, {source.games_kept:,} kept"
         )
+        if source.error is not None:
+            # A source the build could not read whole leaves the dataset short of its games,
+            # which is the first thing to know about a dataset that looks smaller than it should.
+            lines.append(f"    NOT READ WHOLE: {source.error}")
     lines += ["", f"skipped games  {manifest.games_skipped:,}"]
     if manifest.skipped:
         lines += _bars(

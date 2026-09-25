@@ -112,7 +112,9 @@ def test_dataset_build_over_an_existing_dataset_needs_overwrite(tmp_path, capsys
         main(["dataset", "build", "games", fixture("unrated.pgn")])
 
     assert exit_info.value.code == 2
-    assert "already in" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "already in" in error
+    assert "--overwrite" in error, "the message names the way out"
 
     assert main(["dataset", "build", "games", fixture("unrated.pgn"), "--overwrite"]) == 0
     assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 3

@@ -13,6 +13,7 @@ and nothing at all that says which rating pool an ``Elo`` came from.
 
 import hashlib
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 from typing import Final
 
@@ -284,7 +285,10 @@ def _date(headers: chess.pgn.Headers) -> int:
     """When the game was played, as ``yyyymmdd``, or 0 if the file did not say.
 
     PGN writes an unknown part of a date as "?", so a game known only to the month keeps its
-    year and month and loses its day.
+    year and month and loses its day. A part that is not a date at all is treated the same way,
+    because a field read as ``yyyymmdd`` has to be one: scraped PGN carries "2024.99.99" and
+    "2024.02.30", and a day of 99 stored as a day would quietly poison every date range, month
+    bucket and chart that ever reads it. A day without a month it belongs to goes the same way.
     """
     for name in ("UTCDate", "Date"):
         parts = headers.get(name, "").strip().split(".")
@@ -294,18 +298,32 @@ def _date(headers: chess.pgn.Headers) -> int:
             year = int(parts[0])
         except ValueError:
             continue
-        month, day = (_number(part) for part in parts[1:])
-        if 0 <= year <= 9999:
-            return year * 10000 + month * 100 + day
+        if not 1 <= year <= 9999:
+            continue
+        month = _within(parts[1], 12)
+        day = _within(parts[2], 31) if month else 0
+        if day and not _is_a_day(year, month, day):
+            day = 0
+        return year * 10000 + month * 100 + day
     return 0
 
 
-def _number(part: str) -> int:
-    """One part of a date, with PGN's "??" for an unknown one reading as 0."""
+def _within(part: str, most: int) -> int:
+    """One part of a date, or 0 for PGN's "??" and for anything that is not that part."""
     try:
-        return int(part)
+        value = int(part)
     except ValueError:
         return 0
+    return value if 1 <= value <= most else 0
+
+
+def _is_a_day(year: int, month: int, day: int) -> bool:
+    """Whether that month of that year has such a day, which February decides for itself."""
+    try:
+        date(year, month, day)
+    except ValueError:
+        return False
+    return True
 
 
 def _identity_header(headers: chess.pgn.Headers, name: str) -> str:
