@@ -1,10 +1,15 @@
 """The ``chess-ai`` command-line tool."""
 
 import argparse
+import sys
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 
 from chess_ai.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_FILE, Config, ConfigError, load_config
+
+AUTO = "auto"
+"""What ``--rating-source`` is when each game's own headers should say."""
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -12,9 +17,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
-    except ConfigError as e:
-        parser.exit(2, f"{parser.prog}: error: {e}\n")
-    return args.handler(config)
+        return args.handler(config, args)
+    except (ConfigError, _UserError) as e:
+        _say(f"{parser.prog}: error: {e}", err=True)
+        parser.exit(2)
+        raise  # parser.exit has already left; this is only here to say so.
+
+
+class _UserError(Exception):
+    """Something the person running the command can fix, reported without a traceback."""
+
+
+def _say(text: str, *, err: bool = False) -> None:
+    """Print ``text``, or do not, if there is nobody left to print it to.
+
+    Every stream this command writes to can go away while it is running, and they go together: a
+    closed terminal, a dropped ssh session, a pipe into ``head``. None of that is worth turning a
+    finished build into a traceback, and on the way out of a failed one it must not take the place
+    of the reason it failed. The exit status says what happened whether or not anyone hears it.
+    """
+    with suppress(OSError):
+        print(text, file=sys.stderr if err else sys.stdout, flush=True)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -31,17 +54,148 @@ def _build_parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="serve the web app")
     serve.set_defaults(handler=_serve)
 
+    _add_dataset_commands(commands)
     return parser
 
 
-def _serve(config: Config) -> int:
+def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
+    """``chess-ai dataset ...``: making datasets out of PGN files, and looking at them."""
+    from chess_ai.dataset import DEFAULT_VALIDATION_FRACTION, RatingSource
+
+    dataset = commands.add_parser("dataset", help="build and inspect training datasets")
+    actions = dataset.add_subparsers(title="dataset commands", required=True, metavar="COMMAND")
+
+    build = actions.add_parser(
+        "build",
+        help="build a dataset from PGN files",
+        description="Build a named dataset in the data directory from PGN files, directories "
+        "of PGN files, or globs. Games that cannot be read are skipped and counted.",
+    )
+    build.add_argument("name", help="what to call the dataset")
+    build.add_argument(
+        "sources",
+        nargs="+",
+        metavar="PGN",
+        help="PGN files, directories of them, or glob patterns",
+    )
+    build.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=DEFAULT_VALIDATION_FRACTION,
+        metavar="FRACTION",
+        help="share of games held back for validation, chosen by a hash of each game "
+        f"(default: {DEFAULT_VALIDATION_FRACTION})",
+    )
+    build.add_argument(
+        "--rating-source",
+        choices=[AUTO, *(source.name.lower() for source in RatingSource)],
+        default=AUTO,
+        help="rating pool to record for every game (default: auto, from each game's headers)",
+    )
+    build.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace a dataset of this name that is already there",
+    )
+    build.set_defaults(handler=_build_dataset)
+
+    stats = actions.add_parser(
+        "stats",
+        help="show what a dataset contains",
+        description="Summarise a built dataset: its sources, counts, and the distribution of "
+        "ratings, results and time controls.",
+    )
+    stats.add_argument("name", help="the dataset to summarise")
+    stats.set_defaults(handler=_dataset_stats)
+
+
+def _serve(config: Config, args: argparse.Namespace) -> int:
     import uvicorn
 
     from chess_ai.web import create_app
 
     server = config.server
-    print(
-        f"chess-ai: serving on http://{server.host}:{server.port}{server.path_prefix}/", flush=True
-    )
+    _say(f"chess-ai: serving on http://{server.host}:{server.port}{server.path_prefix}/")
     uvicorn.run(create_app(config), host=server.host, port=server.port)
     return 0
+
+
+def _build_dataset(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.dataset import (
+        DatasetError,
+        ProgressPrinter,
+        RatingSource,
+        build_dataset,
+        dataset_path,
+    )
+
+    source = None if args.rating_source == AUTO else RatingSource[args.rating_source.upper()]
+    printer = ProgressPrinter()
+    try:
+        manifest = build_dataset(
+            args.name,
+            args.sources,
+            data_dir=config.paths.data,
+            validation_fraction=args.validation_fraction,
+            rating_source=source,
+            progress=printer,
+            overwrite=args.overwrite,
+        )
+    except DatasetError as e:
+        raise _UserError(e) from e
+    except OSError as e:
+        # A full disk, a mount that went away: the most ordinary way a long build dies, and the
+        # one thing here that was still answered with a traceback.
+        raise _UserError(f"could not build dataset {args.name!r}: {e.strerror or e}") from e
+    finally:
+        # A build that failed never printed that it was done, so the line it was rewriting is
+        # still open and the error would otherwise be written onto the end of it.
+        printer.finish()
+    lost = [source.path for source in manifest.sources if source.went_away]
+    # Only the sources that were there throughout and whose contents gave up: a source that went
+    # away took an unknown number of games with it, and saying "not read whole" of that on stdout
+    # while the warning says the rest of it understates it in the line a log gets read for.
+    unread = [
+        source.path
+        for source in manifest.sources
+        if source.error is not None and not source.went_away
+    ]
+    _say(
+        f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
+        f"{manifest.games:,} games, {manifest.positions:,} positions, "
+        f"{manifest.games_skipped:,} skipped"
+        # A source that could not be read leaves the dataset short of its games, which is not
+        # something to leave to whoever thinks to run "dataset stats" afterwards.
+        + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else "")
+    )
+    if lost:
+        # Built, and not the dataset that was asked for. Said on its own line and answered for in
+        # the exit status, because a build in a cron job is read by a script before a person.
+        _say(
+            f"chess-ai: warning: dataset {manifest.name} is missing games from "
+            f"{len(lost)} source(s) that could not be read whole: {', '.join(lost)}",
+            err=True,
+        )
+        return 1
+    return 0
+
+
+def _dataset_stats(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.dataset import DatasetError, ManifestError, open_dataset, summarize
+
+    try:
+        dataset = open_dataset(args.name, data_dir=config.paths.data)
+    except (DatasetError, ManifestError) as e:
+        raise _UserError(_with_available(e, config.paths.data)) from e
+    _say(summarize(dataset.manifest).rstrip("\n"))
+    return 0
+
+
+def _with_available(error: Exception, data_dir: Path) -> str:
+    """``error``, plus the datasets there actually are, which is usually the next question."""
+    from chess_ai.dataset import list_datasets
+
+    names = list_datasets(data_dir)
+    if not names:
+        return f"{error} (no datasets in {data_dir}; build one with 'chess-ai dataset build')"
+    return f"{error} (datasets in {data_dir}: {', '.join(names)})"

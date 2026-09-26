@@ -24,3 +24,10 @@ path_prefix = ""
 # saved. A relative path is relative to the directory chess-ai runs in, and a
 # leading ~ is your home directory. The directory is made when it is first needed.
 games = "games"
+
+# Where datasets built from PGN files are kept, one directory per dataset under
+# <data>/datasets/. A dataset holds sharded record files and a manifest, and can
+# reach tens of gigabytes, so this may be worth pointing at a roomier disk. A
+# relative path is relative to the directory chess-ai runs in, and a leading ~ is
+# your home directory. The directory is made when it is first needed.
+data = "data"
