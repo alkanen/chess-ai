@@ -53,26 +53,34 @@ class SourceInfo(BaseModel):
     dataset short of its games. The dataset is still usable, and this is what says it is not
     the dataset the sources asked for.
     """
-    opened: bool = True
-    """Whether the file could be opened at all, which is a detail for whoever is reading.
+    went_away: bool = False
+    """Whether what failed was the file rather than the PGN in it.
 
-    What a build decides on is :attr:`gave_nothing`; this only tells the two ways of giving
-    nothing apart in a report.
+    A file that could not be opened, or that stopped answering while it was being read, took an
+    unknown number of its games with it: a mount that drops can do so before the first game or
+    after the thousandth, and how many came back first says nothing about how many were left. A
+    file that is *there* and stops making sense is the opposite — that is the file's own content,
+    it is counted among the skipped games, and what came before it is all there was to have.
     """
 
     @property
     def gave_nothing(self) -> bool:
         """Whether the file left nothing at all behind, for a reason of its own.
 
-        A file that could not be opened and a file that gave up before its first game are the same
-        thing from the dataset's side: everything that was in it is missing. Opening is not the
-        test, because a mount that drops rarely fails the open — the descriptor is often already
-        cached — and fails the first read instead.
-
-        A file that read some games and *then* stopped is not this. That is ordinary bad PGN: its
-        earlier games are in the dataset and its failure is counted among the skipped games.
+        Everything that was in it is missing, whether the file went away or its very first game
+        was unreadable.
         """
         return self.error is not None and self.games_read == 0
+
+    @property
+    def lost_games(self) -> bool:
+        """Whether this source left the dataset short of games that were in the file.
+
+        The question a build has to answer before replacing a dataset with this one: bad PGN is
+        the file's own fault and is fair to publish around, and a file that went away or gave
+        nothing is not.
+        """
+        return self.went_away or self.gave_nothing
 
 
 class Filters(BaseModel):

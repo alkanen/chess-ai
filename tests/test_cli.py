@@ -1,4 +1,5 @@
 import errno
+import io
 import os
 import sys
 from pathlib import Path
@@ -186,7 +187,7 @@ def test_dataset_build_says_so_when_a_source_could_not_be_read(tmp_path, capsys)
 
     assert status == 1, "a partial build is not a success"
     error = capsys.readouterr().err
-    assert "missing everything in 1 source(s)" in error
+    assert "missing games from 1 source(s)" in error
     assert str(gone) in error
     assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 4
 
@@ -266,7 +267,7 @@ def test_dataset_build_does_not_call_a_file_it_never_opened_partly_read(tmp_path
 
     written = capsys.readouterr()
     assert "not read whole" not in written.out
-    assert "missing everything in 1 source(s)" in written.err
+    assert "missing games from 1 source(s)" in written.err
 
 
 def test_dataset_build_says_a_disk_that_filled_up_plainly(tmp_path, capsys):
@@ -286,3 +287,90 @@ def test_dataset_build_says_a_disk_that_filled_up_plainly(tmp_path, capsys):
     assert "chess-ai: error:" in error
     assert "No space left on device" in error
     assert "Traceback" not in error
+
+
+class DeadStream(io.StringIO):
+    """A stream that goes away after its first write, as a tty does when its terminal closes.
+
+    After the first one, so that a line has been written and is waiting to be closed: a stream
+    that dies on its very first write leaves nothing open and nothing to trip over.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes = 0
+
+    def write(self, text: str) -> int:
+        self.writes += 1
+        if self.writes > 1:
+            raise OSError(errno.EIO, "Input/output error")
+        return super().write(text)
+
+
+def test_dataset_build_survives_its_terminal_going_away(tmp_path, capsys):
+    # A nohuped build whose tty closes: the reporting stops, and the build it was reporting on
+    # is finished, published and reported as a success.
+    import chess_ai.dataset
+    from chess_ai.dataset import ProgressPrinter, builder
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "REPORT_EVERY", 1)
+        patch.setattr(
+            chess_ai.dataset,
+            "ProgressPrinter",
+            lambda *args, **kwargs: ProgressPrinter(DeadStream(), interval=0.0, rewrite=True),
+        )
+
+        assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+
+    assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 4
+
+
+def test_dataset_build_reports_why_it_failed_even_with_its_terminal_gone(tmp_path, capsys):
+    # The failure path of the same thing: closing the progress line must not take the place of
+    # the message saying what went wrong.
+    import chess_ai.dataset
+    from chess_ai.dataset import ProgressPrinter, builder
+
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "REPORT_EVERY", 1)
+        patch.setattr(os, "fsync", out_of_space)
+        patch.setattr(
+            chess_ai.dataset,
+            "ProgressPrinter",
+            lambda *args, **kwargs: ProgressPrinter(DeadStream(), interval=0.0, rewrite=True),
+        )
+
+        with pytest.raises(SystemExit) as exit_info:
+            main(["dataset", "build", "games", fixture("lichess.pgn")])
+
+    assert exit_info.value.code == 2
+    assert "No space left on device" in capsys.readouterr().err
+
+
+def test_dataset_build_does_not_call_a_lost_source_a_success(tmp_path, capsys):
+    # A build that lost most of a dump to a mount that dropped is not a success a cron job
+    # should read past, even though it built something.
+    import chess.pgn
+
+    real_read_game = chess.pgn.read_game
+    calls = {"n": 0}
+
+    def goes_away(handle, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError(errno.ESTALE, "Stale file handle")
+        return real_read_game(handle, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", goes_away)
+
+        status = main(["dataset", "build", "games", fixture("unrated.pgn")])
+
+    assert status == 1
+    written = capsys.readouterr()
+    assert "missing games from 1 source(s)" in written.err
+    assert "not read whole" not in written.out, "that is for a file that was there throughout"

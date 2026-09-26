@@ -215,7 +215,7 @@ def test_a_summary_tells_a_source_that_gave_nothing_from_one_that_gave_some(tmp_
 
     manifest = build(tmp_path, "lichess.pgn", validation_fraction=0.0)
     gave_nothing = SourceInfo(
-        path="gone.pgn", bytes=1, games_read=0, games_kept=0, error="went away", opened=False
+        path="gone.pgn", bytes=1, games_read=0, games_kept=0, error="went away", went_away=True
     )
     gave_up_later = SourceInfo(
         path="broken.pgn", bytes=1, games_read=5, games_kept=5, error="stopped after 5 games"
@@ -226,3 +226,28 @@ def test_a_summary_tells_a_source_that_gave_nothing_from_one_that_gave_some(tmp_
 
     assert "NOTHING READ FROM IT: went away" in summary
     assert "NOT READ WHOLE: stopped after 5 games" in summary
+
+
+class DeadStream(io.StringIO):
+    """A stream that goes away after its first write, as a tty does when its terminal closes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes = 0
+
+    def write(self, text: str) -> int:
+        self.writes += 1
+        if self.writes > 1:
+            raise OSError(5, "Input/output error")
+        return super().write(text)
+
+
+def test_closing_a_line_on_a_stream_that_has_gone_is_not_an_error():
+    # The same reasoning the build's own reporting settled on: a dead terminal is not worth a
+    # finished build, and a build that failed should report why it failed, not this.
+    out = DeadStream()
+    printer = ProgressPrinter(out, interval=0.0, rewrite=True)
+
+    printer(_at(1.0))
+
+    printer.finish()  # Must not raise.

@@ -139,13 +139,14 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
         # A build that failed never printed that it was done, so the line it was rewriting is
         # still open and the error would otherwise be written onto the end of it.
         printer.finish()
-    missing = [source.path for source in manifest.sources if source.gave_nothing]
-    # Only the sources that were read and did not finish: a source that gave nothing at all is
-    # not "not read whole", and saying so twice about one file understates it the first time.
+    lost = [source.path for source in manifest.sources if source.lost_games]
+    # Only the sources that were there throughout and whose contents gave up: a source that went
+    # away took an unknown number of games with it, and saying "not read whole" of that on stdout
+    # while the warning says the rest of it understates it in the line a log gets read for.
     unread = [
         source.path
         for source in manifest.sources
-        if source.error is not None and not source.gave_nothing
+        if source.error is not None and not source.lost_games
     ]
     print(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
@@ -156,12 +157,12 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
         + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else ""),
         flush=True,
     )
-    if missing:
+    if lost:
         # Built, and not the dataset that was asked for. Said on its own line and answered for in
         # the exit status, because a build in a cron job is read by a script before a person.
         print(
-            f"chess-ai: warning: dataset {manifest.name} is missing everything in "
-            f"{len(missing)} source(s) that could not be read: {', '.join(missing)}",
+            f"chess-ai: warning: dataset {manifest.name} is missing games from "
+            f"{len(lost)} source(s) that could not be read whole: {', '.join(lost)}",
             file=sys.stderr,
             flush=True,
         )

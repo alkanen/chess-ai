@@ -92,12 +92,19 @@ class ProgressPrinter:
         newline on it and whatever is printed next — the error, on the same stream — lands on the
         end of it. This closes the line and says nothing else, which is the point: only a build
         that finished may print that it did.
+
+        Best effort, for the reason a report is: the stream this writes to can go away — a closed
+        terminal, a dropped ssh session — and tidying up the line is not worth a finished build,
+        nor worth taking the place of the message saying why an unfinished one stopped.
         """
         if not self._unfinished:
             return
         self._unfinished = False
-        self._stream.write("\n")
-        self._stream.flush()
+        try:
+            self._stream.write("\n")
+            self._stream.flush()
+        except Exception:  # noqa: BLE001 - see above; there is nowhere left to report it to
+            pass
 
 
 def format_progress(progress: Progress) -> str:

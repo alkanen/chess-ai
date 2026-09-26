@@ -115,7 +115,7 @@ def build_dataset(
 
     A *source* that cannot be opened is counted rather than fatal, but only so far: a build that
     could open none of them, or that could not open all of them and would be replacing a dataset
-    already there, is refused. See :func:`_check_sources_were_read`.
+    already there, is refused. See :func:`_check_worth_publishing`.
     """
     valid_name(name)
     if not 0.0 <= validation_fraction <= 1.0:
@@ -187,32 +187,35 @@ def _check_worth_publishing(manifest: Manifest, directory: Path) -> None:
 
     - if *every* source gave nothing, there is nothing to publish, whether or not a dataset of
       this name is already there
-    - if *some* source gave nothing and a dataset is already there, the dataset in place was built
-      from more than this one could be, and a nightly ``--overwrite`` must not trade it for this.
-      The remedy is to fix the source or stop naming it, not a flag that says to carry on anyway
+    - if *some* source went away or gave nothing and a dataset is already there, the dataset in
+      place was built from more than this one could be, and a nightly ``--overwrite`` must not
+      trade it for this. The remedy is to fix the source or stop naming it, not a flag that says
+      to carry on anyway
     - if *no games at all* were kept and a dataset is already there, it does not matter why: a
       dataset of nothing is not a replacement for a dataset of something. This is the one that
       catches a source truncated between being sized and being read, which fails in no way at all
       — no error, no games, nothing to complain of
 
-    A source that read some games and then stopped is none of these; see
-    :attr:`~chess_ai.dataset.manifest.SourceInfo.gave_nothing`.
+    A source that was there throughout and whose *contents* stopped making sense is none of
+    these; see :attr:`~chess_ai.dataset.manifest.SourceInfo.lost_games`.
     """
     nothing = [source for source in manifest.sources if source.gave_nothing]
-    named = ", ".join(str(source.path) for source in nothing)
+    lost = [source for source in manifest.sources if source.lost_games]
     if nothing and len(nothing) == len(manifest.sources):
         raise DatasetError(
             f"none of the {len(nothing)} source(s) of dataset {manifest.name!r} could be read, "
-            f"so there is nothing to build from: {named}"
+            f"so there is nothing to build from: "
+            f"{', '.join(str(source.path) for source in nothing)}"
         )
     if not directory.exists():
         return
-    if nothing:
+    if lost:
         raise DatasetError(
-            f"{len(nothing)} of the {len(manifest.sources)} source(s) of dataset "
-            f"{manifest.name!r} could not be read, and the dataset already in {directory} was "
-            f"built from more than this one could be: {named}. It has been left alone; fix those "
-            "sources, or leave them out to build from the rest on purpose"
+            f"{len(lost)} of the {len(manifest.sources)} source(s) of dataset "
+            f"{manifest.name!r} could not be read whole, and the dataset already in {directory} "
+            f"was built from more than this one could be: "
+            f"{', '.join(str(source.path) for source in lost)}. It has been left alone; fix "
+            "those sources, or leave them out to build from the rest on purpose"
         )
     if manifest.games == 0:
         raise DatasetError(
@@ -278,8 +281,11 @@ def _publish(partial: Path, directory: Path, *, name: str, overwrite: bool) -> N
             # contents, which is the state the rename exists to prevent.
             sync_directory(discarded.parent)
         except OSError:
-            # Nothing else can be done about it here, and the dataset is already in place.
-            discarded = aside
+            # Left whole rather than deleted where it is: a delete that stopped half way would
+            # leave a gutted dataset still called ".replaced", which _report_leftovers offers
+            # back as one to rename into place. Reported as a leftover instead; it costs disk,
+            # and _report_leftovers exists to make that somebody's decision.
+            return
         # Past the point of no return: failing here leaves rubble rather than losing a dataset.
         shutil.rmtree(discarded, ignore_errors=True)
 
@@ -375,7 +381,7 @@ class _Build:
         read = 0
         kept = 0
         error: str | None = None
-        opened = True
+        went_away = False
         reader = PgnReader(source)
         try:
             # The open is guarded on its own, and nothing else is: a DatasetError out of the
@@ -388,11 +394,11 @@ class _Build:
             # than one that was never there: resolve_sources refuses those up front. Hours of
             # reading is not worth throwing away over one file of a hundred.
             error = str(e)
-            opened = False
+            went_away = True
             LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
         else:
             try:
-                read, kept, error = self._read_games(reader, index)
+                read, kept, error, went_away = self._read_games(reader, index)
             finally:
                 reader.close()
         self._bytes_before += source.bytes
@@ -404,12 +410,13 @@ class _Build:
                 games_read=read,
                 games_kept=kept,
                 error=error,
-                opened=opened,
+                went_away=went_away,
             )
         )
 
-    def _read_games(self, reader: PgnReader, index: int) -> tuple[int, int, str | None]:
-        """Read an open file's games, and say how many it held, how many were kept, and why not.
+    def _read_games(self, reader: PgnReader, index: int) -> tuple[int, int, str | None, bool]:
+        """Read an open file's games: how many it held, how many were kept, why not, and whose
+        fault it was.
 
         Only the parsing of each game is forgiven here. Everything the loop body does — writing
         the records, counting them — is outside that, because a write failure is not a broken
@@ -423,13 +430,17 @@ class _Build:
             try:
                 record = next(games)
             except StopIteration:
-                return read, kept, None
+                return read, kept, None, False
             except Exception as e:
-                # The file stopped making sense, mid-game. What was read is kept, the rest of the
-                # file is not, and the count says a game was lost.
+                # The file stopped, mid-game. What was read is kept, the rest of the file is not,
+                # and the count says a game was lost. Whether the file went away or the chess in
+                # it stopped making sense is the difference between a dataset missing an unknown
+                # number of games and one that has all the games there were: an OSError is the
+                # file, and anything else is what the parser found in it.
                 self._note_failure(e)
                 self.skipped[SkipReason.UNREADABLE] += 1
-                return read, kept, f"stopped reading after {read} games: {_described(e)}"
+                why = f"stopped reading after {read} games: {_described(e)}"
+                return read, kept, why, isinstance(e, OSError)
             read += 1
             self.games_read += 1
             self._bytes_read = self._bytes_before + reader.bytes_read

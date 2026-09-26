@@ -1035,10 +1035,11 @@ def test_a_source_that_went_away_still_builds_a_dataset_that_is_not_there_yet(tm
         gone.chmod(0o600)
 
     assert manifest.games == 4
-    missing = [source for source in manifest.sources if not source.opened]
+    missing = [source for source in manifest.sources if source.went_away]
     assert len(missing) == 1
     assert missing[0].error is not None and "Permission denied" in missing[0].error
-    assert all(source.opened for source in manifest.sources if source.error is None)
+    assert missing[0].gave_nothing, "it never got as far as a game"
+    assert not any(source.went_away for source in manifest.sources if source.error is None)
 
 
 def test_a_source_that_stops_part_way_through_still_replaces_a_dataset(tmp_path):
@@ -1061,7 +1062,7 @@ def test_a_source_that_stops_part_way_through_still_replaces_a_dataset(tmp_path)
 
     assert replaced.games == 2, "the games before the file gave up"
     assert replaced.sources[0].error is not None
-    assert replaced.sources[0].opened, "it opened; it just did not finish"
+    assert not replaced.sources[0].went_away, "it was there; its chess stopped making sense"
     assert open_dataset("test", data_dir=tmp_path).manifest.games == 2
 
 
@@ -1134,3 +1135,93 @@ def test_a_build_of_nothing_is_still_allowed_where_there_is_nothing_to_lose(tmp_
 
     assert manifest.games == 0
     assert list_datasets(tmp_path / "data") == ["test"]
+
+
+def test_a_source_that_goes_away_part_way_does_not_replace_a_dataset(tmp_path):
+    # A mount can drop after the first game as easily as before it. What tells this from bad PGN
+    # is not how many games came back but what failed: the file, or the chess in it.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_read_game = chess.pgn.read_game
+    calls = {"n": 0}
+
+    def goes_away(handle, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError(errno.ESTALE, "Stale file handle")
+        return real_read_game(handle, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", goes_away)
+
+        with pytest.raises(DatasetError, match="could not be read"):
+            build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 4, "the whole one is kept"
+
+
+def test_a_source_that_goes_away_is_recorded_as_the_file_and_not_the_chess(tmp_path):
+    real_read_game = chess.pgn.read_game
+    calls = {"n": 0}
+
+    def goes_away(handle, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise OSError(errno.ESTALE, "Stale file handle")
+        return real_read_game(handle, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", goes_away)
+
+        manifest = build(tmp_path / "data", "unrated.pgn", validation_fraction=0.0)
+
+    source = manifest.sources[0]
+    assert manifest.games == 1, "the game it read before the file went"
+    assert source.went_away, "the file went away; the PGN in it was fine"
+    assert source.lost_games
+    assert not source.gave_nothing, "it did give one"
+
+
+def test_bad_pgn_part_way_through_is_still_the_files_own_fault(tmp_path):
+    # The other side of the same line: a dump whose tail stops making sense is ordinary, its
+    # earlier games are in the dataset, and it must not block a rebuild.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_read_game = chess.pgn.read_game
+    calls = {"n": 0}
+
+    def nonsense(handle, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ValueError("the file stops making sense here")
+        return real_read_game(handle, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", nonsense)
+
+        replaced = build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert replaced.games == 2
+    assert not replaced.sources[0].went_away
+    assert not replaced.sources[0].lost_games
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 2
+
+
+def test_a_dataset_that_cannot_be_marked_as_discarded_is_left_whole(tmp_path):
+    # If it cannot even be renamed within its own parent, deleting it in place would leave a
+    # gutted directory still called ".replaced" — the state the rename exists to prevent.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_replace = os.replace
+
+    def replace(source, target, **kwargs):
+        if str(target).endswith(store.DISCARDED_SUFFIX):
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_replace(source, target, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder.os, "replace", replace)
+
+        replaced = build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert replaced.games == 3, "the new dataset went in"
+    left = store.replaced_datasets(tmp_path, "test")
+    assert left, "the old one is still there"
+    assert load_manifest(left[0]).games == 4, "and whole, so renaming it back really would work"
