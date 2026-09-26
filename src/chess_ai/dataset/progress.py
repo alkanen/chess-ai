@@ -68,6 +68,8 @@ class ProgressPrinter:
         self._interval = interval
         self._last = -interval
         self._rewrite = rewrite if rewrite is not None else _is_terminal(self._stream)
+        self._unfinished = False
+        """Whether a line has been written that nothing has ended yet."""
 
     def __call__(self, progress: Progress) -> None:
         if not progress.done and progress.seconds - self._last < self._interval:
@@ -80,6 +82,21 @@ class ProgressPrinter:
         else:
             # Clear to the end of the line: the line before may have been longer than this one.
             self._stream.write(f"\r\x1b[K{line}" + ("\n" if progress.done else ""))
+            self._unfinished = not progress.done
+        self._stream.flush()
+
+    def finish(self) -> None:
+        """End the line being rewritten, if one is still open, without claiming anything.
+
+        A build that fails never reports itself done, so the line it left in a terminal has no
+        newline on it and whatever is printed next — the error, on the same stream — lands on the
+        end of it. This closes the line and says nothing else, which is the point: only a build
+        that finished may print that it did.
+        """
+        if not self._unfinished:
+            return
+        self._unfinished = False
+        self._stream.write("\n")
         self._stream.flush()
 
 

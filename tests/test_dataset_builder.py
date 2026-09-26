@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import chess
+import chess.pgn
 import pytest
 from dataset_helpers import FIXTURES, GOOD_GAMES, build, fixture, move_sequences
 
@@ -970,3 +971,120 @@ def test_a_build_that_fails_unserialised_is_not_blamed_on_the_lock(tmp_path):
         chained.append(str(cause))
         cause = cause.__context__
     assert not any("No locks available" in text for text in chained), chained
+
+
+def unopenable(directory: Path, name: str = "gone.pgn") -> Path:
+    """A PGN file that resolves now and cannot be opened when the build gets to it."""
+    path = directory / name
+    path.write_text('[Event "x"]\n[Site "s"]\n[Result "1-0"]\n\n1. e4 e5 1-0\n')
+    path.chmod(0o000)
+    return path
+
+
+NOT_ROOT = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can read a file of any mode"
+)
+
+
+@NOT_ROOT
+def test_a_build_that_could_read_nothing_at_all_publishes_nothing(tmp_path):
+    # A build whose every source went away read no games. Publishing that is publishing an empty
+    # dataset, and with --overwrite it would be publishing it over a working one.
+    gone = unopenable(tmp_path)
+    try:
+        with pytest.raises(DatasetError, match="none of"):
+            build(tmp_path / "data", str(gone), validation_fraction=0.0)
+    finally:
+        gone.chmod(0o600)
+
+    assert list_datasets(tmp_path / "data") == []
+
+
+@NOT_ROOT
+def test_a_source_that_went_away_does_not_replace_a_dataset_that_is_there(tmp_path):
+    # The race this is all for: the files are sized at second zero and opened hours later, so a
+    # nightly "build --overwrite" over a mount that drops must not swap a whole dataset for the
+    # part of one it could still read.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    gone = unopenable(tmp_path)
+    try:
+        with pytest.raises(DatasetError, match="could not be read"):
+            build(
+                tmp_path,
+                "unrated.pgn",
+                str(gone),
+                validation_fraction=0.0,
+                overwrite=True,
+            )
+    finally:
+        gone.chmod(0o600)
+
+    kept = open_dataset("test", data_dir=tmp_path).manifest
+    assert kept.games == 4, "the dataset that was there is the one still there"
+    assert [Path(source.path).name for source in kept.sources] == ["lichess.pgn"]
+
+
+@NOT_ROOT
+def test_a_source_that_went_away_still_builds_a_dataset_that_is_not_there_yet(tmp_path):
+    # Nothing to lose here, so the games that could be read are worth keeping — with the
+    # manifest saying the dataset is not the one the sources asked for.
+    gone = unopenable(tmp_path)
+    try:
+        manifest = build(tmp_path / "data", "lichess.pgn", str(gone), validation_fraction=0.0)
+    finally:
+        gone.chmod(0o600)
+
+    assert manifest.games == 4
+    missing = [source for source in manifest.sources if not source.opened]
+    assert len(missing) == 1
+    assert missing[0].error is not None and "Permission denied" in missing[0].error
+    assert all(source.opened for source in manifest.sources if source.error is None)
+
+
+def test_a_source_that_stops_part_way_through_still_replaces_a_dataset(tmp_path):
+    # Not the same thing as a source that could not be opened: bad PGN in the tail of a dump is
+    # ordinary, is already counted as skipped games, and must not block every rebuild.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_read_game = chess.pgn.read_game
+    calls = {"n": 0}
+
+    def read_game(handle, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise ValueError("the file stops making sense here")
+        return real_read_game(handle, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", read_game)
+
+        replaced = build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert replaced.games == 2, "the games before the file gave up"
+    assert replaced.sources[0].error is not None
+    assert replaced.sources[0].opened, "it opened; it just did not finish"
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 2
+
+
+def test_a_half_removed_old_dataset_is_reported_as_rubble_not_as_a_dataset(tmp_path):
+    # The cleanup past the point of no return ignores errors, so it can stop half way and leave
+    # part of the old dataset behind. Advertising that as "rename it back to have it again" would
+    # have the user rename a gutted dataset over the good one this build just made.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_rmtree = builder.shutil.rmtree
+
+    def rmtree(path, *args, **kwargs):
+        if str(path).endswith(store.DISCARDED_SUFFIX):
+            # What ignore_errors=True leaves behind when one file will not go: some of the
+            # dataset, gone, and no exception to say so.
+            (Path(path) / "manifest.json").unlink()
+            return None
+        return real_rmtree(path, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder.shutil, "rmtree", rmtree)
+
+        replaced = build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert replaced.games == 3, "the new dataset went in"
+    assert store.replaced_datasets(tmp_path, "test") == [], "nothing offers the gutted one back"
+    assert store.discarded_datasets(tmp_path, "test"), "it is reported as rubble instead"

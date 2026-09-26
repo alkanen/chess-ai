@@ -62,6 +62,8 @@ from chess_ai.dataset.store import (
     abandoned_partials,
     dataset_lock,
     dataset_path,
+    discarded_datasets,
+    discarded_path,
     new_partial_path,
     replaced_datasets,
     replaced_path,
@@ -110,6 +112,10 @@ def build_dataset(
     a build that fails — at the cost of both existing at once while it runs. That way round
     because a disk with room for only one copy is exactly the disk that fills up part-way
     through, and deleting first would leave neither.
+
+    A *source* that cannot be opened is counted rather than fatal, but only so far: a build that
+    could open none of them, or that could not open all of them and would be replacing a dataset
+    already there, is refused. See :func:`_check_sources_were_read`.
     """
     valid_name(name)
     if not 0.0 <= validation_fraction <= 1.0:
@@ -157,6 +163,7 @@ def build_dataset(
                     name=name,
                     created=now if now is not None else datetime.now(UTC),
                 )
+            _check_sources_were_read(manifest, directory)
             manifest.save(partial)
             _publish(partial, directory, name=name, overwrite=overwrite)
         except BaseException:
@@ -169,6 +176,40 @@ def build_dataset(
         # was finished and then be followed by the reason it was not.
         build.report(done=True)
     return manifest
+
+
+def _check_sources_were_read(manifest: Manifest, directory: Path) -> None:
+    """Refuse to publish a build that did not read the files it was given, where that would lose.
+
+    The sources are sized when a build starts and opened as it reaches them, hours later, so a
+    mount that drops or a sync job that rotates a directory of dumps can leave a build reading
+    nothing at all. Such a build has no business being published:
+
+    - if *no* source could be opened, there is nothing to publish, whether or not a dataset of
+      this name is already there
+    - if *some* source could not be opened and a dataset is already there, the dataset in place
+      is more complete than this one, and a nightly ``--overwrite`` must not trade it for this.
+      The remedy is to fix the source or to stop naming it, not a flag that says to carry on
+
+    A source that opened and then stopped making sense part-way through is not this: that is
+    ordinary bad PGN, its earlier games are in the dataset, and it is counted as skipped games.
+    """
+    missing = [source for source in manifest.sources if not source.opened]
+    if not missing:
+        return
+    named = ", ".join(str(source.path) for source in missing)
+    if len(missing) == len(manifest.sources):
+        raise DatasetError(
+            f"none of the {len(missing)} source(s) of dataset {manifest.name!r} could be read, "
+            f"so there is nothing to build from: {named}"
+        )
+    if directory.exists():
+        raise DatasetError(
+            f"{len(missing)} of the {len(manifest.sources)} source(s) of dataset "
+            f"{manifest.name!r} could not be read, and the dataset already in {directory} was "
+            f"built from more than this one could be: {named}. It has been left alone; fix those "
+            "sources, or leave them out to build from the rest on purpose"
+        )
 
 
 def _publish(partial: Path, directory: Path, *, name: str, overwrite: bool) -> None:
@@ -215,8 +256,18 @@ def _publish(partial: Path, directory: Path, *, name: str, overwrite: bool) -> N
         raise
     sync_directory(directory.parent)
     if aside is not None:
+        # Renamed before it is deleted, so that a delete which stops half way leaves something
+        # that reads as rubble. A half-deleted dataset still called ".replaced" would be offered
+        # back to whoever reads the next build's warning, and renaming it over the dataset this
+        # build just made would lose them both.
+        discarded = discarded_path(aside)
+        try:
+            os.replace(aside, discarded)
+        except OSError:
+            # Nothing else can be done about it here, and the dataset is already in place.
+            discarded = aside
         # Past the point of no return: failing here leaves rubble rather than losing a dataset.
-        shutil.rmtree(aside, ignore_errors=True)
+        shutil.rmtree(discarded, ignore_errors=True)
 
 
 def _report_leftovers(data_dir: Path, name: str) -> None:
@@ -233,6 +284,13 @@ def _report_leftovers(data_dir: Path, name: str) -> None:
             "no build of %r is running.",
             path,
             name,
+            name,
+        )
+    for path in discarded_datasets(data_dir, name):
+        LOGGER.warning(
+            "chess-ai: %s is what is left of a dataset an earlier build of %r replaced and could "
+            "not finish deleting. It is part of a dataset without the rest of it; remove it.",
+            path,
             name,
         )
     for path in replaced_datasets(data_dir, name):
@@ -293,6 +351,7 @@ class _Build:
         read = 0
         kept = 0
         error: str | None = None
+        opened = True
         reader = PgnReader(source)
         try:
             # The open is guarded on its own, and nothing else is: a DatasetError out of the
@@ -305,6 +364,7 @@ class _Build:
             # than one that was never there: resolve_sources refuses those up front. Hours of
             # reading is not worth throwing away over one file of a hundred.
             error = str(e)
+            opened = False
             LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
         else:
             try:
@@ -320,6 +380,7 @@ class _Build:
                 games_read=read,
                 games_kept=kept,
                 error=error,
+                opened=opened,
             )
         )
 

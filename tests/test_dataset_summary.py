@@ -163,3 +163,48 @@ def test_a_size_reads_at_a_glance():
     assert format_bytes(512) == "512 B"
     assert format_bytes(2048) == "2.0 KB"
     assert format_bytes(5 * 1024**3) == "5.0 GB"
+
+
+def test_a_line_left_open_is_closed_without_claiming_anything():
+    # A build that fails never reports itself done, so the line it was rewriting has no newline
+    # and the error printed next would land on the end of it.
+    out = io.StringIO()
+    printer = ProgressPrinter(out, interval=0.0, rewrite=True)
+
+    printer(_at(1.0))
+    printer.finish()
+
+    assert out.getvalue().endswith("\n")
+    assert "built" not in out.getvalue(), "closing the line says nothing about finishing"
+
+
+def test_closing_a_line_that_is_already_closed_writes_nothing():
+    out = io.StringIO()
+    printer = ProgressPrinter(out, interval=0.0, rewrite=True)
+
+    printer(_at(1.0, done=True))
+    written = out.getvalue()
+    printer.finish()
+    printer.finish()
+
+    assert out.getvalue() == written
+
+
+def test_nothing_is_written_for_a_build_that_never_reported():
+    out = io.StringIO()
+
+    ProgressPrinter(out, interval=0.0, rewrite=True).finish()
+
+    assert out.getvalue() == ""
+
+
+def test_a_log_file_needs_no_closing():
+    # Every line there already ended when it was written.
+    out = io.StringIO()
+    printer = ProgressPrinter(out, interval=0.0, rewrite=False)
+
+    printer(_at(1.0))
+    written = out.getvalue()
+    printer.finish()
+
+    assert out.getvalue() == written

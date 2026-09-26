@@ -126,7 +126,9 @@ uv run chess-ai dataset build masters ~/pgn/lichess-2024-01.pgn
 It streams, so the input's size is not limited by memory, and it reports throughput and
 time remaining as it goes. Games it cannot read — an illegal move, a position that is not a
 position, a variant that is not chess, a game with no result — are skipped and counted by
-reason rather than ending the build. Games whose ratings the file does not give are kept and
+reason rather than ending the build. A whole *file* that cannot be read is counted too, and
+named in the manifest, but not silently: the command exits non-zero, and it refuses outright to
+replace an existing dataset with a build that was missing one of its sources. Games whose ratings the file does not give are kept and
 marked as unrated, and the rating pool (Lichess, chess.com) is read from each game's headers,
 or given for every game with `--rating-source`.
 

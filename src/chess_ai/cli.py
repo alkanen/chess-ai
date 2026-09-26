@@ -1,6 +1,7 @@
 """The ``chess-ai`` command-line tool."""
 
 import argparse
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -117,6 +118,7 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
     )
 
     source = None if args.rating_source == AUTO else RatingSource[args.rating_source.upper()]
+    printer = ProgressPrinter()
     try:
         manifest = build_dataset(
             args.name,
@@ -124,12 +126,17 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
             data_dir=config.paths.data,
             validation_fraction=args.validation_fraction,
             rating_source=source,
-            progress=ProgressPrinter(),
+            progress=printer,
             overwrite=args.overwrite,
         )
     except DatasetError as e:
         raise _UserError(e) from e
+    finally:
+        # A build that failed never printed that it was done, so the line it was rewriting is
+        # still open and the error would otherwise be written onto the end of it.
+        printer.finish()
     unread = [source.path for source in manifest.sources if source.error is not None]
+    missing = [source.path for source in manifest.sources if not source.opened]
     print(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
         f"{manifest.games:,} games, {manifest.positions:,} positions, "
@@ -139,6 +146,16 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
         + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else ""),
         flush=True,
     )
+    if missing:
+        # Built, and not the dataset that was asked for. Said on its own line and answered for in
+        # the exit status, because a build in a cron job is read by a script before a person.
+        print(
+            f"chess-ai: warning: dataset {manifest.name} is missing everything in "
+            f"{len(missing)} source(s) that could not be read: {', '.join(missing)}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     return 0
 
 

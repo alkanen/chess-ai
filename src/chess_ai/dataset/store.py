@@ -67,6 +67,14 @@ PARTIAL_SUFFIX: Final = ".partial"
 REPLACED_SUFFIX: Final = ".replaced"
 """What the dataset being replaced is called for the moment between two renames."""
 
+DISCARDED_SUFFIX: Final = ".discarded"
+"""What a dataset being thrown away is called once nothing wants it back.
+
+The dataset a build replaces is renamed to this before it is deleted, so that a delete which
+stops half way leaves something that reads as rubble rather than as a dataset somebody could
+still have. See :func:`replaced_datasets` and :func:`discarded_datasets`.
+"""
+
 BUILD_TOKEN: Final = 8
 """Hex digits of randomness naming one build, which is plenty to never see twice."""
 
@@ -247,6 +255,20 @@ def replaced_datasets(data_dir: Path, name: str) -> list[Path]:
     have it again, which is worth saying to whoever lost it.
     """
     return _leftovers(data_dir, name, REPLACED_SUFFIX)
+
+
+def discarded_datasets(data_dir: Path, name: str) -> list[Path]:
+    """Remains of datasets this dataset's builds replaced and then failed to finish deleting.
+
+    Nothing wants these: whatever is left is part of a dataset, without the rest of it. They are
+    reported so that the disk they are taking up is somebody's decision rather than a mystery.
+    """
+    return _leftovers(data_dir, name, DISCARDED_SUFFIX)
+
+
+def discarded_path(aside: Path) -> Path:
+    """What the dataset waiting in ``aside`` is called once it is being thrown away."""
+    return aside.with_name(aside.name[: -len(REPLACED_SUFFIX)] + DISCARDED_SUFFIX)
 
 
 def _leftovers(data_dir: Path, name: str, suffix: str) -> list[Path]:

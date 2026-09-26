@@ -53,6 +53,14 @@ class SourceInfo(BaseModel):
     dataset short of its games. The dataset is still usable, and this is what says it is not
     the dataset the sources asked for.
     """
+    opened: bool = True
+    """Whether the file could be opened at all.
+
+    The two ways to fall short are not the same thing. A file that stopped making sense part-way
+    through is ordinary bad PGN and left its earlier games behind; a file that could never be
+    opened left nothing, and means the dataset is missing everything that was in it — which is
+    why a build will not replace a dataset that is already there over one of these.
+    """
 
 
 class Filters(BaseModel):

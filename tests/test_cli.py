@@ -1,3 +1,6 @@
+import errno
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -166,3 +169,80 @@ def test_dataset_needs_a_command(capsys):
         main(["dataset"])
 
     assert exit_info.value.code == 2
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can read a file of any mode"
+)
+def test_dataset_build_says_so_when_a_source_could_not_be_read(tmp_path, capsys):
+    # Built, and not the dataset that was asked for. A cron job reads the exit status.
+    gone = tmp_path / "gone.pgn"
+    gone.write_text('[Event "x"]\n[Site "s"]\n[Result "1-0"]\n\n1. e4 e5 1-0\n')
+    gone.chmod(0o000)
+    try:
+        status = main(["dataset", "build", "games", fixture("lichess.pgn"), str(gone)])
+    finally:
+        gone.chmod(0o600)
+
+    assert status == 1, "a partial build is not a success"
+    error = capsys.readouterr().err
+    assert "missing everything in 1 source(s)" in error
+    assert str(gone) in error
+    assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 4
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can read a file of any mode"
+)
+def test_dataset_build_refuses_to_replace_a_dataset_with_less_than_it_has(tmp_path, capsys):
+    assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+    gone = tmp_path / "gone.pgn"
+    gone.write_text('[Event "x"]\n[Site "s"]\n[Result "1-0"]\n\n1. e4 e5 1-0\n')
+    gone.chmod(0o000)
+    capsys.readouterr()
+
+    try:
+        with pytest.raises(SystemExit) as exit_info:
+            main(
+                [
+                    "dataset",
+                    "build",
+                    "games",
+                    fixture("unrated.pgn"),
+                    str(gone),
+                    "--overwrite",
+                ]
+            )
+    finally:
+        gone.chmod(0o600)
+
+    assert exit_info.value.code == 2
+    assert "left alone" in capsys.readouterr().err
+    assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 4
+
+
+def test_dataset_build_closes_its_progress_line_when_it_fails(tmp_path, capsys):
+    # In a terminal the progress line is rewritten and left open, so a build that fails has to
+    # close it or whatever is printed next lands on the end of it.
+    import chess_ai.dataset
+    from chess_ai.dataset import ProgressPrinter, builder
+
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "REPORT_EVERY", 1)
+        patch.setattr(os, "fsync", out_of_space)
+        patch.setattr(
+            chess_ai.dataset,
+            "ProgressPrinter",
+            lambda *args, **kwargs: ProgressPrinter(sys.stderr, interval=0.0, rewrite=True),
+        )
+
+        with pytest.raises(OSError, match="No space left"):
+            main(["dataset", "build", "games", fixture("lichess.pgn")])
+
+    written = capsys.readouterr().err
+    assert "\r" in written, "it really was a line being rewritten"
+    assert written.endswith("\n"), "and it was closed"
+    assert "built" not in written, "without saying the build finished"
