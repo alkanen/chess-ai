@@ -1038,7 +1038,7 @@ def test_a_source_that_went_away_still_builds_a_dataset_that_is_not_there_yet(tm
     missing = [source for source in manifest.sources if source.went_away]
     assert len(missing) == 1
     assert missing[0].error is not None and "Permission denied" in missing[0].error
-    assert missing[0].gave_nothing, "it never got as far as a game"
+    assert missing[0].left_nothing, "it never got as far as a game"
     assert not any(source.went_away for source in manifest.sources if source.error is None)
 
 
@@ -1177,8 +1177,7 @@ def test_a_source_that_goes_away_is_recorded_as_the_file_and_not_the_chess(tmp_p
     source = manifest.sources[0]
     assert manifest.games == 1, "the game it read before the file went"
     assert source.went_away, "the file went away; the PGN in it was fine"
-    assert source.lost_games
-    assert not source.gave_nothing, "it did give one"
+    assert not source.left_nothing, "it did give one before it went"
 
 
 def test_bad_pgn_part_way_through_is_still_the_files_own_fault(tmp_path):
@@ -1201,7 +1200,6 @@ def test_bad_pgn_part_way_through_is_still_the_files_own_fault(tmp_path):
 
     assert replaced.games == 2
     assert not replaced.sources[0].went_away
-    assert not replaced.sources[0].lost_games
     assert open_dataset("test", data_dir=tmp_path).manifest.games == 2
 
 
@@ -1225,3 +1223,87 @@ def test_a_dataset_that_cannot_be_marked_as_discarded_is_left_whole(tmp_path):
     left = store.replaced_datasets(tmp_path, "test")
     assert left, "the old one is still there"
     assert load_manifest(left[0]).games == 4, "and whole, so renaming it back really would work"
+
+
+def nonsense_pgn(handle, **kwargs):
+    raise ValueError("the first record is not chess")
+
+
+def test_bad_pgn_in_the_very_first_game_is_not_a_file_that_went_away(tmp_path):
+    # The same file and the same corruption as the test above, at the top of the file instead of
+    # three games in. Where in the file it happened is not what decides anything: the file was
+    # there throughout either way, and those games do not exist to be missed.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", nonsense_pgn)
+
+        manifest = build(tmp_path / "data", "unrated.pgn", validation_fraction=0.0)
+
+    assert manifest.games == 0, "there was nothing in it to have"
+    assert not manifest.sources[0].went_away, "the file was there; its contents were not chess"
+    assert not manifest.sources[0].left_nothing
+    assert list_datasets(tmp_path / "data") == ["test"], "and nothing was in the way of building"
+
+
+def test_bad_pgn_in_the_very_first_game_is_refused_for_the_reason_it_is(tmp_path):
+    # Refusing to replace a dataset with an empty one is right; refusing it as a file that
+    # "could not be read" was not, because the file was read and had nothing in it.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", nonsense_pgn)
+
+        with pytest.raises(DatasetError, match="kept no games") as refusal:
+            build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert "could not be read" not in str(refusal.value)
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 4
+
+
+def test_one_source_of_nothing_but_junk_does_not_block_a_rebuild(tmp_path):
+    # The asymmetry that mattered: with another source still giving games, where the junk is in
+    # the file decides nothing at all.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_read_game = chess.pgn.read_game
+    seen = set()
+
+    def junk_in_one_file(handle, **kwargs):
+        if "unrated" in getattr(handle, "name", "") and handle.name not in seen:
+            seen.add(handle.name)
+            raise ValueError("the first record is not chess")
+        return real_read_game(handle, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", junk_in_one_file)
+
+        replaced = build(
+            tmp_path, "unrated.pgn", "custom-start.pgn", validation_fraction=0.0, overwrite=True
+        )
+
+    assert replaced.games == 1, "the other source's game"
+    assert not any(source.went_away for source in replaced.sources)
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 1
+
+
+def test_a_superseded_dataset_is_not_offered_back_over_a_newer_one(tmp_path, caplog):
+    # A dataset left beside a newer one is not one to rename into place, whichever way it got
+    # there: doing so would replace the newer one, silently, at the user's own hand.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_replace = os.replace
+
+    def replace(source, target, **kwargs):
+        if str(target).endswith(store.DISCARDED_SUFFIX):
+            raise OSError(errno.EACCES, "Permission denied")
+        return real_replace(source, target, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder.os, "replace", replace)
+
+        build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    caplog.clear()
+    build(tmp_path, "custom-start.pgn", validation_fraction=0.0, overwrite=True)
+
+    said = caplog.text
+    assert str(store.replaced_datasets(tmp_path, "test")[0]) in said
+    assert "interrupted" not in said, "this build finished; it just could not tidy up"
+    assert "newer" in said, "and what is in place now is newer than what is being reported"

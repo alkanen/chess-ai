@@ -374,3 +374,52 @@ def test_dataset_build_does_not_call_a_lost_source_a_success(tmp_path, capsys):
     written = capsys.readouterr()
     assert "missing games from 1 source(s)" in written.err
     assert "not read whole" not in written.out, "that is for a file that was there throughout"
+
+
+def dead_everywhere(patch, stream):
+    """Point the command's output and its progress reporting at one stream that will go away."""
+    import chess_ai.dataset
+    from chess_ai.dataset import ProgressPrinter, builder
+
+    patch.setattr(builder, "REPORT_EVERY", 1)
+    patch.setattr(sys, "stdout", stream)
+    patch.setattr(sys, "stderr", stream)
+    patch.setattr(
+        chess_ai.dataset,
+        "ProgressPrinter",
+        lambda *args, **kwargs: ProgressPrinter(stream, interval=0.0, rewrite=True),
+    )
+
+
+def test_dataset_build_survives_losing_every_stream_at_once(tmp_path):
+    # What a closed terminal or a dropped ssh session really does: the progress line, the summary
+    # and the error all go to the same place, and it goes away all at once.
+    with pytest.MonkeyPatch.context() as patch:
+        dead_everywhere(patch, DeadStream())
+
+        assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+
+    assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 4
+
+
+def test_dataset_build_still_exits_two_with_nowhere_to_say_why(tmp_path):
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as patch:
+        dead_everywhere(patch, DeadStream())
+        patch.setattr(os, "fsync", out_of_space)
+
+        with pytest.raises(SystemExit) as exit_info:
+            main(["dataset", "build", "games", fixture("lichess.pgn")])
+
+    assert exit_info.value.code == 2, "the exit status stands even with nobody to tell"
+
+
+def test_dataset_stats_survives_a_reader_that_went_away(tmp_path):
+    main(["dataset", "build", "games", fixture("lichess.pgn")])
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, "stdout", DeadStream())
+
+        assert main(["dataset", "stats", "games"]) == 0

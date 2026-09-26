@@ -64,23 +64,15 @@ class SourceInfo(BaseModel):
     """
 
     @property
-    def gave_nothing(self) -> bool:
-        """Whether the file left nothing at all behind, for a reason of its own.
+    def left_nothing(self) -> bool:
+        """Whether the file went away before a single game came back out of it.
 
-        Everything that was in it is missing, whether the file went away or its very first game
-        was unreadable.
+        Not "no games came back", which would be a count standing in for a reason: a file that is
+        there and whose every record is junk gave nothing either, and those games do not exist to
+        be missed. This is the file that went before it said anything, so what was in it is
+        unknown and the build has no idea what it is missing.
         """
-        return self.error is not None and self.games_read == 0
-
-    @property
-    def lost_games(self) -> bool:
-        """Whether this source left the dataset short of games that were in the file.
-
-        The question a build has to answer before replacing a dataset with this one: bad PGN is
-        the file's own fault and is fair to publish around, and a file that went away or gave
-        nothing is not.
-        """
-        return self.went_away or self.gave_nothing
+        return self.went_away and self.games_read == 0
 
 
 class Filters(BaseModel):

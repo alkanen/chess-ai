@@ -3,6 +3,7 @@
 import argparse
 import sys
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 
 from chess_ai.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_FILE, Config, ConfigError, load_config
@@ -18,12 +19,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = load_config(args.config)
         return args.handler(config, args)
     except (ConfigError, _UserError) as e:
-        parser.exit(2, f"{parser.prog}: error: {e}\n")
+        _say(f"{parser.prog}: error: {e}", err=True)
+        parser.exit(2)
         raise  # parser.exit has already left; this is only here to say so.
 
 
 class _UserError(Exception):
     """Something the person running the command can fix, reported without a traceback."""
+
+
+def _say(text: str, *, err: bool = False) -> None:
+    """Print ``text``, or do not, if there is nobody left to print it to.
+
+    Every stream this command writes to can go away while it is running, and they go together: a
+    closed terminal, a dropped ssh session, a pipe into ``head``. None of that is worth turning a
+    finished build into a traceback, and on the way out of a failed one it must not take the place
+    of the reason it failed. The exit status says what happened whether or not anyone hears it.
+    """
+    with suppress(OSError):
+        print(text, file=sys.stderr if err else sys.stdout, flush=True)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -101,9 +115,7 @@ def _serve(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.web import create_app
 
     server = config.server
-    print(
-        f"chess-ai: serving on http://{server.host}:{server.port}{server.path_prefix}/", flush=True
-    )
+    _say(f"chess-ai: serving on http://{server.host}:{server.port}{server.path_prefix}/")
     uvicorn.run(create_app(config), host=server.host, port=server.port)
     return 0
 
@@ -139,32 +151,30 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
         # A build that failed never printed that it was done, so the line it was rewriting is
         # still open and the error would otherwise be written onto the end of it.
         printer.finish()
-    lost = [source.path for source in manifest.sources if source.lost_games]
+    lost = [source.path for source in manifest.sources if source.went_away]
     # Only the sources that were there throughout and whose contents gave up: a source that went
     # away took an unknown number of games with it, and saying "not read whole" of that on stdout
     # while the warning says the rest of it understates it in the line a log gets read for.
     unread = [
         source.path
         for source in manifest.sources
-        if source.error is not None and not source.lost_games
+        if source.error is not None and not source.went_away
     ]
-    print(
+    _say(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
         f"{manifest.games:,} games, {manifest.positions:,} positions, "
         f"{manifest.games_skipped:,} skipped"
         # A source that could not be read leaves the dataset short of its games, which is not
         # something to leave to whoever thinks to run "dataset stats" afterwards.
-        + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else ""),
-        flush=True,
+        + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else "")
     )
     if lost:
         # Built, and not the dataset that was asked for. Said on its own line and answered for in
         # the exit status, because a build in a cron job is read by a script before a person.
-        print(
+        _say(
             f"chess-ai: warning: dataset {manifest.name} is missing games from "
             f"{len(lost)} source(s) that could not be read whole: {', '.join(lost)}",
-            file=sys.stderr,
-            flush=True,
+            err=True,
         )
         return 1
     return 0
@@ -177,7 +187,7 @@ def _dataset_stats(config: Config, args: argparse.Namespace) -> int:
         dataset = open_dataset(args.name, data_dir=config.paths.data)
     except (DatasetError, ManifestError) as e:
         raise _UserError(_with_available(e, config.paths.data)) from e
-    print(summarize(dataset.manifest), end="")
+    _say(summarize(dataset.manifest).rstrip("\n"))
     return 0
 
 

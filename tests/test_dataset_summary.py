@@ -210,21 +210,32 @@ def test_a_log_file_needs_no_closing():
     assert out.getvalue() == written
 
 
-def test_a_summary_tells_a_source_that_gave_nothing_from_one_that_gave_some(tmp_path):
+def test_a_summary_tells_the_three_ways_a_source_falls_short_apart(tmp_path):
     from chess_ai.dataset.manifest import SourceInfo
 
     manifest = build(tmp_path, "lichess.pgn", validation_fraction=0.0)
-    gave_nothing = SourceInfo(
+    left_nothing = SourceInfo(
         path="gone.pgn", bytes=1, games_read=0, games_kept=0, error="went away", went_away=True
+    )
+    went_away_later = SourceInfo(
+        path="dropped.pgn",
+        bytes=1,
+        games_read=9,
+        games_kept=9,
+        error="stale file handle",
+        went_away=True,
     )
     gave_up_later = SourceInfo(
         path="broken.pgn", bytes=1, games_read=5, games_kept=5, error="stopped after 5 games"
     )
-    described = manifest.model_copy(update={"sources": [gave_nothing, gave_up_later]})
+    described = manifest.model_copy(
+        update={"sources": [left_nothing, went_away_later, gave_up_later]}
+    )
 
     summary = summarize(described)
 
     assert "NOTHING READ FROM IT: went away" in summary
+    assert "WENT AWAY PART-WAY THROUGH: stale file handle" in summary
     assert "NOT READ WHOLE: stopped after 5 games" in summary
 
 

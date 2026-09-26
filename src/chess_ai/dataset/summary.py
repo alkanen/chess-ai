@@ -43,10 +43,11 @@ def summarize(manifest: Manifest) -> str:
         if source.error is not None:
             # A source the build could not read whole leaves the dataset short of its games,
             # which is the first thing to know about a dataset that looks smaller than it should.
-            # Three things worth telling apart: a file that gave nothing at all, a file that
-            # went away with an unknown number of its games still in it, and a file that was
-            # there throughout and whose chess stopped making sense, which is all it had.
-            if source.gave_nothing:
+            # Three things worth telling apart: a file that went before it said anything, a
+            # file that went away with an unknown number of its games still in it, and a file
+            # that was there throughout and whose chess stopped making sense, which is all it
+            # had to give.
+            if source.left_nothing:
                 what = "NOTHING READ FROM IT"
             elif source.went_away:
                 what = "WENT AWAY PART-WAY THROUGH"

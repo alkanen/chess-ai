@@ -185,27 +185,28 @@ def _check_worth_publishing(manifest: Manifest, directory: Path) -> None:
     that drops or a sync job that rotates a directory of dumps can leave a build with nothing in
     it. Being tolerant of one bad file must not extend to publishing that:
 
-    - if *every* source gave nothing, there is nothing to publish, whether or not a dataset of
-      this name is already there
-    - if *some* source went away or gave nothing and a dataset is already there, the dataset in
-      place was built from more than this one could be, and a nightly ``--overwrite`` must not
-      trade it for this. The remedy is to fix the source or stop naming it, not a flag that says
-      to carry on anyway
+    - if *every* source went away before saying anything, there is nothing to publish, whether or
+      not a dataset of this name is already there
+    - if *some* source went away and a dataset is already there, that source took an unknown
+      number of its games with it, the dataset in place was built from more than this one could
+      be, and a nightly ``--overwrite`` must not trade it for this. The remedy is to fix the
+      source or stop naming it, not a flag that says to carry on anyway
     - if *no games at all* were kept and a dataset is already there, it does not matter why: a
       dataset of nothing is not a replacement for a dataset of something. This is the one that
       catches a source truncated between being sized and being read, which fails in no way at all
       — no error, no games, nothing to complain of
 
     A source that was there throughout and whose *contents* stopped making sense is none of
-    these; see :attr:`~chess_ai.dataset.manifest.SourceInfo.lost_games`.
+    these, wherever in the file that happened: those games do not exist to be missed. See
+    :attr:`~chess_ai.dataset.manifest.SourceInfo.went_away`.
     """
-    nothing = [source for source in manifest.sources if source.gave_nothing]
-    lost = [source for source in manifest.sources if source.lost_games]
-    if nothing and len(nothing) == len(manifest.sources):
+    silent = [source for source in manifest.sources if source.left_nothing]
+    lost = [source for source in manifest.sources if source.went_away]
+    if silent and len(silent) == len(manifest.sources):
         raise DatasetError(
-            f"none of the {len(nothing)} source(s) of dataset {manifest.name!r} could be read, "
+            f"none of the {len(silent)} source(s) of dataset {manifest.name!r} could be read, "
             f"so there is nothing to build from: "
-            f"{', '.join(str(source.path) for source in nothing)}"
+            f"{', '.join(str(source.path) for source in silent)}"
         )
     if not directory.exists():
         return
@@ -323,7 +324,21 @@ def _report_leftovers(data_dir: Path, name: str) -> None:
             path,
             name,
         )
+    in_place = dataset_path(data_dir, name)
     for path in replaced_datasets(data_dir, name):
+        if in_place.exists():
+            # Either a build that could not mark it as discarded, or one interrupted between the
+            # two renames and followed by a later build. Which it was does not change the advice:
+            # what is in place now is newer, and renaming this over it would lose that.
+            LOGGER.warning(
+                "chess-ai: %s is a dataset %r that a build set aside and did not remove. What is "
+                "in %s now is newer than it, so renaming it back would replace the newer one; "
+                "keep it only if you want the older dataset, and remove it otherwise.",
+                path,
+                name,
+                in_place,
+            )
+            continue
         LOGGER.warning(
             "chess-ai: %s is the dataset %r that an interrupted build set aside and never put "
             "back. Nothing else will mention it: rename it to %s to have it again, or remove it.",
