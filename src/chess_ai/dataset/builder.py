@@ -163,7 +163,7 @@ def build_dataset(
                     name=name,
                     created=now if now is not None else datetime.now(UTC),
                 )
-            _check_sources_were_read(manifest, directory)
+            _check_worth_publishing(manifest, directory)
             manifest.save(partial)
             _publish(partial, directory, name=name, overwrite=overwrite)
         except BaseException:
@@ -178,37 +178,47 @@ def build_dataset(
     return manifest
 
 
-def _check_sources_were_read(manifest: Manifest, directory: Path) -> None:
-    """Refuse to publish a build that did not read the files it was given, where that would lose.
+def _check_worth_publishing(manifest: Manifest, directory: Path) -> None:
+    """Refuse to publish a build that read less than it was asked to, where that would lose.
 
-    The sources are sized when a build starts and opened as it reaches them, hours later, so a
-    mount that drops or a sync job that rotates a directory of dumps can leave a build reading
-    nothing at all. Such a build has no business being published:
+    The sources are sized when a build starts and read as it reaches them, hours later, so a mount
+    that drops or a sync job that rotates a directory of dumps can leave a build with nothing in
+    it. Being tolerant of one bad file must not extend to publishing that:
 
-    - if *no* source could be opened, there is nothing to publish, whether or not a dataset of
+    - if *every* source gave nothing, there is nothing to publish, whether or not a dataset of
       this name is already there
-    - if *some* source could not be opened and a dataset is already there, the dataset in place
-      is more complete than this one, and a nightly ``--overwrite`` must not trade it for this.
-      The remedy is to fix the source or to stop naming it, not a flag that says to carry on
+    - if *some* source gave nothing and a dataset is already there, the dataset in place was built
+      from more than this one could be, and a nightly ``--overwrite`` must not trade it for this.
+      The remedy is to fix the source or stop naming it, not a flag that says to carry on anyway
+    - if *no games at all* were kept and a dataset is already there, it does not matter why: a
+      dataset of nothing is not a replacement for a dataset of something. This is the one that
+      catches a source truncated between being sized and being read, which fails in no way at all
+      — no error, no games, nothing to complain of
 
-    A source that opened and then stopped making sense part-way through is not this: that is
-    ordinary bad PGN, its earlier games are in the dataset, and it is counted as skipped games.
+    A source that read some games and then stopped is none of these; see
+    :attr:`~chess_ai.dataset.manifest.SourceInfo.gave_nothing`.
     """
-    missing = [source for source in manifest.sources if not source.opened]
-    if not missing:
-        return
-    named = ", ".join(str(source.path) for source in missing)
-    if len(missing) == len(manifest.sources):
+    nothing = [source for source in manifest.sources if source.gave_nothing]
+    named = ", ".join(str(source.path) for source in nothing)
+    if nothing and len(nothing) == len(manifest.sources):
         raise DatasetError(
-            f"none of the {len(missing)} source(s) of dataset {manifest.name!r} could be read, "
+            f"none of the {len(nothing)} source(s) of dataset {manifest.name!r} could be read, "
             f"so there is nothing to build from: {named}"
         )
-    if directory.exists():
+    if not directory.exists():
+        return
+    if nothing:
         raise DatasetError(
-            f"{len(missing)} of the {len(manifest.sources)} source(s) of dataset "
+            f"{len(nothing)} of the {len(manifest.sources)} source(s) of dataset "
             f"{manifest.name!r} could not be read, and the dataset already in {directory} was "
             f"built from more than this one could be: {named}. It has been left alone; fix those "
             "sources, or leave them out to build from the rest on purpose"
+        )
+    if manifest.games == 0:
+        raise DatasetError(
+            f"this build of dataset {manifest.name!r} kept no games, and the dataset already in "
+            f"{directory} has {_games_in(directory)}. It has been left alone; check the "
+            "sources are what you meant before replacing it with nothing"
         )
 
 
@@ -263,11 +273,25 @@ def _publish(partial: Path, directory: Path, *, name: str, overwrite: bool) -> N
         discarded = discarded_path(aside)
         try:
             os.replace(aside, discarded)
+            # Made durable before a single file of it is unlinked: a crash part-way through the
+            # minutes it takes to delete 50 GB would otherwise leave the old name over gutted
+            # contents, which is the state the rename exists to prevent.
+            sync_directory(discarded.parent)
         except OSError:
             # Nothing else can be done about it here, and the dataset is already in place.
             discarded = aside
         # Past the point of no return: failing here leaves rubble rather than losing a dataset.
         shutil.rmtree(discarded, ignore_errors=True)
+
+
+def _games_in(directory: Path) -> str:
+    """How many games the dataset in ``directory`` holds, for saying what would have been lost."""
+    from chess_ai.dataset.manifest import ManifestError, load_manifest
+
+    try:
+        return f"{load_manifest(directory).games:,} games"
+    except ManifestError:
+        return "games in it"
 
 
 def _report_leftovers(data_dir: Path, name: str) -> None:

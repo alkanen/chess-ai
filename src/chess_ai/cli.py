@@ -131,12 +131,22 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
         )
     except DatasetError as e:
         raise _UserError(e) from e
+    except OSError as e:
+        # A full disk, a mount that went away: the most ordinary way a long build dies, and the
+        # one thing here that was still answered with a traceback.
+        raise _UserError(f"could not build dataset {args.name!r}: {e.strerror or e}") from e
     finally:
         # A build that failed never printed that it was done, so the line it was rewriting is
         # still open and the error would otherwise be written onto the end of it.
         printer.finish()
-    unread = [source.path for source in manifest.sources if source.error is not None]
-    missing = [source.path for source in manifest.sources if not source.opened]
+    missing = [source.path for source in manifest.sources if source.gave_nothing]
+    # Only the sources that were read and did not finish: a source that gave nothing at all is
+    # not "not read whole", and saying so twice about one file understates it the first time.
+    unread = [
+        source.path
+        for source in manifest.sources
+        if source.error is not None and not source.gave_nothing
+    ]
     print(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
         f"{manifest.games:,} games, {manifest.positions:,} positions, "

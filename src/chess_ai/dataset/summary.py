@@ -43,8 +43,9 @@ def summarize(manifest: Manifest) -> str:
         if source.error is not None:
             # A source the build could not read whole leaves the dataset short of its games,
             # which is the first thing to know about a dataset that looks smaller than it should.
-            # Not opening at all is the worse of the two: everything in that file is missing.
-            what = "NOT READ AT ALL" if not source.opened else "NOT READ WHOLE"
+            # Giving nothing is the worse of the two: everything in that file is missing,
+            # whether it could not be opened or gave up before its first game.
+            what = "NOTHING READ FROM IT" if source.gave_nothing else "NOT READ WHOLE"
             lines.append(f"    {what}: {source.error}")
     lines += ["", f"skipped games  {manifest.games_skipped:,}"]
     if manifest.skipped:

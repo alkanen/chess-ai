@@ -54,13 +54,25 @@ class SourceInfo(BaseModel):
     the dataset the sources asked for.
     """
     opened: bool = True
-    """Whether the file could be opened at all.
+    """Whether the file could be opened at all, which is a detail for whoever is reading.
 
-    The two ways to fall short are not the same thing. A file that stopped making sense part-way
-    through is ordinary bad PGN and left its earlier games behind; a file that could never be
-    opened left nothing, and means the dataset is missing everything that was in it — which is
-    why a build will not replace a dataset that is already there over one of these.
+    What a build decides on is :attr:`gave_nothing`; this only tells the two ways of giving
+    nothing apart in a report.
     """
+
+    @property
+    def gave_nothing(self) -> bool:
+        """Whether the file left nothing at all behind, for a reason of its own.
+
+        A file that could not be opened and a file that gave up before its first game are the same
+        thing from the dataset's side: everything that was in it is missing. Opening is not the
+        test, because a mount that drops rarely fails the open — the descriptor is often already
+        cached — and fails the first read instead.
+
+        A file that read some games and *then* stopped is not this. That is ordinary bad PGN: its
+        earlier games are in the dataset and its failure is counted among the skipped games.
+        """
+        return self.error is not None and self.games_read == 0
 
 
 class Filters(BaseModel):

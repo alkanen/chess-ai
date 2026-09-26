@@ -1088,3 +1088,49 @@ def test_a_half_removed_old_dataset_is_reported_as_rubble_not_as_a_dataset(tmp_p
     assert replaced.games == 3, "the new dataset went in"
     assert store.replaced_datasets(tmp_path, "test") == [], "nothing offers the gutted one back"
     assert store.discarded_datasets(tmp_path, "test"), "it is reported as rubble instead"
+
+
+def test_a_source_that_goes_away_on_its_first_read_does_not_replace_a_dataset(tmp_path):
+    # A mount that drops rarely fails the open — the descriptor is often already cached — it
+    # fails the first read. So "could it be opened" is not the question; "did it leave anything
+    # behind" is.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+    real_read_game = chess.pgn.read_game
+
+    def stale(handle, **kwargs):
+        raise OSError(errno.ESTALE, "Stale file handle")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", stale)
+
+        with pytest.raises(DatasetError, match="nothing to build from"):
+            build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert real_read_game is chess.pgn.read_game, "the patch is undone"
+    kept = open_dataset("test", data_dir=tmp_path).manifest
+    assert kept.games == 4, "the dataset that was there is the one still there"
+
+
+def test_a_source_truncated_to_nothing_does_not_replace_a_dataset(tmp_path):
+    # No error at all this time: a sync job that truncates a dump mid-build leaves a file the
+    # parser reads no games from, which is a build with nothing in it and nothing to complain of.
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(chess.pgn, "read_game", lambda handle, **kwargs: None)
+
+        with pytest.raises(DatasetError, match="no games"):
+            build(tmp_path, "unrated.pgn", validation_fraction=0.0, overwrite=True)
+
+    assert open_dataset("test", data_dir=tmp_path).manifest.games == 4
+
+
+def test_a_build_of_nothing_is_still_allowed_where_there_is_nothing_to_lose(tmp_path):
+    # The refusals above are about replacing a dataset, not about empty datasets as such.
+    empty = tmp_path / "empty.pgn"
+    empty.write_text("")
+
+    manifest = build(tmp_path / "data", str(empty), validation_fraction=0.0)
+
+    assert manifest.games == 0
+    assert list_datasets(tmp_path / "data") == ["test"]

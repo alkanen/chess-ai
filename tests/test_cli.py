@@ -239,10 +239,50 @@ def test_dataset_build_closes_its_progress_line_when_it_fails(tmp_path, capsys):
             lambda *args, **kwargs: ProgressPrinter(sys.stderr, interval=0.0, rewrite=True),
         )
 
-        with pytest.raises(OSError, match="No space left"):
+        with pytest.raises(SystemExit):
             main(["dataset", "build", "games", fixture("lichess.pgn")])
 
     written = capsys.readouterr().err
     assert "\r" in written, "it really was a line being rewritten"
-    assert written.endswith("\n"), "and it was closed"
     assert "built" not in written, "without saying the build finished"
+    # Closed before the error, rather than the error landing on the end of it.
+    progress, _, reported = written.partition("chess-ai: error:")
+    assert progress.endswith("\n"), written
+    assert reported
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root can read a file of any mode"
+)
+def test_dataset_build_does_not_call_a_file_it_never_opened_partly_read(tmp_path, capsys):
+    # One line about one file, and the right one: "not read whole" is for a source that was.
+    gone = tmp_path / "gone.pgn"
+    gone.write_text('[Event "x"]\n[Site "s"]\n[Result "1-0"]\n\n1. e4 e5 1-0\n')
+    gone.chmod(0o000)
+    try:
+        main(["dataset", "build", "games", fixture("lichess.pgn"), str(gone)])
+    finally:
+        gone.chmod(0o600)
+
+    written = capsys.readouterr()
+    assert "not read whole" not in written.out
+    assert "missing everything in 1 source(s)" in written.err
+
+
+def test_dataset_build_says_a_disk_that_filled_up_plainly(tmp_path, capsys):
+    # The most ordinary way a long build dies, and every other failure in this command says
+    # "chess-ai: error: ..." rather than showing a traceback.
+    def out_of_space(fd):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fsync", out_of_space)
+
+        with pytest.raises(SystemExit) as exit_info:
+            main(["dataset", "build", "games", fixture("lichess.pgn")])
+
+    assert exit_info.value.code == 2
+    error = capsys.readouterr().err
+    assert "chess-ai: error:" in error
+    assert "No space left on device" in error
+    assert "Traceback" not in error
