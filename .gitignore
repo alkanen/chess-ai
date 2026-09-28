@@ -10,6 +10,9 @@ chess-ai.toml
 # Datasets built from PGN files, in the default data directory (./data, and only there)
 /data/
 
+# Training runs, in the default runs directory (./runs, and only there)
+/runs/
+
 # PGN files downloaded to work with, which are nobody else's business
 /downloaded_games/
 

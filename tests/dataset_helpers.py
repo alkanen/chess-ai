@@ -24,14 +24,14 @@ def fixture(name: str) -> str:
     return str(path)
 
 
-def build(data_dir: Path, *sources: str, **options) -> Manifest:
+def build(data_dir: Path, *sources: str, name: str = "test", **options) -> Manifest:
     """Build a dataset called "test" from ``sources``, or from every fixture file.
 
     A bare fixture file name becomes its path; anything else is passed to the build as it is,
     so a test can hand it a glob, a directory or a file it wrote itself.
     """
     named = [fixture(source) if (FIXTURES / source).is_file() else source for source in sources]
-    return build_dataset("test", named or [str(FIXTURES)], data_dir=data_dir, **options)
+    return build_dataset(name, named or [str(FIXTURES)], data_dir=data_dir, **options)
 
 
 def move_sequences(split) -> list[tuple[int, ...]]:
