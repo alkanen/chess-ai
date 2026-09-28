@@ -5,11 +5,13 @@
       "id": "fools-mate",
       "white": {
         "name": "Scripted",
-        "accepts_moves": false
+        "accepts_moves": false,
+        "model": null
       },
       "black": {
         "name": "Scripted",
-        "accepts_moves": false
+        "accepts_moves": false,
+        "model": null
       },
       "start_fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
       "moves": [],

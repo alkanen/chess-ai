@@ -128,3 +128,23 @@ def test_reports_malformed_toml(tmp_path):
 
     with pytest.raises(ConfigError, match="invalid TOML"):
         load_config(path, environ={})
+
+
+def test_a_device_that_is_not_one_is_refused_when_the_config_is_read(tmp_path):
+    """Said at startup rather than at the first model game, which is far from the cause."""
+    path = write(tmp_path / "chess-ai.toml", '[inference]\ndevice = "gpu"\n')
+
+    with pytest.raises(ConfigError, match="inference.device"):
+        load_config(path, environ={})
+
+
+def test_a_device_from_the_environment_is_checked_too(tmp_path):
+    with pytest.raises(ConfigError, match="inference.device"):
+        load_config(environ={"CHESS_AI_INFERENCE_DEVICE": "metal"})
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "auto"])
+def test_the_devices_a_network_can_be_asked_to_run_on(tmp_path, device):
+    path = write(tmp_path / "chess-ai.toml", f'[inference]\ndevice = "{device}"\n')
+
+    assert load_config(path, environ={}).inference.device == device

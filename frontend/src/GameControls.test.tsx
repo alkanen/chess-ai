@@ -1,15 +1,18 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { GameState, PlayerKind } from './api';
+import type { GameState, PlayerInfo } from './api';
 import { GameControls } from './GameControls';
 import startPosition from './test/fixtures/start-position.json';
 
 const PGN = '[Event "chess-ai game"]\n[Result "*"]\n\n1. e4 *\n';
 
 const PLAYERS = {
-  human: { name: 'Human', accepts_moves: true },
-  random: { name: 'Random mover', accepts_moves: false },
-} satisfies Record<PlayerKind, { name: string; accepts_moves: boolean }>;
+  human: { name: 'Human', accepts_moves: true, model: null },
+  random: { name: 'Random mover', accepts_moves: false, model: null },
+} satisfies Record<string, PlayerInfo>;
+
+/** The kinds of player these tests set a game up between. */
+type Playing = keyof typeof PLAYERS;
 
 const POSITION = startPosition as GameState['position'];
 const GAME = 'a-game';
@@ -28,7 +31,7 @@ function pgnResponse(): Response {
 /** Every file the browser has been handed to save, as a download link would hand it. */
 const saved: { name: string; text: Promise<string> }[] = [];
 
-function gameOf(white: PlayerKind, black: PlayerKind, moves = 0): GameState {
+function gameOf(white: Playing, black: Playing, moves = 0): GameState {
   return {
     id: GAME,
     white: PLAYERS[white],

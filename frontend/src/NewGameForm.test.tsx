@@ -1,13 +1,79 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { CheckpointSummary, RunSummary } from './api';
 import { NewGameForm } from './NewGameForm';
+
+const HUMAN = { kind: 'human' };
+const RANDOM = { kind: 'random' };
+
+const RUNS: RunSummary[] = [
+  {
+    name: 'mlp-baseline',
+    architecture: 'mlp',
+    created: '2026-09-20T10:00:00Z',
+    status: 'finished',
+    step: 12000,
+    steps: 12000,
+    checkpoints: 2,
+  },
+  {
+    name: 'mlp-wider',
+    architecture: 'mlp',
+    created: '2026-09-18T10:00:00Z',
+    status: 'running',
+    step: 400,
+    steps: 8000,
+    checkpoints: 1,
+  },
+];
+
+const CHECKPOINTS: Record<string, CheckpointSummary[]> = {
+  'mlp-baseline': [
+    { step: 12000, created: '2026-09-20T12:00:00Z', metrics: {}, best: false, latest: true },
+    { step: 6000, created: '2026-09-20T11:00:00Z', metrics: {}, best: true, latest: false },
+  ],
+  'mlp-wider': [
+    { step: 400, created: '2026-09-18T11:00:00Z', metrics: {}, best: true, latest: true },
+  ],
+};
+
+/** A server with `runs` on it, answering each request with a body of its own. */
+function serving(runs: RunSummary[] = RUNS) {
+  return vi.fn((url: string) => {
+    if (url.endsWith('/api/runs')) {
+      return Promise.resolve(Response.json(runs));
+    }
+    const asked = /\/api\/runs\/([^/]+)\/checkpoints$/.exec(url);
+    if (asked !== null) {
+      const run = decodeURIComponent(asked[1]);
+      return Promise.resolve(Response.json({ run, checkpoints: CHECKPOINTS[run] ?? [] }));
+    }
+    return Promise.resolve(Response.json({}));
+  });
+}
+
+/** Everything the form has posted so far, which is every game it has started. */
+function posted(fetch: ReturnType<typeof vi.fn>): unknown[] {
+  return (fetch.mock.calls as [string, RequestInit?][])
+    .filter(([, init]) => init?.method === 'POST')
+    .map(([, init]) => JSON.parse(init?.body as string));
+}
 
 /** Starts a game with the form as it stands and returns what was posted. */
 async function start(fetch: ReturnType<typeof vi.fn>): Promise<unknown> {
+  const before = posted(fetch).length;
   fireEvent.click(screen.getByRole('button', { name: 'Start' }));
-  await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
-  const [, init] = fetch.mock.calls[0] as [string, RequestInit];
-  return JSON.parse(init.body as string);
+  await vi.waitFor(() => expect(posted(fetch).length).toBe(before + 1));
+  return posted(fetch)[before];
+}
+
+/** Gives `side` to a model and waits for the run it is offered to arrive. */
+async function chooseModel(side: 'White' | 'Black'): Promise<void> {
+  fireEvent.change(screen.getByLabelText(side), { target: { value: 'model' } });
+  await screen.findByLabelText(`${side} run`);
+  await vi.waitFor(() =>
+    expect(screen.getByLabelText(`${side} run`)).toHaveValue('mlp-baseline'),
+  );
 }
 
 describe('NewGameForm', () => {
@@ -18,7 +84,7 @@ describe('NewGameForm', () => {
     const base = document.createElement('base');
     base.href = '/chess/';
     document.head.append(base);
-    fetch = vi.fn().mockResolvedValue(Response.json({}));
+    fetch = serving();
     vi.stubGlobal('fetch', fetch);
   });
 
@@ -36,7 +102,7 @@ describe('NewGameForm', () => {
     const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
     expect(url).toBe(new URL('/chess/api/game', window.location.href).href);
     expect(init.method).toBe('POST');
-    expect(posted).toEqual({ white: 'human', black: 'random', move_delay: 2, fen: null });
+    expect(posted).toEqual({ white: HUMAN, black: RANDOM, move_delay: 2, fen: null });
     expect(await screen.findByRole('button', { name: 'Start' })).toBeEnabled();
   });
 
@@ -46,6 +112,12 @@ describe('NewGameForm', () => {
     expect(screen.getByLabelText('White')).toHaveDisplayValue('Human');
     expect(screen.getByLabelText('Black')).toHaveDisplayValue('Random mover');
     expect(screen.getByLabelText('Delay between moves')).toHaveDisplayValue('0.5 s');
+  });
+
+  it('asks the server nothing about runs until a model is chosen', () => {
+    render(<NewGameForm />);
+
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -58,7 +130,12 @@ describe('NewGameForm', () => {
     fireEvent.change(screen.getByLabelText('White'), { target: { value: white } });
     fireEvent.change(screen.getByLabelText('Black'), { target: { value: black } });
 
-    expect(await start(fetch)).toEqual({ white, black, move_delay: 0.5, fen: null });
+    expect(await start(fetch)).toEqual({
+      white: { kind: white },
+      black: { kind: black },
+      move_delay: 0.5,
+      fen: null,
+    });
   });
 
   it('paces nothing when both sides are played by hand, and says so', () => {
@@ -88,8 +165,8 @@ describe('NewGameForm', () => {
     expect(delay).toBeEnabled();
     expect(delay).toHaveDisplayValue('2 s');
     expect(await start(fetch)).toEqual({
-      white: 'human',
-      black: 'random',
+      white: HUMAN,
+      black: RANDOM,
       move_delay: 2,
       fen: null,
     });
@@ -111,8 +188,8 @@ describe('NewGameForm', () => {
     fireEvent.change(screen.getByLabelText('Start from FEN'), { target: { value: ` ${fen} ` } });
 
     expect(await start(fetch)).toEqual({
-      white: 'human',
-      black: 'random',
+      white: HUMAN,
+      black: RANDOM,
       move_delay: 0.5,
       // Typed-in positions come with whatever was pasted around them.
       fen,
@@ -138,5 +215,147 @@ describe('NewGameForm', () => {
     render(<NewGameForm />);
 
     expect(screen.getByLabelText('Start from FEN')).toHaveValue('');
+  });
+
+  describe('playing a checkpoint', () => {
+    it('offers the runs there are, newest first, and plays the first of them', async () => {
+      render(<NewGameForm />);
+
+      await chooseModel('Black');
+
+      expect(screen.getByLabelText('Black run')).toHaveDisplayValue(
+        'mlp-baseline (2 checkpoints, 12000/12000 steps)',
+      );
+      expect(
+        screen.getByRole('option', { name: 'mlp-wider (1 checkpoints, 400/8000 steps)' }),
+      ).toBeInTheDocument();
+      expect(await start(fetch)).toEqual({
+        white: HUMAN,
+        black: {
+          kind: 'model',
+          run: 'mlp-baseline',
+          checkpoint: 'best',
+          rating: null,
+          strategy: 'argmax',
+          temperature: 1,
+        },
+        move_delay: 0.5,
+        fen: null,
+      });
+    });
+
+    it('offers the best and the latest checkpoint as well as each one by step', async () => {
+      render(<NewGameForm />);
+
+      await chooseModel('White');
+
+      const checkpoint = await screen.findByLabelText('White checkpoint');
+      await vi.waitFor(() =>
+        expect(screen.getByRole('option', { name: 'Step 12000 (latest)' })).toBeInTheDocument(),
+      );
+      expect(screen.getByRole('option', { name: 'Step 6000 (best)' })).toBeInTheDocument();
+      expect(checkpoint).toHaveDisplayValue('Best');
+
+      fireEvent.change(checkpoint, { target: { value: '6000' } });
+
+      expect(await start(fetch)).toMatchObject({ white: { checkpoint: 6000 } });
+    });
+
+    it('asks for another run’s checkpoints and goes back to its best one', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+      fireEvent.change(await screen.findByLabelText('White checkpoint'), {
+        target: { value: '6000' },
+      });
+
+      fireEvent.change(screen.getByLabelText('White run'), { target: { value: 'mlp-wider' } });
+
+      await vi.waitFor(() =>
+        expect(screen.getByRole('option', { name: 'Step 400 (best, latest)' })).toBeInTheDocument(),
+      );
+      expect(screen.getByLabelText('White checkpoint')).toHaveDisplayValue('Best');
+      expect(await start(fetch)).toMatchObject({
+        white: { run: 'mlp-wider', checkpoint: 'best' },
+      });
+    });
+
+    it('plays like the rating that was typed in', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1600' } });
+
+      expect(await start(fetch)).toMatchObject({ white: { rating: 1600 } });
+    });
+
+    it('claims no rating at all when the box is left empty', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      expect(screen.getByLabelText('White rating')).toHaveValue(null);
+      expect(await start(fetch)).toMatchObject({ white: { rating: null } });
+    });
+
+    it('offers a temperature only when the model samples its move', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      expect(screen.queryByLabelText('White temperature')).not.toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText('White plays'), { target: { value: 'sample' } });
+      fireEvent.change(screen.getByLabelText('White temperature'), { target: { value: '1.5' } });
+
+      expect(await start(fetch)).toMatchObject({
+        white: { strategy: 'sample', temperature: 1.5 },
+      });
+    });
+
+    it('sets the two sides up as different checkpoints of the same run', async () => {
+      render(<NewGameForm />);
+
+      await chooseModel('White');
+      await chooseModel('Black');
+      fireEvent.change(await screen.findByLabelText('Black checkpoint'), {
+        target: { value: '6000' },
+      });
+
+      expect(await start(fetch)).toMatchObject({
+        white: { kind: 'model', checkpoint: 'best' },
+        black: { kind: 'model', checkpoint: 6000 },
+      });
+    });
+
+    it('keeps the run and rating while the side is given back to a person', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1200' } });
+
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'model' } });
+
+      expect(screen.getByLabelText('White rating')).toHaveValue(1200);
+      expect(await start(fetch)).toMatchObject({ white: { run: 'mlp-baseline', rating: 1200 } });
+    });
+
+    it('says when there is nothing here to play against, and will not start', async () => {
+      vi.stubGlobal('fetch', serving([]));
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'model' } });
+
+      expect(await screen.findByText(/No training runs have been kept here yet/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+    });
+
+    it('says why the runs could not be listed', async () => {
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('', { status: 500 })));
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'model' } });
+
+      expect(
+        await screen.findByText(/Could not list the training runs/),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+    });
   });
 });

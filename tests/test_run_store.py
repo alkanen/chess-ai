@@ -1,11 +1,13 @@
 """The run directory: what it writes, what it keeps, and what a reader sees mid-write."""
 
 import json
+import os
 from datetime import UTC, datetime
 
 import pytest
 
 from chess_ai.encoders import create_encoder
+from chess_ai.training import run_store
 from chess_ai.training.run_store import (
     CHECKPOINT_INDEX,
     CHECKPOINTS_DIR,
@@ -20,9 +22,11 @@ from chess_ai.training.run_store import (
     RunStatus,
     RunWriter,
     checkpoint_file,
+    choose_checkpoint,
     code_version,
     list_runs,
     open_run,
+    read_checkpoints,
     run_path,
 )
 
@@ -424,3 +428,96 @@ def test_the_code_version_says_which_commit_or_which_release():
     version = code_version()
 
     assert version.startswith(("git ", "version ")), version
+
+
+def test_opening_a_run_that_is_not_kept_here(tmp_path):
+    """Said as a missing run rather than as an empty one: the two mean different things."""
+    with pytest.raises(RunError, match="no run called 'ghost'"):
+        open_run(tmp_path, "ghost")
+
+
+def test_opening_a_run_whose_name_could_never_be_one(tmp_path):
+    with pytest.raises(RunError, match="invalid run name"):
+        open_run(tmp_path, "../elsewhere")
+
+
+def test_a_run_can_be_opened_before_it_has_written_anything_but_its_directory(tmp_path):
+    """A checkpoint is self-contained, so a half-written run is still one worth opening."""
+    (tmp_path / "started").mkdir()
+
+    assert open_run(tmp_path, "started").checkpoints() == []
+
+
+def test_choosing_the_best_the_latest_or_a_particular_checkpoint(tmp_path):
+    with writer(tmp_path, policy=CheckpointPolicy(keep=3)) as run:
+        save(run, 10, policy_loss=2.0)
+        save(run, 20, policy_loss=1.0)
+        save(run, 30, policy_loss=3.0)
+    reader = open_run(tmp_path, "test")
+
+    assert choose_checkpoint(reader, "best").step == 20
+    assert choose_checkpoint(reader, "latest").step == 30
+    assert choose_checkpoint(reader, 10).step == 10
+
+
+def test_the_best_checkpoint_of_a_run_that_has_not_validated_yet(tmp_path):
+    """Nothing to judge them by, so the newest is the only answer there is."""
+    with writer(tmp_path) as run:
+        save(run, 10)
+        save(run, 20)
+
+    assert choose_checkpoint(open_run(tmp_path, "test"), "best").step == 20
+
+
+def test_choosing_a_checkpoint_from_a_step_that_was_never_saved(tmp_path):
+    with writer(tmp_path) as run:
+        save(run, 10)
+
+    with pytest.raises(RunError, match="no checkpoint from step 15"):
+        choose_checkpoint(open_run(tmp_path, "test"), 15)
+
+
+def test_choosing_a_checkpoint_from_a_run_that_has_saved_none(tmp_path):
+    with writer(tmp_path):
+        pass
+
+    with pytest.raises(RunError, match="not saved a checkpoint"):
+        choose_checkpoint(open_run(tmp_path, "test"), "best")
+
+
+class Vanished:
+    """A directory entry for a checkpoint that goes between the scan and the stat.
+
+    What a reader sees when something outside this module touches the directory: a
+    checkpoint deleted by hand, or one the reader is not allowed to read.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def is_file(self) -> bool:
+        # os.DirEntry swallows a FileNotFoundError here and answers False for a path that
+        # has gone; what it does not swallow is the one in stat().
+        return True
+
+    def stat(self):
+        raise FileNotFoundError(2, "No such file or directory", self.name)
+
+
+def test_a_checkpoint_that_goes_while_the_directory_is_read_is_not_one(tmp_path, monkeypatch):
+    """A file that is gone is not a checkpoint, and is no reason to fail the whole listing."""
+    with writer(tmp_path) as run:
+        save(run, 10)
+    checkpoints = run_path(tmp_path, "test") / CHECKPOINTS_DIR
+    # Held before it is replaced: run_store.os is the os module itself, so the replacement
+    # would otherwise call itself.
+    scandir = os.scandir
+    monkeypatch.setattr(
+        run_store.os,
+        "scandir",
+        lambda directory: [Vanished(checkpoint_file(20)), *scandir(directory)],
+    )
+
+    found = read_checkpoints(checkpoints)
+
+    assert [info.step for info in found] == [10]

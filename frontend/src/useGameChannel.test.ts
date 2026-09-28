@@ -7,8 +7,8 @@ import { useGameChannel } from './useGameChannel';
 
 const GAME = {
   id: 'a-game',
-  white: { name: 'Human', accepts_moves: true },
-  black: { name: 'Random mover', accepts_moves: false },
+  white: { name: 'Human', accepts_moves: true, model: null },
+  black: { name: 'Random mover', accepts_moves: false, model: null },
   moves: [],
   position: startPosition,
 } as unknown as GameState;

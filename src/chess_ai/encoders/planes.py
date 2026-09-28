@@ -17,9 +17,10 @@ is built, and the packed board in each record is unpacked with shifts and masks.
 
 from typing import Final
 
+import chess
 import numpy as np
 
-from chess_ai.dataset import POSITION_DTYPE, PositionFlags
+from chess_ai.dataset import POSITION_DTYPE, PositionFlags, live_position
 from chess_ai.dataset.records import NO_SQUARE
 from chess_ai.encoders.registry import ENCODERS
 from chess_ai.encoders.spec import BOARD_SIZE, EncoderSpec, InputBundle
@@ -107,6 +108,23 @@ class BoardPlanesEncoder:
         """
         positions = np.asarray(positions, dtype=POSITION_DTYPE).reshape(-1)
         return InputBundle(spatial=self._planes(positions), globals=self._globals(positions))
+
+    def encode_board(
+        self,
+        board: chess.Board,
+        *,
+        mover_rating: int | None = None,
+        opponent_rating: int | None = None,
+    ) -> InputBundle:
+        """Encode one position being played, as a batch of one.
+
+        Through a record and :meth:`encode`, rather than reading the board directly: the two
+        paths then cannot drift apart, and a position played here is encoded as the same
+        position out of a dataset would be.
+        """
+        return self.encode(
+            live_position(board, mover_rating=mover_rating, opponent_rating=opponent_rating)
+        )
 
     def _planes(self, positions: np.ndarray) -> np.ndarray:
         """The piece planes, as (batch, :data:`PIECE_PLANES`, 8, 8) ``float32``."""

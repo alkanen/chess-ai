@@ -3,15 +3,20 @@
 A game session asks the player to move whenever it is that player's turn. Human,
 model, Stockfish and search-based players all implement the same interface, so game
 sessions, matches and the UI never need to know which kind they are dealing with.
+
+The two narrower protocols below are what a session does have to tell apart: which sides a
+viewer may move for, and which sides are a checkpoint playing. Both are answered by asking the
+player, so that adding a kind of player adds nothing here — and so that nothing in this module,
+which the web server imports to start any game at all, has to know what a network is.
 """
 
 import asyncio
 import random
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 import chess
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class MoveRejectedError(Exception):
@@ -64,6 +69,60 @@ class Player(Protocol):
 
     async def choose_move(self, context: GameContext) -> PlayerMove:
         """Return a legal move for the side to move in ``context.board``."""
+        ...
+
+
+SelectionStrategy = Literal["argmax", "sample"]
+"""How a player turns a distribution over moves into the one move it plays.
+
+Named here rather than with the network, because it is a property of the player: the same
+checkpoint plays its best move or samples from its distribution, and a search-based player will
+one day choose by another rule again from the same probabilities.
+"""
+
+DEFAULT_TEMPERATURE = 1.0
+"""Sampling straight from the distribution given, neither flattened nor sharpened."""
+
+MIN_TEMPERATURE = 0.01
+"""The lowest temperature worth asking for: below this, sampling is argmax with extra steps.
+
+Here beside the strategy rather than with the sampling, so that whatever takes the setting —
+a web request, a config file, a match runner — refuses the same values the sampler would.
+"""
+
+
+class ModelDescription(BaseModel):
+    """Which model a player is, and how it was asked to play.
+
+    Everything here is what a game was played with rather than what the network is, so that a
+    game watched now and a PGN read in six months both say which weights produced the moves.
+    """
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    run: str
+    """The training run the weights came from."""
+    checkpoint: int
+    """The step the checkpoint was saved at, which is what names it in the run."""
+    rating: int | None = None
+    """The rating it was asked to play like, or ``None`` for a position that claims none."""
+    strategy: SelectionStrategy = "argmax"
+    temperature: float | None = None
+    """How flat the distribution is sampled from; ``None`` when it is not sampled at all."""
+
+
+@runtime_checkable
+class ModelBackedPlayer(Protocol):
+    """A player whose moves come from a checkpoint, which is what it can say about itself.
+
+    Recognized the way :class:`SubmittedMovePlayer` is, so that a game session can describe a
+    model player to viewers and to PGN without knowing what an inference engine is — and without
+    the web server importing torch to find out.
+    """
+
+    @property
+    def model(self) -> ModelDescription:
+        """Which checkpoint plays these moves, and how it was asked to choose them."""
         ...
 
 

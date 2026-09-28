@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 import chess
 
 from chess_ai.game_session import GameEvent, GameSession, GameState
-from chess_ai.players import GameContext, PlayerMove, Thoughts
+from chess_ai.players import GameContext, ModelDescription, PlayerMove, Thoughts
 
 
 class ScriptedPlayer:
@@ -20,6 +20,28 @@ class ScriptedPlayer:
 
     async def choose_move(self, context: GameContext) -> PlayerMove:
         return PlayerMove(chess.Move.from_uci(next(self._moves)), self._thoughts)
+
+
+class ScriptedModelPlayer(ScriptedPlayer):
+    """A scripted player that says it is a checkpoint, which is what a model player adds.
+
+    Everything a game, a PGN or a browser is told about a model comes from the description,
+    never from the weights, so what these tests are about needs no weights.
+    """
+
+    def __init__(
+        self,
+        moves: Sequence[str],
+        model: ModelDescription,
+        thoughts: Thoughts | None = None,
+    ) -> None:
+        super().__init__(moves, thoughts)
+        self.name = f"{model.run} step {model.checkpoint}"
+        self._model = model
+
+    @property
+    def model(self) -> ModelDescription:
+        return self._model
 
 
 class PlayerBroke(Exception):

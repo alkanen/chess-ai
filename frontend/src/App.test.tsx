@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { PlayerKind, PositionSnapshot } from './api';
+import type { PlayerInfo, PositionSnapshot } from './api';
 import { App } from './App';
 import {
   checkSquare,
@@ -16,16 +16,19 @@ import { foolsMateMoves, foolsMateStart, type StateEvent } from './test/foolsMat
 import { castling, check, drawnByFiftyMoves, promotion } from './test/positions';
 
 const PLAYERS = {
-  human: { name: 'Human', accepts_moves: true },
-  random: { name: 'Random mover', accepts_moves: false },
-} satisfies Record<PlayerKind, { name: string; accepts_moves: boolean }>;
+  human: { name: 'Human', accepts_moves: true, model: null },
+  random: { name: 'Random mover', accepts_moves: false, model: null },
+} satisfies Record<string, PlayerInfo>;
+
+/** The kinds of player these tests set a game up between. */
+type Playing = keyof typeof PLAYERS;
 
 const GAME = 'the-game';
 
 /** A game at the given position, between the given kinds of player. */
 function gameOf(
-  white: PlayerKind,
-  black: PlayerKind,
+  white: Playing,
+  black: Playing,
   position: PositionSnapshot,
   id = GAME,
 ): StateEvent {
@@ -208,13 +211,53 @@ describe('App', () => {
       type: 'state',
       game: {
         ...foolsMateStart.game,
-        white: { name: 'Random mover', accepts_moves: false },
-        black: { name: 'Someone else', accepts_moves: false },
+        white: { name: 'Random mover', accepts_moves: false, model: null },
+        black: { name: 'Someone else', accepts_moves: false, model: null },
       },
     });
 
     const players = screen.getAllByRole('definition').map((element) => element.textContent);
     expect(players).toEqual(['Random mover', 'Someone else']);
+  });
+
+  it('says how each checkpoint of a model against model game was asked to play', () => {
+    render(<App />);
+    FakeWebSocket.latest.open();
+
+    FakeWebSocket.latest.deliver({
+      type: 'state',
+      game: {
+        ...foolsMateStart.game,
+        white: {
+          name: 'mlp-baseline step 12000',
+          accepts_moves: false,
+          model: {
+            run: 'mlp-baseline',
+            checkpoint: 12000,
+            rating: 1600,
+            strategy: 'argmax',
+            temperature: null,
+          },
+        },
+        black: {
+          name: 'mlp-baseline step 6000',
+          accepts_moves: false,
+          model: {
+            run: 'mlp-baseline',
+            checkpoint: 6000,
+            rating: null,
+            strategy: 'sample',
+            temperature: 1.5,
+          },
+        },
+      },
+    });
+
+    const players = screen.getAllByRole('definition').map((element) => element.textContent);
+    expect(players).toEqual([
+      'mlp-baseline step 12000plays like 1600, plays its best move',
+      'mlp-baseline step 6000no rating, samples at 1.5',
+    ]);
   });
 
   it('reconnects after losing the connection and catches up with the game', () => {

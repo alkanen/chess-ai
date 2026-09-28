@@ -1,54 +1,88 @@
-import { useState, type FormEvent } from 'react';
-import { PLAYER_NAMES, startGame, type PlayerKind } from './api';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { fetchRuns, startGame, type RunSummary } from './api';
+import {
+  isPlayable,
+  NO_MODEL,
+  playerSpec,
+  PlayerPicker,
+  resolved,
+  type PlayerChoice,
+} from './PlayerPicker';
 import './NewGameForm.css';
-
-const PLAYER_KINDS = Object.keys(PLAYER_NAMES) as PlayerKind[];
 
 /** Choices for the delay between moves, in seconds. */
 const MOVE_DELAYS = [0, 0.1, 0.25, 0.5, 1, 2, 5];
 const DEFAULT_MOVE_DELAY = 0.5;
 
-interface PlayerChoiceProps {
-  label: string;
-  value: PlayerKind;
-  onChange: (kind: PlayerKind) => void;
-}
+/**
+ * The runs there are to play against, or null until they arrive, and why there are none.
+ *
+ * Asked for the first time a side is given to a model, and not before: most games started
+ * here have no model in them, and a server with no runs on it should answer no questions
+ * about runs. Asked once, because a run that saves its first checkpoint meanwhile is one
+ * reload away and nothing here is worth polling the server for.
+ */
+function useRuns(wanted: boolean): [RunSummary[] | null, string | null] {
+  const [runs, setRuns] = useState<RunSummary[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const asked = useRef(false);
 
-function PlayerChoice({ label, value, onChange }: PlayerChoiceProps) {
-  return (
-    <label>
-      {label}{' '}
-      <select value={value} onChange={(e) => onChange(e.target.value as PlayerKind)}>
-        {PLAYER_KINDS.map((kind) => (
-          <option key={kind} value={kind}>
-            {PLAYER_NAMES[kind]}
-          </option>
-        ))}
-      </select>
-    </label>
-  );
+  useEffect(() => {
+    if (!wanted || asked.current) {
+      return;
+    }
+    asked.current = true;
+    let dropped = false;
+    fetchRuns().then(
+      (found) => !dropped && setRuns(found),
+      (e: unknown) => {
+        if (!dropped) {
+          // An empty list rather than no list: the form has an answer to give, which is
+          // that there is nothing here to play against.
+          setRuns([]);
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      },
+    );
+    return () => {
+      dropped = true;
+    };
+  }, [wanted]);
+
+  return [runs, error];
 }
 
 /** Starts a new game on the server, replacing the current one for every viewer. */
 export function NewGameForm() {
-  const [white, setWhite] = useState<PlayerKind>('human');
-  const [black, setBlack] = useState<PlayerKind>('random');
+  const [white, setWhite] = useState<PlayerChoice>({ ...NO_MODEL, kind: 'human' });
+  const [black, setBlack] = useState<PlayerChoice>({ ...NO_MODEL, kind: 'random' });
   const [moveDelay, setMoveDelay] = useState(DEFAULT_MOVE_DELAY);
   const [fen, setFen] = useState('');
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runs, runsError] = useRuns(white.kind === 'model' || black.kind === 'model');
 
+  // What is actually being asked for: a model chosen before the runs arrived means the
+  // run it is being shown, which is the first of them.
+  const sides = { white: resolved(white, runs), black: resolved(black, runs) };
   // The delay holds back a move a player works out for itself, so two people at the
   // board have nothing to hold back. The setting is kept, just switched off.
-  const pacesNothing = white === 'human' && black === 'human';
+  const pacesNothing = sides.white.kind === 'human' && sides.black.kind === 'human';
+  // A model with no run to play is not a player, and the server would only refuse it.
+  const ready = isPlayable(sides.white) && isPlayable(sides.black);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStarting(true);
     setError(null);
     try {
-      // An empty box is not a position: that game starts where games start.
-      await startGame({ white, black, move_delay: moveDelay, fen: fen.trim() || null });
+      await startGame({
+        white: playerSpec(sides.white),
+        black: playerSpec(sides.black),
+        move_delay: moveDelay,
+        // An empty box is not a position: that game starts where games start.
+        fen: fen.trim() || null,
+      });
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -59,8 +93,11 @@ export function NewGameForm() {
   return (
     <form className="new-game" aria-labelledby="new-game-heading" onSubmit={submit}>
       <h2 id="new-game-heading">New game</h2>
-      <PlayerChoice label="White" value={white} onChange={setWhite} />
-      <PlayerChoice label="Black" value={black} onChange={setBlack} />
+      <PlayerPicker label="White" value={white} onChange={setWhite} runs={runs} />
+      <PlayerPicker label="Black" value={black} onChange={setBlack} runs={runs} />
+      {runsError !== null && (
+        <p className="note">Could not list the training runs: {runsError}</p>
+      )}
       <label>
         Delay between moves{' '}
         <select
@@ -91,7 +128,7 @@ export function NewGameForm() {
           onChange={(e) => setFen(e.target.value)}
         />
       </label>
-      <button type="submit" disabled={starting}>
+      <button type="submit" disabled={starting || !ready}>
         Start
       </button>
       {error !== null && <p role="alert">Could not start the game: {error}</p>}

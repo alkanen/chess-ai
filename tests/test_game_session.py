@@ -10,6 +10,7 @@ import pytest
 from game_helpers import (
     BrokenPlayer,
     PlayerBroke,
+    ScriptedModelPlayer,
     ScriptedPlayer,
     collect,
     playing,
@@ -22,6 +23,7 @@ from chess_ai.game_session import ActionRejectedError, GameSession, IllegalMoveE
 from chess_ai.players import (
     CandidateMove,
     HumanPlayer,
+    ModelDescription,
     MoveRejectedError,
     RandomPlayer,
     Thoughts,
@@ -72,8 +74,28 @@ async def test_state_names_the_players_and_says_who_takes_submitted_moves():
     session = GameSession(RandomPlayer(), HumanPlayer())
 
     state = session.state
-    assert state.white.model_dump() == {"name": "Random mover", "accepts_moves": False}
-    assert state.black.model_dump() == {"name": "Human", "accepts_moves": True}
+    assert state.white.model_dump() == {
+        "name": "Random mover",
+        "accepts_moves": False,
+        # Neither side is a checkpoint, and a viewer is told so rather than left to guess.
+        "model": None,
+    }
+    assert state.black.model_dump() == {
+        "name": "Human",
+        "accepts_moves": True,
+        "model": None,
+    }
+
+
+async def test_state_says_which_checkpoint_is_playing_a_side_one_is_playing():
+    model = ModelDescription(run="mlp-baseline", checkpoint=12000, rating=1600)
+    session = GameSession(ScriptedModelPlayer([], model), HumanPlayer())
+
+    state = session.state
+    assert state.white.name == "mlp-baseline step 12000"
+    assert state.white.model == model
+    assert state.white.accepts_moves is False
+    assert state.black.model is None
 
 
 @pytest.mark.parametrize("seed", range(10))

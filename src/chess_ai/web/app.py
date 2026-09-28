@@ -9,11 +9,11 @@ import asyncio
 import html
 import logging
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import aclosing, asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, assert_never
 
 import chess
 from fastapi import (
@@ -39,8 +39,33 @@ from chess_ai.config import Config
 from chess_ai.game_session import ActionRejectedError, GameSession, GameState
 from chess_ai.pgn import MEDIA_TYPE as PGN_MEDIA_TYPE
 from chess_ai.pgn import game_pgn, pgn_filename, save_game
-from chess_ai.players import HumanPlayer, MoveRejectedError, Player, RandomPlayer
-from chess_ai.position_view import Color, InvalidFenError, PositionSnapshot, snapshot
+from chess_ai.players import (
+    DEFAULT_TEMPERATURE,
+    MIN_TEMPERATURE,
+    HumanPlayer,
+    MoveRejectedError,
+    Player,
+    RandomPlayer,
+    SelectionStrategy,
+)
+from chess_ai.position_view import (
+    Color,
+    InvalidFenError,
+    PositionSnapshot,
+    board_from_fen,
+    snapshot,
+)
+from chess_ai.training.run_store import (
+    CheckpointChoice,
+    Heartbeat,
+    RunError,
+    RunInfo,
+    RunReader,
+    RunStatus,
+    choose_checkpoint,
+    list_runs,
+    open_run,
+)
 from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
 
 logger = logging.getLogger(__name__)
@@ -71,11 +96,54 @@ _WHICH_GAME = (
     "it are returned whichever one this is."
 )
 
-PlayerKind = Literal["human", "random"]
-_PLAYERS: dict[PlayerKind, Callable[[], Player]] = {
-    "human": HumanPlayer,
-    "random": RandomPlayer,
-}
+
+class PlayerSpec(BaseModel):
+    """What one side of a new game is to be played by.
+
+    A tagged union rather than a name, because the kinds of player do not take the same
+    settings: a checkpoint needs a run, a step, a rating and a way of choosing its move, and
+    the engine that comes next needs a strength. ``kind`` is what tells them apart, so adding
+    a kind adds a class here and takes nothing away.
+    """
+
+    model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
+
+
+class HumanSpec(PlayerSpec):
+    """A person at a browser, whose moves are submitted over the game WebSocket."""
+
+    kind: Literal["human"]
+
+
+class RandomSpec(PlayerSpec):
+    """A uniformly random legal move, which is what there was to play against first."""
+
+    kind: Literal["random"]
+
+
+class ModelSpec(PlayerSpec):
+    """A checkpoint from a training run, playing by its policy."""
+
+    kind: Literal["model"]
+
+    run: str
+    """The training run to take the weights from, by the name it is kept under."""
+    checkpoint: CheckpointChoice = "best"
+    """Which checkpoint of the run to play: "latest", "best", or a step number."""
+    rating: int | None = Field(default=None, ge=0, le=4000)
+    """The rating to play like, given to the network as both sides' rating. Left out, the
+    position claims no rating at all, which is also something the model was trained on."""
+    strategy: SelectionStrategy = "argmax"
+    """"argmax" plays the most likely move every time; "sample" draws from the distribution."""
+    temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=MIN_TEMPERATURE, le=10)
+    """How flat the distribution is sampled from: below 1 sharpens towards the best move,
+    above 1 flattens towards a coin toss. Not used when the model plays its best move."""
+    seed: int | None = None
+    """Fixes the sampling, so that the same game can be played twice. Left out, it is not."""
+
+
+AnyPlayer = Annotated[HumanSpec | RandomSpec | ModelSpec, Field(discriminator="kind")]
+"""What either colour may be played by; see :class:`PlayerSpec`."""
 
 
 class NewGameRequest(BaseModel):
@@ -83,8 +151,8 @@ class NewGameRequest(BaseModel):
     # only place someone choosing a move delay has to go on.
     model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
-    white: PlayerKind
-    black: PlayerKind
+    white: AnyPlayer
+    black: AnyPlayer
     move_delay: float = Field(default=0.5, ge=0, le=10)
     """The least number of seconds before a move a player works out for itself, so that a
     game between players that move instantly can be followed. A move a human submits is
@@ -92,6 +160,52 @@ class NewGameRequest(BaseModel):
     fen: str | None = None
     """The position to start the game from, which the side it gives the move opens from.
     The standard starting position is used when this is left out."""
+
+
+class RunSummary(BaseModel):
+    """One training run, as the new-game form lists it.
+
+    Everything but the name is optional: a run being written right now, or one whose
+    ``run.json`` cannot be read, is still a run with checkpoints worth playing against.
+    """
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    name: str
+    architecture: str | None = None
+    created: datetime | None = None
+    status: RunStatus | None = None
+    """What the run's last heartbeat said, which for a run that is not running may be stale."""
+    step: int | None = None
+    """How far the run has got, as its last heartbeat said."""
+    steps: int | None = None
+    """How far it is going, which with ``step`` says how far through it is."""
+    checkpoints: int = 0
+    """How many checkpoints there are to choose between."""
+
+
+class CheckpointSummary(BaseModel):
+    """One checkpoint of a run, as the form lists it."""
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    step: int
+    created: datetime
+    metrics: dict[str, float | None] = {}
+    """The validation metrics measured at this step, which is what "best" is decided on."""
+    best: bool
+    """Whether this is the run's best checkpoint by its own metric."""
+    latest: bool
+    """Whether this is the newest checkpoint of the run."""
+
+
+class RunCheckpoints(BaseModel):
+    """A run's checkpoints, newest first, which is the order they are offered in."""
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    run: str
+    checkpoints: list[CheckpointSummary]
 
 
 class ViewerAction(BaseModel):
@@ -158,6 +272,14 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
         logger.info("Saved the finished game to %s", save_game(game, config.paths.games))
 
     game_channel = GameChannel(on_finished=save_finished_game)
+    # One game starts at a time. Making a model player reads a checkpoint off the disk, which
+    # the handler suspends for, and two starts that interleave there would finish in whichever
+    # order their players happened to be built: the game somebody asked for first could come
+    # back and replace the game that replaced it, and the viewer who started that second game
+    # would have been told it was theirs. Held for the whole of starting, so that the games
+    # start in the order they were asked for — and so that two checkpoints are never loaded
+    # at once on a machine that may also be training.
+    starting = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -181,29 +303,84 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     def start_position() -> PositionSnapshot:
         return snapshot(chess.Board())
 
-    @api.post("/game")
+    @api.post(
+        "/game",
+        responses={
+            400: {
+                "description": "The position cannot be played from, or a player cannot be "
+                "made: no such run, no such checkpoint, or a checkpoint that cannot be loaded"
+            },
+            500: {
+                "description": "A model was asked for and the inference device this server "
+                "is configured with is not there on this machine"
+            },
+            503: {"description": "The server is shutting down and is starting no more games"},
+        },
+    )
     async def new_game(request: NewGameRequest) -> GameState:
         """Start a new game, replacing the current one for every viewer.
 
         A game starts from the standard starting position unless a FEN says otherwise.
-        A FEN that cannot be played from is refused, and the current game plays on.
+        Anything that would stop the game being started is refused, and the current game
+        plays on: a FEN that cannot be played from, or a checkpoint that is not there. Not
+        every refusal is the asker's doing — a configured inference device that this machine
+        does not have is answered as the server's own fault, and a server on its way down
+        starts nothing at all.
         """
-        try:
-            session = GameSession(
-                _PLAYERS[request.white](),
-                _PLAYERS[request.black](),
-                move_delay=request.move_delay,
-                fen=request.fen,
-            )
-        except InvalidFenError as invalid:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(invalid)) from invalid
-        try:
-            game_channel.start(session)
-        except GameChannelClosedError as closed:
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "the server is shutting down"
-            ) from closed
+        # The position is checked before the players are made, so that a mistyped FEN is
+        # answered at once rather than after tens of megabytes of checkpoint have been read.
+        if request.fen is not None:
+            try:
+                board_from_fen(request.fen)
+            except InvalidFenError as invalid:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(invalid)) from invalid
+        async with starting:
+            # Making the players happens on a worker thread: a model player reads a checkpoint
+            # off the disk and builds a network from it, which the game being played meanwhile,
+            # and every viewer watching it, should not be held up by.
+            white, black = await run_in_threadpool(_players, request, config)
+            session = GameSession(white, black, move_delay=request.move_delay, fen=request.fen)
+            try:
+                game_channel.start(session)
+            except GameChannelClosedError as closed:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "the server is shutting down"
+                ) from closed
         return session.state
+
+    # The two routes below read run directories, which the trainer may be writing to at this
+    # moment. Plain `def`, so that FastAPI runs them in a worker thread: the reads are small,
+    # but they are file reads all the same, and the game is being played on the event loop.
+
+    @api.get("/runs")
+    def runs(response: Response) -> list[RunSummary]:
+        """Every training run here, newest first, with what it takes to pick one to play.
+
+        Kept by nobody: a run saves a checkpoint at a moment of its own, and a list that a
+        browser had kept would go on offering the checkpoints of an hour ago.
+        """
+        response.headers.update(NO_STORE)
+        found = [
+            _describe_run(RunReader(config.paths.runs / name))
+            for name in list_runs(config.paths.runs)
+        ]
+        # Newest first, because the run someone wants to play against is almost always the
+        # one they are training now. A run that does not say when it began sorts last.
+        found.sort(key=lambda run: run.created.timestamp() if run.created else 0.0, reverse=True)
+        return found
+
+    @api.get(
+        "/runs/{name}/checkpoints",
+        responses={404: {"description": "No run of that name is kept here"}},
+    )
+    def run_checkpoints(name: str, response: Response) -> RunCheckpoints:
+        """The checkpoints of one run, newest first, to choose which to play against."""
+        response.headers.update(NO_STORE)
+        try:
+            run = open_run(config.paths.runs, name)
+        except RunError as missing:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
+        return _describe_checkpoints(run)
 
     @api.get(
         "/game/pgn",
@@ -350,6 +527,142 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
     app.mount(prefix or "/", _FrontendFiles(directory=static_dir, check_dir=False), name="static")
 
     return app
+
+
+def _players(request: NewGameRequest, config: Config) -> tuple[Player, Player]:
+    """Both sides of a new game, made from what was asked for.
+
+    Raises:
+        HTTPException: a player cannot be made. A run, a checkpoint or the weights in it that
+            are not what the request said are answered as a bad request rather than a fault of
+            the server's: the person who asked chose the run and the checkpoint, and the
+            message names what was wrong with the choice. The one refusal that is not theirs
+            is an inference device this machine does not have, which nobody choosing a player
+            picked; :func:`_model_player` answers that as the server's own fault.
+    """
+    # One engine per checkpoint rather than per player: a checkpoint playing itself at two
+    # ratings, or its best move against its own sampling, is one set of weights and two ways
+    # of choosing from them. Everything a player was asked for — the rating, the strategy,
+    # its generator — lives in the player, so the engine has nothing of either side in it.
+    engines: dict[tuple[str, int], Any] = {}
+    try:
+        return (
+            _player(request.white, config, engines),
+            _player(request.black, config, engines),
+        )
+    except RunError as missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(missing)) from missing
+
+
+def _player(spec: AnyPlayer, config: Config, engines: dict[tuple[str, int], Any]) -> Player:
+    match spec:
+        case HumanSpec():
+            return HumanPlayer()
+        case RandomSpec():
+            return RandomPlayer()
+        case ModelSpec():
+            return _model_player(spec, config, engines)
+        case _:
+            # The union is closed, so this is unreachable until somebody adds a kind of
+            # player and not the case that makes it. Said here, where the omission is, rather
+            # than left to fail on the first move of a game with nobody playing it.
+            assert_never(spec)
+
+
+def _model_player(spec: ModelSpec, config: Config, engines: dict[tuple[str, int], Any]) -> Player:
+    """A checkpoint, loaded and sat down at the board.
+
+    The inference package is imported here rather than at the top of this module, because it
+    is what brings in torch: a server that is replaying games and playing people against the
+    random mover has no use for it, and starting up is a second or two quicker without it.
+
+    ``engines`` is what the two sides of one game share, keyed by the checkpoint they came
+    from; see :func:`_players`.
+    """
+    from chess_ai.inference import DeviceUnavailableError, InferenceError, ModelPlayer, load_engine
+
+    run = open_run(config.paths.runs, spec.run)
+    chosen = choose_checkpoint(run, spec.checkpoint)
+    engine = engines.get((run.name, chosen.step))
+    if engine is None:
+        try:
+            engine = load_engine(
+                run.checkpoint_path(chosen),
+                device=config.inference.device,
+                batch_size=config.inference.batch_size,
+            )
+        except DeviceUnavailableError as misconfigured:
+            # Nobody who clicked Start chose the device; the machine this server runs on did.
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(misconfigured)
+            ) from misconfigured
+        except InferenceError as unusable:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(unusable)) from unusable
+        engines[(run.name, chosen.step)] = engine
+    return ModelPlayer(
+        engine,
+        run=run.name,
+        checkpoint=chosen.step,
+        rating=spec.rating,
+        strategy=spec.strategy,
+        temperature=spec.temperature,
+        seed=spec.seed,
+    )
+
+
+def _describe_run(run: RunReader) -> RunSummary:
+    """One run as the new-game form lists it, as far as its files can be read.
+
+    A run being written right now is a run someone may well want to play against, so anything
+    unreadable is left out rather than turned into a refusal: the name and the checkpoints on
+    the disk are enough to pick one. Every part is read on its own, so that whatever cannot be
+    read costs this run that one line of its description and costs the other runs nothing —
+    one run mid-save must not turn the whole list into "could not list the training runs".
+    """
+    summary = RunSummary(name=run.name)
+    for part, describe in (
+        ("what it has saved", lambda: {"checkpoints": len(run.checkpoints())}),
+        ("what it is", lambda: _describes(run.info)),
+        ("where it has got to", lambda: _got_to(run.status)),
+    ):
+        try:
+            summary = summary.model_copy(update=describe())
+        except (RunError, OSError):
+            logger.debug("run %s does not say %s", run.name, part, exc_info=True)
+    return summary
+
+
+def _describes(info: RunInfo) -> dict[str, Any]:
+    """What ``run.json`` adds to a run's line in the list."""
+    return {
+        "architecture": info.model.architecture,
+        "created": info.created,
+        "steps": info.steps,
+    }
+
+
+def _got_to(beat: Heartbeat | None) -> dict[str, Any]:
+    """What the last heartbeat adds, or nothing at all before a run has written one."""
+    return {} if beat is None else {"status": beat.status, "step": beat.step}
+
+
+def _describe_checkpoints(run: RunReader) -> RunCheckpoints:
+    """A run's checkpoints, newest first, each saying whether it is the best or the newest."""
+    index = run.checkpoint_index()
+    latest = index.checkpoints[-1].step if index.checkpoints else None
+    return RunCheckpoints(
+        run=run.name,
+        checkpoints=[
+            CheckpointSummary(
+                step=info.step,
+                created=info.created,
+                metrics=info.metrics,
+                best=info.step == index.best_step,
+                latest=info.step == latest,
+            )
+            for info in reversed(index.checkpoints)
+        ],
+    )
 
 
 async def _read_at_most(body: AsyncIterator[bytes], limit: int) -> bytes:

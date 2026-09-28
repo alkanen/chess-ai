@@ -6,15 +6,29 @@ wired together and write what they promise, which a small model shows as well as
 """
 
 import textwrap
+from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 import chess
 import numpy as np
+import torch
 from dataset_helpers import build
 
 from chess_ai.dataset import POSITION_DTYPE, RatingSource, Result, TimeControl
 from chess_ai.dataset.records import position_record
+from chess_ai.encoders import create_encoder
+from chess_ai.models import create_model
 from chess_ai.move_codec import move_index
+from chess_ai.training import checkpoint
+from chess_ai.training.run_store import (
+    CheckpointPolicy,
+    DatasetReference,
+    ModelReference,
+    RunInfo,
+    RunStatus,
+    RunWriter,
+)
 
 VALIDATION_FRACTION = 0.3
 """Enough of the fixture games held back that the validation split is worth measuring on."""
@@ -94,3 +108,75 @@ def experiment(path: Path, dataset_name: str = "test", **settings) -> Path:
     )
     path.write_text(text + "\n", encoding="utf-8")
     return path
+
+
+def model_run(
+    runs_dir: Path,
+    name: str = "tiny",
+    *,
+    steps: Sequence[int] = (2, 4),
+    depth: int = 1,
+    width: int = 4,
+    seed: int = 7,
+) -> Path:
+    """A run directory with real checkpoints in it, written without training anything.
+
+    What the inference and web tests need is a file the engine can load, not a model that has
+    learned something: untrained weights make a legal move as surely as trained ones do. Each
+    step gets weights of its own, so a test can tell two checkpoints apart by the moves they
+    play, and the validation metrics fall as the steps rise — which makes the *first* step the
+    best one, so that "best" and "latest" are never the same checkpoint.
+    """
+    encoder = create_encoder("board-planes")
+    options = {"depth": depth, "width": width}
+    directory = runs_dir / name
+    info = RunInfo(
+        name=name,
+        created=datetime.now(UTC),
+        seed=seed,
+        code_version="test",
+        device="cpu",
+        dataset=DatasetReference(
+            name="test",
+            directory=str(runs_dir / "data" / "test"),
+            format_version=1,
+            games=2,
+            positions=40,
+            train_positions=30,
+            validation_positions=10,
+        ),
+        encoder=encoder.spec,
+        model=ModelReference(
+            architecture="mlp",
+            options=options,
+            parameter_count=create_model("mlp", encoder.spec, **options).parameter_count,
+        ),
+        config={},
+        steps=max(steps),
+        batch_size=8,
+    )
+    with RunWriter.create(
+        directory, info, config_text="", policy=CheckpointPolicy(keep=len(steps))
+    ) as writer:
+        for index, step in enumerate(steps):
+            # A seed per step, so that two checkpoints of one run are two different models.
+            torch.manual_seed(seed + step)
+            model = create_model("mlp", encoder.spec, **options)
+            metrics = {"policy_loss": 1.0 + index}
+            payload = checkpoint.build(
+                step=step,
+                run=name,
+                seed=seed,
+                architecture="mlp",
+                model_options=options,
+                spec=encoder.spec,
+                config={},
+                model_state=model.state_dict(),
+                optimizer_state={},
+                metrics=metrics,
+            )
+            writer.save_checkpoint(
+                step, lambda path, saved=payload: checkpoint.save(saved, path), metrics=metrics
+            )
+        writer.finish(RunStatus.FINISHED, step=max(steps), steps=max(steps))
+    return directory
