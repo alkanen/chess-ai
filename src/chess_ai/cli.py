@@ -126,6 +126,7 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.set_defaults(handler=_serve)
 
     _add_dataset_commands(commands)
+    _add_train_command(commands)
     return parser
 
 
@@ -178,6 +179,63 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
     )
     stats.add_argument("name", help="the dataset to summarise")
     stats.set_defaults(handler=_dataset_stats)
+
+
+def _add_train_command(commands: argparse._SubParsersAction) -> None:
+    """``chess-ai train``: one experiment config file, one run directory."""
+    train = commands.add_parser(
+        "train",
+        help="train a model from an experiment config file",
+        description="Train the architecture an experiment config names, on the dataset it "
+        "names, and write everything the run produces to a run directory. The config file is "
+        "copied into the run, so a run can always be traced back to what produced it.",
+    )
+    train.add_argument("config_file", type=Path, metavar="CONFIG", help="the experiment config")
+    train.add_argument(
+        "--name",
+        metavar="NAME",
+        help="what to call the run, overriding the config (default: the config's name, "
+        "else the config file's own name)",
+    )
+    train.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace a run of this name that is already there, metrics and checkpoints and all",
+    )
+    train.set_defaults(handler=_train)
+
+
+def _train(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.training import ExperimentError, RunError, TrainingError, load_experiment, train
+
+    try:
+        experiment = load_experiment(args.config_file, name=args.name)
+    except ExperimentError as e:
+        raise _UserError(e) from e
+    try:
+        config_text = args.config_file.read_text(encoding="utf-8")
+    except OSError as e:
+        raise _UserError(f"cannot read {args.config_file}: {e.strerror}") from e
+    try:
+        train(
+            experiment,
+            data_dir=config.paths.data,
+            runs_dir=config.paths.runs,
+            config_text=config_text,
+            overwrite=args.overwrite,
+            say=_say,
+        )
+    except (TrainingError, RunError) as e:
+        # train() turns the run store's errors into TrainingError; RunError is caught as well
+        # so that a path it does not cover cannot become a traceback either.
+        raise _UserError(e) from e
+    except KeyboardInterrupt:
+        # Not an error: somebody pressed ctrl-c. The run has already said it stopped.
+        _say("chess-ai: interrupted", err=True)
+        return 130
+    except OSError as e:
+        raise _UserError(f"could not finish the run: {e.strerror or e}") from e
+    return 0
 
 
 def _serve(config: Config, args: argparse.Namespace) -> int:

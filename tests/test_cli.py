@@ -596,3 +596,84 @@ def test_a_program_that_detached_stdout_is_not_given_one_either(tmp_path):
 
     assert "atexit" not in detached.stderr
     assert "_drain_streams" not in detached.stderr
+
+
+def test_train_writes_a_run_in_the_configured_runs_directory(tmp_path, capsys):
+    from training_helpers import dataset, experiment
+
+    from chess_ai.training import RunStatus, open_run
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+
+    assert main(["train", str(config)]) == 0
+
+    out = capsys.readouterr().out
+    reader = open_run(tmp_path / "runs", "tiny")
+    assert reader.status.status == RunStatus.FINISHED
+    assert "mlp," in out and "parameters" in out, "the parameter count, before it starts"
+    assert "positions/s measured" in out, "and how fast a step actually was"
+    assert "runs/tiny" in out, "and where the run went"
+
+
+def test_train_uses_the_configured_runs_directory(tmp_path):
+    from training_helpers import dataset, experiment
+
+    from chess_ai.training import list_runs
+
+    dataset(tmp_path / "elsewhere")
+    config = tmp_path / "custom.toml"
+    config.write_text(
+        f'[paths]\ndata = "{tmp_path / "elsewhere"}"\nruns = "{tmp_path / "somewhere"}"\n'
+    )
+
+    assert main(["--config", str(config), "train", str(experiment(tmp_path / "tiny.toml"))]) == 0
+
+    assert list_runs(tmp_path / "somewhere") == ["tiny"]
+
+
+def test_train_can_be_given_the_run_name_on_the_command_line(tmp_path):
+    from training_helpers import dataset, experiment
+
+    from chess_ai.training import list_runs
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+
+    assert main(["train", str(config), "--name", "second-try"]) == 0
+
+    assert list_runs(tmp_path / "runs") == ["second-try"]
+
+
+def test_train_refuses_to_write_over_a_run_unless_told_to(tmp_path, capsys):
+    from training_helpers import dataset, experiment
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+    assert main(["train", str(config)]) == 0
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["train", str(config)])
+
+    assert exit_info.value.code == 2
+    assert "already in" in capsys.readouterr().err
+    assert main(["train", str(config), "--overwrite"]) == 0
+
+
+def test_train_reports_a_config_it_cannot_use_without_a_traceback(tmp_path, capsys):
+    broken = tmp_path / "broken.toml"
+    broken.write_text('[dataset]\nname = "games"\n[training]\nbatch_size = -1\n')
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["train", str(broken)])
+
+    assert exit_info.value.code == 2
+    assert "invalid experiment config" in capsys.readouterr().err
+
+
+def test_train_reports_a_missing_config_file(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["train", str(tmp_path / "nowhere.toml")])
+
+    assert exit_info.value.code == 2
+    assert "cannot read experiment config" in capsys.readouterr().err

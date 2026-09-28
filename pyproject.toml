@@ -8,7 +8,9 @@ dependencies = [
     "chess>=1.11.2",
     "fastapi>=0.141.1",
     "numpy>=2.5.3",
+    "nvidia-ml-py>=13.615.71",
     "pydantic>=2.13.5",
+    "torch>=2.14.0",
     "uvicorn[standard]>=0.53.0",
 ]
 

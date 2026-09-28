@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, and the CLI builds training datasets out of PGN files; the models and the trainer come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, the CLI builds training datasets out of PGN files, and it trains an MLP on them from an experiment config file; more architectures, the evaluator and the runs dashboard come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -41,12 +41,12 @@ A testbed for training neural-network chess players the way large language model
 
 The trainer, the evaluator and the web server are independent processes that share run directories on disk. Restarting the web server never interrupts training.
 
-## Planned tech stack
+## Tech stack
 
 | Area | Choice |
 |---|---|
 | Language and packaging | Python 3.12, managed with [uv](https://docs.astral.sh/uv/) |
-| Machine learning | PyTorch with CUDA (developed on an RTX 4090 under WSL2) |
+| Machine learning | PyTorch with CUDA, bfloat16 (developed on an RTX 4090 under WSL2) |
 | Chess rules, PGN and UCI | [python-chess](https://python-chess.readthedocs.io/) |
 | Web server | FastAPI + uvicorn |
 | Frontend | React + TypeScript, built with Vite; custom SVG board |
@@ -61,7 +61,7 @@ Running the system needs only Python and the built frontend. Node.js is only nee
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/). It installs Python 3.12 for the project by itself; the system Python is not used.
 - [Node.js](https://nodejs.org/) 22.12 or later with npm, only to build the frontend.
-- For training (not needed yet, and never needed to serve the UI): an NVIDIA GPU with a recent driver. PyTorch's wheels bring their own CUDA runtime, so no CUDA toolkit is needed. Under WSL2, install the NVIDIA driver on the Windows side only, never inside WSL; `nvidia-smi` in WSL should then list the GPU.
+- For training, an NVIDIA GPU with a recent driver. Not needed to serve the UI, and not needed to train either — training falls back to the CPU, slowly. PyTorch's wheels bring their own CUDA runtime, so no CUDA toolkit is needed. Under WSL2, install the NVIDIA driver on the Windows side only, never inside WSL; `nvidia-smi` in WSL should then list the GPU.
 
 ### Install
 
@@ -96,6 +96,7 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[server] path_prefix` | `CHESS_AI_SERVER_PATH_PREFIX` | empty (serve at `/`) |
 | `[paths] games` | `CHESS_AI_PATHS_GAMES` | `games`, in the working directory |
 | `[paths] data` | `CHESS_AI_PATHS_DATA` | `data`, in the working directory |
+| `[paths] runs` | `CHESS_AI_PATHS_RUNS` | `runs`, in the working directory |
 
 ### Serve
 
@@ -160,6 +161,81 @@ results
 
 `.pgn.zst` Lichess dumps, a command that downloads them, and filters on rating, time control,
 termination and date are next.
+
+### Train a model
+
+A run is started from one experiment config file, which says everything it depends on: the
+dataset, the input encoding, the architecture and its size, the optimizer and the schedule, what
+to validate and how often, what to keep, and the seed. [experiments/mlp-baseline.toml](experiments/mlp-baseline.toml)
+lists every option with its built-in default noted beside it, and only `[dataset] name` has to be
+filled in:
+
+```sh
+uv run chess-ai train experiments/mlp-baseline.toml
+```
+
+It uses the GPU when there is one, in bfloat16, and the CPU when there is not. Before it starts
+it says what it is about to do, including how many parameters the model has and how fast a real
+step actually ran, so a two-day run can be recognised as one before it is two days in:
+
+```
+chess-ai: run mlp-baseline, seed 1234
+  device     cuda:0 NVIDIA GeForce RTX 4090, 24 GiB, bf16
+  dataset    carlsen: 4,500 games, 331,842 train positions, 6,772 validation
+  encoder    board-planes: spatial 12x8x8, globals 11, policy 1968
+  model      mlp, 4,918,195 parameters (depth=3, dropout=0.0, width=1024)
+  schedule   10,000 steps of 1024 (30.9 epochs), lr 0.001 warmup 500 then cosine
+  throughput 240,000 positions/s measured, about 43s for the run
+```
+
+The model is shown a position as 12 planes of 8×8 — one per piece type and colour — and a
+separate vector of what is not on the board: side to move, castling rights, en passant, the
+halfmove clock, and both players' ratings divided by 5000 with a flag for each rating the file
+did not give. It answers with a score for every one of the 1,968 moves in the shared vocabulary
+and a win/draw/loss judgement of the position from the mover's point of view. The loss is
+cross-entropy on the move actually played, plus a weighted cross-entropy on how the game
+actually ended.
+
+Validation runs on the held-back games at `[validation] every_steps`, on the same positions every
+time so the curve means something, and prints and logs five numbers:
+
+```
+  step    500/10,000  policy 4.8213  value 1.0402  top1 14.2%  top5 36.1%  illegal 12.4%
+```
+
+`top1` and `top5` are how often the played move is the model's first or top-five guess, which is
+what a move-prediction model is for. `illegal` is how often the model's own best move cannot be
+played at all: nothing tells the network the rules, so watching that fall is the clearest early
+sign it is learning chess rather than move frequencies. At play time the distribution is masked
+down to legal moves, so a high rate costs strength rather than legality.
+
+Each run lands in `<runs>/<name>/`:
+
+```
+runs/mlp-baseline/config.toml        the config as it was written, comments and all
+runs/mlp-baseline/run.json           the same config resolved, the code version, the seed,
+                                     the dataset, the encoder spec and the parameter count
+runs/mlp-baseline/metrics.jsonl      append-only, one JSON object per measurement
+runs/mlp-baseline/status.json        the heartbeat: step, epoch, positions/s, ETA, GPU
+runs/mlp-baseline/checkpoints/       step-<step>.pt, plus an index naming the best
+```
+
+Nothing is rewritten in place: the metrics log is appended to and everything else is written to a
+temporary name and renamed over the old one, so the run directory can be read at any moment —
+which is how the web server will follow a run without ever talking to the trainer. Checkpoints
+hold the weights, the optimizer state, the config and the encoder spec, so one is enough on its
+own; `[checkpoints] keep` bounds how many are kept, and the best one by `[checkpoints] metric` is
+kept however old it gets.
+
+A run directory is never written into twice. Give the run another name, in the config or with
+`--name`, or pass `--overwrite` to replace one:
+
+```sh
+uv run chess-ai train experiments/mlp-baseline.toml --name mlp-baseline-lr3
+```
+
+Resuming a stopped run, fine-tuning from another run's checkpoint, and following a run in the
+browser are next.
 
 ### Shortcuts with make
 

@@ -31,3 +31,11 @@ games = "games"
 # relative path is relative to the directory chess-ai runs in, and a leading ~ is
 # your home directory. The directory is made when it is first needed.
 data = "data"
+
+# Where training runs are kept, one directory per run: the config it was started
+# from, its metrics log, its heartbeat and its checkpoints. Checkpoints are the
+# large part, and how many are kept is the run's own business (see the
+# [checkpoints] section of an experiment config). A relative path is relative to
+# the directory chess-ai runs in, and a leading ~ is your home directory. The
+# directory is made when it is first needed.
+runs = "runs"
