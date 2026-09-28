@@ -32,17 +32,15 @@ stops the run instead of quietly training at a default; see :mod:`chess_ai.regis
 import re
 import tomllib
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from chess_ai.config import Device
 from chess_ai.encoders import BOARD_PLANES
 from chess_ai.training.run_store import CheckpointPolicy
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-
-Device = Literal["auto", "cuda", "cpu"]
-"""What a config may ask to train on. ``auto`` is the GPU when there is one, else the CPU."""
 
 VALIDATION_METRICS: Final = {
     "loss": False,

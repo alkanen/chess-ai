@@ -13,7 +13,7 @@ from pathlib import Path
 import chess
 import chess.pgn
 
-from chess_ai.game_session import GameState
+from chess_ai.game_session import GameState, PlayerInfo
 from chess_ai.position_view import GameOverReason, board_from_fen
 
 MEDIA_TYPE = "application/x-chess-pgn"
@@ -77,6 +77,8 @@ def game_pgn(game: GameState, *, now: datetime | None = None) -> str:
     )
     if over is not None:
         record.headers["Termination"] = TERMINATIONS[over.reason]
+    for color, player in (("White", game.white), ("Black", game.black)):
+        record.headers.update(_model_tags(color, player))
     node: chess.pgn.GameNode = record
     for move in game.moves:
         node = node.add_main_variation(chess.Move.from_uci(move.uci))
@@ -116,3 +118,33 @@ def save_game(game: GameState, directory: Path, *, now: datetime | None = None) 
 def _player_type(accepts_moves: bool) -> str:
     """What PGN calls a player: a person at a board, or something computing its moves."""
     return "human" if accepts_moves else "program"
+
+
+def _model_tags(color: str, player: PlayerInfo) -> dict[str, str]:
+    """Which checkpoint played this side: ``WhiteRun`` and the rest, or nothing for a person.
+
+    A game is worth keeping only if it says what produced it: two of these files differ by a
+    run, a step, a rating or a way of choosing, and the moves alone cannot say which.
+
+    Tags of this project's own, because PGN has none that mean these things. The rating in
+    particular is not ``WhiteElo``: it is the rating the model was asked to imitate, not an
+    estimate of how well it plays, and writing it where every other program reads a strength
+    from would be a claim this project has not measured.
+    """
+    model = player.model
+    if model is None:
+        return {}
+    tags = {
+        "Run": model.run,
+        "Checkpoint": str(model.checkpoint),
+        "Rating": str(model.rating) if model.rating is not None else None,
+        "Selection": _selection(model.strategy, model.temperature),
+    }
+    return {f"{color}{tag}": value for tag, value in tags.items() if value is not None}
+
+
+def _selection(strategy: str, temperature: float | None) -> str:
+    """How the model picked its move: its best one, or a draw at the temperature it used."""
+    if strategy != "sample" or temperature is None:
+        return strategy
+    return f"{strategy} {temperature:g}"

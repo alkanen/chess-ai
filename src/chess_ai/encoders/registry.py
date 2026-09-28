@@ -2,6 +2,7 @@
 
 from typing import Any, Final, Protocol
 
+import chess
 import numpy as np
 
 from chess_ai.encoders.spec import EncoderSpec, InputBundle
@@ -9,7 +10,13 @@ from chess_ai.registry import Registry
 
 
 class Encoder(Protocol):
-    """What every encoder does: say its shapes, and turn dataset records into model input."""
+    """What every encoder does: say its shapes, and turn positions into model input.
+
+    Two ways in, for the two places positions come from. Training hands over a batch of dataset
+    records; a game being played hands over the board itself, which has no move played in it, no
+    result and no game around it to fill a record's other fields with. Both come out as the same
+    bundle, so a checkpoint sees at play time exactly what it was trained on.
+    """
 
     @property
     def spec(self) -> EncoderSpec:
@@ -18,6 +25,21 @@ class Encoder(Protocol):
 
     def encode(self, positions: np.ndarray) -> InputBundle:
         """Encode a batch of :data:`~chess_ai.dataset.POSITION_DTYPE` records."""
+        ...
+
+    def encode_board(
+        self,
+        board: chess.Board,
+        *,
+        mover_rating: int | None = None,
+        opponent_rating: int | None = None,
+    ) -> InputBundle:
+        """Encode one live position as a batch of one.
+
+        The ratings are the side to move's and their opponent's, which is what a rating-
+        conditioned model is asked to play like. ``None`` is the rating a position does not
+        claim, flagged as unknown, exactly as a dataset records a game that gave none.
+        """
         ...
 
 

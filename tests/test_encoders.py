@@ -187,3 +187,52 @@ def test_a_batch_encodes_each_position_in_the_order_given():
         alone = encoder.encode(record(board))
         assert np.array_equal(bundle.spatial[index], alone.spatial[0])
         assert np.array_equal(bundle.globals[index], alone.globals[0])
+
+
+def test_a_live_position_encodes_as_the_same_position_out_of_a_dataset():
+    """The point of encoding a board through a record: play sees what training saw."""
+    board = chess.Board("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R b KQkq - 3 3")
+    encoder = create_encoder("board-planes")
+
+    live = encoder.encode_board(board, mover_rating=1600, opponent_rating=1800)
+    stored = encoder.encode(record(board, mover_rating=1600, opponent_rating=1800))
+
+    assert np.array_equal(live.spatial, stored.spatial)
+    assert np.array_equal(live.globals, stored.globals)
+
+
+def test_a_live_position_is_one_example_shaped_as_the_spec_says():
+    encoder = create_encoder("board-planes")
+
+    bundle = encoder.encode_board(chess.Board())
+
+    assert bundle.spatial.shape == (1, *encoder.spec.spatial_shape)
+    assert bundle.globals.shape == (1, encoder.spec.global_features)
+    assert bundle.sequence is None
+
+
+def test_a_live_position_with_no_rating_says_so_rather_than_guessing():
+    """The caller of a game has no ratings to hand, and a guess would be a feature."""
+    encoder = create_encoder("board-planes")
+
+    unknown = dict(
+        zip(GLOBAL_FEATURES, encoder.encode_board(chess.Board()).globals[0].tolist(), strict=True)
+    )
+
+    assert (unknown["mover_rating"], unknown["mover_rating_unknown"]) == (0.0, 1.0)
+    assert (unknown["opponent_rating"], unknown["opponent_rating_unknown"]) == (0.0, 1.0)
+
+
+def test_only_the_rating_that_was_given_is_known():
+    encoder = create_encoder("board-planes")
+
+    half = dict(
+        zip(
+            GLOBAL_FEATURES,
+            encoder.encode_board(chess.Board(), mover_rating=2000).globals[0].tolist(),
+            strict=True,
+        )
+    )
+
+    assert half["mover_rating"] == pytest.approx(2000 / DEFAULT_RATING_SCALE)
+    assert (half["mover_rating_unknown"], half["opponent_rating_unknown"]) == (0.0, 1.0)

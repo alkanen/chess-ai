@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { GameState, PositionSnapshot } from './api';
+import type { GameState, PlayerInfo, PositionSnapshot } from './api';
 import { Board } from './board/Board';
 import type { Orientation } from './board/geometry';
 import { GameControls } from './GameControls';
@@ -46,6 +46,34 @@ function useOrientation(game: GameState | null): [Orientation, () => void] {
   return [orientation, flip];
 }
 
+/**
+ * How a checkpoint was asked to play, for a side a checkpoint is playing.
+ *
+ * The name says which run and which step, and this says the rest: two sides of a game can be
+ * the same checkpoint at two ratings, and nothing else on the page would tell them apart.
+ */
+function describeModel(player: PlayerInfo): string | null {
+  const model = player.model;
+  if (model === null) {
+    return null;
+  }
+  const rating = model.rating !== null ? `plays like ${model.rating}` : 'no rating';
+  const choosing =
+    model.strategy === 'sample' ? `samples at ${model.temperature}` : 'plays its best move';
+  return `${rating}, ${choosing}`;
+}
+
+/** One side of the game: who is playing it, and how they were asked to. */
+function Player({ player }: { player: PlayerInfo }) {
+  const model = describeModel(player);
+  return (
+    <dd>
+      {player.name}
+      {model !== null && <span className="model-note">{model}</span>}
+    </dd>
+  );
+}
+
 /** The game the server is playing: the board it is played on, and what is asked of it. */
 export function GameView() {
   const { view, connected, error, movePending, submitMove, resign, abort, takeBack } =
@@ -76,9 +104,9 @@ export function GameView() {
           {view.game !== null && (
             <dl className="players">
               <dt>White</dt>
-              <dd>{view.game.white.name}</dd>
+              <Player player={view.game.white} />
               <dt>Black</dt>
-              <dd>{view.game.black.name}</dd>
+              <Player player={view.game.black} />
             </dl>
           )}
           <GameControls

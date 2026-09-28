@@ -18,6 +18,8 @@ from pydantic import BaseModel
 
 from chess_ai.players import (
     GameContext,
+    ModelBackedPlayer,
+    ModelDescription,
     MoveRejectedError,
     Player,
     PlayerMove,
@@ -56,6 +58,12 @@ class PlayerInfo(BaseModel):
     """Shown to viewers, such as "Random mover"."""
     accepts_moves: bool
     """Whether this side's moves are submitted by a viewer rather than played by itself."""
+    model: ModelDescription | None = None
+    """Which checkpoint is playing this side, for a side a checkpoint is playing.
+
+    The name alone cannot carry it: a viewer comparing two checkpoints wants to see which run,
+    which step and which rating each side is, and the PGN of the game has to say the same
+    things six months later."""
 
 
 class GameState(BaseModel):
@@ -407,7 +415,11 @@ def _side(color: Color) -> chess.Color:
 
 
 def _describe(player: Player) -> PlayerInfo:
-    return PlayerInfo(name=player.name, accepts_moves=isinstance(player, SubmittedMovePlayer))
+    return PlayerInfo(
+        name=player.name,
+        accepts_moves=isinstance(player, SubmittedMovePlayer),
+        model=player.model if isinstance(player, ModelBackedPlayer) else None,
+    )
 
 
 async def _events_until_closed(

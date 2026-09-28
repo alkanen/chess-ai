@@ -13,9 +13,21 @@ import re
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+Device = Literal["auto", "cuda", "cpu"]
+"""What a config may ask to run a network on. ``auto`` is the GPU when there is one, else the
+CPU. Named here rather than with the training config, because two configs choose a device and
+this is the module that neither of them, and nothing heavier, has to import to say so."""
+
+DEFAULT_INFERENCE_BATCH = 32
+"""Positions per forward pass when a checkpoint is asked about several at once.
+
+Repeated from :mod:`chess_ai.inference` rather than imported, because importing it here would
+put torch behind every ``chess-ai`` command; the inference tests check that the two agree.
+"""
 
 ENV_PREFIX = "CHESS_AI_"
 CONFIG_PATH_ENV = "CHESS_AI_CONFIG"
@@ -72,11 +84,34 @@ class PathsConfig(BaseModel):
         return value.expanduser()
 
 
+class InferenceConfig(BaseModel):
+    """How a checkpoint is played with, when a game has one in it.
+
+    The defaults are what it takes to play against a model on the machine that is training one:
+    the CPU, and batches small enough that nothing here is what makes a run run out of memory.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    device: Device = "cpu"
+    """Where to run the network: "cpu", "cuda", or "auto" for a GPU if there is one.
+
+    The CPU by default, deliberately. A game asks about one position at a time, which even a
+    large model answers fast enough to play against, and a training run has the card.
+
+    Typed, so that a misspelled device is refused when the config is read rather than when
+    somebody first tries to play a model — which is a request away from anything that could
+    explain it, and which nobody who clicked Start had a hand in."""
+    batch_size: int = Field(default=DEFAULT_INFERENCE_BATCH, ge=1, le=1024)
+    """How many positions go through the network at once when several are asked about."""
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     server: ServerConfig = ServerConfig()
     paths: PathsConfig = PathsConfig()
+    inference: InferenceConfig = InferenceConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> Config:

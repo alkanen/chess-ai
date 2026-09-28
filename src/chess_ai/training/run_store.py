@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
-from typing import Any, Final, Self
+from typing import Any, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -63,6 +63,10 @@ VALIDATION: Final = "validation"
 """What the ``split`` field of a metrics line says about where the numbers came from."""
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+CheckpointChoice = Literal["latest", "best"] | int
+"""Which of a run's checkpoints is meant: its newest, its best by the run's own metric, or the
+one saved at a particular step. See :func:`choose_checkpoint`."""
 
 
 class RunError(Exception):
@@ -572,8 +576,43 @@ class RunReader:
 
 
 def open_run(runs_dir: Path, name: str) -> RunReader:
-    """The run called ``name`` in ``runs_dir``, ready to read."""
-    return RunReader(run_path(runs_dir, name))
+    """The run called ``name`` in ``runs_dir``, ready to read.
+
+    The run's own ``run.json`` is not read to decide that it is there. A checkpoint carries
+    everything it takes to load it, so a run whose other files are half-written, or were
+    written by a version of this code that is no longer here, is still a run worth opening.
+
+    Raises:
+        RunError: ``name`` could not be a run's, or no run of that name is kept here.
+    """
+    run = RunReader(run_path(runs_dir, name))
+    if not run.directory.is_dir():
+        raise RunError(f"no run called {name!r} is kept here")
+    return run
+
+
+def choose_checkpoint(run: RunReader, choice: CheckpointChoice) -> CheckpointInfo:
+    """The checkpoint of ``run`` that ``choice`` names.
+
+    One definition of "best" and "latest" for everything that plays a checkpoint, so that a
+    game started in the browser and a script run against the same run mean the same file.
+
+    Raises:
+        RunError: the run has saved no checkpoint yet, or none from the step asked for.
+    """
+    if choice == "best":
+        # A run that has not validated yet has no best checkpoint, and the newest one is the
+        # only answer there is to "the one worth playing".
+        chosen = run.best_checkpoint() or run.latest_checkpoint()
+    elif choice == "latest":
+        chosen = run.latest_checkpoint()
+    else:
+        chosen = next((info for info in run.checkpoints() if info.step == choice), None)
+        if chosen is None:
+            raise RunError(f"run {run.name!r} has no checkpoint from step {choice}")
+    if chosen is None:
+        raise RunError(f"run {run.name!r} has not saved a checkpoint yet")
+    return chosen
 
 
 def checkpoint_file(step: int) -> str:
@@ -606,11 +645,20 @@ def read_checkpoints(directory: Path) -> list[CheckpointInfo]:
             continue
         info = recorded.get(step)
         if info is None or info.file != entry.name:
-            info = CheckpointInfo(
-                step=step,
-                file=entry.name,
-                created=datetime.fromtimestamp(entry.stat().st_mtime, UTC),
-            )
+            # Only a checkpoint the index does not describe is asked when it was written,
+            # and that question is the one thing in here that can fail on a directory
+            # somebody else is touching: the file can go, or refuse to be read, between the
+            # scan and the stat. Not through this module's own writing — it unlinks what it
+            # prunes before it rewrites the index, so a pruned file is one this reader still
+            # has an entry for and never stats — but through anything outside it: a
+            # checkpoint deleted by hand, or one this process may not read. A checkpoint that
+            # cannot be looked at is not one to offer, which is a plainer answer than a
+            # reader raising in the middle of a listing.
+            try:
+                written = datetime.fromtimestamp(entry.stat().st_mtime, UTC)
+            except OSError:
+                continue
+            info = CheckpointInfo(step=step, file=entry.name, created=written)
         found.append(info)
     return sorted(found, key=lambda info: info.step)
 

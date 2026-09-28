@@ -3,12 +3,18 @@
 from datetime import datetime
 
 import pytest
-from game_helpers import ScriptedPlayer, playing, scripted_players, settled
+from game_helpers import (
+    ScriptedModelPlayer,
+    ScriptedPlayer,
+    playing,
+    scripted_players,
+    settled,
+)
 from pgn_helpers import read_back, replayed
 
 from chess_ai.game_session import GameSession, GameState
 from chess_ai.pgn import game_pgn, pgn_filename, save_game
-from chess_ai.players import HumanPlayer
+from chess_ai.players import HumanPlayer, ModelDescription
 from chess_ai.position_view import GameOver, GameOverReason
 
 pytestmark = pytest.mark.anyio
@@ -196,3 +202,66 @@ async def test_a_game_whose_id_is_no_name_for_a_file_is_saved_in_the_directory_a
 
     assert path.parent == tmp_path
     assert path.name == "20260924-143005-etcpassw.pgn"
+
+
+async def model_game(white: ModelDescription, black: ModelDescription | None = None) -> GameState:
+    """One move each, played by checkpoints rather than by anyone."""
+    session = GameSession(
+        ScriptedModelPlayer(["e2e4"], white),
+        ScriptedModelPlayer(["e7e5"], black) if black is not None else ScriptedPlayer(["e7e5"]),
+        id=GAME_ID,
+    )
+    async with playing(session):
+        await settled()
+        return session.state
+
+
+async def test_a_side_a_checkpoint_played_says_which_run_step_and_rating_it_was():
+    game = await model_game(ModelDescription(run="mlp-baseline", checkpoint=12000, rating=1600))
+
+    headers = read_back(game_pgn(game)).headers
+
+    assert headers["White"] == "mlp-baseline step 12000"
+    assert headers["WhiteType"] == "program"
+    assert headers["WhiteRun"] == "mlp-baseline"
+    assert headers["WhiteCheckpoint"] == "12000"
+    assert headers["WhiteRating"] == "1600"
+    assert headers["WhiteSelection"] == "argmax"
+
+
+async def test_a_sampled_side_records_the_temperature_it_was_drawn_at():
+    game = await model_game(
+        ModelDescription(run="r", checkpoint=1, strategy="sample", temperature=1.25)
+    )
+
+    assert read_back(game_pgn(game)).headers["WhiteSelection"] == "sample 1.25"
+
+
+async def test_a_model_asked_for_no_rating_in_particular_claims_none():
+    game = await model_game(ModelDescription(run="r", checkpoint=1))
+
+    headers = read_back(game_pgn(game)).headers
+
+    assert "WhiteRating" not in headers
+    assert headers["WhiteRun"] == "r"
+
+
+async def test_the_two_sides_of_a_model_against_model_game_are_told_apart():
+    game = await model_game(
+        ModelDescription(run="a", checkpoint=1, rating=1200),
+        ModelDescription(run="b", checkpoint=2, rating=2000),
+    )
+
+    headers = read_back(game_pgn(game)).headers
+
+    assert (headers["WhiteRun"], headers["WhiteCheckpoint"]) == ("a", "1")
+    assert (headers["BlackRun"], headers["BlackCheckpoint"]) == ("b", "2")
+    assert (headers["WhiteRating"], headers["BlackRating"]) == ("1200", "2000")
+
+
+async def test_a_side_no_checkpoint_played_carries_no_model_tags():
+    game = await in_progress()
+
+    headers = read_back(game_pgn(game)).headers
+
+    assert not [tag for tag in headers if tag.startswith(("WhiteRun", "BlackRun"))]

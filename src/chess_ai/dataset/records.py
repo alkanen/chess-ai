@@ -251,6 +251,51 @@ def position_record(
     )
 
 
+UNRATED: Final = 0
+"""What a rating field holds when there is no rating; the unknown flag is what says so."""
+
+
+def live_position(
+    board: chess.Board,
+    *,
+    mover_rating: int | None = None,
+    opponent_rating: int | None = None,
+) -> np.ndarray:
+    """A one-record batch for a position being played right now, rather than one out of a game.
+
+    An encoder reads a batch of records, which is what makes training and playing see exactly
+    the same features. A position on a board in progress has no move played in it, no result and
+    no game around it, so the fields that say those things are filled in here — once, where the
+    reason for each is written down — rather than by every caller that wants a move out of a
+    model.
+
+    A rating of ``None`` is a rating this position does not claim, flagged as unknown, which is
+    how the dataset records a game whose headers gave none.
+    """
+    return np.array(
+        [
+            position_record(
+                board,
+                # Nothing has been played in this position yet: that is what the model is for.
+                move=0,
+                # The result is the value head's training target, and this game has none.
+                result=Result.DRAW,
+                mover_rating=mover_rating if mover_rating is not None else UNRATED,
+                opponent_rating=opponent_rating if opponent_rating is not None else UNRATED,
+                mover_rating_known=mover_rating is not None,
+                opponent_rating_known=opponent_rating is not None,
+                # A game played here belongs to no rating pool, and its clock is not one of
+                # the classes a dump records. No encoder reads either field today, and one
+                # that did would want to be told they are unknown rather than given a guess.
+                rating_source=RatingSource.UNKNOWN,
+                time_control=TimeControl.UNKNOWN,
+                ply=min(board.ply(), 0xFFFF),
+            )
+        ],
+        dtype=POSITION_DTYPE,
+    )
+
+
 def unpack_board(position: np.void) -> chess.Board:
     """The position ``position`` was packed from, as a board the rules apply to again.
 

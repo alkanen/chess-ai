@@ -39,3 +39,15 @@ data = "data"
 # the directory chess-ai runs in, and a leading ~ is your home directory. The
 # directory is made when it is first needed.
 runs = "runs"
+
+[inference]
+# Where to run a model player's network: "cpu", "cuda", or "auto" for a GPU if
+# there is one. The CPU by default, deliberately: the machine that plays is
+# usually the machine that is training, a game asks about one position at a time,
+# and a training run should have the card to itself.
+device = "cpu"
+
+# How many positions go through the network at once when several are asked about,
+# which a game never is and an evaluation suite will be. Small, for the same
+# reason as the device above.
+batch_size = 32

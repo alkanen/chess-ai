@@ -86,11 +86,29 @@ export interface MoveRecord {
   thoughts: Thoughts | null;
 }
 
+/** How a model turns its distribution over moves into the one move it plays. */
+export type SelectionStrategy = 'argmax' | 'sample';
+
+/** Which checkpoint a model player is: mirrors chess_ai.players.ModelDescription. */
+export interface ModelDescription {
+  /** The training run the weights came from. */
+  run: string;
+  /** The step the checkpoint was saved at, which is what names it in the run. */
+  checkpoint: number;
+  /** The rating it was asked to play like, or null for a position that claims none. */
+  rating: number | null;
+  strategy: SelectionStrategy;
+  /** How flat the distribution is sampled from; null when it is not sampled at all. */
+  temperature: number | null;
+}
+
 export interface PlayerInfo {
   /** Shown to viewers, such as "Random mover". */
   name: string;
   /** Whether this side's moves are submitted by a viewer rather than played by itself. */
   accepts_moves: boolean;
+  /** Which checkpoint is playing this side, for a side a checkpoint is playing. */
+  model: ModelDescription | null;
 }
 
 /** Mirrors chess_ai.game_session.GameState. */
@@ -182,17 +200,41 @@ export interface SavedGame {
   result: Result;
 }
 
-export type PlayerKind = 'human' | 'random';
+export type PlayerKind = 'human' | 'random' | 'model';
 
 /** What each player kind is called in the new-game form. */
 export const PLAYER_NAMES: Record<PlayerKind, string> = {
   human: 'Human',
   random: 'Random mover',
+  model: 'Model',
 };
 
+/** Which checkpoint of a run to play: its newest, its best, or the one from a step. */
+export type CheckpointChoice = 'latest' | 'best' | number;
+
+/** A checkpoint from a training run, playing by its policy. */
+export interface ModelPlayerSpec {
+  kind: 'model';
+  run: string;
+  checkpoint: CheckpointChoice;
+  /** The rating to play like, or null to claim no rating at all. */
+  rating: number | null;
+  strategy: SelectionStrategy;
+  /** How flat the distribution is sampled from. Not used when it plays its best move. */
+  temperature: number;
+  /** Fixes the sampling, so that the same game can be played twice. */
+  seed?: number | null;
+}
+
+/**
+ * What one side of a new game is to be played by. A tagged union, because the kinds do
+ * not take the same settings; mirrors the server's own.
+ */
+export type PlayerSpec = { kind: 'human' } | { kind: 'random' } | ModelPlayerSpec;
+
 export interface NewGameRequest {
-  white: PlayerKind;
-  black: PlayerKind;
+  white: PlayerSpec;
+  black: PlayerSpec;
   /**
    * The least number of seconds before a move a player works out for itself, so that a
    * game between players that move instantly can be followed. A move a human submits is
@@ -204,6 +246,39 @@ export interface NewGameRequest {
    * or null, the game starts where games start.
    */
   fen?: string | null;
+}
+
+/** One training run, as the new-game form lists it. */
+export interface RunSummary {
+  name: string;
+  architecture: string | null;
+  /** When the run started, as an ISO timestamp. */
+  created: string | null;
+  status: 'running' | 'finished' | 'stopped' | 'crashed' | null;
+  /** How far the run has got, as its last heartbeat said. */
+  step: number | null;
+  /** How far it is going, which with `step` says how far through it is. */
+  steps: number | null;
+  /** How many checkpoints there are to choose between. */
+  checkpoints: number;
+}
+
+/** One checkpoint of a run, as the form lists it. */
+export interface CheckpointSummary {
+  step: number;
+  created: string;
+  /** The validation metrics measured at this step; a diverged step may have nulls. */
+  metrics: Record<string, number | null>;
+  /** Whether this is the run's best checkpoint by its own metric. */
+  best: boolean;
+  /** Whether this is the newest checkpoint of the run. */
+  latest: boolean;
+}
+
+/** A run's checkpoints, newest first, which is the order they are offered in. */
+export interface RunCheckpoints {
+  run: string;
+  checkpoints: CheckpointSummary[];
 }
 
 /**
@@ -317,6 +392,24 @@ async function replayed(url: URL, init?: RequestInit): Promise<ReplayFile> {
     throw new Error(await refusal(response));
   }
   return (await response.json()) as ReplayFile;
+}
+
+/** Every training run on this server, newest first, to pick one to play against. */
+export async function fetchRuns(): Promise<RunSummary[]> {
+  const response = await fetch(apiUrl('runs'));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as RunSummary[];
+}
+
+/** The checkpoints of one run, newest first. */
+export async function fetchCheckpoints(run: string): Promise<RunCheckpoints> {
+  const response = await fetch(apiUrl(`runs/${encodeURIComponent(run)}/checkpoints`));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as RunCheckpoints;
 }
 
 /** Starts a new game, replacing the current one for every viewer. */

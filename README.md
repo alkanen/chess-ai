@@ -97,6 +97,8 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[paths] games` | `CHESS_AI_PATHS_GAMES` | `games`, in the working directory |
 | `[paths] data` | `CHESS_AI_PATHS_DATA` | `data`, in the working directory |
 | `[paths] runs` | `CHESS_AI_PATHS_RUNS` | `runs`, in the working directory |
+| `[inference] device` | `CHESS_AI_INFERENCE_DEVICE` | `cpu` |
+| `[inference] batch_size` | `CHESS_AI_INFERENCE_BATCH_SIZE` | `32` |
 
 ### Serve
 
@@ -106,7 +108,20 @@ uv run chess-ai serve
 
 Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets, the API (`…/api/`, with interactive docs at `…/api/docs`) and the WebSocket that streams the game (`…/api/game/ws`) are all served under the prefix.
 
-The server holds one game, which every open browser shows. Start a game from the page, choosing a human player or a random mover for each colour, with a delay between moves so that a game between random movers can be followed; starting another game replaces it for everyone.
+The server holds one game, which every open browser shows. Start a game from the page, choosing a human player, a random mover or a model for each colour, with a delay between moves so that a game between players that move instantly can be followed; starting another game replaces it for everyone.
+
+### Play a checkpoint
+
+Choosing **Model** for a colour asks the server which training runs it keeps, and offers the run's checkpoints: its **best** one by the run's own validation metric, its **latest**, or any step it has saved. Two more settings say how it plays:
+
+- **rating** is what the model is asked to play like, given to the network as both sides' rating — the whole point of training on rated games. Left empty, the position claims no rating at all, which is also something the model was trained on.
+- **plays** is either its best move every time, which makes the same position give the same move, or a sample from its distribution at a **temperature**: below 1 sharpens towards the best move, above 1 flattens towards a coin toss.
+
+Both colours can be models, so two checkpoints of one run, or two runs, can be watched against each other. A model's moves are masked to the legal ones before the probabilities are normalized, so an untrained checkpoint plays badly rather than illegally.
+
+Whether the rating does anything is a property of the training data rather than of the model player: a run whose games all came from one narrow band of ratings has never seen that feature move, and will have learned nothing from it. To see which it is for a checkpoint, play it against itself twice from the same position with **plays** set to its best move, changing nothing between the two games but the rating: a run that learned something from the feature plays a different game, and one that did not plays the same one move for move. Ask only for ratings inside the range the run trained on, which `chess-ai dataset stats <name>` reports for its dataset — a rating the run never saw takes the feature off the end of its training data, and whatever the model does then says nothing about what it learned.
+
+The network runs on the CPU unless `[inference] device` says otherwise, so a game can be played against a checkpoint while a run is training on the GPU. The PGN of a game a model played records the run, the checkpoint's step, the rating it was asked for and how it chose its moves, as `WhiteRun`, `WhiteCheckpoint`, `WhiteRating` and `WhiteSelection` (and the same for Black).
 
 On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. A pawn reaching the last rank asks which piece to promote it to, and nothing is submitted until you pick one, by clicking it or with Enter or Space on the choice the picker opens on. Clicking elsewhere on the board, or pressing Escape, puts the pawn back.
 

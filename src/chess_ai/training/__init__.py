@@ -19,6 +19,7 @@ from chess_ai.training.experiment import (
 )
 from chess_ai.training.hardware import HardwareError, describe_device, resolve_device
 from chess_ai.training.run_store import (
+    CheckpointChoice,
     CheckpointInfo,
     CheckpointPolicy,
     GpuStats,
@@ -28,6 +29,7 @@ from chess_ai.training.run_store import (
     RunReader,
     RunStatus,
     RunWriter,
+    choose_checkpoint,
     list_runs,
     open_run,
     run_path,
@@ -38,6 +40,7 @@ from chess_ai.training.validate import validate
 __all__ = [
     "VALIDATION_METRICS",
     "Batch",
+    "CheckpointChoice",
     "CheckpointInfo",
     "CheckpointPolicy",
     "ExperimentConfig",
@@ -53,6 +56,7 @@ __all__ = [
     "RunWriter",
     "TrainingError",
     "batch_loader",
+    "choose_checkpoint",
     "describe_device",
     "list_runs",
     "load_experiment",

@@ -81,3 +81,11 @@
 .players dd {
   margin: 0;
 }
+
+/* How a checkpoint was asked to play, under the run and step that name it. Muted through
+   the inherited colour, so it stays readable in either colour scheme. */
+.players .model-note {
+  display: block;
+  font-size: 0.85rem;
+  opacity: 0.75;
+}

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -17,12 +18,15 @@ from starlette.websockets import WebSocketDisconnect
 from chess_ai.config import Config, PathsConfig, ServerConfig
 from chess_ai.game_session import GameEvent, MoveEvent
 from chess_ai.pgn import game_pgn
+from chess_ai.web import app as app_module
 from chess_ai.web import create_app
 from chess_ai.web.app import ViewerEvent
 
 EVENT = TypeAdapter(ViewerEvent)
-RANDOM_GAME = {"white": "random", "black": "random", "move_delay": 0}
-HUMAN_GAME = {"white": "human", "black": "random", "move_delay": 0}
+RANDOM = {"kind": "random"}
+HUMAN = {"kind": "human"}
+RANDOM_GAME = {"white": RANDOM, "black": RANDOM, "move_delay": 0}
+HUMAN_GAME = {"white": HUMAN, "black": RANDOM, "move_delay": 0}
 
 
 PGN_FILE = re.compile(r'attachment; filename="\d{8}-\d{6}-[0-9a-f]{8}\.pgn"')
@@ -107,8 +111,8 @@ def test_random_game_streams_live_to_the_end(chess_client):
 
     assert response.status_code == 200
     started = response.json()
-    assert started["white"] == {"name": "Random mover", "accepts_moves": False}
-    assert started["black"] == {"name": "Random mover", "accepts_moves": False}
+    mover = {"name": "Random mover", "accepts_moves": False, "model": None}
+    assert (started["white"], started["black"]) == (mover, mover)
     assert started["position"]["fen"] == chess.STARTING_FEN
     assert events[0].type == "state"
     assert len(events[0].game.moves) < len(replay(events).moves)
@@ -166,7 +170,8 @@ def test_new_game_replaces_the_current_one_for_every_viewer(chess_client):
 @pytest.mark.parametrize(
     "change",
     [
-        {"white": "stockfish"},
+        {"white": {"kind": "stockfish"}},
+        {"white": "random"},
         {"black": None},
         {"move_delay": -0.1},
         {"move_delay": 10.5},
@@ -188,8 +193,12 @@ def test_a_human_move_submitted_over_the_websocket_is_played(chess_client):
         ask(websocket, response.json()["id"], type="move", uci="e2e4")
         played, answered = receive(websocket), receive(websocket)
 
-    assert response.json()["white"] == {"name": "Human", "accepts_moves": True}
-    assert response.json()["black"] == {"name": "Random mover", "accepts_moves": False}
+    assert response.json()["white"] == {"name": "Human", "accepts_moves": True, "model": None}
+    assert response.json()["black"] == {
+        "name": "Random mover",
+        "accepts_moves": False,
+        "model": None,
+    }
     assert played.type == "move"
     assert (played.ply, played.move.uci) == (1, "e2e4")
     assert answered.type == "move" and answered.ply == 2
@@ -198,7 +207,7 @@ def test_a_human_move_submitted_over_the_websocket_is_played(chess_client):
 def test_human_against_human_takes_both_sides_moves(chess_client):
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "no_game"
-        game = start_game(chess_client, black="human")
+        game = start_game(chess_client, black=HUMAN)
         assert receive(websocket).type == "state"
 
         ask(websocket, game, type="move", uci="e2e4")
@@ -320,7 +329,7 @@ def test_a_resignation_ends_the_game_for_every_viewer(chess_client):
 
 
 def test_black_resigning_hands_the_game_to_white(chess_client):
-    game = start_game(chess_client, black="human")
+    game = start_game(chess_client, black=HUMAN)
 
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "state"
@@ -532,7 +541,7 @@ async def test_starting_a_game_while_shutting_down_is_refused(tmp_path):
 
 def test_a_takeback_over_the_websocket_reaches_every_viewer(chess_client):
     """The takeback flow under the prefix: everyone watching goes back together."""
-    game = start_game(chess_client, black="human")
+    game = start_game(chess_client, black=HUMAN)
 
     with (
         chess_client.websocket_connect("/chess/api/game/ws") as player,
@@ -602,13 +611,13 @@ def test_a_takeback_before_a_move_has_been_played_is_refused(chess_client):
 
 def test_a_takeback_reaches_only_the_game_the_viewer_named(chess_client):
     """A new game in the moment before the click must not be taken back instead."""
-    stale = start_game(chess_client, black="human")
+    stale = start_game(chess_client, black=HUMAN)
 
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "state"
         ask(websocket, stale, type="move", uci="e2e4")
         assert receive(websocket).type == "move"
-        replacement = start_game(chess_client, black="human")
+        replacement = start_game(chess_client, black=HUMAN)
         assert receive(websocket).type == "state"
 
         ask(websocket, stale, type="takeback")
@@ -626,7 +635,7 @@ def test_a_game_starts_from_a_fen_and_says_so(chess_client):
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "no_game"
         response = chess_client.post(
-            "/chess/api/game", json={"white": "random", "black": "human", "fen": fen}
+            "/chess/api/game", json={"white": RANDOM, "black": HUMAN, "fen": fen}
         )
         state = receive(websocket)
 
@@ -658,7 +667,7 @@ def test_a_fen_that_cannot_be_played_from_is_refused_with_a_reason(chess_client,
 
 
 def test_a_refused_fen_leaves_the_game_that_is_being_played(chess_client):
-    game = start_game(chess_client, black="human")
+    game = start_game(chess_client, black=HUMAN)
 
     with chess_client.websocket_connect("/chess/api/game/ws") as websocket:
         assert receive(websocket).type == "state"
@@ -827,3 +836,56 @@ def test_nothing_the_pgn_route_answers_is_ever_cached(chess_client):
     answers = [before_any_game, refused, downloaded]
     assert [answer.status_code for answer in answers] == [404, 409, 200]
     assert [answer.headers.get("cache-control") for answer in answers] == ["no-store"] * 3
+
+
+@pytest.mark.anyio
+async def test_two_games_started_at_once_leave_the_one_asked_for_last_playing(
+    tmp_path, monkeypatch
+):
+    """Making a model player reads a checkpoint off the disk, which takes seconds.
+
+    The handler suspends for that, so two starts can now interleave where they never could
+    before. Whichever was asked for last has to be the one left on the board: a game that
+    takes longer to set up must not come back and replace the game that replaced it.
+    """
+    app = create_app(
+        Config(
+            server=ServerConfig(path_prefix="/chess"),
+            paths=PathsConfig(games=tmp_path / "games"),
+        ),
+        tmp_path / "static",
+    )
+    entered, release = threading.Event(), threading.Event()
+    build, made, guard = app_module._players, [], threading.Lock()
+
+    def slowly(request, config):
+        """The first game's players take as long as a real checkpoint would."""
+        with guard:
+            first = not made
+            made.append(request)
+        if first:
+            entered.set()
+            assert release.wait(timeout=10), "the slow game was never released"
+        return build(request, config)
+
+    monkeypatch.setattr(app_module, "_players", slowly)
+
+    async with (
+        app.router.lifespan_context(app),
+        httpx2.AsyncClient(transport=httpx2.ASGITransport(app), base_url="http://testserver") as c,
+    ):
+        async with asyncio.timeout(30):
+            slow = asyncio.create_task(c.post("/chess/api/game", json=RANDOM_GAME))
+            await asyncio.to_thread(entered.wait, 10)
+            asked_last = asyncio.create_task(c.post("/chess/api/game", json=HUMAN_GAME))
+            # Long enough for the second request to reach the handler, which is all it has
+            # to do: whether it gets any further is the thing being tested.
+            await asyncio.sleep(0.1)
+            release.set()
+            first, last = await slow, await asked_last
+            assert (first.status_code, last.status_code) == (200, 200)
+            playing = await c.get(f"/chess/api/game/pgn?game={last.json()['id']}")
+            replaced = await c.get(f"/chess/api/game/pgn?game={first.json()['id']}")
+
+    assert playing.status_code == 200, "the game asked for last is the one being played"
+    assert replaced.status_code == 409, "the game asked for first has been replaced"

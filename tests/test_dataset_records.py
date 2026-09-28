@@ -14,6 +14,7 @@ from chess_ai.dataset.records import (
     RatingSource,
     Result,
     TimeControl,
+    live_position,
     position_record,
     unpack_board,
 )
@@ -169,3 +170,25 @@ def test_a_result_read_from_the_other_side():
     assert Result.WIN.opponent == Result.LOSS
     assert Result.LOSS.opponent == Result.WIN
     assert Result.DRAW.opponent == Result.DRAW
+
+
+def test_a_live_position_holds_the_position_it_was_made_from():
+    board = chess.Board()
+    for move in ("e2e4", "c7c5", "g1f3"):
+        board.push_uci(move)
+
+    live = live_position(board, mover_rating=1500, opponent_rating=1500)[0]
+
+    assert unpack_board(live).fen() == board.fen()
+    assert int(live["ply"]) == 3, "a live position knows how far into the game it is"
+    assert int(live["rating_source"]) == RatingSource.UNKNOWN
+    assert int(live["time_control"]) == TimeControl.UNKNOWN
+
+
+def test_a_live_position_without_ratings_flags_both_as_unknown():
+    live = live_position(chess.Board())[0]
+
+    flags = int(live["flags"])
+    assert flags & PositionFlags.MOVER_RATING_UNKNOWN
+    assert flags & PositionFlags.OPPONENT_RATING_UNKNOWN
+    assert (int(live["mover_rating"]), int(live["opponent_rating"])) == (0, 0)

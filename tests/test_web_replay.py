@@ -321,7 +321,8 @@ def test_a_game_played_here_is_listed_and_replayed_move_for_move(tmp_path, games
     ):
         assert websocket.receive_json()["type"] == "no_game"
         playing.post(
-            "/chess/api/game", json={"white": "random", "black": "random", "move_delay": 0}
+            "/chess/api/game",
+            json={"white": {"kind": "random"}, "black": {"kind": "random"}, "move_delay": 0},
         )
         # Played out to its result, which is the point at which a game is saved. A game
         # that ends on the board ends with the move that ended it, and sends no more.
