@@ -1,5 +1,6 @@
 """Building datasets out of the fixture PGN files: what is kept, what is not, and the split."""
 
+import ast
 import errno
 import io
 import logging
@@ -7,6 +8,8 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +17,17 @@ from pathlib import Path
 import chess
 import chess.pgn
 import pytest
-from dataset_helpers import FIXTURES, GOOD_GAMES, build, fixture, move_sequences
+from dataset_helpers import (
+    FIXTURES,
+    GOOD_GAMES,
+    CountingPath,
+    build,
+    fixture,
+    flat_pgn,
+    move_sequences,
+    separated_pgn,
+    shard_bytes,
+)
 
 from chess_ai.dataset import (
     SPLITS,
@@ -33,12 +46,21 @@ from chess_ai.dataset import (
     list_datasets,
     load_manifest,
     open_dataset,
+    sources,
     store,
     unpack_board,
 )
 from chess_ai.dataset.builder import DEFAULT_VALIDATION_FRACTION
 from chess_ai.dataset.games import split_of, time_control_class
+from chess_ai.dataset.progress import format_progress
 from chess_ai.dataset.records import POSITION_DTYPE
+from chess_ai.dataset.sources import (
+    ByteRange,
+    Source,
+    game_ranges,
+    games_in_range,
+    resolve_sources,
+)
 from chess_ai.dataset.store import dataset_path
 from chess_ai.move_codec import VOCABULARY_SIZE, move_at
 
@@ -1413,3 +1435,933 @@ def test_a_superseded_dataset_is_not_offered_back_over_a_newer_one(tmp_path, cap
     assert str(store.replaced_datasets(tmp_path, "test")[0]) in said
     assert "interrupted" not in said, "this build finished; it just could not tidy up"
     assert "newer" in said, "and what is in place now is newer than what is being reported"
+
+
+def test_a_file_cut_into_pieces_gives_up_every_game_exactly_once(tmp_path):
+    # Whatever size the pieces are: what a build reads in several processes has to be the games
+    # the file holds, not most of them and not one of them twice.
+    source = resolve_sources([fixture("lichess.pgn")])[0]
+    with source.path.open(encoding="utf-8-sig") as handle:
+        whole = []
+        while (game := chess.pgn.read_game(handle)) is not None:
+            whole.append(str(game))
+
+    for target in (1, 8, 200, 1 << 20):
+        pieces = game_ranges(source, 0, target)
+        assert sum(piece.bytes for piece in pieces) == source.bytes, f"every byte, at {target}"
+        assert [str(game) for piece in pieces for game, _ in games_in_range(piece)] == whole, (
+            f"the same games in the same order, at {target}"
+        )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_a_cut_is_never_made_inside_a_game(tmp_path, newline):
+    # A comment may hold anything, including something that reads like the start of a game. Cut
+    # there and the half before it is kept as a game whose moves stop early, which no count would
+    # ever show up: the boundary is a blank line and an [Event, not an [Event.
+    #
+    # Both line endings, because PGN's own specification says CR/LF and a check that only
+    # required the blank line for LF files would be no check at all for the common shape: every
+    # line-initial [Event in a CRLF file is preceded by \r\n.
+    lines = [
+        '[Event "First"]',
+        '[Result "1-0"]',
+        "",
+        "1. e4 { a comment that goes on",
+        '[Event "Not really a game"]',
+        "and on } e5 2. d4 1-0",
+        "",
+        '[Event "Second"]',
+        '[Result "0-1"]',
+        "",
+        "1. d4 d5 0-1",
+        "",
+    ]
+    path = tmp_path / "commented.pgn"
+    path.write_bytes(newline.join(lines).encode())
+    source = resolve_sources([str(path)])[0]
+
+    for target in (1, 8, 32, 200):
+        events = [
+            game.headers["Event"]
+            for piece in game_ranges(source, 0, target)
+            for game, _ in games_in_range(piece)
+        ]
+        assert events == ["First", "Second"], f"two whole games, at {target}"
+
+
+def test_a_piece_size_of_nothing_is_refused(tmp_path):
+    source = resolve_sources([fixture("lichess.pgn")])[0]
+
+    with pytest.raises(ValueError, match="some bytes long"):
+        game_ranges(source, 0, 0)
+
+
+def test_reading_in_several_processes_gives_the_same_dataset_to_the_byte(tmp_path):
+    # The whole claim of the parallel path in one test: the shards, not just the counts. A game's
+    # ply_offset and a position's game index are the two things order decides, and they are in
+    # here, so a piece appended out of turn could not pass this.
+    serial, parallel = tmp_path / "one", tmp_path / "many"
+
+    alone = build(serial, workers=1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 200)
+        together = build(parallel, workers=4)
+
+    assert shard_bytes(dataset_path(parallel, "test")) == shard_bytes(dataset_path(serial, "test"))
+    assert together.model_dump(exclude={"created"}) == alone.model_dump(exclude={"created"}), (
+        "and the manifest says the same thing about them, statistics and skip counts and all"
+    )
+
+
+def test_the_split_is_the_same_however_many_processes_read_the_files(tmp_path):
+    # split_of is a hash of the game itself for exactly this reason, so it is worth a test that
+    # would fail if it ever became a running count.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 120)
+        many = build(tmp_path / "many", validation_fraction=0.5, workers=3)
+    one = build(tmp_path / "one", validation_fraction=0.5, workers=1)
+
+    with (
+        open_dataset("test", data_dir=tmp_path / "many") as parallel,
+        open_dataset("test", data_dir=tmp_path / "one") as serial,
+    ):
+        for split in SPLITS:
+            assert move_sequences(parallel[split]) == move_sequences(serial[split])
+    assert many.splits == one.splits
+
+
+def test_a_small_build_reads_in_this_process_whatever_it_was_offered(tmp_path):
+    # Starting eight processes to read a directory of exports costs more than reading it does.
+    def refuse(*args, **kwargs):
+        raise AssertionError("a build this small should not start a process to do it")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "ProcessPoolExecutor", refuse)
+        manifest = build(tmp_path, workers=8)
+
+    assert manifest.games == GOOD_GAMES
+
+
+def test_a_build_needs_at_least_one_worker(tmp_path):
+    with pytest.raises(DatasetError, match="at least one worker"):
+        build(tmp_path, workers=0)
+
+
+def test_broken_games_are_counted_the_same_when_workers_read_them(tmp_path):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 100)
+        manifest = build(tmp_path / "many", "malformed.pgn", "lichess.pgn", workers=3)
+    serial = build(tmp_path / "one", "malformed.pgn", "lichess.pgn", workers=1)
+
+    assert manifest.skipped == serial.skipped
+    assert [source.games_read for source in manifest.sources] == [
+        source.games_read for source in serial.sources
+    ]
+    assert [source.games_kept for source in manifest.sources] == [
+        source.games_kept for source in serial.sources
+    ]
+
+
+def test_a_source_that_cannot_be_read_is_counted_when_workers_read_them(tmp_path):
+    # Cutting the file into pieces is what opens it, so a file that went away fails there rather
+    # than in a worker -- and has to be counted exactly as the serial path counts it.
+    unreadable = tmp_path / "locked.pgn"
+    unreadable.write_text('[Event "x"]\n[Result "1-0"]\n\n1. e4 e5 1-0\n')
+    unreadable.chmod(0o000)
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+            patch.setattr(builder, "CHUNK_BYTES", 200)
+            manifest = build(
+                tmp_path / "data",
+                str(unreadable),
+                fixture("lichess.pgn"),
+                validation_fraction=0.0,
+                workers=2,
+            )
+    finally:
+        unreadable.chmod(0o600)
+
+    assert manifest.games == 4, "the readable source is still read"
+    locked, lichess = manifest.sources
+    assert locked.games_read == 0
+    assert locked.went_away, "so that an --overwrite does not trade a dataset for this one"
+    assert locked.error is not None and "cannot read" in locked.error
+    assert lichess.games_kept == 4 and lichess.error is None
+
+
+def test_a_worker_records_a_failure_nothing_expected_with_its_traceback():
+    # The worker half of the contract. Called here rather than through a pool on purpose: a
+    # monkeypatch only reaches a worker that inherited this process's memory, which is true
+    # under the fork start method and false under spawn (macOS today) and forkserver (Linux
+    # from 3.14). A test that needs one of the three is a test that is red on the others.
+    real_game_records = builder.game_records
+
+    def explode(record, **kwargs):
+        if record.headers.get("White") in ("alice", "erin"):
+            raise RuntimeError("something nothing expected")
+        return real_game_records(record, **kwargs)
+
+    path = Path(fixture("lichess.pgn"))
+    job = builder._Job(
+        piece=ByteRange(source=0, path=path, start=0, end=path.stat().st_size),
+        rating_source=None,
+        validation_fraction=0.0,
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "game_records", explode)
+        read = builder._read_piece(job)
+
+    assert read.kept == 2, "the games it could still read"
+    assert read.tally.skipped[SkipReason.UNREADABLE] == 2
+    assert read.tally.unexpected is not None
+    assert "something nothing expected" in read.tally.unexpected
+    assert "Traceback" in read.tally.unexpected, "so a broken build is recognisable as one"
+
+
+def test_a_failure_nothing_expected_is_said_once_for_the_whole_build(tmp_path, caplog):
+    # The build half: however many pieces carried one, and whichever processes read them, the
+    # count is the build's and so is the warning that explains it.
+    real_in_order = builder._in_order
+
+    def carrying_failures(pool, jobs, *, in_flight, **rest):
+        for read in real_in_order(pool, jobs, in_flight=in_flight, **rest):
+            read.tally.note(RuntimeError("something nothing expected"))
+            read.tally.skipped[SkipReason.UNREADABLE] += 1
+            yield read
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 120)
+        patch.setattr(builder, "_in_order", carrying_failures)
+        manifest = build(tmp_path, workers=3)
+
+    assert manifest.skipped[SkipReason.UNREADABLE.value] > 1, "several pieces carried one"
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1, "said once for the build, not once per piece or per process"
+    assert "something nothing expected" in caplog.text
+
+
+def test_a_worker_that_dies_says_what_to_do_about_it(tmp_path):
+    # A worker killed for its memory is the one failure of the parallel path a person can act on,
+    # and a raw BrokenProcessPool traceback does not tell them how.
+    def died(*args, **kwargs):
+        raise BrokenProcessPool("a process in the process pool was terminated abruptly")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "_in_order", died)
+        with pytest.raises(DatasetError, match="fewer --workers"):
+            build(tmp_path, workers=2)
+
+    assert list_datasets(tmp_path) == [], "and nothing is left behind"
+
+
+def test_progress_is_reported_while_workers_read(tmp_path):
+    reports: list[Progress] = []
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 120)
+        manifest = build(tmp_path, progress=reports.append, workers=3)
+
+    assert len(reports) > 1, "a piece at a time, not only at the end"
+    final = reports[-1]
+    assert final.done
+    assert final.games_kept == manifest.games
+    assert final.games_read == manifest.games + manifest.games_skipped
+    assert final.bytes_read == final.bytes_total
+    # Monotonic, because it is what a time remaining is worked out from: a piece arriving out of
+    # turn would make the estimate walk backwards.
+    read = [report.bytes_read for report in reports]
+    assert read == sorted(read)
+
+
+def test_cutting_a_file_with_no_boundaries_reads_it_once(tmp_path, monkeypatch):
+    # A file whose games are not separated by a blank line has no boundary to cut at, so every
+    # offset's scan runs to the end of it. Scanned from scratch each time that is quadratic in
+    # the file's size -- hours of silent reading on a dump, before a single game is parsed.
+    path = flat_pgn(tmp_path / "flat.pgn", games=4000)
+    source = resolve_sources([str(path)])[0]
+    counter = CountingPath(path)
+    counter.install(monkeypatch)
+
+    pieces = game_ranges(source, 0, 4096)
+
+    assert len(pieces) == 1, "nothing to cut at, so the file is one piece"
+    assert pieces[0].bytes == source.bytes
+    # One pass, plus a little overlap. Before this was a single forward pass it read about
+    # (size / target) x size, which for this file is fifty times over.
+    assert counter.bytes_read < 3 * source.bytes, (
+        f"read {counter.bytes_read:,} bytes to cut a {source.bytes:,} byte file"
+    )
+
+
+def test_cutting_a_file_scales_with_its_size_not_its_square(tmp_path, monkeypatch):
+    # The shape of the cost, which is what makes the difference between seconds and hours: twice
+    # the file should read about twice as much, not four times as much.
+    reads = {}
+    for games in (2000, 4000):
+        path = flat_pgn(tmp_path / f"flat{games}.pgn", games=games)
+        source = resolve_sources([str(path)])[0]
+        counter = CountingPath(path)
+        with pytest.MonkeyPatch.context() as patch:
+            counter.install(patch)
+            game_ranges(source, 0, 4096)
+        reads[games] = counter.bytes_read
+
+    assert reads[4000] < 3 * reads[2000], (
+        f"doubling the file multiplied the reading by {reads[4000] / reads[2000]:.1f}x"
+    )
+
+
+def test_reading_a_piece_does_not_pull_the_whole_file_into_memory(tmp_path, monkeypatch):
+    # A piece is only as small as the boundaries found in the file. A file with none is one
+    # piece spanning all of it, so a piece read in one go is a read of the whole file -- and on
+    # a dump that is tens of gigabytes in a worker, which the OOM killer answers.
+    path = flat_pgn(tmp_path / "flat.pgn", games=4000)
+    size = path.stat().st_size
+    piece = ByteRange(source=0, path=path, start=0, end=size)
+    counter = CountingPath(path)
+    counter.install(monkeypatch)
+
+    games = games_in_range(piece)
+    first, _ = next(games)
+
+    assert first.headers["Event"] == "x"
+    assert counter.bytes_read < size // 4, (
+        f"read {counter.bytes_read:,} of {size:,} bytes to hand back one game"
+    )
+
+
+def test_a_piece_read_as_a_stream_gives_the_same_games(tmp_path):
+    # Whatever it reads at a time, a piece is still exactly the games inside it.
+    path = flat_pgn(tmp_path / "flat.pgn", games=50)
+    size = path.stat().st_size
+    whole = [g for g, _ in games_in_range(ByteRange(source=0, path=path, start=0, end=size))]
+
+    assert len(whole) == 50
+    assert all(game.headers["Result"] == "1-0" for game in whole)
+
+
+def test_the_default_worker_count_follows_the_cpus_this_process_may_use(monkeypatch):
+    # os.cpu_count() is the machine's, not this process's. A build pinned to two cores of a
+    # large host must not default to one worker per core of the host.
+    monkeypatch.setattr(os, "cpu_count", lambda: 96)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0, 1}, raising=False)
+    monkeypatch.delattr(os, "process_cpu_count", raising=False)
+
+    assert builder.default_workers() == 2
+
+
+def test_the_default_worker_count_is_capped(monkeypatch):
+    monkeypatch.setattr(os, "cpu_count", lambda: 512)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(512)), raising=False)
+    monkeypatch.delattr(os, "process_cpu_count", raising=False)
+
+    assert builder.default_workers() == builder.MAX_DEFAULT_WORKERS
+    assert builder.most_workers() >= builder.default_workers(), "the ceiling is not below it"
+
+
+def test_a_worker_count_that_reads_as_a_typo_is_refused(tmp_path):
+    # --workers 1000 for 100: 1000 processes, each holding pieces of a file, is not a plan.
+    with pytest.raises(DatasetError, match="more than this machine has any use for"):
+        build(tmp_path, workers=builder.most_workers() + 1)
+
+    assert list_datasets(tmp_path) == [], "and nothing was built on the way to finding out"
+
+
+def test_a_worker_count_up_to_the_ceiling_is_allowed(tmp_path):
+    # Oversubscribing on purpose still works; only the absurd is refused.
+    manifest = build(tmp_path, workers=builder.most_workers())
+
+    assert manifest.games == GOOD_GAMES
+
+
+def test_a_piece_too_large_for_a_worker_is_not_given_to_one():
+    # Streaming the read bounded the bytes, not the records: _read_piece keeps every record of
+    # its piece until it has them all, so a piece that is a whole file is a whole file's records
+    # in one process however carefully they were read.
+    class Refusing:
+        def submit(self, *args, **kwargs):
+            raise AssertionError("a piece too large to hold must not be given to a worker")
+
+    oversized = builder._Job(
+        piece=ByteRange(
+            source=0, path=Path("nothing.pgn"), start=0, end=builder.MAX_PIECE_BYTES + 1
+        ),
+        rating_source=None,
+        validation_fraction=0.0,
+    )
+
+    assert list(builder._in_order(Refusing(), [oversized], in_flight=2)) == [oversized], (
+        "it comes back to be read here instead"
+    )
+
+
+def test_a_file_with_no_boundaries_is_read_without_holding_it(tmp_path, caplog):
+    # The file that motivates the whole cap: no blank line between games, so it cuts into one
+    # piece spanning all of it. It has to build, and it has to say why it was slow.
+    path = flat_pgn(tmp_path / "flat.pgn", games=400)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 2048)
+        patch.setattr(builder, "MAX_PIECE_BYTES", 4096)
+        manifest = build(tmp_path / "data", str(path), validation_fraction=0.0, workers=3)
+
+    assert manifest.games == 400
+    warnings = [record.message for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1, "said once for the file, not once per piece"
+    assert "no game boundary" in warnings[0] and "flat.pgn" in warnings[0]
+
+
+def test_a_piece_read_here_gives_the_same_dataset_as_a_worker_would(tmp_path):
+    # The fallback is slower, not different: it has to produce the same shards as reading the
+    # same file in one process does, which is the property the whole parallel path rests on.
+    path = flat_pgn(tmp_path / "flat.pgn", games=400)
+    alone = build(tmp_path / "one", str(path), workers=1)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 2048)
+        patch.setattr(builder, "MAX_PIECE_BYTES", 4096)
+        fallen_back = build(tmp_path / "many", str(path), workers=3)
+
+    assert shard_bytes(dataset_path(tmp_path / "many", "test")) == shard_bytes(
+        dataset_path(tmp_path / "one", "test")
+    )
+    assert fallen_back.model_dump(exclude={"created"}) == alone.model_dump(exclude={"created"})
+
+
+def test_progress_moves_while_a_piece_is_read_here(tmp_path):
+    # The fallback is the slow path, so it is the one where somebody most needs to see that the
+    # build is getting somewhere. A byte count that never moves makes `fraction` stick at 0 and
+    # `seconds_remaining` either None or an estimate that climbs for as long as the read lasts.
+    reports: list[Progress] = []
+    path = flat_pgn(tmp_path / "flat.pgn", games=2000)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 2048)
+        patch.setattr(builder, "MAX_PIECE_BYTES", 4096)
+        manifest = build(
+            tmp_path / "data",
+            str(path),
+            validation_fraction=0.0,
+            workers=3,
+            progress=reports.append,
+        )
+
+    assert manifest.games == 2000
+    during = [report for report in reports if not report.done]
+    assert during, "a read this long reports while it runs"
+    assert any(report.bytes_read > 0 for report in during), "and the byte count moves"
+    assert any(0 < report.fraction < 1 for report in during), "so a percentage means something"
+    read = [report.bytes_read for report in during]
+    assert read == sorted(read), "and it never goes backwards"
+    assert during[-1].bytes_read <= manifest.sources[0].bytes, "nor past the end of the file"
+
+
+def test_the_worker_ceiling_is_one_the_pool_will_honour_on_windows(monkeypatch):
+    # ProcessPoolExecutor refuses more than 61 workers on Windows, and MIN_WORKER_CEILING is 64,
+    # so the ceiling promised a number that platform would not start -- passing the build's own
+    # check and then dying inside the pool with a bare ValueError, hours into a real read.
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    assert builder.most_workers() <= builder.WINDOWS_MAX_WORKERS
+    assert builder.WINDOWS_MAX_WORKERS == 61, "what concurrent.futures says it is"
+
+
+def test_the_worker_ceiling_is_not_capped_elsewhere(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    assert builder.most_workers() >= builder.MIN_WORKER_CEILING
+
+
+def test_progress_keeps_moving_after_a_file_gives_up(tmp_path):
+    # A file that stops part way still has its remaining pieces read -- they were already in
+    # flight -- and their games dropped. Those bytes were read either way, so progress has to
+    # account for them: otherwise the fraction sticks and the estimate climbs for the rest of
+    # the file, which is exactly what _read_here was fixed for.
+    reports: list[Progress] = []
+    real_in_order = builder._in_order
+
+    def stopping(pool, jobs, *, in_flight, **rest):
+        for seen, outcome in enumerate(real_in_order(pool, jobs, in_flight=in_flight, **rest)):
+            if seen == 2 and not isinstance(outcome, builder._Job):
+                outcome.error = "stopped reading after 2 games: pretend the file gave up"
+            yield outcome
+
+    path = separated_pgn(tmp_path / "many.pgn", games=200)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 1000)
+        patch.setattr(builder, "_in_order", stopping)
+        manifest = build(
+            tmp_path / "data",
+            str(path),
+            validation_fraction=0.0,
+            workers=2,
+            progress=reports.append,
+        )
+
+    assert manifest.sources[0].error is not None, "the file gave up part way"
+    assert 0 < manifest.games < 200, "keeping what it read before that and no more"
+    during = [report for report in reports if not report.done]
+    read = [report.bytes_read for report in during]
+    assert read == sorted(read), "progress never goes backwards"
+    assert during[-1].bytes_read > 0.8 * manifest.sources[0].bytes, (
+        f"progress stalled at {during[-1].bytes_read:,} of {manifest.sources[0].bytes:,} bytes"
+    )
+
+
+@pytest.mark.parametrize(
+    "blank",
+    ["", " ", "\t", "   ", " " * 20, "\t \t " * 6],
+    ids=["empty", "space", "tab", "spaces", "wide", "wider"],
+)
+def test_a_separator_line_may_hold_whitespace(tmp_path, blank):
+    # Exporters that leave a space or a tab on the line between games are not rare, and the line
+    # is still blank. Refusing them costs a file every boundary it has -- which is not a wrong
+    # dataset, just a build that silently reads a dump on one core for hours.
+    game = (
+        '[Event "x"]\r\n[Site "s"]\r\n[Result "1-0"]\r\n[WhiteElo "1500"]\r\n'
+        '[BlackElo "1500"]\r\n[TimeControl "600+0"]\r\n\r\n1. e4 e5 1-0\r\n' + blank + "\r\n"
+    )
+    path = tmp_path / "spaced.pgn"
+    path.write_bytes((game * 200).encode())
+    source = resolve_sources([str(path)])[0]
+
+    pieces = game_ranges(source, 0, 512)
+
+    assert len(pieces) > 20, f"{len(pieces)} pieces: the separator was not recognised"
+    assert sum(piece.bytes for piece in pieces) == source.bytes
+    games = [game for piece in pieces for game, _ in games_in_range(piece)]
+    assert len(games) == 200
+    assert all(len(list(game.mainline_moves())) == 2 for game in games), "and none was cut open"
+
+
+def test_whitespace_does_not_make_a_comment_line_a_boundary(tmp_path):
+    # The reason the blank line is required at all: allowing whitespace must not let a line of
+    # text inside a {} comment pass for the start of a game.
+    lines = [
+        '[Event "First"]',
+        '[Result "1-0"]',
+        "",
+        "1. e4 { a comment that goes on   ",
+        '[Event "Not really a game"]',
+        "and on } e5 2. d4 1-0",
+        " ",
+        '[Event "Second"]',
+        '[Result "0-1"]',
+        "",
+        "1. d4 d5 0-1",
+        "",
+    ]
+    path = tmp_path / "commented.pgn"
+    path.write_bytes("\r\n".join(lines).encode())
+    source = resolve_sources([str(path)])[0]
+
+    for target in (1, 8, 32, 200):
+        events = [
+            game.headers["Event"]
+            for piece in game_ranges(source, 0, target)
+            for game, _ in games_in_range(piece)
+        ]
+        assert events == ["First", "Second"], f"two whole games, at {target}"
+
+
+def test_no_docstring_about_line_endings_is_mangled_by_its_own_escapes():
+    # A docstring explaining \r\n has to survive being printed. Without an r-prefix the escapes
+    # become the characters: the sentence breaks apart, and a bare \r sends a terminal's cursor
+    # back over what it already wrote.
+    source = Path(sources.__file__).read_text()
+    mangled = []
+    for node in ast.walk(ast.parse(source)):
+        if not (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            continue
+        written = ast.get_source_segment(source, node.value) or ""
+        escaped = "\\r" in written or "\\n" in written
+        if escaped and not written.lstrip().startswith(("r'", 'r"')):
+            mangled.append(written.splitlines()[0][:60])
+    assert not mangled, f"{len(mangled)} docstring(s) need an r-prefix: {mangled}"
+
+
+def test_a_worker_running_out_of_memory_says_which_file_and_what_to_do():
+    # A worker holds every record of its piece and then joins them, so MemoryError is a real way
+    # for it to end -- and it arrives as itself rather than as BrokenProcessPool, so it missed
+    # the handler that exists for the same failure one step further along, where the kernel does
+    # the killing instead. A raw traceback out of concurrent.futures says neither which file it
+    # was reading nor that --workers is the knob.
+    class OutOfMemory:
+        def submit(self, function, job):
+            failed = Future()
+            failed.set_exception(MemoryError("cannot allocate array"))
+            return failed
+
+    job = builder._Job(
+        piece=ByteRange(source=0, path=Path("enormous.pgn"), start=0, end=1024),
+        rating_source=None,
+        validation_fraction=0.0,
+    )
+
+    with pytest.raises(DatasetError, match="enormous.pgn") as failure:
+        list(builder._in_order(OutOfMemory(), [job], in_flight=2))
+
+    assert "--workers" in str(failure.value)
+    assert isinstance(failure.value.__cause__, MemoryError)
+
+
+def test_a_build_that_has_read_no_games_yet_says_so_and_the_line_moves():
+    # Before the first game comes back -- a build cutting its files into pieces, which for a
+    # file with no boundaries in it is a scan of the whole thing -- every count is zero and
+    # stays zero. A line made of them is one the printer rewrites with itself, which on a
+    # terminal cannot be told from a hang.
+    lines = [
+        format_progress(
+            Progress(
+                games_read=0,
+                games_kept=0,
+                positions=0,
+                bytes_read=0,
+                bytes_total=10**10,
+                seconds=seconds,
+                done=False,
+                scanning=True,
+            )
+        )
+        for seconds in (0.0, 30.0, 90.0)
+    ]
+
+    assert len(set(lines)) == 3, f"the line has to move: {lines}"
+    assert all("games/s" not in line for line in lines), "and not claim a rate it has not got"
+
+
+def test_a_piece_that_gives_up_reports_the_files_count_not_its_own(tmp_path):
+    # `error` reaches the manifest, and the serial path fills it with the file's running total.
+    # A worker only knows its own piece, so composing the sentence there would say "stopped
+    # after 7 games" of a file that had read six million.
+    real_in_order = builder._in_order
+
+    def stopping(pool, jobs, *, in_flight, **rest):
+        for seen, outcome in enumerate(real_in_order(pool, jobs, in_flight=in_flight, **rest)):
+            if seen == 5 and not isinstance(outcome, builder._Job):
+                outcome.error = "ValueError: pretend the chess stopped making sense"
+            yield outcome
+
+    path = separated_pgn(tmp_path / "many.pgn", games=200)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 1000)
+        patch.setattr(builder, "_in_order", stopping)
+        manifest = build(tmp_path / "data", str(path), validation_fraction=0.0, workers=2)
+
+    source = manifest.sources[0]
+    assert source.error is not None
+    assert "pretend the chess stopped making sense" in source.error, "the reason survives"
+    assert source.games_read > 20, "several pieces had been read by then"
+    assert f"after {source.games_read} games" in source.error, (
+        f"{source.error!r} should count the file's games, not one piece's"
+    )
+
+
+def test_a_source_that_has_yielded_no_games_still_reports_how_far_it_has_got():
+    # "Nothing read yet" is not the same state as "still cutting" once bytes have been read. A
+    # source that yields no games at all -- a renamed archive, or a file whose pieces were all
+    # dropped after an early one gave up -- has a real percentage and a real estimate, and
+    # saying it is still looking for the games is both false and a different-looking hang.
+    line = format_progress(
+        Progress(
+            games_read=0,
+            games_kept=0,
+            positions=0,
+            bytes_read=3_000_000_000,
+            bytes_total=10_000_000_000,
+            seconds=60.0,
+            done=False,
+        )
+    )
+
+    assert "finding where the games start" not in line
+    assert "30%" in line, line
+
+
+def test_progress_is_reported_while_a_file_is_being_cut(tmp_path):
+    # The line moving is format_progress's job; getting it onto the terminal is this one's.
+    # game_ranges is a single blocking call per source, so without a report from inside the
+    # scan a boundary-free file shows one line at t=0 and nothing until the cut is over.
+    reports: list[Progress] = []
+    path = flat_pgn(tmp_path / "flat.pgn", games=8000)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 4096)
+        patch.setattr(builder, "MAX_PIECE_BYTES", 8192)
+        patch.setattr(builder, "SCANS_PER_REPORT", 1)
+        patch.setattr(sources, "ALIGN_SCAN", 4096)
+        manifest = build(
+            tmp_path / "data",
+            str(path),
+            validation_fraction=0.0,
+            workers=2,
+            progress=reports.append,
+        )
+
+    assert manifest.games == 8000
+    cutting = [r for r in reports if not r.games_read and not r.bytes_read]
+    assert len(cutting) > 10, f"only {len(cutting)} report(s) while the file was being cut"
+
+
+def test_no_piece_ends_past_the_size_the_build_recorded(tmp_path):
+    # align_to_game reads a whole window from below `size`, so it can accept a boundary above it
+    # and hand back a cut past the end the build is measuring against. That happens for a file
+    # that grew between resolve_sources' stat() and the cut -- a download or an export still
+    # running -- and it makes the last piece reach past bytes_total, so the fraction pins at 100%
+    # and the estimate goes negative, then backwards at the next source.
+    game = '[Event "x"]\r\n[Result "1-0"]\r\n\r\n1. e4 e5 1-0\r\n\r\n'
+    path = tmp_path / "growing.pgn"
+    path.write_bytes((game * 100).encode())
+    whole = path.stat().st_size
+
+    for recorded in range(whole // 2, whole // 2 + len(game) + 1):
+        pieces = game_ranges(Source(path=path, bytes=recorded), 0, 20)
+        assert pieces, recorded
+        assert pieces[-1].end <= recorded, (
+            f"recorded {recorded}, last piece {(pieces[-1].start, pieces[-1].end)}"
+        )
+        assert sum(piece.bytes for piece in pieces) == recorded, recorded
+
+
+def test_a_source_that_gives_up_stops_being_handed_to_workers():
+    # The `if not state.stopped` guard skips the writing, not the submitting: _in_order pulls the
+    # next job every iteration whatever the consumer does. So a dump that gives up at piece 12 of
+    # 1,200 had the other 1,188 parsed in full and thrown away -- the whole parallel read of the
+    # file, for nothing.
+    empty = builder._Read(
+        piece=ByteRange(source=0, path=Path("x.pgn"), start=0, end=1),
+        tally=builder._Tally(),
+        splits={},
+    )
+    submitted: list[builder._Job] = []
+
+    class Counting:
+        def submit(self, function, job):
+            submitted.append(job)
+            done = Future()
+            done.set_result(empty)
+            return done
+
+    jobs = [
+        builder._Job(
+            piece=ByteRange(source=0, path=Path("x.pgn"), start=i * 100, end=(i + 1) * 100),
+            rating_source=None,
+            validation_fraction=0.0,
+        )
+        for i in range(40)
+    ]
+    stopped: set[int] = set()
+    taken = 0
+    for _ in builder._in_order(
+        Counting(), jobs, in_flight=2, wanted=lambda job: job.piece.source not in stopped
+    ):
+        taken += 1
+        stopped.add(0)
+
+    assert taken < 10, f"took {taken} pieces after the source had given up"
+    assert len(submitted) < 10, f"submitted {len(submitted)} of 40 pieces of a stopped file"
+
+
+def test_a_serial_build_says_something_before_its_first_game(tmp_path):
+    # Three rounds went into the parallel path's progress and this branch got none of it: no
+    # report before the loop, none after a source, and _read_games only reports every
+    # REPORT_EVERY games. A file that yields no games therefore passes in silence, and
+    # --workers 1 is what the README now recommends for annotated PGN.
+    reports: list[Progress] = []
+    junk = tmp_path / "junk.pgn"
+    junk.write_text("not pgn at all\n" * 100_000)
+
+    manifest = build(
+        tmp_path / "data",
+        str(junk),
+        fixture("lichess.pgn"),
+        validation_fraction=0.0,
+        workers=1,
+        progress=reports.append,
+    )
+
+    assert manifest.games == 4, "the readable source is still read"
+    assert reports[0].bytes_read == 0, "the first report comes before anything has been read"
+    during = [r for r in reports if not r.done]
+    assert len(during) >= 2, f"only {len(during)} report(s) before the summary"
+    assert any(r.bytes_read >= junk.stat().st_size for r in during), (
+        "and one of them accounts for the file that gave nothing"
+    )
+
+
+def test_scanning_for_boundaries_does_not_report_per_window(tmp_path):
+    # on_scan fires per ALIGN_SCAN window, which for a boundary-free Lichess month is ~127,000
+    # times in a phase where nothing changes but the clock. The printer throttles, but the
+    # callback also feeds a test collector and, in time, a socket -- neither of which does.
+    reports: list[Progress] = []
+    path = flat_pgn(tmp_path / "flat.pgn", games=40000)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 4096)
+        patch.setattr(builder, "MAX_PIECE_BYTES", 8192)
+        patch.setattr(sources, "ALIGN_SCAN", 1024)
+        build(
+            tmp_path / "data",
+            str(path),
+            validation_fraction=0.0,
+            workers=2,
+            progress=reports.append,
+        )
+
+    windows = path.stat().st_size // 1024
+    cutting = [r for r in reports if not r.games_read and not r.bytes_read]
+    assert cutting, "it still reports while cutting"
+    assert len(cutting) < windows // 10, (
+        f"{len(cutting)} reports for {windows} windows scanned: no coarser than per-window"
+    )
+
+
+def test_a_stale_total_does_not_make_a_negative_estimate():
+    # bytes_total is the size resolve_sources recorded; the serial reader follows the file to
+    # whatever its real end is. A file that grew in between makes read exceed total, and
+    # `seconds * (total - read) / read` is then negative -- printed as "-9000s left", since
+    # format_duration does not guard it either.
+    over = Progress(
+        games_read=20,
+        games_kept=20,
+        positions=100,
+        bytes_read=2840,
+        bytes_total=284,
+        seconds=1.0,
+        done=False,
+    )
+
+    assert over.seconds_remaining is None, "there is no estimate to give once the total is past"
+    assert "left" not in format_progress(over)
+
+
+def test_only_a_build_that_is_scanning_says_it_is_scanning():
+    # The serial path has no game_ranges, no align_to_game and no boundary scan: it opens a file
+    # and reads games. Inferring the phase from two zeros told it to say otherwise.
+    zeros = dict(games_read=0, games_kept=0, positions=0, bytes_read=0, bytes_total=10**10)
+
+    assert "finding where the games start" in format_progress(
+        Progress(**zeros, seconds=3.0, done=False, scanning=True)
+    )
+    reading = format_progress(Progress(**zeros, seconds=3.0, done=False))
+    assert "finding where the games start" not in reading
+    assert "0%" in reading and "0 games" in reading, reading
+
+
+def test_a_file_that_yields_no_games_still_reports_while_it_is_read(tmp_path):
+    # read_game consumes a whole file looking for a header before it returns None, so a file with
+    # no games in it reports nothing for as long as the read takes -- ~73 minutes for 20 GB. Both
+    # readers are gated on games, so neither path escapes it.
+    prose = tmp_path / "prose.pgn"
+    prose.write_text("not pgn at all, just prose that goes on and on\n" * 200_000)
+
+    for workers in (1, 4):
+        reports: list[Progress] = []
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(sources, "READ_REPORT_BYTES", 64 << 10)
+            patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+            # Above the cap, so the parallel path reads it here rather than in a worker. A
+            # worker has no channel to report through, so a piece it reads is silent for as
+            # long as it takes -- bounded by MAX_PIECE_BYTES, which is the point of the cap.
+            patch.setattr(builder, "MAX_PIECE_BYTES", 1 << 20)
+            build(
+                tmp_path / f"data{workers}",
+                str(prose),
+                fixture("lichess.pgn"),
+                validation_fraction=0.0,
+                workers=workers,
+                progress=reports.append,
+            )
+        read = [r.bytes_read for r in reports if not r.done and r.bytes_read]
+        assert len(read) > 10, f"workers={workers}: only {len(read)} report(s) during the read"
+        assert read == sorted(read), f"workers={workers}: and it never goes backwards"
+
+
+def test_closing_a_reader_closes_the_file_it_opened(tmp_path):
+    # The reader opens the file and then reads it through a window, and closing the text on top
+    # closes the window -- which is not the file. The handle underneath was left to be collected,
+    # which is a ResourceWarning and, on an interpreter without refcounting, a descriptor held
+    # for as long as it likes.
+    path = separated_pgn(tmp_path / "games.pgn", games=3)
+    reader = sources.PgnReader(Source(path=path, bytes=path.stat().st_size))
+    reader.open()
+    handle = reader._handle
+    assert next(reader.games()) is not None
+
+    reader.close()
+
+    assert handle is not None and handle.closed
+    reader.close()  # and closing twice is closing once
+
+
+def test_every_report_while_the_files_are_being_cut_says_so(tmp_path):
+    # The report between one file's cut and the next's carries the same zeros as the ones from
+    # inside the scan, so without the flag it prints "0%, 0 games" in the middle of a phase that
+    # is otherwise saying it is looking for boundaries.
+    reports: list[Progress] = []
+    for name in ("a.pgn", "b.pgn", "c.pgn"):
+        separated_pgn(tmp_path / name, games=50)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+        patch.setattr(builder, "CHUNK_BYTES", 2048)
+        build(
+            tmp_path / "data",
+            str(tmp_path / "*.pgn"),
+            validation_fraction=0.0,
+            workers=2,
+            progress=reports.append,
+        )
+
+    cutting = [r for r in reports if not r.bytes_read and not r.done]
+    assert len(cutting) >= 4, f"only {len(cutting)} report(s) while cutting three files"
+    assert all(r.scanning for r in cutting), [r.scanning for r in cutting]
+    assert not any(r.scanning for r in reports if r.bytes_read), "and none once reading starts"
+
+
+def test_a_file_that_grew_does_not_count_into_the_next_files_share(tmp_path):
+    # The serial reader follows a file to its real end, and the size the build measures against
+    # is the one recorded when it started. Clamped to the build's total rather than to the
+    # file's own size, a file that grew reports its extra bytes as the following sources' --
+    # and then steps back to where it should have been when it finishes.
+    grown = separated_pgn(tmp_path / "a.pgn", games=2000)
+    separated_pgn(tmp_path / "b.pgn", games=2000)
+    recorded = grown.stat().st_size // 2
+    real = sources.resolve_sources
+
+    def stale(patterns):
+        return [
+            Source(path=s.path, bytes=recorded) if s.path == grown else s for s in real(patterns)
+        ]
+
+    reports: list[Progress] = []
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "resolve_sources", stale)
+        patch.setattr(sources, "READ_REPORT_BYTES", 8 << 10)
+        manifest = build(
+            tmp_path / "data",
+            str(tmp_path / "*.pgn"),
+            validation_fraction=0.0,
+            workers=1,
+            progress=reports.append,
+        )
+
+    assert manifest.games == 4000, "the serial path still reads to the real end"
+    read = [r.bytes_read for r in reports if not r.done]
+    assert read == sorted(read), "it never goes backwards"
+    # Short of its last game, because the reports after that one are of the next file's bytes.
+    first = [r.bytes_read for r in reports if r.games_read < 2000 and not r.done]
+    assert max(first) <= recorded, f"{max(first)} reported of a file recorded as {recorded}"

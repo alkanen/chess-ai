@@ -133,6 +133,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
     """``chess-ai dataset ...``: making datasets out of PGN files, and looking at them."""
     from chess_ai.dataset import DEFAULT_VALIDATION_FRACTION, RatingSource
+    from chess_ai.dataset.builder import default_workers, most_workers
 
     dataset = commands.add_parser("dataset", help="build and inspect training datasets")
     actions = dataset.add_subparsers(title="dataset commands", required=True, metavar="COMMAND")
@@ -163,6 +164,17 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
         choices=[AUTO, *(source.name.lower() for source in RatingSource)],
         default=AUTO,
         help="rating pool to record for every game (default: auto, from each game's headers)",
+    )
+    build.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"processes parsing the PGN files at once (default here: {default_workers()}, "
+        f"at most {most_workers()}). The default is one per usable CPU core up to a cap, since "
+        "each process holds part of a file while it reads it. 1 reads them in this process, and "
+        "so does any build with little enough to do that starting processes would cost more "
+        "than the reading",
     )
     build.add_argument(
         "--overwrite",
@@ -269,6 +281,7 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
             rating_source=source,
             progress=printer,
             overwrite=args.overwrite,
+            workers=args.workers,
         )
     except DatasetError as e:
         raise _UserError(e) from e

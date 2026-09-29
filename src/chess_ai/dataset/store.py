@@ -392,13 +392,34 @@ class SplitWriter:
     def add_game(self, game: np.ndarray, positions: np.ndarray, moves: np.ndarray) -> None:
         """Append one whole game: its record, its positions, and the moves played in them."""
         assert len(game) == 1, "a game is one record"
+        self.add_games(game, positions, moves, np.array([len(positions)], dtype=np.int64))
+
+    def add_games(
+        self,
+        games: np.ndarray,
+        positions: np.ndarray,
+        moves: np.ndarray,
+        ply_counts: np.ndarray,
+    ) -> None:
+        """Append several whole games at once, ``ply_counts`` saying how long each one is.
+
+        What :meth:`add_game` does, worked out for the whole lot in one go: arithmetic over an
+        array rather than a Python loop per game. That is what lets a build which parsed its
+        games in other processes write them here without the writing becoming the slow part.
+
+        This is the only place the two things only a growing file knows are decided, so a caller
+        can hand over what it worked out for itself -- the chess -- and never where it went.
+        """
+        assert len(games) == len(ply_counts), "a count for every game"
         assert len(positions) == len(moves), "every position has the move played in it"
-        game["ply_offset"] = self._positions.count
-        game["ply_count"] = len(positions)
-        positions["game"] = self._games.count
+        assert int(np.sum(ply_counts)) == len(positions), "the counts have to add up"
+        # An exclusive running total: where each game's plies start, counted from the first of them.
+        games["ply_offset"] = self._positions.count + (np.cumsum(ply_counts) - ply_counts)
+        games["ply_count"] = ply_counts
+        positions["game"] = self._games.count + np.repeat(np.arange(len(games)), ply_counts)
         self._positions.append(positions)
         self._moves.append(moves)
-        self._games.append(game)
+        self._games.append(games)
 
     def close(self) -> None:
         """Close all three streams, whatever any one of them does on the way.
