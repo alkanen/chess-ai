@@ -252,6 +252,138 @@ uv run chess-ai train experiments/mlp-baseline.toml --name mlp-baseline-lr3
 Resuming a stopped run, fine-tuning from another run's checkpoint, and following a run in the
 browser are next.
 
+### Choosing training parameters
+
+The defaults in [experiments/mlp-baseline.toml](experiments/mlp-baseline.toml) will train
+something. Getting a *good* result out of a large dataset means choosing a handful of numbers,
+and they interact, so the order you choose them in matters. What follows is the reasoning and
+the numbers one sweep produced, on an RTX 4090 against 10.6M Lichess games — treat the shapes as
+transferable and the exact figures as this setup's.
+
+**Choose with short runs, deliver with long ones.** The single most useful thing to know is that
+a run reaches its endpoint when its cosine schedule bottoms out, whatever length you gave it. A
+15,000-step run and a 172,000-step run of the same config land in the same place relative to
+their own schedules, so a nine-minute run answers most questions that a two-hour run answers.
+Sweep at a length you are willing to repeat a dozen times, and spend the long run only once
+something has actually moved.
+
+The corollary is a trap worth naming: **a loss curve falling all the way to the end of a run
+tells you nothing about whether the run was worth its length.** That fall is mostly the learning
+rate annealing. Only the final numbers of two completed runs can be compared.
+
+#### Learning rate
+
+This is the one that repays attention. In one sweep, getting it wrong cost more than an
+eleven-fold increase in training data was worth.
+
+It scales with **batch size**, and upward, which surprises most people. A larger batch does not
+give a larger gradient — it gives the same gradient measured more accurately, since the variance
+of the estimate falls as 1/batch. Noise is what forces a small step at small batch sizes; remove
+the noise and the limit becomes curvature instead, which is further away. Linear scaling
+(`lr ∝ batch`) is the rule for SGD; for AdamW use **√batch**, because Adam's normalisation by
+`√v̂` already absorbs part of the change. So 1024 → 4096 takes 1e-3 to about 2e-3.
+
+It scales with **model size**, and downward. A wider or deeper network wants a smaller rate,
+roughly as 1/width. A learning rate tuned on a small model will quietly hobble a larger one, and
+the symptom is that the larger model looks *worse* early in training rather than better.
+
+Bracket it rather than guessing — test above and below, and make sure the winner has losers on
+both sides. Three runs of 15,000 steps, 26.6M parameters, batch 16,384, all annealing to 2e-4:
+
+| peak learning rate | policy loss | top-1 |
+| --- | --- | --- |
+| 1e-3 | 1.9844 | 41.6% |
+| **2e-3** | **1.9536** | **42.7%** |
+| 4e-3 | 2.0305 | 41.3% |
+
+Too high is loud and cheap to detect: the loss spikes or goes NaN within a few hundred steps of
+warmup ending. Too low is silent, and looks like a model that has run out of capacity.
+
+#### The floor, and comparing two peaks fairly
+
+`min_learning_rate_fraction` is a fraction **of the peak**, so changing the peak silently moves
+the endpoint too — and a run that anneals further will look better for that reason alone. To
+compare two peaks, set the fraction so the final rates match: 4e-3 with `0.05` and 2e-3 with
+`0.1` both end at 2e-4.
+
+You cannot make that comparison perfectly clean. With the budget and the floor both fixed, the
+peak, the span and the rate of decay are algebraically tied: match any two against your baseline
+and the third differs. That is a reason to stop decomposing and pick a setting, not a reason for
+another run.
+
+#### Batch size
+
+Raise it until throughput stops improving, then stop. A small model at a small batch is not
+limited by arithmetic but by per-step overhead, and batch size is nearly free until it isn't:
+
+| batch | positions/s | per step |
+| --- | --- | --- |
+| 4,096 | 440,285 | 9.30 ms |
+| 16,384 | 523,804 | 31.28 ms |
+
+Going 1,024 → 4,096 tripled throughput; 4,096 → 16,384 added 19%, because four times the work
+now costs 3.4 times the time. That is the knee, and past it you are paying for arithmetic rather
+than reclaiming overhead. Read the median `positions_per_second` out of `metrics.jsonl` rather
+than the startup estimate, which measures a cold GPU and under-reports by 2–3×.
+
+Every increase in batch size needs the learning rate raised with it, or you have simply made the
+run shorter: the same number of steps at the same rate now travels the same distance through a
+larger fraction of the data.
+
+#### How long to train
+
+`steps × batch_size / positions` is how many epochs you get, and the run prints it before it
+starts. Watch that line — 30,000 steps of 1,024 against 704M positions is 0.04 epochs, which is
+almost certainly not what was intended.
+
+More data does help, but **only once the learning rate is right**. In the same sweep, a four-epoch
+run at 4e-3 (2.8 billion positions) finished worse than a 15,000-step run at 2e-3 that saw
+less than a tenth as much. If more data appears not
+to be helping, suspect the learning rate before concluding the model is saturated.
+
+The learning-rate schedule spans `steps`, and resuming a finished run is not supported yet, so
+decide the total length up front. Two epochs is `steps = 2 × positions / batch_size`; running a
+one-epoch config twice gives two runs that each annealed to their floor, which is a different and
+worse thing.
+
+#### What did not matter
+
+Worth knowing so you do not spend runs on them. In this sweep, neither moved the result by more
+than measurement noise:
+
+- **Warmup length.** 500 and 3,000 steps gave the same answer. Warmup exists to protect Adam
+  while its second-moment estimate is built from too few gradients, and that window is about
+  `1/(1-beta2)` steps — 20 at the default `beta2 = 0.95`. Anything from 1–5% of the run is fine.
+- **`value_loss_weight`.** Dropping it from 0.5 to 0.1 moved the policy by 0.003. The value head
+  is a genuinely hard, noisy auxiliary task — every position in a game carries that game's final
+  result — so it neither learns much nor costs the policy much. Leave it at 0.5 and get the
+  better value head for free.
+
+#### What to watch
+
+- **`illegal`** is the clearest signal that the network is learning chess rather than move
+  frequencies, and it needs no interpretation. Across one series it went 32.3% → 1.21%.
+- **The train/validation gap** is your overfitting detector: `policy_loss` on the `train` rows of
+  `metrics.jsonl` against the `validation` rows. Across this series it stayed under +0.02, and
+  under +0.01 for the two-epoch run. If it opens up, you have found the data limit.
+- **`top1` against published work.** Maia-class residual networks reach roughly 50% move
+  matching; a dense MLP on these inputs plateaus in the low-to-mid 40s.
+
+#### Two settings that are not about model quality
+
+- **`[validation] positions`** is your error bar, and it is coarser than it looks: 16,384
+  positions come from only ~240 games, and positions within a game are heavily correlated, so the
+  effective sample is far smaller than the count suggests. 163,840 spans ~2,400 games and costs
+  about three seconds per validation, nearly all of it the per-position legality check.
+  Differences under about a point of `top1` are not resolvable at the smaller size.
+- **`[training] data_workers`** costs memory twice. Each worker builds its own shuffle
+  permutation — four bytes per position, so 2.8 GB against a 704M-position split — and each
+  batch in flight is pinned host memory, `batch_size × data_workers × 4` batches' worth. On
+  platforms where page-locked memory is scarce (WSL2 caps it near 1 GiB whatever `ulimit -l`
+  reports) a large batch with four workers can exhaust it, which surfaces confusingly as
+  `CUDA error: out of memory` while the GPU is nearly empty. Two workers cost about 7% throughput
+  and a great deal of headroom.
+
 ### Shortcuts with make
 
 With `make` installed, one command builds the frontend if it is out of date and then serves the app:
