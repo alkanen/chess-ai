@@ -37,7 +37,9 @@ class Batch(NamedTuple):
     """One batch of encoded input and the targets that go with it."""
 
     spatial: torch.Tensor
-    """(batch, channels, board, board) ``float32``."""
+    """(batch, channels, board, board) ``uint8`` until :meth:`to` moves it, ``float32`` after.
+
+    See :attr:`~chess_ai.encoders.InputBundle.spatial` for why it travels as bytes."""
     globals: torch.Tensor
     """(batch, features) ``float32``."""
     move: torch.Tensor
@@ -47,8 +49,15 @@ class Batch(NamedTuple):
     """(batch,) ``int64`` :class:`~chess_ai.dataset.Result`, from the mover's point of view."""
 
     def to(self, device: torch.device, *, non_blocking: bool = False) -> "Batch":
-        """This batch on ``device``."""
-        return Batch(*(tensor.to(device, non_blocking=non_blocking) for tensor in self))
+        """This batch on ``device``, with the planes as the floats a model reads.
+
+        Converted after the copy rather than before, so that what crosses to the device is the
+        quarter-size bytes and the conversion runs there.
+        """
+        spatial, globals_, move, result = (
+            tensor.to(device, non_blocking=non_blocking) for tensor in self
+        )
+        return Batch(spatial.float(), globals_, move, result)
 
     def __len__(self) -> int:
         return len(self.move)

@@ -104,7 +104,7 @@ def _forward(
     """
     records = frames[:, 0]
     bundle = encoder.encode(frames)
-    spatial = torch.from_numpy(bundle.spatial).to(device)
+    spatial = torch.from_numpy(bundle.spatial).to(device).float()
     globals_ = torch.from_numpy(bundle.globals).to(device)
     played = torch.as_tensor(
         encoder.model_moves(records["move"], white_to_move(records)), device=device

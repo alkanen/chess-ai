@@ -56,7 +56,7 @@ def test_the_spec_describes_what_encode_actually_returns():
     assert bundle.sequence is None, "this encoder produces no move sequence"
     assert spec.policy_size == VOCABULARY_SIZE
     assert spec.spatial_channels == PIECE_PLANES
-    assert (bundle.spatial.dtype, bundle.globals.dtype) == (np.float32, np.float32)
+    assert (bundle.spatial.dtype, bundle.globals.dtype) == (np.uint8, np.float32)
 
 
 def test_the_spec_records_the_options_it_was_made_with():
@@ -480,3 +480,19 @@ def test_the_history_turns_with_the_position_it_belongs_to():
     assert opening[WHITE_PAWNS, 1].tolist() == [1] * 8, "black's pawns at the bottom"
     assert opening[BLACK_PAWNS, 6].tolist() == [1] * 8, "and white's, unmoved, at the top"
     assert opening[WHITE_KING][0][4] == 1
+
+
+def test_the_planes_are_bytes_so_a_big_batch_is_cheap_to_allocate_and_ship():
+    """A float32 batch of 8192 with one history frame is 48 MiB, allocated afresh per batch.
+
+    That is past 32 MiB, the most glibc's dynamic mmap threshold ever rises to on 64-bit, so the
+    allocation is always a fresh mapping and every one of its pages faults on first touch. That
+    measured at half a second a batch and starved the GPU. As bytes the same batch is 12 MiB.
+    """
+    encoder = create_encoder("board-planes", history=1)
+
+    planes = encoder.encode(records(chess.Board(), played("e4"))).spatial
+
+    assert planes.dtype == np.uint8
+    assert set(np.unique(planes).tolist()) == {0, 1}
+    assert 8192 * encoder.spec.spatial_features * planes.itemsize == 12 * 2**20, "the batch above"

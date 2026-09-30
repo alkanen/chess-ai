@@ -183,7 +183,7 @@ class InferenceEngine:
         ]
         spatial = torch.from_numpy(np.concatenate([bundle.spatial for bundle in bundles]))
         globals_ = torch.from_numpy(np.concatenate([bundle.globals for bundle in bundles]))
-        out = self._model(spatial.to(self.device), globals_.to(self.device))
+        out = self._model(spatial.to(self.device).float(), globals_.to(self.device))
         return out.policy.float().cpu().numpy(), out.value.float().cpu().numpy()
 
 

@@ -74,7 +74,13 @@ class InputBundle:
     """
 
     spatial: np.ndarray
-    """``float32`` of shape (batch, channels, board, board)."""
+    """``uint8`` of shape (batch, channels, board, board), turned into floats on the device.
+
+    Bytes rather than floats because the planes are all ones and zeros, and a batch is allocated
+    afresh, sent from a loader worker through shared memory, pinned and copied to the GPU: at
+    four bytes a square a batch of 8192 with one history frame is 48 MiB, and allocating that
+    much every batch cost more than the rest of the step put together.
+    """
     globals: np.ndarray
     """``float32`` of shape (batch, features)."""
     sequence: np.ndarray | None = None

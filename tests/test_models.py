@@ -46,7 +46,7 @@ def spec(encoder) -> EncoderSpec:
 def batch(encoder):
     """The test positions, encoded and as tensors, the way the trainer would hand them over."""
     bundle = encoder.encode(records(*POSITIONS))
-    return torch.from_numpy(bundle.spatial), torch.from_numpy(bundle.globals)
+    return torch.from_numpy(bundle.spatial).float(), torch.from_numpy(bundle.globals)
 
 
 @pytest.mark.parametrize("architecture", architecture_names())

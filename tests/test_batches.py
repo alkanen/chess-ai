@@ -207,3 +207,13 @@ def test_an_oriented_batch_mirrors_the_targets_of_the_positions_it_turned(direct
     assert torch.equal(turned.move[~white_to_move], mirrored[~white_to_move])
     assert not torch.equal(turned.move, absolute.move)
     assert torch.equal(turned.result, absolute.result), "the result is already the mover's"
+
+
+def test_the_planes_travel_as_bytes_and_arrive_on_the_device_as_floats(directory):
+    batch = batches(directory)[0]
+
+    assert batch.spatial.dtype == torch.uint8, "a quarter of the size through the loader"
+    moved = batch.to(torch.device("cpu"))
+    assert moved.spatial.dtype == torch.float32
+    assert torch.equal(moved.spatial, batch.spatial.float())
+    assert moved.move.dtype == torch.int64, "only the planes are converted"

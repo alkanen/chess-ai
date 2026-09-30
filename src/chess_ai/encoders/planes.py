@@ -214,7 +214,7 @@ class BoardPlanesEncoder:
         return (current["flags"] & PositionFlags.WHITE_TO_MOVE) == 0
 
     def _planes(self, frames: np.ndarray, turned: np.ndarray) -> np.ndarray:
-        """The piece planes, as (batch, (history + 1) * :data:`PIECE_PLANES`, 8, 8) ``float32``.
+        """The piece planes, as (batch, (history + 1) * :data:`PIECE_PLANES`, 8, 8) ``uint8``.
 
         The current position's twelve planes first, then each earlier position's, most recent
         first. A history frame the batch does not hold, or holds as a blank record, is twelve
@@ -227,12 +227,12 @@ class BoardPlanesEncoder:
             # Every frame of an example turns with its current position, earlier ones included:
             # the mover's pieces stay on the same planes all the way back through the history.
             codes[turned] = _turn(codes[turned])
-        planes = np.zeros((batch, (self.history + 1) * PIECE_PLANES, SQUARES), dtype=np.float32)
+        planes = np.zeros((batch, (self.history + 1) * PIECE_PLANES, SQUARES), dtype=np.uint8)
         # Only the occupied squares, scattered in one pass: a board holds at most 32 pieces, so
         # this touches a twentieth of what a plane-by-plane comparison would.
         example, frame, square = np.nonzero(codes)
         plane = frame * PIECE_PLANES + codes[example, frame, square] - 1
-        planes[example, plane, square] = 1.0
+        planes[example, plane, square] = 1
         return planes.reshape(batch, -1, BOARD_SIZE, BOARD_SIZE)
 
     def _globals(self, positions: np.ndarray, turned: np.ndarray) -> np.ndarray:

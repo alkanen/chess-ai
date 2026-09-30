@@ -51,7 +51,10 @@ class ChessModel(nn.Module, ABC):
         """Score every move and judge the position, for a whole batch.
 
         ``spatial`` is (batch, channels, board, board) and ``globals`` is (batch, features), as
-        the spec describes them.
+        the spec describes them, and both are floats. An encoder's planes are bytes, which is
+        not what a model takes: whatever moves them to the device converts them, as
+        :meth:`~chess_ai.training.batches.Batch.to` does, so a raw
+        :class:`~chess_ai.encoders.InputBundle` is never handed over as it is.
         """
 
     @property
