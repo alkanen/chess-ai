@@ -600,6 +600,28 @@ class SplitReader:
         """Positions ``indices`` as one array, which is what a training batch is."""
         return self._positions.gather(indices)
 
+    def position_history(self, indices: np.ndarray | list[int], history: int) -> np.ndarray:
+        """Positions ``indices``, each followed by the ``history`` positions before it in its game.
+
+        Shaped (len(indices), 1 + history): column 0 is what :meth:`positions` returns, and
+        column ``k`` is the position ``k`` plies earlier. Where a game had not been going that
+        long the record is blank — zero bytes, which is an empty board — rather than the tail
+        of whichever game happens to be stored in front of it.
+
+        A game's positions are stored end to end in the order they were played, so going back a
+        ply is going back a record, and a position's own ``ply`` says how far back its game goes.
+        """
+        wanted = np.asarray(indices, dtype=np.int64).reshape(-1)
+        wanted = np.where(wanted < 0, wanted + len(self), wanted)
+        out = np.zeros((len(wanted), history + 1), dtype=POSITION_DTYPE)
+        out[:, 0] = self._positions.gather(wanted)
+        if history:
+            back = np.arange(1, history + 1)
+            played = out[:, 0]["ply"][:, None] >= back
+            earlier = out[:, 1:]
+            earlier[played] = self._positions.gather((wanted[:, None] - back)[played])
+        return out
+
     def game(self, index: int) -> np.void:
         """Game ``index``, as a :data:`~chess_ai.dataset.records.GAME_DTYPE` record."""
         return self._games.record(index)

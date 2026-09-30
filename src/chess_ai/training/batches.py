@@ -26,7 +26,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
 
-from chess_ai.dataset import Dataset, SplitReader
+from chess_ai.dataset import Dataset, SplitReader, white_to_move
 from chess_ai.encoders import Encoder, create_encoder
 
 PREFETCH_BATCHES: Final = 4
@@ -41,7 +41,8 @@ class Batch(NamedTuple):
     globals: torch.Tensor
     """(batch, features) ``float32``."""
     move: torch.Tensor
-    """(batch,) ``int64`` indices into the move vocabulary: the move actually played."""
+    """(batch,) ``int64`` indices into the move vocabulary: the move actually played, as the
+    encoder shows moves to the model; see :meth:`~chess_ai.encoders.Encoder.model_moves`."""
     result: torch.Tensor
     """(batch,) ``int64`` :class:`~chess_ai.dataset.Result`, from the mover's point of view."""
 
@@ -98,12 +99,14 @@ class PositionBatches(TorchDataset):
         epoch, within = divmod(index, self.batches_per_epoch)
         start = within * self.batch_size
         order = self._order(epoch)[start : start + self.batch_size]
-        records = self._split_reader().positions(order)
-        bundle = self._position_encoder().encode(records)
+        encoder = self._position_encoder()
+        frames = self._split_reader().position_history(order, encoder.history)
+        records = frames[:, 0]
+        bundle = encoder.encode(frames)
         return Batch(
             spatial=torch.from_numpy(bundle.spatial),
             globals=torch.from_numpy(bundle.globals),
-            move=torch.from_numpy(records["move"].astype(np.int64)),
+            move=torch.from_numpy(encoder.model_moves(records["move"], white_to_move(records))),
             result=torch.from_numpy(records["result"].astype(np.int64)),
         )
 

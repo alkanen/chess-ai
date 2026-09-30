@@ -5,6 +5,7 @@ answers what the test tells it to, so top-1, top-5 and the illegal-move rate can
 against the arithmetic.
 """
 
+import numpy as np
 import pytest
 import torch
 from training_helpers import dataset
@@ -49,7 +50,7 @@ def split(tmp_path):
 
 def measure(split, ranking, *, positions=8, **options):
     """Validate a scripted model over ``positions`` positions of ``split``."""
-    encoder = create_encoder("board-planes")
+    encoder = create_encoder("board-planes", **options.pop("encoder", {}))
     model = Scripted(encoder.spec, ranking)
     return validate(
         model,
@@ -195,3 +196,57 @@ def test_the_move_a_record_holds_is_legal_in_the_position_it_holds(split):
 
         assert board.is_valid(), board.fen()
         assert board.is_legal(move_at(int(record["move"]))), board.fen()
+
+
+ORIENTED = {"orientation": "side-to-move"}
+
+
+def test_an_oriented_model_is_scored_on_the_moves_as_it_was_shown_them(split):
+    """The model answers in its own terms, mirrored for black, and that is the right answer."""
+    encoder = create_encoder("board-planes", **ORIENTED)
+    white = [bool(unpack_board(split.position(index)).turn) for index in range(8)]
+    assert not all(white), "black is to move in some of these"
+    moves = encoder.model_moves(np.array(played(split, 8)), np.array(white)).tolist()
+
+    metrics = measure(split, lambda row: [moves[row]], encoder=ORIENTED)
+
+    assert metrics["top1"] == 1.0
+    assert metrics["illegal_top_move_rate"] == 0.0, "turned back before the rules are asked"
+
+
+def test_an_oriented_model_that_answers_for_the_real_board_is_wrong_for_black(split):
+    moves = played(split, 8)
+    black = sum(not unpack_board(split.position(index)).turn for index in range(8))
+
+    metrics = measure(split, lambda row: [moves[row]], encoder=ORIENTED)
+
+    assert metrics["top1"] == pytest.approx((8 - black) / 8)
+
+
+def test_validation_gives_the_encoder_the_history_it_asks_for(split):
+    seen = []
+
+    class Watching(Scripted):
+        def forward(self, spatial, globals):  # noqa: A002
+            seen.append(spatial.clone())
+            return super().forward(spatial, globals)
+
+    encoder = create_encoder("board-planes", history=1)
+    validate(
+        Watching(encoder.spec, lambda row: [0]),
+        split,
+        encoder,
+        positions=8,
+        batch_size=8,
+        device=torch.device("cpu"),
+        value_loss_weight=0.5,
+    )
+
+    (spatial,) = seen
+    assert spatial.shape == (8, 24, 8, 8)
+    plain = create_encoder("board-planes").encode(split.positions(np.arange(8))).spatial
+    # The first eight positions are one game's first eight plies, so each one's history is
+    # the position before it, and the first has none.
+    assert [int(split.position(index)["ply"]) for index in range(8)] == list(range(8))
+    assert spatial[0, 12:].sum() == 0
+    assert np.array_equal(spatial[1:, 12:].numpy(), plain[:-1])

@@ -35,6 +35,17 @@ name = "board-planes"                      # default: "board-planes"
 # leaving the range the model was trained on.
 rating_scale = 5000.0                      # default: 5000.0
 
+# How many earlier positions of the game are shown behind the current one, as 12 more
+# planes each. 0 shows the position alone. Planes for positions before the game began
+# are all zero.
+history = 0                                # default: 0
+
+# Which way up the board is shown. "absolute" is always from white's side.
+# "side-to-move" turns it around when black is to move, so the mover's pieces are
+# always on the same planes and always play up the board; the castling features and
+# the moves the model predicts are turned with it, and turned back when it plays.
+orientation = "absolute"                   # default: "absolute"
+
 [model]
 # Which architecture, by its registered name. Everything below this line is that
 # architecture's own hyperparameters, so a typo is refused rather than ignored.

@@ -23,8 +23,31 @@ class Encoder(Protocol):
         """The shapes this encoder produces, and the settings it was made with."""
         ...
 
+    history: int
+    """How many earlier positions of its game each position is encoded with, 0 for none.
+
+    Whoever gathers the records gathers this many more behind each; see
+    :meth:`~chess_ai.dataset.SplitReader.position_history`.
+    """
+
     def encode(self, positions: np.ndarray) -> InputBundle:
-        """Encode a batch of :data:`~chess_ai.dataset.POSITION_DTYPE` records."""
+        """Encode a batch of :data:`~chess_ai.dataset.POSITION_DTYPE` records.
+
+        Either (batch,) positions, or (batch, 1 + history): each position and then the ones
+        before it in its game, most recent first.
+        """
+        ...
+
+    def model_moves(self, moves: np.ndarray, white_to_move: np.ndarray | bool) -> np.ndarray:
+        """Vocabulary indices of moves on the board, as the indices the model predicts.
+
+        An encoder may show the model a transformed board, and then it has to transform the
+        moves to match. Training targets go through this on the way in.
+        """
+        ...
+
+    def board_moves(self, moves: np.ndarray, white_to_move: np.ndarray | bool) -> np.ndarray:
+        """The inverse of :meth:`model_moves`: what the model predicted, as moves on the board."""
         ...
 
     def encode_board(

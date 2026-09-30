@@ -254,3 +254,57 @@ def test_a_dataset_gives_back_the_shards_it_mapped(tmp_path):
 
 def _open_files() -> int:
     return len(os.listdir("/proc/self/fd"))
+
+
+def test_a_position_comes_with_the_positions_before_it_in_its_game(tmp_path):
+    reader = built(tmp_path, shards=TINY_SHARDS)[TRAIN]
+    game = reader.game_positions(1)
+    offset = int(reader.game(1)["ply_offset"])
+    assert len(game) > 5, "a game long enough to have a history"
+
+    frames = reader.position_history([offset + 5, offset + 3], history=3)
+
+    assert frames.shape == (2, 4)
+    assert frames.dtype == POSITION_DTYPE
+    assert frames[0].tobytes() == game[[5, 4, 3, 2]].tobytes(), "most recent first"
+    assert frames[1].tobytes() == game[[3, 2, 1, 0]].tobytes()
+
+
+def test_history_stops_at_the_start_of_the_game_rather_than_running_into_the_one_before(tmp_path):
+    reader = built(tmp_path, shards=TINY_SHARDS)[TRAIN]
+    offset = int(reader.game(1)["ply_offset"])
+    assert offset > 0, "there is a game stored in front of this one to run into"
+    blank = np.zeros(1, dtype=POSITION_DTYPE)[0].tobytes()
+
+    first, second = reader.position_history([offset, offset + 1], history=2)
+
+    assert first[0].tobytes() == reader.position(offset).tobytes()
+    assert [frame.tobytes() for frame in first[1:]] == [blank, blank]
+    assert second[1].tobytes() == reader.position(offset).tobytes()
+    assert second[2].tobytes() == blank
+
+
+def test_every_history_frame_is_from_the_same_game_one_ply_further_back(tmp_path):
+    """Over a whole split in tiny shards, so histories cross shard boundaries too."""
+    reader = built(tmp_path, shards=TINY_SHARDS)[TRAIN]
+
+    frames = reader.position_history(np.arange(len(reader)), history=4)
+
+    current = frames[:, :1]
+    back = np.arange(5)
+    there = current["ply"] >= back
+    assert np.array_equal(
+        frames["game"][there], np.broadcast_to(current["game"], there.shape)[there]
+    )
+    assert np.array_equal(frames["ply"][there], (current["ply"] - back)[there])
+    assert not frames["board"][~there].any(), "and nothing at all where the game had not begun"
+    assert (~there).any() and there[:, 1:].any()
+
+
+def test_no_history_is_just_the_positions(tmp_path):
+    reader = built(tmp_path)[TRAIN]
+
+    frames = reader.position_history([3, 0, -1], history=0)
+
+    assert frames.shape == (3, 1)
+    assert frames[:, 0].tobytes() == reader.positions([3, 0, -1]).tobytes()

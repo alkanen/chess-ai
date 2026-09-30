@@ -5,6 +5,7 @@ the fixture PGN files the dataset tests already use. What the tests check is tha
 wired together and write what they promise, which a small model shows as well as a large one.
 """
 
+import random
 import textwrap
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -78,6 +79,20 @@ def record(
         ],
         dtype=POSITION_DTYPE,
     )
+
+
+def playout(seed: int, plies: int = 120) -> list[chess.Board]:
+    """The positions a random game passes through, as a source of varied positions."""
+    rng = random.Random(seed)
+    board = chess.Board()
+    boards = [board.copy()]
+    for _ in range(plies):
+        moves = list(board.legal_moves)
+        if not moves:
+            break
+        board.push(rng.choice(moves))
+        boards.append(board.copy())
+    return boards
 
 
 def records(*boards: chess.Board) -> np.ndarray:

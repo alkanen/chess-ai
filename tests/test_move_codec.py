@@ -1,10 +1,9 @@
 """The move vocabulary, checked against python-chess over a large sample of positions."""
 
-import random
-
 import chess
 import numpy as np
 import pytest
+from training_helpers import playout
 
 from chess_ai.move_codec import (
     MIRRORED_INDEX,
@@ -15,20 +14,6 @@ from chess_ai.move_codec import (
     move_at,
     move_index,
 )
-
-
-def playout(seed: int, plies: int = 120) -> list[chess.Board]:
-    """The positions a random game passes through, as a source of varied positions."""
-    rng = random.Random(seed)
-    board = chess.Board()
-    boards = [board.copy()]
-    for _ in range(plies):
-        moves = list(board.legal_moves)
-        if not moves:
-            break
-        board.push(rng.choice(moves))
-        boards.append(board.copy())
-    return boards
 
 
 @pytest.fixture(scope="module")

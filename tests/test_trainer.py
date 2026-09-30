@@ -6,11 +6,13 @@ import tempfile
 import tracemalloc
 from pathlib import Path
 
+import chess
 import pytest
 import torch
 from training_helpers import dataset, experiment
 
 from chess_ai.dataset import open_dataset
+from chess_ai.inference import load_engine
 from chess_ai.training import (
     RunStatus,
     TrainingError,
@@ -625,3 +627,23 @@ def test_counting_extra_validations_does_not_scale_with_the_run(tmp_path):
     # both, so it is not extra.
     assert answer == 10_000_000 - 10_000
     assert peak < 1_000_000, f"counting allocated {peak / 1e6:.0f} MB to print one line"
+
+
+def test_a_run_with_history_and_side_to_move_orientation_trains_validates_and_plays(
+    tmp_path, data_dir
+):
+    reader = run(tmp_path, data_dir, encoder='history = 2\norientation = "side-to-move"')
+
+    assert reader.info.encoder.spatial_channels == 36
+    assert reader.info.encoder.options == {
+        "rating_scale": 5000.0,
+        "history": 2,
+        "orientation": "side-to-move",
+    }
+    validation = [row for row in reader.metrics() if row["split"] == "validation"]
+    assert validation and all(0.0 <= row["illegal_top_move_rate"] <= 1.0 for row in validation)
+    engine = load_engine(reader.checkpoint_path(reader.latest_checkpoint()))
+    assert engine.spec == reader.info.encoder
+    board = chess.Board()
+    board.push_san("e4")
+    assert engine.evaluate(board).best in board.legal_moves

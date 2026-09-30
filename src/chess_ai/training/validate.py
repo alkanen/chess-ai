@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from chess_ai.dataset import SplitReader
+from chess_ai.dataset import SplitReader, white_to_move
 from chess_ai.dataset.records import unpack_board
 from chess_ai.encoders import Encoder
 from chess_ai.models import ChessModel
@@ -57,9 +57,12 @@ def validate(
     counts = {"top1": 0, "top5": 0, "illegal_top_move": 0}
     try:
         for start in range(0, total, batch_size):
-            records = split.positions(np.arange(start, min(start + batch_size, total)))
+            frames = split.position_history(
+                np.arange(start, min(start + batch_size, total)), encoder.history
+            )
+            records = frames[:, 0]
             played, policy, value = _forward(
-                model, encoder, records, device=device, dtype=autocast_dtype
+                model, encoder, frames, device=device, dtype=autocast_dtype
             )
             result = torch.as_tensor(records["result"].astype(np.int64), device=policy.device)
             sums["policy_loss"] += _total_loss(policy, played)
@@ -67,7 +70,8 @@ def validate(
             ranked = policy.topk(TOP_K, dim=1).indices
             counts["top1"] += int((ranked[:, 0] == played).sum())
             counts["top5"] += int((ranked == played.unsqueeze(1)).any(dim=1).sum())
-            counts["illegal_top_move"] += _illegal(records, ranked[:, 0].tolist())
+            top_moves = encoder.board_moves(ranked[:, 0].cpu().numpy(), white_to_move(records))
+            counts["illegal_top_move"] += _illegal(records, top_moves.tolist())
     finally:
         model.train(was_training)
 
@@ -88,16 +92,23 @@ def validate(
 def _forward(
     model: ChessModel,
     encoder: Encoder,
-    records: np.ndarray,
+    frames: np.ndarray,
     *,
     device: torch.device,
     dtype: torch.dtype | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The played moves and the model's two outputs for ``records``, as float32 logits."""
-    bundle = encoder.encode(records)
+    """The played moves and the model's two outputs for ``frames``, as float32 logits.
+
+    The played moves are in the model's own terms, as its policy is, so the two can be compared
+    directly whichever way the encoder turned the board.
+    """
+    records = frames[:, 0]
+    bundle = encoder.encode(frames)
     spatial = torch.from_numpy(bundle.spatial).to(device)
     globals_ = torch.from_numpy(bundle.globals).to(device)
-    played = torch.as_tensor(records["move"].astype(np.int64), device=device)
+    played = torch.as_tensor(
+        encoder.model_moves(records["move"], white_to_move(records)), device=device
+    )
     with torch.autocast(device.type, dtype=dtype, enabled=dtype is not None):
         out = model(spatial, globals_)
     # Back to float32 before the losses and the ranking: a bfloat16 logit has eight bits of
@@ -112,6 +123,8 @@ def _total_loss(logits: torch.Tensor, targets: torch.Tensor) -> float:
 
 def _illegal(records: np.ndarray, top_moves: list[int]) -> int:
     """How many of ``top_moves`` cannot be played in the position they were predicted for.
+
+    ``top_moves`` are moves on the real board, which is where the rules apply.
 
     The one place validation leaves numpy for python-chess. Only the top move is checked rather
     than the whole distribution, which turns generating every legal move into a single legality

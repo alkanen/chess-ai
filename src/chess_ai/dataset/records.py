@@ -296,6 +296,39 @@ def live_position(
     )
 
 
+def white_to_move(positions: np.ndarray) -> np.ndarray:
+    """Which of ``positions`` have white to move, as booleans of the same shape."""
+    return (positions["flags"] & PositionFlags.WHITE_TO_MOVE) != 0
+
+
+def live_history(
+    board: chess.Board,
+    history: int,
+    *,
+    mover_rating: int | None = None,
+    opponent_rating: int | None = None,
+) -> np.ndarray:
+    """A position being played and the ``history`` positions before it, shaped (1, 1 + history).
+
+    The live counterpart of :meth:`~chess_ai.dataset.SplitReader.position_history`, and laid out
+    the same way: the position itself first, then the ones it came from, most recent first. They
+    are read off the moves played on ``board``; where the board has had fewer than ``history``
+    moves played on it the records are blank, as they are before the start of a dataset's game.
+    """
+    frames = np.zeros((1, history + 1), dtype=POSITION_DTYPE)
+    frames[0, 0] = live_position(board, mover_rating=mover_rating, opponent_rating=opponent_rating)[
+        0
+    ]
+    if history and board.move_stack:
+        earlier = board.copy()
+        for back in range(1, min(history, len(earlier.move_stack)) + 1):
+            earlier.pop()
+            # The ratings swap sides with every ply back; nothing reads them off an earlier
+            # position, so they are left unknown rather than kept straight.
+            frames[0, back] = live_position(earlier)[0]
+    return frames
+
+
 def unpack_board(position: np.void) -> chess.Board:
     """The position ``position`` was packed from, as a board the rules apply to again.
 

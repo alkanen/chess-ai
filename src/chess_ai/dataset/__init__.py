@@ -38,8 +38,10 @@ from chess_ai.dataset.records import (
     RatingSource,
     Result,
     TimeControl,
+    live_history,
     live_position,
     unpack_board,
+    white_to_move,
 )
 from chess_ai.dataset.store import (
     Dataset,
@@ -77,9 +79,11 @@ __all__ = [
     "build_dataset",
     "dataset_path",
     "list_datasets",
+    "live_history",
     "live_position",
     "load_manifest",
     "open_dataset",
     "summarize",
     "unpack_board",
+    "white_to_move",
 ]
