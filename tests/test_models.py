@@ -21,15 +21,31 @@ POSITIONS = [
 """A handful of positions to check shapes on, and to make a tiny model memorize."""
 
 
-@pytest.fixture
-def spec() -> EncoderSpec:
-    return create_encoder("board-planes").spec
+ENCODER_OPTIONS = [
+    {},
+    {"history": 2},
+    {"orientation": "side-to-move"},
+    {"history": 3, "orientation": "side-to-move"},
+]
+"""Every shape of input the encoder can be asked for, which every model has to be built from."""
+
+
+@pytest.fixture(
+    params=ENCODER_OPTIONS, ids=lambda options: ",".join(map(str, options.values())) or "plain"
+)
+def encoder(request):
+    return create_encoder("board-planes", **request.param)
 
 
 @pytest.fixture
-def batch(spec):
+def spec(encoder) -> EncoderSpec:
+    return encoder.spec
+
+
+@pytest.fixture
+def batch(encoder):
     """The test positions, encoded and as tensors, the way the trainer would hand them over."""
-    bundle = create_encoder("board-planes").encode(records(*POSITIONS))
+    bundle = encoder.encode(records(*POSITIONS))
     return torch.from_numpy(bundle.spatial), torch.from_numpy(bundle.globals)
 
 

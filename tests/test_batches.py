@@ -9,7 +9,7 @@ from training_helpers import dataset
 
 from chess_ai.dataset import Result, open_dataset
 from chess_ai.encoders import create_encoder
-from chess_ai.move_codec import VOCABULARY_SIZE
+from chess_ai.move_codec import MIRRORED_INDEX, VOCABULARY_SIZE
 from chess_ai.training.batches import PositionBatches, batch_loader
 
 
@@ -181,3 +181,29 @@ def test_closing_leaves_nothing_of_the_split_to_pickle(directory):
         f"closing left {closed - untouched} bytes behind that a new object does not carry"
     )
     assert len(source[0]) == 4, "and it maps and shuffles again when asked for another batch"
+
+
+def test_a_batch_carries_the_history_its_encoder_asks_for(directory):
+    options = {"history": 2}
+    source = batches(directory, encoder_options=options)
+
+    batch = source[0]
+
+    spec = create_encoder("board-planes", **options).spec
+    assert batch.spatial.shape == (4, *spec.spatial_shape) == (4, 36, 8, 8)
+    assert torch.equal(batch.spatial[:, :12], batches(directory)[0].spatial), "the same positions"
+    assert batch.spatial[:, 12:].sum() > 0, "with something behind them"
+
+
+def test_an_oriented_batch_mirrors_the_targets_of_the_positions_it_turned(directory):
+    """The target has to be the move on the board the model was shown."""
+    absolute = batches(directory, batch_size=32)[0]
+    turned = batches(directory, batch_size=32, encoder_options={"orientation": "side-to-move"})[0]
+
+    white_to_move = absolute.globals[:, 0] == 1
+    mirrored = torch.from_numpy(MIRRORED_INDEX.astype(np.int64))[absolute.move]
+    assert white_to_move.any() and (~white_to_move).any()
+    assert torch.equal(turned.move[white_to_move], absolute.move[white_to_move])
+    assert torch.equal(turned.move[~white_to_move], mirrored[~white_to_move])
+    assert not torch.equal(turned.move, absolute.move)
+    assert torch.equal(turned.result, absolute.result), "the result is already the mover's"

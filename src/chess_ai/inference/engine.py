@@ -162,7 +162,8 @@ class InferenceEngine:
             batch = boards[start : start + self.batch_size]
             policy, value = self._forward(batch, mover_rating, opponent_rating)
             evaluations.extend(
-                _evaluation(board, policy[index], value[index]) for index, board in enumerate(batch)
+                _evaluation(board, self._encoder, policy[index], value[index])
+                for index, board in enumerate(batch)
             )
         return evaluations
 
@@ -186,18 +187,24 @@ class InferenceEngine:
         return out.policy.float().cpu().numpy(), out.value.float().cpu().numpy()
 
 
-def _evaluation(board: chess.Board, policy: np.ndarray, value: np.ndarray) -> Evaluation:
+def _evaluation(
+    board: chess.Board, encoder: Encoder, policy: np.ndarray, value: np.ndarray
+) -> Evaluation:
     """One position's logits turned into what the caller asked about."""
-    mask = legal_mask(board)
-    if not mask.any():
+    legal_moves = np.flatnonzero(legal_mask(board))
+    if not len(legal_moves):
         raise ValueError(f"no legal move in {board.fen()}, so there is nothing to choose from")
+    # Where the model keeps each legal move's logit. An encoder that turned the board around
+    # turned the moves with it, and this is where they are turned back: everything from here
+    # on is about moves on the real board.
+    mask = encoder.model_moves(legal_moves, board.turn == chess.WHITE)
     # Two softmaxes rather than one and a division. The masked one is taken over the legal
     # logits alone, so it sums to one however little the network thought of all of them; the
     # unmasked one is only ever read for the mass that fell outside the mask.
     legal = _softmax(policy[mask])
     illegal = float(np.clip(1.0 - _softmax(policy)[mask].sum(), 0.0, 1.0))
     moves = sorted(
-        zip((VOCABULARY[index] for index in np.flatnonzero(mask)), legal.tolist(), strict=True),
+        zip((VOCABULARY[index] for index in legal_moves), legal.tolist(), strict=True),
         # Descending by probability, then by the move itself, so that two equally likely moves
         # are always ranked the same way and an argmax player is reproducible.
         key=lambda pair: (-pair[1], pair[0].uci()),

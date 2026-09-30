@@ -406,3 +406,65 @@ async def _play(session: GameSession) -> None:
     """Play a whole game, under a timeout so that a broken player fails rather than hangs."""
     async with asyncio.timeout(120):
         await session.play()
+
+
+def oriented_engine(policy: dict[str, float], elsewhere: float = -50.0) -> InferenceEngine:
+    """An engine on a side-to-move encoder, whose model scores the UCI moves named."""
+    encoder = create_encoder("board-planes", orientation="side-to-move")
+    logits = torch.full((1, VOCABULARY_SIZE), elsewhere)
+    for uci, logit in policy.items():
+        logits[0, move_index(chess.Move.from_uci(uci))] = logit
+    return InferenceEngine(FixedModel(encoder.spec, logits, torch.zeros(1, 3)), encoder)
+
+
+def test_an_oriented_models_predictions_are_turned_back_for_the_real_board():
+    """The model says "push the e-pawn two squares" and means the mover's e-pawn."""
+    played = oriented_engine({"e2e4": 5.0, "g1f3": 3.0})
+    black_to_move = chess.Board()
+    black_to_move.push_san("d4")
+
+    as_white = played.evaluate(chess.Board())
+    as_black = played.evaluate(black_to_move)
+
+    assert [move.uci() for move, _ in as_white.top(2)] == ["e2e4", "g1f3"]
+    assert [move.uci() for move, _ in as_black.top(2)] == ["e7e5", "g8f6"]
+    assert {move for move, _ in as_black.moves} == set(black_to_move.legal_moves)
+    assert sum(probability for _, probability in as_black.moves) == pytest.approx(1.0)
+    assert as_black.illegal_mass == pytest.approx(as_white.illegal_mass)
+
+
+def test_an_oriented_model_that_answers_for_the_wrong_side_is_playing_illegal_moves():
+    """e7e5 in the model's terms is a move from its own seventh rank: not black's pawn push."""
+    played = oriented_engine({"e7e5": 20.0})
+    black_to_move = chess.Board()
+    black_to_move.push_san("d4")
+
+    assert played.evaluate(black_to_move).illegal_mass == pytest.approx(1.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("options", [{"history": 3}, {"history": 2, "orientation": "side-to-move"}])
+def test_an_engine_plays_from_a_game_with_its_history_behind_it(options):
+    encoder = create_encoder("board-planes", **options)
+    torch.manual_seed(0)
+    played = InferenceEngine(create_model("mlp", encoder.spec, depth=1, width=4), encoder)
+    board = chess.Board()
+    from_fen = []
+    for san in ("e4", "c5", "Nf3"):
+        board.push_san(san)
+        from_fen.append(chess.Board(board.fen()))
+
+    with_history = played.evaluate(board)
+    without = played.evaluate(from_fen[-1])
+
+    assert {move for move, _ in with_history.moves} == set(board.legal_moves)
+    assert _named(with_history) != pytest.approx(_named(without)), "the history is an input"
+    assert len(played.evaluate_many([board, *from_fen])) == 4
+
+
+def test_a_checkpoint_saved_before_the_encoder_had_these_options_still_loads(tmp_path):
+    """Its spec names only the rating scale, which is still the spec of that encoder."""
+    run = RunReader(model_run(tmp_path))
+    path = run.checkpoint_path(run.latest_checkpoint())
+    assert checkpoint.load(path)["encoder"]["options"] == {"rating_scale": 5000.0}
+
+    assert load_engine(path).evaluate(chess.Board()).best in chess.Board().legal_moves

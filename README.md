@@ -238,6 +238,16 @@ and a win/draw/loss judgement of the position from the mover's point of view. Th
 cross-entropy on the move actually played, plus a weighted cross-entropy on how the game
 actually ended.
 
+Two `[encoder]` options change what the model is shown, and both are off by default:
+
+- `history = N` adds the N positions before the current one as 12 more planes each, most recent
+  first, so the model can see what was just played. Planes for positions before the game began
+  are all zero.
+- `orientation = "side-to-move"` turns the board around when black is to move, so the mover's
+  pieces are always on the same planes and always play up the board. The castling features and
+  the move indices are mirrored along with it, and predictions are mirrored back before a move
+  is played, so nothing outside the encoder sees the difference.
+
 Validation runs on the held-back games at `[validation] every_steps`, on the same positions every
 time so the curve means something, and prints and logs five numbers:
 
