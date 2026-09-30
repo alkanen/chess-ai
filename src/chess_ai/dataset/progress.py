@@ -30,6 +30,13 @@ class Progress:
     """How long the build has been running."""
     done: bool
     """Whether this is the final report of the build."""
+    scanning: bool = False
+    """Whether the build is still finding where its games are, rather than reading them.
+
+    Said rather than inferred. It used to be read off "no games and no bytes yet", which is true
+    of the cutting and also of the moment before a serial read begins -- and that path does no
+    cutting at all, so it was told it was looking for boundaries it never looks for.
+    """
 
     @property
     def games_per_second(self) -> float:
@@ -46,6 +53,11 @@ class Progress:
     def seconds_remaining(self) -> float | None:
         """How much longer at this rate, or ``None`` when there is no way to tell yet."""
         if self.done or self.bytes_total <= 0 or self.bytes_read <= 0 or self.seconds <= 0:
+            return None
+        if self.bytes_read >= self.bytes_total:
+            # Past the total, which happens when a file grew after it was sized: the difference
+            # below goes negative, and format_duration does not guard it either -- a build two
+            # hours over its estimate printed "-9000s left". There is no estimate to give.
             return None
         return self.seconds * (self.bytes_total - self.bytes_read) / self.bytes_read
 
@@ -119,6 +131,16 @@ def format_progress(progress: Progress) -> str:
         parts.append(f"{skipped:,} skipped")
     if progress.done:
         return f"built {', '.join(parts)} in {format_duration(progress.seconds)}"
+    if progress.scanning:
+        # Only where the build says so. Inferring it from "nothing read yet" also caught the
+        # moment before a serial read, which does no scanning -- see Progress.scanning.
+        #
+        # For a build cutting its files into pieces this is a scan of them --
+        # of the whole of one whose games are not separated by a blank line. Every count above is
+        # zero and stays zero, so a line made of them is one this rewrites with itself, and a
+        # terminal showing the same characters for half a minute is a terminal showing a hang.
+        # The clock is the only thing that has anything to say yet, so it is what the line says.
+        return f"finding where the games start, {format_duration(progress.seconds)}"
     if progress.bytes_total > 0:
         parts.insert(0, f"{progress.fraction:.0%}")
         remaining = progress.seconds_remaining

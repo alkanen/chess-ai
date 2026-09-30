@@ -104,6 +104,32 @@ def test_dataset_build_passes_on_the_options_it_is_given(tmp_path):
     assert manifest.splits["validation"].games > 0
 
 
+def test_dataset_build_passes_on_how_many_workers_to_read_with(tmp_path):
+    import chess_ai.dataset as dataset_package
+
+    asked: list[int | None] = []
+    real = dataset_package.build_dataset
+
+    def record(*args, **kwargs):
+        asked.append(kwargs.get("workers"))
+        return real(*args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(dataset_package, "build_dataset", record)
+        assert main(["dataset", "build", "one", str(FIXTURES), "--workers", "3"]) == 0
+        assert main(["dataset", "build", "two", str(FIXTURES)]) == 0
+
+    assert asked == [3, None], "what was asked for, and None for one per CPU"
+
+
+def test_dataset_build_refuses_fewer_than_one_worker(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "build", "games", str(FIXTURES), "--workers", "0"])
+
+    assert exit_info.value.code == 2
+    assert "at least one worker" in capsys.readouterr().err
+
+
 def test_dataset_build_reports_progress_while_it_works(tmp_path, capsys):
     assert main(["dataset", "build", "games", str(FIXTURES)]) == 0
 
