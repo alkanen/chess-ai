@@ -113,7 +113,18 @@ The server holds one game, which every open browser shows. Start a game from the
 
 ### Follow training
 
-**Runs** lists every training run with its state, architecture, dataset, progress and latest losses, top-1 accuracy and illegal-move rate, refreshed every few seconds. Opening a run shows its step, epoch, throughput, time left and GPU statistics, and charts its loss (on a log scale), validation accuracy, learning rate and illegal-move rate against the step. The charts follow the run over a WebSocket (`…/api/runs/<name>/ws`) as the trainer logs, so they update without reloading; a finished run shows the same charts for its whole history. Drag across a chart to zoom in, and double-click to let it follow the run again.
+**Runs** lists every training run with its state, architecture, dataset, progress and latest losses, top-1 accuracy and illegal-move rate, refreshed every few seconds. Opening a run shows its step, epoch, throughput, time left and GPU statistics, and charts its loss (on a log scale), validation accuracy, learning rate and illegal-move rate against the step. The charts follow the run over a WebSocket (`…/api/runs/<name>/ws`) as the trainer logs, so they update without reloading; a finished run shows the same charts for its whole history. Drag across a chart to zoom in, and double-click to let it follow the run again. Every chart can be drawn against the step, the positions seen (which lines up runs with different batch sizes) or the wall time; the choice is remembered in the browser.
+
+Tick two or more runs in the list (up to eight) and choose **Compare** to overlay them on the same charts, one line per run: training and validation loss, top-1 and top-5 accuracy, illegal-move rate and learning rate, all followed live.
+
+A run can be given a title, tags and notes, from its page in the browser or from the command line. They are kept in `notes.json` in the run directory, and the run list can be filtered by tag. The run's name never changes, since it is the directory; the title is what it is shown as instead.
+
+```sh
+uv run chess-ai runs annotate mlp-baseline --title "MLP baseline" --tag mlp --tag baseline --notes "First run on the 2024 games."
+uv run chess-ai runs annotate mlp-baseline --untag baseline --notes-file notes.md   # - reads standard input
+uv run chess-ai runs annotate mlp-baseline     # shows what it has
+uv run chess-ai runs list --tag mlp
+```
 
 The web server never talks to a trainer: it reads the run directory, so it can be restarted at any time without affecting a run. A trainer that dies without saying so — killed, out of memory, or the machine gone — leaves a heartbeat that claims it is still running. Once that heartbeat is older than `[server] stale_after_seconds` (two minutes by default), the run is flagged **stale**. A trainer rewrites its heartbeat every couple of seconds, but not while it starts up, validates or saves a checkpoint, so keep the threshold well above those.
 

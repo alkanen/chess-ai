@@ -136,6 +136,30 @@ def test_validation_metrics_are_logged_and_include_the_illegal_move_rate(tmp_pat
         assert line["positions"] > 0
 
 
+def test_every_metrics_line_says_how_many_positions_and_seconds_in_it_is(tmp_path, data_dir):
+    """What a chart puts runs side by side on, when their batch sizes or speeds differ."""
+    reader = run(
+        tmp_path,
+        data_dir,
+        training='device = "cpu"\nbatch_size = 8\ndata_workers = 0\nlog_every_steps = 1',
+    )
+
+    lines = reader.metrics()
+    train_lines = {line["step"]: line for line in lines if line["split"] == "train"}
+    seen = [train_lines[step]["positions_seen"] for step in sorted(train_lines)]
+    assert seen == [8 * step for step in sorted(train_lines)]
+    elapsed = [train_lines[step]["elapsed"] for step in sorted(train_lines)]
+    assert elapsed == sorted(elapsed)
+    validation = [line for line in lines if line["split"] == "validation"]
+    assert validation, "the run validated"
+    for line in validation:
+        trained = train_lines[line["step"]]
+        assert (line["positions_seen"], line["elapsed"]) == (
+            trained["positions_seen"],
+            trained["elapsed"],
+        ), "placed where the step it measured was done"
+
+
 def test_a_dataset_with_nothing_held_back_trains_without_validating(tmp_path, capsys):
     """An unsplit dataset is still trainable; it just cannot be measured."""
     dataset(tmp_path / "data", name="unsplit", validation_fraction=0.0)

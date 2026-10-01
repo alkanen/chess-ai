@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react';
 import { fetchRuns, type RunSummary } from './api';
+import { MAX_SERIES } from './runCharts';
 import { RunStateBadge } from './RunState';
 import { formatAgo, formatCount, formatNumber, formatPercent } from './runFormat';
+import { TagList } from './TagList';
 import './RunsView.css';
 
 /**
@@ -62,9 +64,35 @@ function metric(record: RunSummary['latest_train'], name: string): number | null
   return typeof value === 'number' ? value : null;
 }
 
-/** The runs dashboard: every run with its state and its latest numbers, each one to open. */
+/** Where the runs called `names` are compared, in the address. */
+export function compareHash(names: string[]): string {
+  return `#compare/${names.map(encodeURIComponent).join(',')}`;
+}
+
+/** Every tag any of `runs` has, in alphabetical order. */
+function allTags(runs: RunSummary[]): string[] {
+  return [...new Set(runs.flatMap((run) => run.tags ?? []))].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * The runs dashboard: every run with its state and its latest numbers, each one to open,
+ * filtered by a tag if one is picked, and any of them to be compared side by side.
+ */
 export function RunsView() {
   const [runs, error] = useRunList();
+  const [tag, setTag] = useState<string | null>(null);
+  const [chosen, setChosen] = useState<string[]>([]);
+  const tags = runs === null ? [] : allTags(runs);
+  // A tag no run has any more filters nothing out, rather than everything.
+  const filter = tag !== null && tags.includes(tag) ? tag : null;
+  const shown = runs?.filter((run) => filter === null || (run.tags ?? []).includes(filter)) ?? [];
+  // Only runs that are still there; chosen ones the filter hides stay chosen.
+  const compared = chosen.filter((name) => runs?.some((run) => run.name === name));
+  const full = compared.length >= MAX_SERIES;
+
+  function choose(name: string, on: boolean) {
+    setChosen((before) => (on ? [...before, name] : before.filter((other) => other !== name)));
+  }
 
   return (
     <section className="runs-view" aria-labelledby="runs-heading">
@@ -75,12 +103,50 @@ export function RunsView() {
         <p className="note">No training runs here yet. Start one with chess-ai train.</p>
       )}
       {runs !== null && runs.length > 0 && (
+        <div className="runs-tools">
+          {tags.length > 0 && (
+            <div className="tag-filter" role="group" aria-label="Filter by tag">
+              <span className="label">Tags</span>
+              <button type="button" aria-pressed={filter === null} onClick={() => setTag(null)}>
+                All
+              </button>
+              <TagList
+                tags={tags}
+                picked={filter}
+                onPick={(picked) => setTag(picked === filter ? null : picked)}
+              />
+            </div>
+          )}
+          <div className="compare-bar">
+            {compared.length >= 2 ? (
+              <a className="compare" href={compareHash(compared)}>
+                Compare {compared.length} runs
+              </a>
+            ) : (
+              <span className="note">Tick two or more runs to compare them on the same charts.</span>
+            )}
+            {compared.length > 0 && (
+              <button type="button" onClick={() => setChosen([])}>
+                Clear
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {runs !== null && runs.length > 0 && shown.length === 0 && (
+        <p className="note">No run is tagged {filter}.</p>
+      )}
+      {shown.length > 0 && (
         <div className="table-frame">
           <table>
             <thead>
               <tr>
+                <th scope="col">
+                  <span className="visually-hidden">Compare</span>
+                </th>
                 <th scope="col">State</th>
                 <th scope="col">Run</th>
+                <th scope="col">Tags</th>
                 <th scope="col">Architecture</th>
                 <th scope="col">Dataset</th>
                 <th scope="col">Progress</th>
@@ -100,14 +166,32 @@ export function RunsView() {
               </tr>
             </thead>
             <tbody>
-              {runs.map((run) => (
+              {shown.map((run) => (
                 <tr key={run.name}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      aria-label={`Compare ${run.name}`}
+                      checked={compared.includes(run.name)}
+                      disabled={full && !compared.includes(run.name)}
+                      title={
+                        full && !compared.includes(run.name)
+                          ? `A chart can tell ${MAX_SERIES} runs apart`
+                          : undefined
+                      }
+                      onChange={(e) => choose(run.name, e.target.checked)}
+                    />
+                  </td>
                   <td>
                     <RunStateBadge status={run.status} stale={run.stale} />
                   </td>
                   <th scope="row" className="name">
-                    <a href={`#runs/${encodeURIComponent(run.name)}`}>{run.name}</a>
+                    <a href={`#runs/${encodeURIComponent(run.name)}`}>{run.title ?? run.name}</a>
+                    {run.title != null && <span className="run-name">{run.name}</span>}
                   </th>
+                  <td>
+                    <TagList tags={run.tags ?? []} picked={filter} onPick={setTag} />
+                  </td>
                   <td>{run.architecture ?? '–'}</td>
                   <td>{run.dataset ?? '–'}</td>
                   <td className="progress">{progress(run)}</td>

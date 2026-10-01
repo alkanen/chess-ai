@@ -703,3 +703,126 @@ def test_train_reports_a_missing_config_file(tmp_path, capsys):
 
     assert exit_info.value.code == 2
     assert "cannot read experiment config" in capsys.readouterr().err
+
+
+def annotated_run(tmp_path, name: str = "tiny") -> Path:
+    """A run directory with nothing in it but its name, which is all annotating it needs."""
+    directory = tmp_path / "runs" / name
+    directory.mkdir(parents=True)
+    (directory / "run.json").write_text("{}")
+    return directory
+
+
+def test_runs_annotate_gives_a_run_a_title_tags_and_notes(tmp_path, capsys):
+    from chess_ai.training.run_store import RunNotes, open_run
+
+    annotated_run(tmp_path)
+    notes = tmp_path / "notes.txt"
+    notes.write_text("Width 2048.\nBetter than 1024.\n")
+
+    assert (
+        main(
+            [
+                "runs",
+                "annotate",
+                "tiny",
+                "--title",
+                "Wide MLP",
+                "--tag",
+                "mlp",
+                "--tag",
+                "wide",
+                "--notes-file",
+                str(notes),
+            ]
+        )
+        == 0
+    )
+
+    assert open_run(tmp_path / "runs", "tiny").notes == RunNotes(
+        title="Wide MLP", tags=["mlp", "wide"], notes="Width 2048.\nBetter than 1024.\n"
+    )
+    out = capsys.readouterr().out
+    assert "title: Wide MLP" in out and "tags: mlp, wide" in out and "Better than 1024." in out
+
+
+def test_runs_annotate_changes_only_what_it_is_told_to(tmp_path):
+    from chess_ai.training.run_store import RunNotes, open_run, save_notes
+
+    save_notes(
+        open_run(tmp_path / "runs", annotated_run(tmp_path).name),
+        RunNotes(title="Kept", tags=["a", "b"], notes="kept"),
+    )
+
+    assert main(["runs", "annotate", "tiny", "--tag", "c", "--untag", "a"]) == 0
+
+    assert open_run(tmp_path / "runs", "tiny").notes == RunNotes(
+        title="Kept", tags=["b", "c"], notes="kept"
+    )
+
+    assert main(["runs", "annotate", "tiny", "--title", "", "--notes", ""]) == 0
+
+    assert open_run(tmp_path / "runs", "tiny").notes == RunNotes(tags=["b", "c"])
+
+
+def test_runs_annotate_with_no_options_shows_the_notes_and_writes_nothing(tmp_path, capsys):
+    directory = annotated_run(tmp_path)
+
+    assert main(["runs", "annotate", "tiny"]) == 0
+
+    assert "title: –" in capsys.readouterr().out
+    assert not (directory / "notes.json").exists()
+
+
+def test_runs_annotate_refuses_a_tag_that_is_not_one_word(tmp_path, capsys):
+    directory = annotated_run(tmp_path)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["runs", "annotate", "tiny", "--tag", "two words"])
+
+    assert exit_info.value.code == 2
+    assert "tags: invalid tag 'two words'" in capsys.readouterr().err
+    assert not (directory / "notes.json").exists()
+
+
+def test_runs_annotate_refuses_a_run_that_is_not_there(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["runs", "annotate", "ghost", "--tag", "x"])
+
+    assert exit_info.value.code == 2
+    assert "no run called 'ghost'" in capsys.readouterr().err
+
+
+def test_runs_list_shows_every_run_or_those_with_a_tag(tmp_path, capsys):
+    from chess_ai.training.run_store import RunNotes, open_run, save_notes
+
+    for name, tags in [("a", ["mlp", "wide"]), ("b", ["mlp"]), ("c", [])]:
+        annotated_run(tmp_path, name)
+        save_notes(open_run(tmp_path / "runs", name), RunNotes(title=f"Run {name}", tags=tags))
+
+    assert main(["runs", "list"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines == [
+        "a  starting [mlp, wide]  Run a",
+        "b  starting [mlp]  Run b",
+        "c  starting  Run c",
+    ]
+
+    assert main(["runs", "list", "--tag", "mlp", "--tag", "wide"]) == 0
+    assert capsys.readouterr().out.splitlines() == ["a  starting [mlp, wide]  Run a"]
+
+    assert main(["runs", "list", "--tag", "resnet"]) == 0
+    assert "no runs tagged resnet" in capsys.readouterr().err
+
+
+def test_runs_list_still_lists_a_run_whose_notes_cannot_be_read(tmp_path, capsys):
+    (annotated_run(tmp_path) / "notes.json").write_text("{not json")
+
+    assert main(["runs", "list"]) == 0
+
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["tiny  starting"]
+    assert "notes.json" in captured.err
+
+    assert main(["runs", "list", "--tag", "mlp"]) == 0
+    assert "tiny" not in capsys.readouterr().out, "its tags cannot be known, so no tag matches"

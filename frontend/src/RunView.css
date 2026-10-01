@@ -19,6 +19,14 @@
   overflow-wrap: anywhere;
 }
 
+/* The name a run is kept under, beside the title it is shown as. */
+.run-view .run-name {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  opacity: 0.75;
+  overflow-wrap: anywhere;
+}
+
 .run-view .message {
   margin: 0 0 0.75rem;
   padding: 0.5rem 0.75rem;

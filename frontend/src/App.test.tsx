@@ -161,6 +161,19 @@ describe('App', () => {
       expect(screen.getByRole('heading', { name: 'mlp-big' })).toBeInTheDocument();
       expect(FakeWebSocket.latest.url).toMatch(/\/chess\/api\/runs\/mlp-big\/ws$/);
     });
+
+    it('opens the comparison the address names, under the runs dashboard', () => {
+      window.location.hash = '#compare/mlp-big,mlp-small';
+
+      render(<App />);
+
+      expect(screen.getByRole('heading', { name: 'Comparing 2 runs' })).toBeInTheDocument();
+      expect(FakeWebSocket.instances.map((socket) => socket.url)).toEqual([
+        expect.stringMatching(/\/chess\/api\/runs\/mlp-big\/ws$/),
+        expect.stringMatching(/\/chess\/api\/runs\/mlp-small\/ws$/),
+      ]);
+      expect(screen.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page');
+    });
   });
 
   it('follows the game channel under the path prefix', () => {

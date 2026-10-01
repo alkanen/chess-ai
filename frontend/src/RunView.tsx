@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { GpuStats } from './api';
 import { MetricChart } from './MetricChart';
-import { CHARTS, chartData } from './runCharts';
+import { CHARTS, chartData, xAxis } from './runCharts';
 import { RunStateBadge } from './RunState';
 import {
   formatAgo,
@@ -10,7 +10,9 @@ import {
   formatNumber,
   formatRate,
 } from './runFormat';
+import { RunNotesPanel, useShownNotes } from './RunNotesPanel';
 import { useRunChannel } from './useRunChannel';
+import { useXAxis, XAxisPicker } from './XAxisPicker';
 import './RunsView.css';
 import './RunView.css';
 
@@ -54,12 +56,21 @@ interface RunViewProps {
 /** One run: what it is, where it has got to, and its metrics charted live as it trains. */
 export function RunView({ name }: RunViewProps) {
   const { run, error, connected } = useRunChannel(name);
+  const [axis, setAxis] = useXAxis();
   const metrics = run?.metrics;
-  const charts = useMemo(
-    () => CHARTS.map((spec) => ({ spec, data: chartData(metrics ?? [], spec) })),
-    [metrics],
-  );
   const info = run?.info ?? null;
+  const batchSize = info?.batch_size ?? null;
+  const charts = useMemo(
+    () =>
+      CHARTS.map((spec) => ({
+        spec,
+        labels: spec.series.map((series) => series.label),
+        data: chartData(metrics ?? [], spec, axis, batchSize),
+      })),
+    [metrics, axis, batchSize],
+  );
+  const [notes, showSaved] = useShownNotes(run?.notes ?? null);
+  const title = notes?.title ?? null;
   const beat = run?.heartbeat ?? null;
   const running = beat?.status === 'running' && !run?.stale;
   const now = useNow(beat !== null);
@@ -70,7 +81,8 @@ export function RunView({ name }: RunViewProps) {
         <a href="#runs">← All runs</a>
       </p>
       <header>
-        <h2 id="run-heading">{name}</h2>
+        <h2 id="run-heading">{title ?? name}</h2>
+        {title !== null && <span className="run-name">{name}</span>}
         {run !== null && <RunStateBadge status={beat?.status} stale={run.stale} />}
         {run !== null && !connected && error === null && (
           <span className="note">Reconnecting…</span>
@@ -124,9 +136,17 @@ export function RunView({ name }: RunViewProps) {
             <dt>Heartbeat</dt>
             <dd>{formatAgo(beat?.updated, now)}</dd>
           </dl>
+          <RunNotesPanel run={name} notes={notes} onSaved={showSaved} />
+          <XAxisPicker value={axis} onChange={setAxis} />
           <div className="charts">
-            {charts.map(({ spec, data }) => (
-              <MetricChart key={spec.id} spec={spec} data={data} />
+            {charts.map(({ spec, labels, data }) => (
+              <MetricChart
+                key={spec.id}
+                chart={spec}
+                labels={labels}
+                x={xAxis(axis)}
+                data={data}
+              />
             ))}
           </div>
         </>

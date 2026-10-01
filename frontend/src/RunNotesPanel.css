@@ -1,0 +1,56 @@
+.run-notes {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+  max-width: 48rem;
+  margin: 0 0 1.25rem;
+}
+
+.run-notes .text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-notes .note,
+.run-notes .hint {
+  margin: 0;
+  opacity: 0.7;
+}
+
+.run-notes .hint {
+  font-size: 0.85rem;
+}
+
+.run-notes.editing {
+  align-items: stretch;
+  gap: 0.25rem;
+}
+
+.run-notes.editing label {
+  margin-top: 0.4rem;
+  font-weight: 600;
+}
+
+.run-notes input,
+.run-notes textarea {
+  font: inherit;
+  padding: 0.3rem 0.45rem;
+}
+
+.run-notes textarea {
+  resize: vertical;
+}
+
+.run-notes .error {
+  margin: 0.4rem 0 0;
+  font-weight: 600;
+  color: #c33;
+}
+
+.run-notes .actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}

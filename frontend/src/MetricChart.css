@@ -1,10 +1,24 @@
-/* The chart tokens: categorical slots 1 and 2 (blue, orange), stepped for each scheme. */
-.metric-chart {
+/*
+ * The chart tokens: the eight categorical slots (blue, orange, aqua, yellow, magenta, green,
+ * violet, red), taken in this order and stepped for each scheme. A run's charts use the first
+ * two; runs compared side by side take one each, and the key naming them (.chart-palette)
+ * the same.
+ */
+.metric-chart,
+.chart-palette {
   --series-1: #2a78d6;
   --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #4a3aa7;
+  --series-8: #e34948;
   --chart-text: #52514e;
   --chart-grid: rgb(0 0 0 / 10%);
+}
 
+.metric-chart {
   min-width: 0;
   margin: 0;
   padding: 0.75rem;
@@ -13,9 +27,16 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  .metric-chart {
+  .metric-chart,
+  .chart-palette {
     --series-1: #3987e5;
     --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e66767;
     --chart-text: #c3c2b7;
     --chart-grid: rgb(255 255 255 / 10%);
   }

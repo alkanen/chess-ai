@@ -329,6 +329,10 @@ def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[s
     """The step ``latest`` was measured at, so a checkpoint is never indexed with another's."""
     throughput: float | None = None
     step = 0
+    positions_seen = 0
+    """How many training positions the weights have been moved by, which is what a chart of
+    runs with different batch sizes compares them on. Not ``positions``: a validation line
+    already says how many positions it measured under that name."""
     beat = _Beat(writer, steps=steps)
     beat.write(RunStatus.RUNNING, step=0, epoch=0.0, device=run.device, force=True)
 
@@ -340,6 +344,7 @@ def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[s
         window.add(*_step(run, batch, optimizer), positions=len(batch))
         scheduler.step()
         step += 1
+        positions_seen += len(batch)
         progress.step, progress.epoch = step, _epoch(run, step)
         elapsed = time.perf_counter() - started
 
@@ -352,6 +357,7 @@ def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[s
                 split=TRAIN_SPLIT,
                 learning_rate=learning_rate,
                 elapsed=round(elapsed, 3),
+                positions_seen=positions_seen,
                 **speed,
             )
 
@@ -377,7 +383,17 @@ def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[s
         ):
             with window.paused():
                 latest = _validate(run, validation)
-            writer.log(step=step, epoch=round(progress.epoch, 4), split=VALIDATION_SPLIT, **latest)
+            # Placed by the time and the positions the step was done at, as the training line
+            # is, rather than after the validation: it measures the weights of that step, and
+            # a chart against either lines the two up there.
+            writer.log(
+                step=step,
+                epoch=round(progress.epoch, 4),
+                split=VALIDATION_SPLIT,
+                elapsed=round(elapsed, 3),
+                positions_seen=positions_seen,
+                **latest,
+            )
             say(_validation_line(step, steps, latest))
             measured_at = step
 

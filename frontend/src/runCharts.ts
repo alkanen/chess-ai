@@ -1,20 +1,34 @@
 import type { MetricsRecord } from './api';
-import { formatNumber, formatPercent } from './runFormat';
+import { formatCount, formatDuration, formatNumber, formatPercent } from './runFormat';
 
-/** One line on a chart: a metric from the lines of one split of the log. */
-export interface SeriesSpec {
-  label: string;
+/**
+ * The most lines a chart can tell apart. There are eight categorical colours and never more:
+ * a ninth line would need one that cannot be told from one of these.
+ */
+export const MAX_SERIES = 8;
+
+/** A metric from the lines of one split of the log. */
+export interface Metric {
   split: 'train' | 'validation';
   metric: string;
 }
 
-export interface ChartSpec {
+/** One line on a run's chart. */
+export interface SeriesSpec extends Metric {
+  label: string;
+}
+
+/** What a chart is and how it shows its values, whatever its lines are. */
+export interface ChartLook {
   id: string;
   title: string;
-  series: SeriesSpec[];
   format: (value: number) => string;
   /** Whether the y-axis is logarithmic, which keeps a loss's early drop from flattening the rest. */
   logarithmic?: boolean;
+}
+
+export interface ChartSpec extends ChartLook {
+  series: SeriesSpec[];
 }
 
 /** The charts of a run, in the order they are shown. */
@@ -53,43 +67,231 @@ export const CHARTS: ChartSpec[] = [
 ];
 
 /**
- * A chart's lines as uPlot takes them: the steps, and each series' value at every one of
- * them. Validation is measured far less often than training is logged, so a series has a
- * null wherever it has nothing at that step, as it does where a value diverged.
+ * A chart's lines as uPlot takes them: the x values, and each series' value at every one of
+ * them. Validation is measured far less often than training is logged, and runs compared on
+ * one chart are logged at x values of their own, so a series has a null wherever it has
+ * nothing at that x, as it does where a value diverged.
  */
 export type ChartData = [number[], ...(number | null)[][]];
 
-export function chartData(records: MetricsRecord[], spec: ChartSpec): ChartData {
-  const byStep = new Map<number, (number | null)[]>();
-  for (const record of records) {
-    spec.series.forEach((series, index) => {
-      if (record.split !== series.split || !(series.metric in record)) {
-        return;
-      }
-      const value = record[series.metric];
-      let values = byStep.get(record.step);
-      if (values === undefined) {
-        values = spec.series.map(() => null);
-        byStep.set(record.step, values);
-      }
-      values[index] = typeof value === 'number' ? value : null;
-    });
-  }
-  const steps = [...byStep.keys()].sort((a, b) => a - b);
-  return [
-    steps,
-    ...spec.series.map((_, index) => steps.map((step) => byStep.get(step)![index])),
-  ];
+/** What a chart's x-axis can measure a run's progress in. */
+export type XAxisId = 'step' | 'positions' | 'time';
+
+export interface XAxis {
+  id: XAxisId;
+  label: string;
+  /** A value on the axis, for its ticks. */
+  format: (value: number) => string;
+  /** Where along the run a value was logged, for a caption: "step 1,500", "1.2M positions". */
+  describe: (value: number) => string;
+  /** The distances between ticks the axis may use, where uPlot's own would read badly. */
+  increments?: number[];
 }
 
-/** The last value each series has, with the step it was logged at, for the caption. */
-export function latestValues(data: ChartData): ({ step: number; value: number } | null)[] {
-  const [steps, ...series] = data;
+/** A count of positions in three figures and a suffix, such as 12_288_000 as "12.3M". */
+export function formatPositions(value: number): string {
+  for (const [size, suffix] of [
+    [1e9, 'G'],
+    [1e6, 'M'],
+    [1e3, 'k'],
+  ] as const) {
+    if (value >= size) {
+      return `${Number((value / size).toPrecision(3))}${suffix}`;
+    }
+  }
+  return formatCount(value);
+}
+
+const MINUTE = 60;
+const HOUR = 60 * MINUTE;
+
+/**
+ * The x-axes a chart can be drawn against, the first of them the default. Steps compare
+ * runs with the same batch size; positions seen compare runs with different ones; wall time
+ * compares how much of the machine each took to get there.
+ */
+export const X_AXES: XAxis[] = [
+  {
+    id: 'step',
+    label: 'Step',
+    format: formatCount,
+    describe: (value) => `step ${formatCount(value)}`,
+  },
+  {
+    id: 'positions',
+    label: 'Positions seen',
+    format: formatPositions,
+    describe: (value) => `${formatPositions(value)} positions`,
+  },
+  {
+    id: 'time',
+    label: 'Wall time',
+    format: formatDuration,
+    describe: (value) => `${formatDuration(value)} in`,
+    increments: [1, 5, 10, 30, MINUTE, 5 * MINUTE, 10 * MINUTE, 30 * MINUTE, HOUR, 2 * HOUR, 6 * HOUR, 12 * HOUR, 24 * HOUR, 48 * HOUR, 168 * HOUR],
+  },
+];
+
+export function xAxis(id: XAxisId): XAxis {
+  return X_AXES.find((axis) => axis.id === id)!;
+}
+
+/**
+ * Where each line of a run's log goes along `axis`, or null for one the log does not say
+ * enough to place.
+ *
+ * Every line of a log written now says how many positions the run had trained on and how
+ * many seconds it had been going. An older log says so less: its training lines have the
+ * seconds and not the positions, which the run's batch size makes up for, and its validation
+ * lines have neither, so they are placed at the seconds of the line logged before them.
+ */
+export function placeRecords(
+  records: MetricsRecord[],
+  axis: XAxisId,
+  batchSize: number | null = null,
+): (number | null)[] {
+  let elapsed: number | null = null;
+  return records.map((record) => {
+    switch (axis) {
+      case 'step':
+        return record.step;
+      case 'positions': {
+        const seen = record.positions_seen;
+        if (typeof seen === 'number') {
+          return seen;
+        }
+        return batchSize == null ? null : record.step * batchSize;
+      }
+      case 'time':
+        if (typeof record.elapsed === 'number') {
+          elapsed = record.elapsed;
+          return elapsed;
+        }
+        return elapsed;
+    }
+  });
+}
+
+/** One line of a chart: its value at each x it has one at. */
+type Line = [x: number, y: number | null][];
+
+/** Lines that were logged at x values of their own, lined up on every x any of them has. */
+export function alignLines(lines: Line[]): ChartData {
+  const byX = new Map<number, (number | null)[]>();
+  lines.forEach((line, index) => {
+    for (const [x, y] of line) {
+      let values = byX.get(x);
+      if (values === undefined) {
+        values = lines.map(() => null);
+        byX.set(x, values);
+      }
+      values[index] = y;
+    }
+  });
+  const xs = [...byX.keys()].sort((a, b) => a - b);
+  return [xs, ...lines.map((_, index) => xs.map((x) => byX.get(x)![index]))];
+}
+
+/** One metric of one split of a run's log, at the x values `xs` place each line at. */
+function line(records: MetricsRecord[], xs: (number | null)[], series: Metric): Line {
+  const found: Line = [];
+  records.forEach((record, index) => {
+    const x = xs[index];
+    if (x == null || record.split !== series.split || !(series.metric in record)) {
+      return;
+    }
+    const value = record[series.metric];
+    found.push([x, typeof value === 'number' ? value : null]);
+  });
+  return found;
+}
+
+/** The lines of one run's chart, against `axis`. */
+export function chartData(
+  records: MetricsRecord[],
+  spec: ChartSpec,
+  axis: XAxisId = 'step',
+  batchSize: number | null = null,
+): ChartData {
+  const xs = placeRecords(records, axis, batchSize);
+  return alignLines(spec.series.map((series) => line(records, xs, series)));
+}
+
+/** A chart of runs side by side: one metric, a line for each run. */
+export interface ComparisonChart extends ChartLook {
+  metric: Metric;
+}
+
+/** The charts of runs compared, in the order they are shown. */
+export const COMPARISON_CHARTS: ComparisonChart[] = [
+  {
+    id: 'train-loss',
+    title: 'Training loss',
+    metric: { split: 'train', metric: 'loss' },
+    format: (value) => formatNumber(value),
+    logarithmic: true,
+  },
+  {
+    id: 'validation-loss',
+    title: 'Validation loss',
+    metric: { split: 'validation', metric: 'loss' },
+    format: (value) => formatNumber(value),
+    logarithmic: true,
+  },
+  {
+    id: 'top1',
+    title: 'Top-1 accuracy (validation)',
+    metric: { split: 'validation', metric: 'top1' },
+    format: formatPercent,
+  },
+  {
+    id: 'top5',
+    title: 'Top-5 accuracy (validation)',
+    metric: { split: 'validation', metric: 'top5' },
+    format: formatPercent,
+  },
+  {
+    id: 'illegal',
+    title: 'Illegal top-move rate (validation)',
+    metric: { split: 'validation', metric: 'illegal_top_move_rate' },
+    format: formatPercent,
+  },
+  {
+    id: 'learning-rate',
+    title: 'Learning rate',
+    metric: { split: 'train', metric: 'learning_rate' },
+    format: (value) => formatNumber(value, 3),
+  },
+];
+
+/** One run on a comparison chart. */
+export interface ComparedRun {
+  records: MetricsRecord[];
+  /** What makes up for a log too old to say how many positions it had seen. */
+  batchSize: number | null;
+}
+
+/** The lines of a comparison chart against `axis`, one for each of `runs` in their order. */
+export function comparisonData(
+  runs: ComparedRun[],
+  chart: ComparisonChart,
+  axis: XAxisId,
+): ChartData {
+  return alignLines(
+    runs.map(({ records, batchSize }) =>
+      line(records, placeRecords(records, axis, batchSize), chart.metric),
+    ),
+  );
+}
+
+/** The last value each series has, with the x it was logged at, for the caption. */
+export function latestValues(data: ChartData): ({ x: number; value: number } | null)[] {
+  const [xs, ...series] = data;
   return series.map((values) => {
     for (let i = values.length - 1; i >= 0; i -= 1) {
       const value = values[i];
       if (value != null) {
-        return { step: steps[i], value };
+        return { x: xs[i], value };
       }
     }
     return null;

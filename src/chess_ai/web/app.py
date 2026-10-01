@@ -58,10 +58,12 @@ from chess_ai.position_view import (
 from chess_ai.training.run_store import (
     CheckpointChoice,
     RunError,
+    RunNotes,
     RunReader,
     choose_checkpoint,
     list_runs,
     open_run,
+    save_notes,
 )
 from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
 from chess_ai.web.runs import (
@@ -320,12 +322,18 @@ def create_app(
                 ) from closed
         return session.state
 
-    # The two routes below read run directories, which the trainer may be writing to at this
+    # The run routes below read run directories, which the trainer may be writing to at this
     # moment. Plain `def`, so that FastAPI runs them in a worker thread: the reads are small,
     # but they are file reads all the same, and the game is being played on the event loop.
 
     @api.get("/runs")
-    def runs(response: Response) -> list[RunSummary]:
+    def runs(
+        response: Response,
+        tag: Annotated[
+            list[str] | None,
+            Query(description="Only the runs tagged with this; given more than once, with all."),
+        ] = None,
+    ) -> list[RunSummary]:
         """Every training run here, newest first: where each has got to and what it measured.
 
         A run that says it is running and whose heartbeat is older than the configured
@@ -340,6 +348,9 @@ def create_app(
             describe_run(run, stale_after=stale_after, latest=latest)
             for run, latest in zip(readers, latest_metrics.follow(readers), strict=True)
         ]
+        # Filtered after describing rather than before, so that the metrics of the runs left
+        # out go on being followed and the next unfiltered list does not read them whole.
+        found = [run for run in found if set(tag or ()) <= set(run.tags)]
         # Newest first, because the run someone wants to play against is almost always the
         # one they are training now. A run that does not say when it began sorts last.
         found.sort(key=lambda run: run.created.timestamp() if run.created else 0.0, reverse=True)
@@ -357,6 +368,51 @@ def create_app(
         except RunError as missing:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
         return describe_checkpoints(run)
+
+    @api.get(
+        "/runs/{name}/notes",
+        responses={
+            404: {"description": "No run of that name is kept here"},
+            500: {"description": "The run's notes are there and cannot be read"},
+        },
+    )
+    def run_notes(name: str, response: Response) -> RunNotes:
+        """A run's title, tags and notes, empty for a run nobody has written any for."""
+        response.headers.update(NO_STORE)
+        run = _open_run(name)
+        try:
+            return run.notes
+        except RunError as unreadable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unreadable)
+            ) from unreadable
+
+    @api.put(
+        "/runs/{name}/notes",
+        responses={
+            404: {"description": "No run of that name is kept here"},
+            500: {"description": "The notes could not be written to the run directory"},
+        },
+    )
+    def edit_run_notes(name: str, notes: RunNotes) -> RunNotes:
+        """Replace a run's title, tags and notes, all three at once, and return them as kept.
+
+        Kept in the run directory, where the command line reads and writes them too. Whatever
+        is sent replaces what was there: a field left out is emptied, not kept.
+        """
+        run = _open_run(name)
+        try:
+            return save_notes(run, notes)
+        except RunError as unwritable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unwritable)
+            ) from unwritable
+
+    def _open_run(name: str) -> RunReader:
+        try:
+            return open_run(config.paths.runs, name)
+        except RunError as missing:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
 
     @api.get(
         "/game/pgn",

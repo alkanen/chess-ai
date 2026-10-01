@@ -127,6 +127,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     _add_dataset_commands(commands)
     _add_train_command(commands)
+    _add_runs_commands(commands)
     return parser
 
 
@@ -215,6 +216,138 @@ def _add_train_command(commands: argparse._SubParsersAction) -> None:
         help="replace a run of this name that is already there, metrics and checkpoints and all",
     )
     train.set_defaults(handler=_train)
+
+
+def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
+    """``chess-ai runs ...``: finding training runs, and naming, tagging and annotating them."""
+    runs = commands.add_parser("runs", help="list training runs and annotate them")
+    actions = runs.add_subparsers(title="runs commands", required=True, metavar="COMMAND")
+
+    listing = actions.add_parser(
+        "list",
+        help="list the training runs",
+        description="List the training runs in the runs directory, with their state, tags "
+        "and titles.",
+    )
+    listing.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        metavar="TAG",
+        help="only the runs with this tag; given more than once, only those with all of them",
+    )
+    listing.set_defaults(handler=_list_runs)
+
+    annotate = actions.add_parser(
+        "annotate",
+        help="give a run a title, tags and notes",
+        description="Change a run's title, tags and notes, which are kept in its run directory "
+        "and shown on the runs dashboard. With no options, show what it has. The run's name "
+        "never changes; the title is what it is shown as instead.",
+    )
+    annotate.add_argument("name", help="the run")
+    annotate.add_argument(
+        "--title", metavar="TEXT", help="what to show the run as; an empty one shows its name"
+    )
+    annotate.add_argument(
+        "--tag", action="append", default=[], metavar="TAG", help="add a tag; may be repeated"
+    )
+    annotate.add_argument(
+        "--untag",
+        action="append",
+        default=[],
+        metavar="TAG",
+        help="remove a tag; may be repeated",
+    )
+    notes = annotate.add_mutually_exclusive_group()
+    notes.add_argument("--notes", metavar="TEXT", help="replace the notes with this")
+    notes.add_argument(
+        "--notes-file",
+        type=Path,
+        metavar="PATH",
+        help="replace the notes with what this file says; - reads them from standard input",
+    )
+    annotate.set_defaults(handler=_annotate_run)
+
+
+def _list_runs(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.training.run_store import RunError, RunNotes, RunReader, list_runs
+
+    shown = 0
+    for name in list_runs(config.paths.runs):
+        run = RunReader(config.paths.runs / name)
+        try:
+            notes = run.notes
+        except RunError as e:
+            # Listed all the same, as the web list does: a run is still a run without its
+            # notes. Only a filter by tag has to leave it out, since its tags cannot be known.
+            _say(f"chess-ai: warning: {e}", err=True)
+            notes = RunNotes()
+        if not set(args.tag) <= set(notes.tags):
+            continue
+        try:
+            beat = run.status
+        except RunError:
+            beat = None
+        state = beat.status.value if beat is not None else "starting"
+        tags = f" [{', '.join(notes.tags)}]" if notes.tags else ""
+        title = f"  {notes.title}" if notes.title else ""
+        _say(f"{name}  {state}{tags}{title}")
+        shown += 1
+    if shown == 0:
+        wanted = f" tagged {', '.join(args.tag)}" if args.tag else ""
+        _say(f"chess-ai: no runs{wanted} in {config.paths.runs}", err=True)
+    return 0
+
+
+def _annotate_run(config: Config, args: argparse.Namespace) -> int:
+    from pydantic import ValidationError
+
+    from chess_ai.training.run_store import RunError, RunNotes, open_run, save_notes
+
+    try:
+        run = open_run(config.paths.runs, args.name)
+        notes = run.notes
+    except RunError as e:
+        raise _UserError(e) from e
+    text = notes.notes
+    if args.notes is not None:
+        text = args.notes
+    elif args.notes_file is not None:
+        text = _read_notes(args.notes_file)
+    changing = args.title is not None or args.tag or args.untag or text != notes.notes
+    if changing:
+        # Removing wins over adding, so that "--tag a --untag a" leaves the run without it.
+        tags = [tag for tag in [*notes.tags, *args.tag] if tag not in args.untag]
+        try:
+            edited = RunNotes(
+                title=notes.title if args.title is None else args.title, tags=tags, notes=text
+            )
+        except ValidationError as e:
+            problems = "; ".join(
+                f"{error['loc'][0]}: {str(error['msg']).removeprefix('Value error, ')}"
+                for error in e.errors()
+            )
+            raise _UserError(problems) from e
+        try:
+            notes = save_notes(run, edited)
+        except RunError as e:
+            raise _UserError(e) from e
+    _say(f"run: {run.name}")
+    _say(f"title: {notes.title or '–'}")
+    _say(f"tags: {', '.join(notes.tags) or '–'}")
+    _say("notes:" + (f"\n{notes.notes.rstrip()}" if notes.notes.strip() else " –"))
+    return 0
+
+
+def _read_notes(path: Path) -> str:
+    """What ``path`` says, or standard input for ``-``."""
+    if str(path) == "-":
+        return sys.stdin.read()
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise _UserError(f"cannot read {path}: {e.strerror}") from e
 
 
 def _train(config: Config, args: argparse.Namespace) -> int:
