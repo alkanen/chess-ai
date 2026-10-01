@@ -277,9 +277,11 @@ def test_a_dataset_that_is_not_there_lists_the_ones_that_are(tmp_path, data_dir)
 
 
 def test_an_architecture_that_is_not_registered_says_what_there_is(tmp_path, data_dir):
-    config = load_experiment(experiment(tmp_path / "tiny.toml", model='architecture = "resnet"'))
+    config = load_experiment(
+        experiment(tmp_path / "tiny.toml", model='architecture = "transmogrifier"')
+    )
 
-    with pytest.raises(TrainingError, match="no architecture called 'resnet'"):
+    with pytest.raises(TrainingError, match="no architecture called 'transmogrifier'.*resnet"):
         train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="")
 
 
@@ -668,6 +670,25 @@ def test_a_run_with_history_and_side_to_move_orientation_trains_validates_and_pl
     assert validation and all(0.0 <= row["illegal_top_move_rate"] <= 1.0 for row in validation)
     engine = load_engine(reader.checkpoint_path(reader.latest_checkpoint()))
     assert engine.spec == reader.info.encoder
+    board = chess.Board()
+    board.push_san("e4")
+    assert engine.evaluate(board).best in board.legal_moves
+
+
+@pytest.mark.parametrize("globals", ["planes", "film"])
+def test_a_resnet_trains_validates_and_plays_with_nothing_else_changed(tmp_path, data_dir, globals):
+    """The architecture is a config line: the trainer, the checkpoints and the engine take it."""
+    reader = run(
+        tmp_path,
+        data_dir,
+        model=f'architecture = "resnet"\nblocks = 1\nchannels = 4\nglobals = "{globals}"',
+    )
+
+    assert reader.info.model.architecture == "resnet"
+    assert reader.info.model.options == {"blocks": 1, "channels": 4, "globals": globals}
+    validation = [row for row in reader.metrics() if row["split"] == "validation"]
+    assert validation and all(0.0 <= row["top1"] <= 1.0 for row in validation)
+    engine = load_engine(reader.checkpoint_path(reader.latest_checkpoint()))
     board = chess.Board()
     board.push_san("e4")
     assert engine.evaluate(board).best in board.legal_moves
