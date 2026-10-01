@@ -1,0 +1,56 @@
+.run-view .back {
+  margin: 0 0 0.5rem;
+}
+
+.run-view a {
+  color: inherit;
+}
+
+.run-view header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.run-view header h2 {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.run-view .message {
+  margin: 0 0 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid rgb(128 128 128 / 50%);
+}
+
+.run-view .message.crashed {
+  border-left-color: #e34948;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
+
+.run-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0 0 1.25rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.run-facts dt {
+  font-weight: 600;
+}
+
+.run-facts dd {
+  margin: 0;
+}
+
+/* Two charts a row where there is room for them, one where there is not. */
+.run-view .charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 32rem), 1fr));
+  gap: 1rem;
+}

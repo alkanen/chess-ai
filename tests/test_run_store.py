@@ -206,6 +206,140 @@ def test_a_metrics_log_that_is_not_there_yet_reads_as_empty(tmp_path):
     assert RunReader(tmp_path / "test").metrics() == []
 
 
+def steps(records: list[dict]) -> list[int]:
+    return [record["step"] for record in records]
+
+
+def test_a_tail_returns_the_whole_log_first_and_then_only_what_is_new(tmp_path):
+    with writer(tmp_path) as run:
+        run.log(step=1, loss=9.0)
+        run.log(step=2, loss=8.0)
+        tail = open_run(tmp_path, "test").tail_metrics()
+
+        records, replace = tail.read()
+        assert (steps(records), replace) == ([1, 2], True)
+        assert tail.read() == ([], False)
+
+        run.log(step=3, loss=7.0)
+        records, replace = tail.read()
+        assert (steps(records), replace) == ([3], False)
+
+
+def test_a_tail_leaves_a_half_written_line_for_the_next_read(tmp_path):
+    with writer(tmp_path) as run:
+        run.log(step=1, loss=9.0)
+    path = run_path(tmp_path, "test") / METRICS_FILE
+    tail = RunReader(run_path(tmp_path, "test")).tail_metrics()
+    with path.open("a", encoding="utf-8") as f:
+        f.write('{"step": 2, "lo')
+        f.flush()
+        assert steps(tail.read()[0]) == [1]
+        f.write('ss": 8.0}\n')
+        f.flush()
+        assert tail.read() == ([{"step": 2, "loss": 8.0}], False)
+
+
+def test_a_tail_starts_again_when_the_run_is_overwritten(tmp_path):
+    """A new run under the same name is a new history, not more of the old one."""
+    with writer(tmp_path) as run:
+        for step in (1, 2, 3):
+            run.log(step=step, loss=1.0)
+    tail = open_run(tmp_path, "test").tail_metrics()
+    tail.read()
+
+    replaced = RunWriter.create(
+        run_path(tmp_path, "test"),
+        info("test"),
+        config_text="",
+        policy=CheckpointPolicy(keep=2),
+        overwrite=True,
+    )
+    with replaced as run:
+        run.log(step=1, loss=5.0)
+
+    records, replace = tail.read()
+    assert (steps(records), replace) == ([1], True)
+    assert records[0]["loss"] == 5.0
+
+
+def test_a_tail_starts_again_when_the_log_goes_away(tmp_path):
+    with writer(tmp_path) as run:
+        run.log(step=1, loss=1.0)
+    tail = open_run(tmp_path, "test").tail_metrics()
+    tail.read()
+    (run_path(tmp_path, "test") / METRICS_FILE).unlink()
+
+    assert tail.read() == ([], True)
+    assert tail.read() == ([], False)
+
+
+def test_a_tail_reads_nan_from_an_old_log_as_null(tmp_path):
+    """Logs written before ``log`` wrote ``null`` may hold bare tokens a browser cannot parse."""
+    (tmp_path / "test").mkdir()
+    (tmp_path / "test" / METRICS_FILE).write_text('{"step": 1, "loss": NaN, "lr": Infinity}\n')
+
+    records, _ = RunReader(tmp_path / "test").tail_metrics().read()
+
+    assert records == [{"step": 1, "loss": None, "lr": None}]
+
+
+def test_the_latest_metrics_are_the_last_line_of_each_split(tmp_path):
+    with writer(tmp_path) as run:
+        run.log(step=1, split="train", loss=9.0)
+        run.log(step=1, split="validation", loss=9.5)
+        run.log(step=2, split="train", loss=8.0)
+        run.log(step=3, split="train", loss=7.0)
+
+    latest = open_run(tmp_path, "test").track_latest_metrics().read()
+
+    assert latest["train"]["step"] == 3
+    assert latest["validation"]["step"] == 1
+
+
+def test_the_latest_metrics_keep_up_with_a_growing_log(tmp_path):
+    """A split found once is kept until a later line of it replaces it."""
+    with writer(tmp_path) as run:
+        run.log(step=0, split="validation", top1=0.5)
+        run.log(step=1, split="train", loss=9.0)
+        latest = open_run(tmp_path, "test").track_latest_metrics()
+        assert latest.read()["train"]["step"] == 1
+        path = run_path(tmp_path, "test") / METRICS_FILE
+        with path.open("a", encoding="utf-8") as f:
+            f.write('{"step": 2, "split": "train", "lo')
+
+        assert latest.read() == {
+            "train": {"step": 1, "split": "train", "loss": 9.0},
+            "validation": {"step": 0, "split": "validation", "top1": 0.5},
+        }
+
+
+def test_the_latest_metrics_start_again_when_the_run_is_overwritten(tmp_path):
+    with writer(tmp_path) as run:
+        run.log(step=1, split="validation", top1=0.5)
+    latest = open_run(tmp_path, "test").track_latest_metrics()
+    latest.read()
+
+    replaced = RunWriter.create(
+        run_path(tmp_path, "test"),
+        info("test"),
+        config_text="",
+        policy=CheckpointPolicy(keep=2),
+        overwrite=True,
+    )
+    with replaced as run:
+        run.log(step=1, split="train", loss=5.0)
+
+    assert latest.read() == {"train": {"step": 1, "split": "train", "loss": 5.0}}
+
+
+def test_a_run_with_no_metrics_has_no_latest_ones(tmp_path):
+    with writer(tmp_path):
+        pass
+
+    assert open_run(tmp_path, "test").track_latest_metrics().read() == {}
+    assert RunReader(tmp_path / "missing").track_latest_metrics().read() == {}
+
+
 def test_the_heartbeat_is_replaced_rather_than_added_to(tmp_path):
     with writer(tmp_path) as run:
         run.heartbeat(RunStatus.RUNNING, step=10, steps=100, epoch=0.5)

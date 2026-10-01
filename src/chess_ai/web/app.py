@@ -57,16 +57,22 @@ from chess_ai.position_view import (
 )
 from chess_ai.training.run_store import (
     CheckpointChoice,
-    Heartbeat,
     RunError,
-    RunInfo,
     RunReader,
-    RunStatus,
     choose_checkpoint,
     list_runs,
     open_run,
 )
 from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
+from chess_ai.web.runs import (
+    LatestMetricsCache,
+    RunCheckpoints,
+    RunEvent,
+    RunStream,
+    RunSummary,
+    describe_checkpoints,
+    describe_run,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +95,14 @@ CLIENT_GAVE_UP = 499
 No number of HTTP's own says it: the request was neither refused nor served, and the
 one asking is no longer there to read whichever was chosen. 499 is what the proxy in
 front of this server writes in its log for the same thing.
+"""
+
+RUN_POLL_SECONDS = 1.0
+"""How often a run being followed is looked at for new metrics and a new heartbeat.
+
+The trainer is a process of its own that tells nobody when it has written something, so the
+only way to learn it has is to look. Once a second costs a few small reads, and is as often as
+anybody watching a chart could tell the difference.
 """
 
 _WHICH_GAME = (
@@ -162,52 +176,6 @@ class NewGameRequest(BaseModel):
     The standard starting position is used when this is left out."""
 
 
-class RunSummary(BaseModel):
-    """One training run, as the new-game form lists it.
-
-    Everything but the name is optional: a run being written right now, or one whose
-    ``run.json`` cannot be read, is still a run with checkpoints worth playing against.
-    """
-
-    model_config = ConfigDict(use_attribute_docstrings=True)
-
-    name: str
-    architecture: str | None = None
-    created: datetime | None = None
-    status: RunStatus | None = None
-    """What the run's last heartbeat said, which for a run that is not running may be stale."""
-    step: int | None = None
-    """How far the run has got, as its last heartbeat said."""
-    steps: int | None = None
-    """How far it is going, which with ``step`` says how far through it is."""
-    checkpoints: int = 0
-    """How many checkpoints there are to choose between."""
-
-
-class CheckpointSummary(BaseModel):
-    """One checkpoint of a run, as the form lists it."""
-
-    model_config = ConfigDict(use_attribute_docstrings=True)
-
-    step: int
-    created: datetime
-    metrics: dict[str, float | None] = {}
-    """The validation metrics measured at this step, which is what "best" is decided on."""
-    best: bool
-    """Whether this is the run's best checkpoint by its own metric."""
-    latest: bool
-    """Whether this is the newest checkpoint of the run."""
-
-
-class RunCheckpoints(BaseModel):
-    """A run's checkpoints, newest first, which is the order they are offered in."""
-
-    model_config = ConfigDict(use_attribute_docstrings=True)
-
-    run: str
-    checkpoints: list[CheckpointSummary]
-
-
 class ViewerAction(BaseModel):
     """Something a viewer asks of the game their browser is showing them.
 
@@ -264,8 +232,12 @@ ViewerEvent = ChannelEvent | ErrorEvent
 """What the game WebSocket sends: the game's events, plus this viewer's own errors."""
 
 
-def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
+def create_app(
+    config: Config, static_dir: Path = STATIC_DIR, *, run_poll_seconds: float = RUN_POLL_SECONDS
+) -> FastAPI:
     prefix = config.server.path_prefix
+    stale_after = config.server.stale_after_seconds
+    latest_metrics = LatestMetricsCache()
 
     def save_finished_game(game: GameState) -> None:
         """Keep a finished game, so that it can be looked at again or trained on."""
@@ -354,15 +326,19 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
 
     @api.get("/runs")
     def runs(response: Response) -> list[RunSummary]:
-        """Every training run here, newest first, with what it takes to pick one to play.
+        """Every training run here, newest first: where each has got to and what it measured.
 
-        Kept by nobody: a run saves a checkpoint at a moment of its own, and a list that a
-        browser had kept would go on offering the checkpoints of an hour ago.
+        A run that says it is running and whose heartbeat is older than the configured
+        ``stale_after_seconds`` is flagged ``stale``: its trainer has most likely died.
+
+        Kept by nobody: a run saves a checkpoint and logs metrics at moments of its own, and
+        a list that a browser had kept would go on showing those of an hour ago.
         """
         response.headers.update(NO_STORE)
+        readers = [RunReader(config.paths.runs / name) for name in list_runs(config.paths.runs)]
         found = [
-            _describe_run(RunReader(config.paths.runs / name))
-            for name in list_runs(config.paths.runs)
+            describe_run(run, stale_after=stale_after, latest=latest)
+            for run, latest in zip(readers, latest_metrics.follow(readers), strict=True)
         ]
         # Newest first, because the run someone wants to play against is almost always the
         # one they are training now. A run that does not say when it began sorts last.
@@ -380,7 +356,7 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
             run = open_run(config.paths.runs, name)
         except RunError as missing:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
-        return _describe_checkpoints(run)
+        return describe_checkpoints(run)
 
     @api.get(
         "/game/pgn",
@@ -503,6 +479,32 @@ def create_app(config: Config, static_dir: Path = STATIC_DIR) -> FastAPI:
             sending.cancel()
             receiving.cancel()
 
+    @api.websocket("/runs/{name}/ws")
+    async def follow_run(websocket: WebSocket, name: str) -> None:
+        """Send what a run is, its whole metrics log, and then whatever it adds to either.
+
+        The first two messages are a ``run`` event and a ``metrics`` event with ``reset`` set.
+        After that a ``run`` event comes whenever the heartbeat changes or goes stale, and a
+        ``metrics`` event whenever the log has grown. A run that is not here is answered with
+        an ``error`` event, and the connection is closed.
+        """
+        await websocket.accept()
+        connection = _Connection(websocket)
+        try:
+            run = open_run(config.paths.runs, name)
+        except RunError as missing:
+            await connection.send(ErrorEvent(message=str(missing)))
+            await connection.close(status.WS_1008_POLICY_VIOLATION)
+            return
+        stream = RunStream(run, stale_after=stale_after)
+        async with asyncio.TaskGroup() as tasks:
+            sending = tasks.create_task(_send_run_events(connection, stream, run_poll_seconds))
+            # Nothing a viewer sends is acted on; listening is how their going away is heard.
+            waiting = tasks.create_task(_until_disconnected(connection))
+            await asyncio.wait({sending, waiting}, return_when=asyncio.FIRST_COMPLETED)
+            sending.cancel()
+            waiting.cancel()
+
     app.include_router(api, prefix=prefix)
 
     if prefix:
@@ -610,61 +612,6 @@ def _model_player(spec: ModelSpec, config: Config, engines: dict[tuple[str, int]
     )
 
 
-def _describe_run(run: RunReader) -> RunSummary:
-    """One run as the new-game form lists it, as far as its files can be read.
-
-    A run being written right now is a run someone may well want to play against, so anything
-    unreadable is left out rather than turned into a refusal: the name and the checkpoints on
-    the disk are enough to pick one. Every part is read on its own, so that whatever cannot be
-    read costs this run that one line of its description and costs the other runs nothing —
-    one run mid-save must not turn the whole list into "could not list the training runs".
-    """
-    summary = RunSummary(name=run.name)
-    for part, describe in (
-        ("what it has saved", lambda: {"checkpoints": len(run.checkpoints())}),
-        ("what it is", lambda: _describes(run.info)),
-        ("where it has got to", lambda: _got_to(run.status)),
-    ):
-        try:
-            summary = summary.model_copy(update=describe())
-        except (RunError, OSError):
-            logger.debug("run %s does not say %s", run.name, part, exc_info=True)
-    return summary
-
-
-def _describes(info: RunInfo) -> dict[str, Any]:
-    """What ``run.json`` adds to a run's line in the list."""
-    return {
-        "architecture": info.model.architecture,
-        "created": info.created,
-        "steps": info.steps,
-    }
-
-
-def _got_to(beat: Heartbeat | None) -> dict[str, Any]:
-    """What the last heartbeat adds, or nothing at all before a run has written one."""
-    return {} if beat is None else {"status": beat.status, "step": beat.step}
-
-
-def _describe_checkpoints(run: RunReader) -> RunCheckpoints:
-    """A run's checkpoints, newest first, each saying whether it is the best or the newest."""
-    index = run.checkpoint_index()
-    latest = index.checkpoints[-1].step if index.checkpoints else None
-    return RunCheckpoints(
-        run=run.name,
-        checkpoints=[
-            CheckpointSummary(
-                step=info.step,
-                created=info.created,
-                metrics=info.metrics,
-                best=info.step == index.best_step,
-                latest=info.step == latest,
-            )
-            for info in reversed(index.checkpoints)
-        ],
-    )
-
-
 async def _read_at_most(body: AsyncIterator[bytes], limit: int) -> bytes:
     """The body being sent, refused the moment it passes ``limit`` bytes.
 
@@ -720,7 +667,7 @@ class _Connection:
     async def receive(self) -> Message:
         return await self._websocket.receive()
 
-    async def send(self, event: ViewerEvent) -> None:
+    async def send(self, event: ViewerEvent | RunEvent) -> None:
         async with self._sending:
             if self._websocket.application_state is WebSocketState.CONNECTED:
                 await self._websocket.send_text(event.model_dump_json())
@@ -773,6 +720,35 @@ async def _send_game_events(connection: _Connection, game_channel: GameChannel) 
         await connection.close(status.WS_1001_GOING_AWAY)
     except WebSocketDisconnect:
         pass  # The viewer has already gone.
+
+
+async def _send_run_events(connection: _Connection, stream: RunStream, every: float) -> None:
+    """Look at the run every ``every`` seconds, and send whatever has changed in it."""
+    try:
+        while True:
+            # On a worker thread, as the run routes above, because these are file reads and the
+            # game is being played on the event loop.
+            try:
+                events = await run_in_threadpool(stream.poll)
+            except RunError:
+                # A log this process may not read, for instance. Looked at again next time,
+                # since whatever it was may well pass, and the viewer keeps what they have.
+                logger.warning("cannot follow run %s", stream.name, exc_info=True)
+                events = []
+            for event in events:
+                await connection.send(event)
+            await asyncio.sleep(every)
+    except WebSocketDisconnect:
+        pass  # The viewer has already gone.
+
+
+async def _until_disconnected(connection: _Connection) -> None:
+    """Return once the viewer has gone, ignoring whatever they send meanwhile."""
+    try:
+        while (await connection.receive())["type"] != "websocket.disconnect":
+            pass
+    except WebSocketDisconnect:
+        pass
 
 
 class _FrontendFiles(StaticFiles):

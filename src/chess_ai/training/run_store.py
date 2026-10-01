@@ -30,7 +30,8 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable, Iterator, Mapping
+import threading
+from collections.abc import Callable, Collection, Iterator, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
@@ -546,6 +547,14 @@ class RunReader:
         except OSError as e:
             raise RunError(f"cannot read {path}: {e.strerror}") from e
 
+    def tail_metrics(self) -> "MetricsTail":
+        """A cursor over the metrics log, for a reader that follows it as it grows."""
+        return MetricsTail(self.directory / METRICS_FILE)
+
+    def track_latest_metrics(self) -> "LatestMetrics":
+        """The last line of each split of the metrics log, for a reader that asks repeatedly."""
+        return LatestMetrics(self.tail_metrics())
+
     def checkpoints(self) -> list[CheckpointInfo]:
         """The checkpoints on disk, oldest first, with whatever the index knows about them."""
         return read_checkpoints(self.directory / CHECKPOINTS_DIR)
@@ -573,6 +582,100 @@ class RunReader:
     def checkpoint_path(self, info: CheckpointInfo) -> Path:
         """Where ``info``'s file is, which is what a checkpoint is loaded from."""
         return self.directory / CHECKPOINTS_DIR / info.file
+
+
+class MetricsTail:
+    """Where a reader following a metrics log has got to, so that each read returns what is new.
+
+    It keeps a byte offset rather than a line count, so that a read costs what was added and
+    not the whole log again. It also notices when the log it was following is no longer the
+    one on the disk — a run started again under the same name with ``--overwrite`` deletes the
+    log and begins a new one — and says so, because lines appended to what a reader already has
+    would join two runs' metrics into one history that neither of them had.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._offset = 0
+        self._identity: tuple[int, int] | None = None
+        self._started = False
+
+    def read(self) -> tuple[list[dict[str, Any]], bool]:
+        """The whole lines added since the last read, and whether they replace what came before.
+
+        The second value is true on the first read, and whenever the log has been replaced or
+        cut short since: the records returned are then the log from its beginning, and
+        everything read before is to be thrown away. A line still being written is left for
+        the next read, which sees it whole.
+        """
+        replace = not self._started
+        self._started = True
+        try:
+            with self.path.open("rb") as f:
+                stat = os.fstat(f.fileno())
+                identity = (stat.st_dev, stat.st_ino)
+                if identity != self._identity or stat.st_size < self._offset:
+                    replace = replace or self._identity is not None or self._offset > 0
+                    self._identity, self._offset = identity, 0
+                f.seek(self._offset)
+                added = f.read()
+        except FileNotFoundError:
+            # Between an overwrite deleting the log and making the new one, or a run whose
+            # directory has gone. Either way nothing read before still stands.
+            replace = replace or self._offset > 0
+            self._identity, self._offset = None, 0
+            return [], replace
+        except OSError as e:
+            raise RunError(f"cannot read {self.path}: {e.strerror}") from e
+        whole = added[: added.rfind(b"\n") + 1]
+        self._offset += len(whole)
+        records = [record for line in whole.splitlines() if (record := _parse_metrics_line(line))]
+        return records, replace
+
+
+def _parse_metrics_line(line: bytes) -> dict[str, Any] | None:
+    """One metrics line as a record, or ``None`` for one that is not a JSON object.
+
+    ``NaN`` and ``Infinity`` become ``None``, as :meth:`RunWriter.log` writes them now: a log
+    written before it did may still have the bare tokens, which Python reads and a browser's
+    ``JSON.parse`` does not.
+    """
+    try:
+        record = json.loads(line, parse_constant=lambda _: None)
+    except ValueError:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+class LatestMetrics:
+    """The last line the metrics log has for each split, kept up to date as the log grows.
+
+    The run list shows every run's latest numbers and is asked for every few seconds, while a
+    long run's log runs to tens of thousands of lines. A reader that kept one of these per run
+    reads each log once, and after that only what has been appended to it — which a search for
+    the last line of each split cannot promise, since a split the log has no line for (a run
+    with no validation positions, or one that has not validated yet) is only known to be absent
+    once the whole log has been read.
+
+    Safe to share between threads, as the web server's worker threads do.
+    """
+
+    def __init__(self, tail: MetricsTail, splits: Collection[str] = (TRAIN, VALIDATION)) -> None:
+        self._tail = tail
+        self._splits = frozenset(splits)
+        self._latest: dict[str, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    def read(self) -> dict[str, dict[str, Any]]:
+        """The last whole line of each split, keyed by split; a split with no line is left out."""
+        with self._lock:
+            records, replace = self._tail.read()
+            if replace:
+                self._latest = {}
+            for record in records:
+                if (split := record.get("split")) in self._splits:
+                    self._latest[split] = record
+            return dict(self._latest)
 
 
 def open_run(runs_dir: Path, name: str) -> RunReader:

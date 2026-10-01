@@ -1,0 +1,73 @@
+.runs-view h2,
+.run-view h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+}
+
+.runs-view .note,
+.run-view .note {
+  opacity: 0.7;
+}
+
+.runs-view p[role='alert'],
+.run-view p[role='alert'] {
+  font-weight: 600;
+  color: #c33;
+}
+
+/* A wide table scrolls inside its frame rather than pushing the page sideways. */
+.runs-view .table-frame {
+  overflow-x: auto;
+  border: 1px solid rgb(128 128 128 / 30%);
+  border-radius: 6px;
+}
+
+.runs-view table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.runs-view th,
+.runs-view td {
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.runs-view thead th {
+  font-weight: 600;
+  border-bottom: 1px solid rgb(128 128 128 / 35%);
+}
+
+.runs-view tbody tr + tr {
+  border-top: 1px solid rgb(128 128 128 / 18%);
+}
+
+.runs-view tbody tr:hover {
+  background: rgb(128 128 128 / 10%);
+}
+
+.runs-view .name {
+  font-weight: 500;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.runs-view a {
+  color: inherit;
+}
+
+.runs-view .number,
+.runs-view .progress,
+.runs-view .updated {
+  font-variant-numeric: tabular-nums;
+}
+
+.runs-view .number {
+  text-align: right;
+}
+
+.runs-view .updated {
+  opacity: 0.75;
+}

@@ -15,6 +15,9 @@ import startPosition from './test/fixtures/start-position.json';
 import { foolsMateMoves, foolsMateStart, type StateEvent } from './test/foolsMate';
 import { castling, check, drawnByFiftyMoves, promotion } from './test/positions';
 
+// uPlot draws on a canvas, which jsdom does not have; see RunView.test.tsx for the charts.
+vi.mock('uplot', async () => ({ default: (await import('./test/fakeUPlot')).FakeUPlot }));
+
 const PLAYERS = {
   human: { name: 'Human', accepts_moves: true, model: null },
   random: { name: 'Random mover', accepts_moves: false, model: null },
@@ -122,6 +125,41 @@ describe('App', () => {
 
       expect(await screen.findByText('No games have been saved here yet.')).toBeInTheDocument();
       expect(screen.getByRole('heading', { name: 'Replay' })).toBeInTheDocument();
+    });
+
+    it('opens the runs dashboard, and a run from it', async () => {
+      const run = {
+        name: 'mlp-big',
+        architecture: 'mlp',
+        created: null,
+        status: 'finished',
+        step: 10,
+        steps: 10,
+        checkpoints: 1,
+      };
+      vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json([run])));
+      render(<App />);
+
+      fireEvent.click(screen.getByRole('button', { name: 'Runs' }));
+
+      expect(window.location.hash).toBe('#runs');
+      const link = await screen.findByRole('link', { name: 'mlp-big' });
+      // jsdom follows no links, so the address is changed as the browser would change it,
+      // and the app follows the address.
+      window.location.hash = link.getAttribute('href')!;
+
+      expect(await screen.findByRole('heading', { name: 'mlp-big' })).toBeInTheDocument();
+      expect(FakeWebSocket.latest.url).toMatch(/\/chess\/api\/runs\/mlp-big\/ws$/);
+      expect(screen.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page');
+    });
+
+    it('opens the run the address names', () => {
+      window.location.hash = '#runs/mlp-big';
+
+      render(<App />);
+
+      expect(screen.getByRole('heading', { name: 'mlp-big' })).toBeInTheDocument();
+      expect(FakeWebSocket.latest.url).toMatch(/\/chess\/api\/runs\/mlp-big\/ws$/);
     });
   });
 

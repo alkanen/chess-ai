@@ -1,5 +1,5 @@
 import { act } from '@testing-library/react';
-import type { GameEvent } from '../api';
+import type { GameEvent, RunEvent } from '../api';
 
 /** Stands in for the browser's WebSocket; tests drive the server's side of it. */
 export class FakeWebSocket {
@@ -53,7 +53,7 @@ export class FakeWebSocket {
   }
 
   /** The server sends an event. */
-  deliver(event: GameEvent) {
+  deliver(event: GameEvent | RunEvent) {
     act(() => this.onmessage?.({ data: JSON.stringify(event) }));
   }
 

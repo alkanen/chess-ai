@@ -164,7 +164,7 @@ Actors: the **experimenter** trains and evaluates models, the **player** plays g
 - **Machine learning:** PyTorch with CUDA on a single RTX 4090 under WSL2. Training uses bf16 mixed precision, with optional `torch.compile`.
 - **Chess rules, PGN parsing and UCI:** `python-chess` (GPL-3.0). The project is licensed GPL-3.0 to match.
 - **Web server:** FastAPI on uvicorn, using REST for queries and commands and WebSockets for live data.
-- **Frontend:** React with TypeScript, built with Vite into static files that the Python server serves. The board is a custom SVG component, not a third-party board library, so that hover highlights, arrows and probability heatmaps are fully under our control. Pieces come from an openly licensed SVG piece set. Charts use a lightweight charting library, chosen when the dashboard is built.
+- **Frontend:** React with TypeScript, built with Vite into static files that the Python server serves. The board is a custom SVG component, not a third-party board library, so that hover highlights, arrows and probability heatmaps are fully under our control. Pieces come from an openly licensed SVG piece set. Charts use a lightweight charting library: uPlot (MIT), chosen when the dashboard was built for its small size and canvas drawing, which keeps long runs fast.
 - **External opponent and evaluator:** Stockfish as a separately installed binary, located through configuration and driven over UCI.
 - **Data:** Lichess open database dumps (CC0) are the main bulk source. The Lichess puzzle database (CC0) is used for puzzle evaluation.
 
