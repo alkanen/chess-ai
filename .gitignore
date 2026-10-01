@@ -16,6 +16,9 @@ chess-ai.toml
 # PGN files downloaded to work with, which are nobody else's business
 /downloaded_games/
 
+# Editor backup files
+*~
+
 # Python
 .venv/
 __pycache__/
