@@ -1,0 +1,33 @@
+.tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tag-list .tag {
+  display: inline-block;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid rgb(128 128 128 / 40%);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  color: inherit;
+  background: rgb(128 128 128 / 10%);
+}
+
+.tag-list button.tag {
+  cursor: pointer;
+}
+
+.tag-list button.tag:hover {
+  background: rgb(128 128 128 / 22%);
+}
+
+.tag-list button.tag[aria-pressed='true'] {
+  border-color: currentcolor;
+  font-weight: 600;
+}

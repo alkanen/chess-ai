@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { CompareView } from './CompareView';
 import { GameView } from './GameView';
 import { ReplayView } from './ReplayView';
 import { RunsView } from './RunsView';
@@ -19,19 +20,28 @@ interface Place {
   view: View;
   /** The run on show, under the runs view; null for the list of them. */
   run: string | null;
+  /** The runs compared side by side, under the runs view; null when none are. */
+  compare: string[] | null;
 }
 
 const RUN_PAGE = /^#runs\/(.+)$/;
+const COMPARE_PAGE = /^#compare\/(.+)$/;
 
 /** The place the address names, so that a reload comes back to the one you were on. */
 function placeInAddress(): Place {
   const { hash } = window.location;
   const run = RUN_PAGE.exec(hash);
   if (run !== null) {
-    return { view: 'runs', run: decodeURIComponent(run[1]) };
+    return { view: 'runs', run: decodeURIComponent(run[1]), compare: null };
+  }
+  const compare = COMPARE_PAGE.exec(hash);
+  if (compare !== null) {
+    // A run's name has no commas in it, so they are what separates one from the next.
+    const names = compare[1].split(',').filter((name) => name !== '').map(decodeURIComponent);
+    return { view: 'runs', run: null, compare: names };
   }
   const view = VIEWS.find((candidate) => candidate.hash !== '' && candidate.hash === hash);
-  return { view: view?.name ?? 'game', run: null };
+  return { view: view?.name ?? 'game', run: null, compare: null };
 }
 
 /** Which place is on show, and how to go to another view. */
@@ -49,7 +59,7 @@ function usePlace(): [Place, (view: View) => void] {
   return [
     place,
     (next: View) => {
-      setPlace({ view: next, run: null });
+      setPlace({ view: next, run: null, compare: null });
       window.location.hash = VIEWS.find((view) => view.name === next)!.hash;
     },
   ];
@@ -78,8 +88,9 @@ export function App() {
       </header>
       {view === 'game' && <GameView />}
       {view === 'replay' && <ReplayView />}
-      {view === 'runs' &&
-        (place.run === null ? <RunsView /> : <RunView key={place.run} name={place.run} />)}
+      {view === 'runs' && place.compare !== null && <CompareView names={place.compare} />}
+      {view === 'runs' && place.compare === null && place.run === null && <RunsView />}
+      {view === 'runs' && place.run !== null && <RunView key={place.run} name={place.run} />}
     </main>
   );
 }

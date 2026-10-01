@@ -12,12 +12,14 @@ from chess_ai.training.run_store import (
     CHECKPOINT_INDEX,
     CHECKPOINTS_DIR,
     METRICS_FILE,
+    NOTES_FILE,
     STATUS_FILE,
     CheckpointPolicy,
     DatasetReference,
     ModelReference,
     RunError,
     RunInfo,
+    RunNotes,
     RunReader,
     RunStatus,
     RunWriter,
@@ -28,6 +30,7 @@ from chess_ai.training.run_store import (
     open_run,
     read_checkpoints,
     run_path,
+    save_notes,
 )
 
 
@@ -123,6 +126,7 @@ def test_overwriting_leaves_nothing_of_the_run_it_replaced(tmp_path):
         first.log(step=1, loss=9.0)
         save(first, 1, policy_loss=9.0)
         first.heartbeat(RunStatus.RUNNING, steps=100)
+    save_notes(open_run(tmp_path, "test"), RunNotes(title="the old one", tags=["best"]))
 
     replaced = RunWriter.create(
         run_path(tmp_path, "test"),
@@ -138,6 +142,7 @@ def test_overwriting_leaves_nothing_of_the_run_it_replaced(tmp_path):
     assert [line["loss"] for line in reader.metrics()] == [1.0]
     assert reader.checkpoints() == []
     assert reader.status is None
+    assert reader.notes == RunNotes()
     assert reader.config_text == "# newer\n"
 
 
@@ -655,3 +660,130 @@ def test_a_checkpoint_that_goes_while_the_directory_is_read_is_not_one(tmp_path,
     found = read_checkpoints(checkpoints)
 
     assert [info.step for info in found] == [10]
+
+
+# Notes.
+
+
+def test_notes_round_trip_through_the_run_directory(tmp_path):
+    with writer(tmp_path):
+        pass
+    notes = RunNotes(
+        title="Wider MLP", tags=["mlp", "width-2048"], notes="Trying width.\nIt helped."
+    )
+
+    assert save_notes(open_run(tmp_path, "test"), notes) == notes
+
+    assert open_run(tmp_path, "test").notes == notes
+    written = json.loads((run_path(tmp_path, "test") / NOTES_FILE).read_text())
+    assert written["format_version"] == run_store.FORMAT_VERSION
+
+
+def test_a_run_nobody_has_written_notes_for_has_empty_ones(tmp_path):
+    with writer(tmp_path):
+        pass
+
+    assert open_run(tmp_path, "test").notes == RunNotes(title=None, tags=[], notes="")
+
+
+def test_notes_are_replaced_whole(tmp_path):
+    with writer(tmp_path):
+        pass
+    run = open_run(tmp_path, "test")
+    save_notes(run, RunNotes(title="first", tags=["a"], notes="one"))
+
+    save_notes(run, RunNotes(tags=["b"]))
+
+    assert run.notes == RunNotes(tags=["b"])
+    assert not list(run.directory.glob("*.writing"))
+
+
+def test_notes_that_cannot_be_read_say_so(tmp_path):
+    with writer(tmp_path):
+        pass
+    (run_path(tmp_path, "test") / NOTES_FILE).write_text("{not json")
+
+    with pytest.raises(RunError, match="notes.json"):
+        assert open_run(tmp_path, "test").notes
+
+
+def test_notes_that_cannot_be_written_say_so(tmp_path):
+    with writer(tmp_path):
+        pass
+    (run_path(tmp_path, "test") / NOTES_FILE).mkdir()
+
+    with pytest.raises(RunError, match="cannot write"):
+        save_notes(open_run(tmp_path, "test"), RunNotes(title="x"))
+
+
+def test_a_title_is_trimmed_and_an_empty_one_is_no_title():
+    assert RunNotes(title="  Wider MLP ").title == "Wider MLP"
+    assert RunNotes(title="   ").title is None
+
+
+def test_a_title_is_one_line():
+    with pytest.raises(ValueError, match="one line"):
+        RunNotes(title="two\nlines")
+
+
+def test_tags_are_trimmed_and_kept_once_each_in_the_order_given():
+    assert RunNotes(tags=[" mlp", "baseline", "mlp"]).tags == ["mlp", "baseline"]
+
+
+@pytest.mark.parametrize("tag", ["", "two words", "a,b", "x" * 41])
+def test_a_tag_is_one_short_word(tag):
+    with pytest.raises(ValueError, match="tag"):
+        RunNotes(tags=[tag])
+
+
+def test_two_saves_at_once_leave_one_of_them_whole(tmp_path, monkeypatch):
+    """Notes have more than one writer: the web server's threads and the command line.
+
+    The second save happens while the first is between writing its temporary file and renaming
+    it into place, which is where two writers sharing one temporary name would mix their text.
+    """
+    with writer(tmp_path):
+        pass
+    run = open_run(tmp_path, "test")
+    first = RunNotes(title="the first save", notes="a much longer text than the second has " * 5)
+    second = RunNotes(title="second")
+    sync_file = run_store.sync_file
+    interrupted = []
+
+    def interleaved(f):
+        sync_file(f)
+        if not interrupted:
+            interrupted.append(True)
+            save_notes(run, second)
+
+    monkeypatch.setattr(run_store, "sync_file", interleaved)
+
+    save_notes(run, first)
+
+    assert run.notes == first, "the last to be renamed into place wins, whole"
+    assert not list(run.directory.glob("*.writing"))
+
+
+def test_a_heartbeat_replaces_what_a_crash_mid_write_left_behind(tmp_path):
+    """A file with one writer keeps one temporary name, which the next write takes over."""
+    with writer(tmp_path) as run:
+        (run.directory / f"{STATUS_FILE}.writing").write_text("half a heart")
+
+        run.heartbeat(RunStatus.RUNNING, steps=100)
+
+    assert not list(run.directory.glob("*.writing"))
+
+
+def test_overwriting_throws_away_what_crashes_mid_write_left_behind(tmp_path):
+    with writer(tmp_path):
+        pass
+    directory = run_path(tmp_path, "test")
+    (directory / "notes.json.0123abcd.writing").write_text("{")
+    (directory / CHECKPOINTS_DIR / "step-000000005.pt.writing").write_text("half the weights")
+
+    with RunWriter.create(
+        directory, info("test"), config_text="", policy=CheckpointPolicy(), overwrite=True
+    ):
+        pass
+
+    assert not list(directory.rglob("*.writing"))

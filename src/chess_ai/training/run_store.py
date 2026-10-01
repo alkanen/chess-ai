@@ -12,6 +12,7 @@ kills a run nor loses track of one, and a run from six months ago is still brows
     <runs>/<name>/metrics.jsonl     append-only, one JSON object per line
     <runs>/<name>/status.json       the heartbeat: replaced whole, never appended to
     <runs>/<name>/checkpoints/      step-<step>.pt, and an index naming the best of them
+    <runs>/<name>/notes.json        a title, tags and notes: written by people, never by the trainer
 
 Two write disciplines, because two kinds of reader:
 
@@ -31,6 +32,7 @@ import os
 import re
 import subprocess
 import threading
+import uuid
 from collections.abc import Callable, Collection, Iterator, Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -38,7 +40,7 @@ from math import isfinite
 from pathlib import Path
 from typing import Any, Final, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from chess_ai.dataset.files import sync_directory, sync_file
 from chess_ai.encoders import EncoderSpec
@@ -50,6 +52,7 @@ RUN_FILE: Final = "run.json"
 CONFIG_FILE: Final = "config.toml"
 METRICS_FILE: Final = "metrics.jsonl"
 STATUS_FILE: Final = "status.json"
+NOTES_FILE: Final = "notes.json"
 CHECKPOINTS_DIR: Final = "checkpoints"
 CHECKPOINT_INDEX: Final = "index.json"
 CHECKPOINT_SUFFIX: Final = ".pt"
@@ -57,7 +60,7 @@ CHECKPOINT_STEP_DIGITS: Final = 9
 """Enough that a checkpoint file's name sorts by step as text, up to a billion steps."""
 
 TEMPORARY_SUFFIX: Final = ".writing"
-"""What a file being replaced is called until it is whole; see the module docstring."""
+"""What the name of a file being replaced ends in until it is whole; see the module docstring."""
 
 TRAIN: Final = "train"
 VALIDATION: Final = "validation"
@@ -235,6 +238,65 @@ class CheckpointIndex(BaseModel):
     checkpoints: list[CheckpointInfo] = Field(default_factory=list)
 
 
+MAX_TITLE_LENGTH: Final = 200
+MAX_TAG_LENGTH: Final = 40
+MAX_TAGS: Final = 50
+MAX_NOTES_LENGTH: Final = 100_000
+
+_TAG = re.compile(r"[^\s,]+")
+
+
+class RunNotes(BaseModel):
+    """What people have said about a run: a title to know it by, tags to find it by, and notes.
+
+    The run's name is its directory, which a trainer may be writing into at this moment and a
+    checkpoint loaded elsewhere names it by, so it never changes. The title is the name it is
+    shown under instead, and can be changed as often as an experiment's meaning becomes clear.
+
+    Tags are single words, so that a command line can take them one at a time and a list of
+    them can be written with commas or spaces between: no whitespace and no commas inside one.
+    The same tag twice is kept once, in the order first given.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, use_attribute_docstrings=True)
+
+    title: str | None = Field(default=None, max_length=MAX_TITLE_LENGTH)
+    """What to show the run as, instead of its name; ``None`` to show the name."""
+    tags: list[str] = Field(default_factory=list, max_length=MAX_TAGS)
+    notes: str = Field(default="", max_length=MAX_NOTES_LENGTH)
+    """Free text: what the run was for, and what came of it."""
+
+    @field_validator("title")
+    @classmethod
+    def _one_line(cls, title: str | None) -> str | None:
+        if title is None:
+            return None
+        title = title.strip()
+        if "\n" in title or "\r" in title:
+            raise ValueError("a title is one line")
+        return title or None
+
+    @field_validator("tags")
+    @classmethod
+    def _words(cls, tags: list[str]) -> list[str]:
+        kept: list[str] = []
+        for tag in tags:
+            tag = tag.strip()
+            if not _TAG.fullmatch(tag):
+                raise ValueError(f"invalid tag {tag!r}: a tag is one word, with no commas")
+            if len(tag) > MAX_TAG_LENGTH:
+                raise ValueError(f"tag {tag!r} is longer than {MAX_TAG_LENGTH} characters")
+            if tag not in kept:
+                kept.append(tag)
+        return kept
+
+
+class _NotesFile(RunNotes):
+    """``notes.json``: the notes, and the layout version they were written in."""
+
+    format_version: int = FORMAT_VERSION
+
+
 def valid_name(name: str) -> str:
     """``name`` if it can be a run's, else raise :exc:`RunError`.
 
@@ -349,12 +411,21 @@ class RunWriter:
     @staticmethod
     def _clear(directory: Path) -> None:
         """Throw away what a previous run of this name left, so the two cannot be read as one."""
-        for path in (METRICS_FILE, STATUS_FILE):
+        # The notes too: they were written about the run being replaced, and a title or a
+        # "best so far" tag carried over would describe a run that no longer exists.
+        for path in (METRICS_FILE, STATUS_FILE, NOTES_FILE):
             (directory / path).unlink(missing_ok=True)
         checkpoints = directory / CHECKPOINTS_DIR
         for path in checkpoints.glob(f"*{CHECKPOINT_SUFFIX}"):
             path.unlink(missing_ok=True)
         (checkpoints / CHECKPOINT_INDEX).unlink(missing_ok=True)
+        # And whatever a process killed mid-write left: SIGKILL, the OOM killer and a power cut
+        # give it no chance to tidy up, and a notes file's temporary name is never used twice.
+        for path in (
+            *directory.glob(f"*{TEMPORARY_SUFFIX}"),
+            *checkpoints.glob(f"*{TEMPORARY_SUFFIX}"),
+        ):
+            path.unlink(missing_ok=True)
 
     def log(self, **fields: Any) -> None:
         """Append one metrics line. Written whole and flushed, so a tail sees it at once."""
@@ -516,6 +587,21 @@ class RunReader:
         if not (self.directory / STATUS_FILE).exists():
             return None
         return _read_model(self.directory / STATUS_FILE, Heartbeat)
+
+    @property
+    def notes(self) -> RunNotes:
+        """The run's title, tags and notes; empty ones before anybody has written any."""
+        path = self.directory / NOTES_FILE
+        try:
+            text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Asked rather than looked for first, since an overwrite can delete the file
+            # between the looking and the reading.
+            return RunNotes()
+        except OSError as e:
+            raise RunError(f"cannot read {path}: {e.strerror or e}") from e
+        written = _parse_model(path, text, _NotesFile)
+        return RunNotes(title=written.title, tags=written.tags, notes=written.notes)
 
     def metrics(self, *, skip: int = 0) -> list[dict[str, Any]]:
         """The metrics logged so far, oldest first, skipping the first ``skip`` of them.
@@ -694,6 +780,25 @@ def open_run(runs_dir: Path, name: str) -> RunReader:
     return run
 
 
+def save_notes(run: RunReader, notes: RunNotes) -> RunNotes:
+    """Replace ``run``'s title, tags and notes with ``notes``, and return them as kept.
+
+    Replaced whole, as every current value here is, so that the web server reading them on
+    its next poll gets the old notes or the new ones and never half of each. Nothing here
+    merges: whoever writes last wins, which for notes edited by one person is what they meant.
+
+    Raises:
+        RunError: the notes could not be written.
+    """
+    path = run.directory / NOTES_FILE
+    written = _NotesFile(title=notes.title, tags=notes.tags, notes=notes.notes)
+    try:
+        _replace_file(path, _as_json(written), writers="many")
+    except OSError as e:
+        raise RunError(f"cannot write {path}: {e.strerror or e}") from e
+    return notes
+
+
 def choose_checkpoint(run: RunReader, choice: CheckpointChoice) -> CheckpointInfo:
     """The checkpoint of ``run`` that ``choice`` names.
 
@@ -806,6 +911,11 @@ def _read_model(path: Path, model: type[BaseModel]) -> Any:
         text = path.read_text(encoding="utf-8")
     except OSError as e:
         raise RunError(f"cannot read {path}: {e.strerror or e}") from e
+    return _parse_model(path, text, model)
+
+
+def _parse_model(path: Path, text: str, model: type[BaseModel]) -> Any:
+    """Validate ``text``, read from ``path``, or raise :exc:`RunError`."""
     try:
         return model.model_validate_json(text)
     except ValidationError as e:
@@ -818,13 +928,29 @@ def _read_model(path: Path, model: type[BaseModel]) -> Any:
         raise RunError(f"{path} is not valid JSON: {e}") from e
 
 
-def _replace_file(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` by renaming it into place; see the module docstring."""
-    temporary = path.with_name(path.name + TEMPORARY_SUFFIX)
-    with temporary.open("w", encoding="utf-8") as f:
-        f.write(text)
-        sync_file(f)
-    os.replace(temporary, path)
+def _replace_file(path: Path, text: str, *, writers: Literal["one", "many"] = "one") -> None:
+    """Write ``text`` to ``path`` by renaming it into place; see the module docstring.
+
+    A file with one writer — everything the trainer writes — has one temporary name, so a
+    temporary file left by a writer killed mid-write is taken over by the next write rather
+    than left lying there. A file with ``"many"`` writers — the notes, which the web server's
+    threads and the command line can save at the same moment — gives each write a temporary
+    file of its own: two writers sharing one would truncate and write it at once, and rename
+    whatever mixture of the two it held into place. With one each, the last rename wins whole.
+    What a killed writer of those leaves is thrown away when the run is overwritten.
+    """
+    unique = f".{uuid.uuid4().hex}" if writers == "many" else ""
+    temporary = path.with_name(f"{path.name}{unique}{TEMPORARY_SUFFIX}")
+    try:
+        # Written through open() rather than tempfile.mkstemp, whose files are readable by their
+        # owner only: the web server reading a run need not be the user that trained it.
+        with temporary.open("w" if writers == "one" else "x", encoding="utf-8") as f:
+            f.write(text)
+            sync_file(f)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
     sync_directory(path.parent)
 
 

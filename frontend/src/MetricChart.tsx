@@ -1,11 +1,22 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
-import { latestValues, type ChartData, type ChartSpec } from './runCharts';
-import { formatCount } from './runFormat';
+import { latestValues, type ChartData, type ChartLook, type XAxis } from './runCharts';
 import './MetricChart.css';
 
 const HEIGHT = 220;
+
+/** The categorical slots, in the order lines take them, for a page without the tokens. */
+const SERIES_FALLBACKS = [
+  '#2a78d6',
+  '#eb6834',
+  '#1baf7a',
+  '#eda100',
+  '#e87ba4',
+  '#008300',
+  '#4a3aa7',
+  '#e34948',
+];
 
 /** The colours a chart is drawn in, read from the CSS tokens of the scheme in use. */
 interface Palette {
@@ -19,7 +30,7 @@ function readPalette(element: HTMLElement): Palette {
   const token = (name: string, fallback: string) =>
     style.getPropertyValue(name).trim() || fallback;
   return {
-    series: [token('--series-1', '#2a78d6'), token('--series-2', '#eb6834')],
+    series: SERIES_FALLBACKS.map((fallback, index) => token(`--series-${index + 1}`, fallback)),
     text: token('--chart-text', '#52514e'),
     grid: token('--chart-grid', 'rgb(128 128 128 / 20%)'),
   };
@@ -47,18 +58,21 @@ function darkQuery(): MediaQueryList | null {
 }
 
 interface MetricChartProps {
-  spec: ChartSpec;
+  chart: ChartLook;
+  /** What each line is called, in the order of the series in `data`. */
+  labels: string[];
+  x: XAxis;
   data: ChartData;
 }
 
 /**
- * One chart of a run's metrics against the step, drawn by uPlot.
+ * One chart of metrics against `x`, drawn by uPlot: one run's, or several runs' side by side.
  *
  * The chart is made once and handed new data as the run logs it. Dragging across it zooms
  * in, and a zoomed chart stays where it was put while new lines arrive, until a double
  * click lets it follow the run again.
  */
-export function MetricChart({ spec, data }: MetricChartProps) {
+export function MetricChart({ chart: spec, labels, x, data }: MetricChartProps) {
   const container = useRef<HTMLDivElement>(null);
   const chart = useRef<uPlot | null>(null);
   const zoomed = useRef(false);
@@ -68,6 +82,11 @@ export function MetricChart({ spec, data }: MetricChartProps) {
   // The newest data, for a chart made after it arrived.
   const current = useRef(data);
   current.current = data;
+  // The labels as a value rather than an array, so that a new array saying the same thing does
+  // not make the chart again; a renamed run does.
+  const named = labels.join('\n');
+  const currentLabels = useRef(labels);
+  currentLabels.current = labels;
 
   useEffect(() => {
     const element = container.current;
@@ -85,17 +104,22 @@ export function MetricChart({ spec, data }: MetricChartProps) {
       height: HEIGHT,
       scales: { x: { time: false }, y: spec.logarithmic ? { distr: 3 } : {} },
       axes: [
-        { ...axis, values: (_, splits) => splits.map((step) => formatCount(step)) },
+        {
+          ...axis,
+          values: (_, splits) => splits.map((value) => x.format(value)),
+          ...(x.increments === undefined ? {} : { incrs: x.increments }),
+        },
         { ...axis, size: 64, values: (_, splits) => splits.map((value) => spec.format(value)) },
       ],
       series: [
-        { label: 'step', value: (_, step) => (step == null ? '–' : formatCount(step)) },
-        ...spec.series.map((series, index) => ({
-          label: series.label,
+        { label: x.label, value: (_, at) => (at == null ? '–' : x.format(at)) },
+        ...currentLabels.current.map((label, index) => ({
+          label,
           stroke: palette.series[index],
           width: 2,
-          // Validation is measured every so many steps, so its points are joined across the
-          // steps it has nothing at. uPlot marks each point only while they are far enough
+          // Validation is measured every so many steps, and runs side by side are logged at
+          // x values of their own, so each line is joined across the x values it has nothing
+          // at. uPlot marks each point only while they are far enough
           // apart to tell apart; a long run's hundreds of them would be a solid band.
           spanGaps: true,
           points: { size: 8 },
@@ -122,18 +146,18 @@ export function MetricChart({ spec, data }: MetricChartProps) {
       made.destroy();
       chart.current = null;
     };
-  }, [spec, dark, empty]);
+  }, [spec, x, named, dark, empty]);
 
   useEffect(() => {
     chart.current?.setData(data as uPlot.AlignedData, !zoomed.current);
   }, [data]);
 
-  const caption = spec.series
-    .map((series, index) => {
+  const caption = labels
+    .map((label, index) => {
       const value = latest[index];
       return value === null
-        ? `${series.label}: –`
-        : `${series.label} ${spec.format(value.value)} at step ${formatCount(value.step)}`;
+        ? `${label}: –`
+        : `${label} ${spec.format(value.value)} at ${x.describe(value.x)}`;
     })
     .join('; ');
 

@@ -1,0 +1,37 @@
+.compared-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin: 0 0 1rem;
+  padding: 0;
+  list-style: none;
+}
+
+.compared-runs li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.6rem;
+}
+
+/* The line's colour beside its name, so the key reads without the chart's own legend. */
+.compared-runs .swatch {
+  flex: none;
+  width: 1.25rem;
+  height: 0.25rem;
+  border-radius: 2px;
+}
+
+.compared-runs .note {
+  font-size: 0.85rem;
+}
+
+.compared-runs .error {
+  font-weight: 600;
+  color: #c33;
+}
+
+.compared-runs .remove {
+  font-size: 0.85rem;
+  opacity: 0.75;
+}

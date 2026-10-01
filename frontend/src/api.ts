@@ -262,9 +262,21 @@ export interface MetricsRecord {
   [metric: string]: number | string | null | undefined;
 }
 
+/** What people have said about a run: mirrors chess_ai.training.run_store.RunNotes. */
+export interface RunNotes {
+  /** What to show the run as instead of its name; null to show the name. */
+  title: string | null;
+  /** Single words, with no whitespace or commas in them. */
+  tags: string[];
+  notes: string;
+}
+
 /** One training run, as the run list and the new-game form show it. */
 export interface RunSummary {
   name: string;
+  /** What people call the run, to show instead of its name. */
+  title?: string | null;
+  tags?: string[];
   architecture: string | null;
   /** The name of the dataset the run trains on. */
   dataset?: string | null;
@@ -340,6 +352,8 @@ export type RunEvent =
       info: RunInfo | null;
       heartbeat: Heartbeat | null;
       stale: boolean;
+      /** Null while the run's notes cannot be read. */
+      notes: RunNotes | null;
     }
   | { type: 'metrics'; reset: boolean; records: MetricsRecord[] }
   | { type: 'error'; message: string };
@@ -428,6 +442,14 @@ async function refusal(response: Response): Promise<string> {
     if (typeof detail === 'string' && detail !== '') {
       return detail;
     }
+    // What the server says of a request it could not validate: one entry per problem.
+    if (Array.isArray(detail) && detail.length > 0) {
+      return detail
+        .map((problem: { msg?: unknown }) =>
+          String(problem.msg ?? '').replace(/^Value error, /, ''),
+        )
+        .join('; ');
+    }
   } catch {
     // No JSON body, or nothing useful in it; the status is all there is to go on.
   }
@@ -482,6 +504,22 @@ export async function fetchRuns(): Promise<RunSummary[]> {
     throw new Error(await refusal(response));
   }
   return (await response.json()) as RunSummary[];
+}
+
+/**
+ * Replaces a run's title, tags and notes, all three at once, and gives back what the server
+ * kept: it trims a title, and keeps each tag once.
+ */
+export async function saveRunNotes(run: string, notes: RunNotes): Promise<RunNotes> {
+  const response = await fetch(apiUrl(`runs/${encodeURIComponent(run)}/notes`), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(notes),
+  });
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as RunNotes;
 }
 
 /** The checkpoints of one run, newest first. */

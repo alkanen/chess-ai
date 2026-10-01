@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Heartbeat, RunEvent, RunInfo } from './api';
 import { RunView } from './RunView';
@@ -37,7 +37,15 @@ function heartbeat(changes: Partial<Heartbeat> = {}): Heartbeat {
 }
 
 function runEvent(changes: Partial<Extract<RunEvent, { type: 'run' }>> = {}): RunEvent {
-  return { type: 'run', name: 'mlp-big', info: INFO, heartbeat: heartbeat(), stale: false, ...changes };
+  return {
+    type: 'run',
+    name: 'mlp-big',
+    info: INFO,
+    heartbeat: heartbeat(),
+    stale: false,
+    notes: { title: null, tags: [], notes: '' },
+    ...changes,
+  };
 }
 
 describe('RunView', () => {
@@ -48,6 +56,7 @@ describe('RunView', () => {
     FakeWebSocket.instances = [];
     FakeUPlot.instances = [];
     vi.stubGlobal('WebSocket', FakeWebSocket);
+    window.localStorage.clear();
   });
 
   afterEach(() => {
@@ -262,5 +271,175 @@ describe('RunView', () => {
 
     expect(screen.queryByText('Reconnecting…')).not.toBeInTheDocument();
     expect(FakeUPlot.withSeries('validation').data[1]).toEqual([9, 8]);
+  });
+
+  it('shows a run by its title, with its name, tags and notes', () => {
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(
+      runEvent({ notes: { title: 'Wide MLP', tags: ['mlp', 'wide'], notes: 'Width 2048.' } }),
+    );
+
+    expect(screen.getByRole('heading', { name: 'Wide MLP' })).toBeInTheDocument();
+    expect(screen.getByText('mlp-big')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Tags' })).getByText('wide')).toBeInTheDocument();
+    expect(screen.getByText('Width 2048.')).toBeInTheDocument();
+  });
+
+  it('follows notes changed elsewhere, such as from the command line', () => {
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(runEvent());
+    expect(screen.getByText('No notes.')).toBeInTheDocument();
+
+    FakeWebSocket.latest.deliver(runEvent({ notes: { title: 'Renamed', tags: [], notes: '' } }));
+
+    expect(screen.getByRole('heading', { name: 'Renamed' })).toBeInTheDocument();
+  });
+
+  it('saves a title, tags and notes, and shows what the server kept', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValue(Response.json({ title: 'Wide MLP', tags: ['mlp', 'wide'], notes: 'Better.' }));
+    vi.stubGlobal('fetch', fetch);
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(runEvent({ notes: { title: null, tags: ['mlp'], notes: '' } }));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title, tags and notes' }));
+    expect(screen.getByLabelText('Tags')).toHaveValue('mlp');
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'Wide MLP' } });
+    fireEvent.change(screen.getByLabelText('Tags'), { target: { value: 'mlp, wide' } });
+    fireEvent.change(screen.getByLabelText('Notes'), { target: { value: 'Better.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await screen.findByRole('heading', { name: 'Wide MLP' })).toBeInTheDocument();
+    expect(screen.queryByRole('form', { name: 'Edit notes' })).not.toBeInTheDocument();
+    expect(screen.getByText('Better.')).toBeInTheDocument();
+    const [url, request] = fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:3000/chess/api/runs/mlp-big/notes');
+    expect(request.method).toBe('PUT');
+    expect(JSON.parse(request.body as string)).toEqual({
+      title: 'Wide MLP',
+      tags: ['mlp', 'wide'],
+      notes: 'Better.',
+    });
+  });
+
+  it('does not flash the old notes back when a message read before the save arrives after it', async () => {
+    const saved = { title: 'New', tags: [], notes: '' };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json(saved)));
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    const old = { title: 'Old', tags: [], notes: '' };
+    socket.deliver(runEvent({ notes: old }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title, tags and notes' }));
+    fireEvent.change(screen.getByLabelText('Title'), { target: { value: 'New' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(await screen.findByRole('heading', { name: 'New' })).toBeInTheDocument();
+
+    // The server read the notes just before the save, and sends them because the heartbeat moved.
+    socket.deliver(runEvent({ notes: { ...old }, heartbeat: heartbeat({ step: 1_001 }) }));
+    expect(screen.getByRole('heading', { name: 'New' })).toBeInTheDocument();
+
+    socket.deliver(runEvent({ notes: { ...saved }, heartbeat: heartbeat({ step: 1_002 }) }));
+    expect(screen.getByRole('heading', { name: 'New' })).toBeInTheDocument();
+
+    // And whatever is written after that, from anywhere, is followed again.
+    socket.deliver(runEvent({ notes: { title: 'Newer', tags: [], notes: '' } }));
+    expect(screen.getByRole('heading', { name: 'Newer' })).toBeInTheDocument();
+  });
+
+  it('does not flash the first of two quick saves back while the second is on its way', async () => {
+    const first = { title: 'First', tags: [], notes: '' };
+    const second = { title: 'Second', tags: [], notes: '' };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValueOnce(Response.json(first)).mockResolvedValueOnce(Response.json(second)),
+    );
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ notes: { title: 'Old', tags: [], notes: '' } }));
+    for (const title of ['First', 'Second']) {
+      fireEvent.click(screen.getByRole('button', { name: 'Edit title, tags and notes' }));
+      fireEvent.change(screen.getByLabelText('Title'), { target: { value: title } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      expect(await screen.findByRole('heading', { name: title })).toBeInTheDocument();
+    }
+
+    // Read between the two saves, and sent after both.
+    socket.deliver(runEvent({ notes: { ...first }, heartbeat: heartbeat({ step: 1_001 }) }));
+    expect(screen.getByRole('heading', { name: 'Second' })).toBeInTheDocument();
+
+    socket.deliver(runEvent({ notes: { ...second }, heartbeat: heartbeat({ step: 1_002 }) }));
+    socket.deliver(runEvent({ notes: { title: 'Elsewhere', tags: [], notes: '' } }));
+    expect(screen.getByRole('heading', { name: 'Elsewhere' })).toBeInTheDocument();
+  });
+
+  it('keeps what was typed and says why when the notes are refused', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        Response.json(
+          { detail: [{ msg: "Value error, invalid tag 'a/b c': a tag is one word" }] },
+          { status: 422 },
+        ),
+      ),
+    );
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(runEvent());
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title, tags and notes' }));
+    fireEvent.change(screen.getByLabelText('Notes'), { target: { value: 'Keep me.' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "Could not save: invalid tag 'a/b c': a tag is one word",
+    );
+    expect(screen.getByLabelText('Notes')).toHaveValue('Keep me.');
+  });
+
+  it('puts the notes back as they were when editing is cancelled', () => {
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(runEvent({ notes: { title: null, tags: [], notes: 'Old.' } }));
+    fireEvent.click(screen.getByRole('button', { name: 'Edit title, tags and notes' }));
+    fireEvent.change(screen.getByLabelText('Notes'), { target: { value: 'New.' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.getByText('Old.')).toBeInTheDocument();
+  });
+
+  it('charts against positions seen or wall time, and remembers which', async () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent());
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [
+        { step: 50, split: 'train', loss: 3.0, elapsed: 30, positions_seen: 819_200 },
+        { step: 100, split: 'train', loss: 2.5, elapsed: 61, positions_seen: 1_638_400 },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Positions seen' }));
+
+    const chart = FakeUPlot.withSeries('validation');
+    expect(chart.data[0]).toEqual([819_200, 1_638_400]);
+    expect(chart.options.series[0].label).toBe('Positions seen');
+    expect(screen.getByText(/train 2\.5 at 1\.64M positions/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Wall time' }));
+
+    expect(FakeUPlot.withSeries('validation').data[0]).toEqual([30, 61]);
+    await waitFor(() =>
+      expect(window.localStorage.getItem('chess-ai.chart-x-axis')).toBe('time'),
+    );
   });
 });

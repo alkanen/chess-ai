@@ -21,6 +21,7 @@ from chess_ai.training.run_store import (
     LatestMetrics,
     RunError,
     RunInfo,
+    RunNotes,
     RunReader,
     RunStatus,
 )
@@ -57,6 +58,9 @@ class RunSummary(BaseModel):
     model_config = ConfigDict(use_attribute_docstrings=True)
 
     name: str
+    title: str | None = None
+    """What people call the run, to show instead of its name."""
+    tags: list[str] = []
     architecture: str | None = None
     dataset: str | None = None
     """The name of the dataset the run trains on."""
@@ -109,6 +113,7 @@ def describe_run(
     for part, describe in (
         ("what it has saved", lambda: {"checkpoints": len(run.checkpoints())}),
         ("what it is", lambda: _describes(run.info)),
+        ("what it is called", lambda: _called(run.notes)),
         ("where it has got to", lambda: _got_to(run.status, now=now, stale_after=stale_after)),
         ("what it has measured", lambda: _measured(latest.read())),
     ):
@@ -127,6 +132,11 @@ def _describes(info: RunInfo) -> dict[str, Any]:
         "created": info.created,
         "steps": info.steps,
     }
+
+
+def _called(notes: RunNotes) -> dict[str, Any]:
+    """What the notes add: the title and the tags, which is what a list is searched by."""
+    return {"title": notes.title, "tags": notes.tags}
 
 
 def _got_to(beat: Heartbeat | None, *, now: datetime, stale_after: float) -> dict[str, Any]:
@@ -235,7 +245,8 @@ class RunStateEvent(BaseModel):
     """What a run is and where it has got to; sent first, and again whenever it changes.
 
     ``info`` and ``heartbeat`` are ``None`` while they cannot be read: before the trainer has
-    written them, or for a run whose files a newer or older version of this code wrote.
+    written them, or for a run whose files a newer or older version of this code wrote. So are
+    ``notes`` while they cannot be; a run nobody has written notes for has empty ones.
     """
 
     type: Literal["run"] = "run"
@@ -243,6 +254,7 @@ class RunStateEvent(BaseModel):
     info: RunInfo | None
     heartbeat: Heartbeat | None
     stale: bool
+    notes: RunNotes | None
 
 
 class MetricsEvent(BaseModel):
@@ -300,7 +312,7 @@ class RunStream:
         return events
 
     def _state(self) -> RunStateEvent:
-        info = heartbeat = None
+        info = heartbeat = notes = None
         try:
             info = self._run.info
         except RunError:
@@ -309,11 +321,16 @@ class RunStream:
             heartbeat = self._run.status
         except RunError:
             logger.debug("run %s does not say where it has got to", self._run.name, exc_info=True)
+        try:
+            notes = self._run.notes
+        except RunError:
+            logger.debug("run %s has notes that cannot be read", self._run.name, exc_info=True)
         return RunStateEvent(
             name=self._run.name,
             info=info,
             heartbeat=heartbeat,
             stale=is_stale(heartbeat, now=self._clock(), stale_after=self._stale_after),
+            notes=notes,
         )
 
 

@@ -26,6 +26,7 @@ from chess_ai.training.run_store import (
     Heartbeat,
     RunError,
     RunInfo,
+    RunNotes,
     RunReader,
     RunStatus,
     RunWriter,
@@ -33,6 +34,7 @@ from chess_ai.training.run_store import (
     list_runs,
     open_run,
     run_path,
+    save_notes,
 )
 from chess_ai.training.trainer import TrainingError, train
 from chess_ai.training.validate import validate
@@ -51,6 +53,7 @@ __all__ = [
     "PositionBatches",
     "RunError",
     "RunInfo",
+    "RunNotes",
     "RunReader",
     "RunStatus",
     "RunWriter",
@@ -63,6 +66,7 @@ __all__ = [
     "open_run",
     "resolve_device",
     "run_path",
+    "save_notes",
     "train",
     "validate",
 ]

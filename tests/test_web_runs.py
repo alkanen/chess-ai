@@ -18,15 +18,18 @@ from chess_ai.config import Config, PathsConfig, ServerConfig
 from chess_ai.encoders import create_encoder
 from chess_ai.training.run_store import (
     METRICS_FILE,
+    NOTES_FILE,
     STATUS_FILE,
     CheckpointPolicy,
     DatasetReference,
     Heartbeat,
     ModelReference,
     RunInfo,
+    RunNotes,
     RunReader,
     RunStatus,
     RunWriter,
+    save_notes,
 )
 from chess_ai.web import create_app
 from chess_ai.web.runs import MetricsEvent, RunStateEvent, RunStream, is_stale
@@ -253,6 +256,105 @@ def test_staleness_is_decided_on_the_heartbeats_age():
     assert not is_stale(None, now=NOW, stale_after=60)
 
 
+def test_the_run_list_gives_each_runs_title_and_tags(client, runs):
+    with new_run(runs, "titled"), new_run(runs, "plain"):
+        save_notes(RunReader(runs / "titled"), RunNotes(title="Wide MLP", tags=["mlp", "wide"]))
+
+        listed = {run["name"]: run for run in client.get(f"{PREFIX}/api/runs").json()}
+
+    assert (listed["titled"]["title"], listed["titled"]["tags"]) == ("Wide MLP", ["mlp", "wide"])
+    assert (listed["plain"]["title"], listed["plain"]["tags"]) == (None, [])
+
+
+def test_the_run_list_can_be_filtered_by_tag(client, runs):
+    with new_run(runs, "a"), new_run(runs, "b"), new_run(runs, "c"):
+        save_notes(RunReader(runs / "a"), RunNotes(tags=["mlp", "wide"]))
+        save_notes(RunReader(runs / "b"), RunNotes(tags=["mlp"]))
+
+        def names(*tags: str) -> set[str]:
+            found = client.get(f"{PREFIX}/api/runs", params={"tag": list(tags)})
+            return {run["name"] for run in found.json()}
+
+        assert names() == {"a", "b", "c"}
+        assert names("mlp") == {"a", "b"}
+        assert names("mlp", "wide") == {"a"}
+        assert names("resnet") == set()
+
+
+def test_a_run_whose_notes_cannot_be_read_is_still_listed(client, runs):
+    with new_run(runs):
+        (runs / "live" / NOTES_FILE).write_text("{not json")
+
+        [summary] = client.get(f"{PREFIX}/api/runs").json()
+
+    assert (summary["name"], summary["architecture"], summary["tags"]) == ("live", "mlp", [])
+
+
+# Notes, through the API.
+
+
+def test_notes_round_trip_through_the_api_and_the_run_directory(client, runs):
+    with new_run(runs):
+        sent = {"title": "Wide MLP", "tags": ["mlp", "wide"], "notes": "Width 2048.\nBetter."}
+
+        saved = client.put(f"{PREFIX}/api/runs/live/notes", json=sent)
+        fetched = client.get(f"{PREFIX}/api/runs/live/notes")
+
+    assert saved.status_code == 200
+    assert saved.json() == sent
+    assert fetched.json() == sent
+    assert fetched.headers["Cache-Control"] == "no-store"
+    assert RunReader(runs / "live").notes == RunNotes(**sent)
+
+
+def test_a_run_nobody_has_annotated_has_empty_notes(client, runs):
+    with new_run(runs):
+        fetched = client.get(f"{PREFIX}/api/runs/live/notes")
+
+    assert fetched.json() == {"title": None, "tags": [], "notes": ""}
+
+
+def test_notes_sent_are_tidied_as_they_are_kept(client, runs):
+    with new_run(runs):
+        saved = client.put(
+            f"{PREFIX}/api/runs/live/notes", json={"title": "  ", "tags": ["mlp ", "mlp"]}
+        )
+
+    assert saved.json() == {"title": None, "tags": ["mlp"], "notes": ""}
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        {"tags": ["two words"]},
+        {"title": "two\nlines"},
+        {"title": "x" * 201},
+        {"colour": "red"},
+    ],
+)
+def test_notes_that_cannot_be_kept_are_refused_and_nothing_changes(client, runs, notes):
+    with new_run(runs):
+        save_notes(RunReader(runs / "live"), RunNotes(title="kept"))
+
+        refused = client.put(f"{PREFIX}/api/runs/live/notes", json=notes)
+
+    assert refused.status_code == 422
+    assert RunReader(runs / "live").notes == RunNotes(title="kept")
+
+
+def test_notes_of_a_run_that_is_not_here_are_not_found(client, runs):
+    assert client.get(f"{PREFIX}/api/runs/ghost/notes").status_code == 404
+    assert client.put(f"{PREFIX}/api/runs/ghost/notes", json={}).status_code == 404
+    assert not (runs / "ghost").exists()
+
+
+def test_notes_that_cannot_be_read_are_the_servers_fault(client, runs):
+    with new_run(runs):
+        (runs / "live" / NOTES_FILE).write_text("{not json")
+
+        assert client.get(f"{PREFIX}/api/runs/live/notes").status_code == 500
+
+
 # One run, followed.
 
 
@@ -300,6 +402,17 @@ def test_a_viewer_hears_when_the_heartbeat_changes(client, runs):
             changed = next_of(websocket, "run")
             assert changed["heartbeat"]["status"] == "finished"
             assert changed["heartbeat"]["step"] == 100
+
+
+def test_a_viewer_hears_when_the_notes_change(client, runs):
+    with new_run(runs), follow(client) as websocket:
+        assert websocket.receive_json()["notes"] == {"title": None, "tags": [], "notes": ""}
+
+        client.put(f"{PREFIX}/api/runs/live/notes", json={"title": "Renamed", "tags": ["x"]})
+
+        changed = next_of(websocket, "run")
+
+    assert changed["notes"] == {"title": "Renamed", "tags": ["x"], "notes": ""}
 
 
 def test_a_viewer_hears_when_a_run_goes_stale_though_nothing_on_the_disk_changed(tmp_path, runs):
