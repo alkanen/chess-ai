@@ -18,6 +18,13 @@ port = 8000
 # reverse proxy can forward requests unchanged. Empty serves at the root.
 path_prefix = ""
 
+# How many seconds a running training run's heartbeat may go without being
+# updated before the runs dashboard flags the run as stale: its trainer has most
+# likely died without saying so. A trainer updates the heartbeat every couple of
+# seconds while it trains, but not while it starts up, validates or saves a
+# checkpoint, so leave room for those.
+stale_after_seconds = 120
+
 [paths]
 # Where the games played here are saved, one PGN file per game. Every game that
 # reaches a result is saved as it ends; an aborted game reached none and is not

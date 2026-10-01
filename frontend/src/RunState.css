@@ -1,0 +1,35 @@
+.run-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid rgb(128 128 128 / 45%);
+  border-radius: 999px;
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.run-state .icon {
+  font-size: 0.8em;
+}
+
+/* Status colours are kept for state, and always come with the label and an icon. */
+.run-state-running {
+  border-color: #1baf7a;
+}
+
+.run-state-running .icon {
+  color: #1baf7a;
+}
+
+.run-state-stale {
+  border-color: #c98500;
+  font-weight: 600;
+  background: rgb(237 161 0 / 15%);
+}
+
+.run-state-crashed {
+  border-color: #e34948;
+  font-weight: 600;
+  background: rgb(227 73 72 / 12%);
+}

@@ -47,6 +47,11 @@ class ServerConfig(BaseModel):
     port: int = Field(default=8000, ge=1, le=65535)
     path_prefix: str = ""
     """URL path everything is served under, such as "/chess". Empty serves at the root."""
+    stale_after_seconds: float = Field(default=120.0, gt=0)
+    """How old a running run's heartbeat may be before the dashboard flags the run as stale.
+
+    A trainer rewrites its heartbeat every couple of seconds while it steps, but not while it is
+    starting up, compiling, validating or saving a checkpoint, so this is well above that."""
 
     @field_validator("path_prefix")
     @classmethod

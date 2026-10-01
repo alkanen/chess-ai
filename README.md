@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, the CLI builds training datasets out of PGN files, and it trains an MLP on them from an experiment config file; more architectures, the evaluator and the runs dashboard come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP on them from an experiment config file, and a runs dashboard follows training live in the browser; more architectures and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -49,7 +49,7 @@ The trainer, the evaluator and the web server are independent processes that sha
 | Machine learning | PyTorch with CUDA, bfloat16 (developed on an RTX 4090 under WSL2) |
 | Chess rules, PGN and UCI | [python-chess](https://python-chess.readthedocs.io/) |
 | Web server | FastAPI + uvicorn |
-| Frontend | React + TypeScript, built with Vite; custom SVG board |
+| Frontend | React + TypeScript, built with Vite; custom SVG board; [uPlot](https://github.com/leeoniya/uPlot) for charts |
 | Reference opponent | [Stockfish](https://stockfishchess.org/) (installed separately) |
 | Data | [Lichess open database](https://database.lichess.org/) (games and puzzles, CC0) |
 
@@ -94,6 +94,7 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[server] host` | `CHESS_AI_SERVER_HOST` | `127.0.0.1` |
 | `[server] port` | `CHESS_AI_SERVER_PORT` | `8000` |
 | `[server] path_prefix` | `CHESS_AI_SERVER_PATH_PREFIX` | empty (serve at `/`) |
+| `[server] stale_after_seconds` | `CHESS_AI_SERVER_STALE_AFTER_SECONDS` | `120` |
 | `[paths] games` | `CHESS_AI_PATHS_GAMES` | `games`, in the working directory |
 | `[paths] data` | `CHESS_AI_PATHS_DATA` | `data`, in the working directory |
 | `[paths] runs` | `CHESS_AI_PATHS_RUNS` | `runs`, in the working directory |
@@ -109,6 +110,14 @@ uv run chess-ai serve
 Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets, the API (`…/api/`, with interactive docs at `…/api/docs`) and the WebSocket that streams the game (`…/api/game/ws`) are all served under the prefix.
 
 The server holds one game, which every open browser shows. Start a game from the page, choosing a human player, a random mover or a model for each colour, with a delay between moves so that a game between players that move instantly can be followed; starting another game replaces it for everyone.
+
+### Follow training
+
+**Runs** lists every training run with its state, architecture, dataset, progress and latest losses, top-1 accuracy and illegal-move rate, refreshed every few seconds. Opening a run shows its step, epoch, throughput, time left and GPU statistics, and charts its loss (on a log scale), validation accuracy, learning rate and illegal-move rate against the step. The charts follow the run over a WebSocket (`…/api/runs/<name>/ws`) as the trainer logs, so they update without reloading; a finished run shows the same charts for its whole history. Drag across a chart to zoom in, and double-click to let it follow the run again.
+
+The web server never talks to a trainer: it reads the run directory, so it can be restarted at any time without affecting a run. A trainer that dies without saying so — killed, out of memory, or the machine gone — leaves a heartbeat that claims it is still running. Once that heartbeat is older than `[server] stale_after_seconds` (two minutes by default), the run is flagged **stale**. A trainer rewrites its heartbeat every couple of seconds, but not while it starts up, validates or saves a checkpoint, so keep the threshold well above those.
+
+The charts are drawn with [uPlot](https://github.com/leeoniya/uPlot): it is about 50 kB, draws on a canvas, and redraws the tens of thousands of points a long run logs without slowing the page, which SVG charting libraries struggle with.
 
 ### Play a checkpoint
 
@@ -274,7 +283,7 @@ runs/mlp-baseline/checkpoints/       step-<step>.pt, plus an index naming the be
 
 Nothing is rewritten in place: the metrics log is appended to and everything else is written to a
 temporary name and renamed over the old one, so the run directory can be read at any moment —
-which is how the web server will follow a run without ever talking to the trainer. Checkpoints
+which is how the web server follows a run without ever talking to the trainer. Checkpoints
 hold the weights, the optimizer state, the config and the encoder spec, so one is enough on its
 own; `[checkpoints] keep` bounds how many are kept, and the best one by `[checkpoints] metric` is
 kept however old it gets.
@@ -286,8 +295,8 @@ A run directory is never written into twice. Give the run another name, in the c
 uv run chess-ai train experiments/mlp-baseline.toml --name mlp-baseline-lr3
 ```
 
-Resuming a stopped run, fine-tuning from another run's checkpoint, and following a run in the
-browser are next.
+Resuming a stopped run and fine-tuning from another run's checkpoint are next. To watch a run as
+it trains, open **Runs** in the browser (see [Follow training](#follow-training)).
 
 ### Shortcuts with make
 

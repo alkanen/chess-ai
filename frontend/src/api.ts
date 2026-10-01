@@ -248,20 +248,101 @@ export interface NewGameRequest {
   fen?: string | null;
 }
 
-/** One training run, as the new-game form lists it. */
+/** Where a run has got to, as its heartbeat says. */
+export type RunStatus = 'running' | 'finished' | 'stopped' | 'crashed';
+
+/**
+ * One line of a run's metrics log. Every line has a step and says which split its numbers
+ * come from; the rest depends on the split ("loss", "learning_rate" for training lines,
+ * "top1", "illegal_top_move_rate" for validation ones). A loss that diverged is null.
+ */
+export interface MetricsRecord {
+  step: number;
+  split?: string;
+  [metric: string]: number | string | null | undefined;
+}
+
+/** One training run, as the run list and the new-game form show it. */
 export interface RunSummary {
   name: string;
   architecture: string | null;
+  /** The name of the dataset the run trains on. */
+  dataset?: string | null;
   /** When the run started, as an ISO timestamp. */
   created: string | null;
-  status: 'running' | 'finished' | 'stopped' | 'crashed' | null;
+  status: RunStatus | null;
+  /** Whether the run says it is running and its heartbeat has stopped being updated. */
+  stale?: boolean;
+  /** When the last heartbeat was written, as an ISO timestamp. */
+  updated?: string | null;
   /** How far the run has got, as its last heartbeat said. */
   step: number | null;
   /** How far it is going, which with `step` says how far through it is. */
   steps: number | null;
+  epoch?: number | null;
+  positions_per_second?: number | null;
+  eta_seconds?: number | null;
+  /** Why the run crashed, or anything else its last heartbeat had to say. */
+  message?: string | null;
   /** How many checkpoints there are to choose between. */
   checkpoints: number;
+  latest_train?: MetricsRecord | null;
+  latest_validation?: MetricsRecord | null;
 }
+
+/** What the hardware said about itself in a heartbeat; any of it may be missing. */
+export interface GpuStats {
+  name: string | null;
+  utilization_percent: number | null;
+  memory_used_bytes: number | null;
+  memory_total_bytes: number | null;
+  process_memory_bytes: number | null;
+  temperature_celsius: number | null;
+}
+
+/** A run's heartbeat: mirrors chess_ai.training.run_store.Heartbeat. */
+export interface Heartbeat {
+  status: RunStatus;
+  pid: number;
+  started: string;
+  updated: string;
+  step: number;
+  steps: number;
+  epoch: number;
+  positions_per_second: number | null;
+  eta_seconds: number | null;
+  gpu: GpuStats | null;
+  message: string | null;
+}
+
+/** What does not change once a run has started: the parts of run.json the dashboard shows. */
+export interface RunInfo {
+  name: string;
+  created: string;
+  seed: number;
+  code_version: string;
+  device: string;
+  dataset: { name: string; positions: number; train_positions: number };
+  model: { architecture: string; options: Record<string, unknown>; parameter_count: number };
+  steps: number;
+  batch_size: number;
+}
+
+/**
+ * What the run channel sends: what the run is and where it has got to, first and whenever
+ * that changes, and the lines of its metrics log. A metrics event with `reset` set replaces
+ * everything before it rather than adding to it.
+ */
+export type RunEvent =
+  | {
+      type: 'run';
+      name: string;
+      info: RunInfo | null;
+      heartbeat: Heartbeat | null;
+      stale: boolean;
+    }
+  | { type: 'metrics'; reset: boolean; records: MetricsRecord[] }
+  | { type: 'error'; message: string };
 
 /** One checkpoint of a run, as the form lists it. */
 export interface CheckpointSummary {
@@ -394,7 +475,7 @@ async function replayed(url: URL, init?: RequestInit): Promise<ReplayFile> {
   return (await response.json()) as ReplayFile;
 }
 
-/** Every training run on this server, newest first, to pick one to play against. */
+/** Every training run on this server, newest first, with where each has got to. */
 export async function fetchRuns(): Promise<RunSummary[]> {
   const response = await fetch(apiUrl('runs'));
   if (!response.ok) {
@@ -410,6 +491,13 @@ export async function fetchCheckpoints(run: string): Promise<RunCheckpoints> {
     throw new Error(await refusal(response));
   }
   return (await response.json()) as RunCheckpoints;
+}
+
+/** The WebSocket URL of one run's live stream, under the path prefix like every API URL. */
+export function runChannelUrl(run: string): string {
+  const url = new URL(apiUrl(`runs/${encodeURIComponent(run)}/ws`));
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  return url.href;
 }
 
 /** Starts a new game, replacing the current one for every viewer. */
