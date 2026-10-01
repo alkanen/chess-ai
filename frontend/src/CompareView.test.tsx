@@ -143,6 +143,28 @@ describe('CompareView', () => {
     FakeUPlot.live().forEach((chart, index) => expect(chart.data).toBe(drawn[index]));
   });
 
+  it('overlays the gradient norm once any run compared has logged one', () => {
+    render(<CompareView names={['old', 'new']} />);
+    const [old, current] = [socketFor('old'), socketFor('new')];
+    old.open();
+    old.deliver(runEvent('old', 8));
+    old.deliver({ type: 'metrics', reset: true, records: [{ step: 1, split: 'train', loss: 4 }] });
+
+    expect(screen.queryByText('Gradient norm, before clipping')).toBeNull();
+
+    current.open();
+    current.deliver(runEvent('new', 8));
+    current.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [{ step: 1, split: 'train', loss: 3, gradient_norm: 0.5, clipped_fraction: 0 }],
+    });
+
+    const figure = screen.getByText('Gradient norm, before clipping').closest('figure')!;
+    const chart = FakeUPlot.live().find((candidate) => figure.contains(candidate.target))!;
+    expect(chart.data).toEqual([[1], [null], [0.5]]);
+  });
+
   it('names each run with a link to it, and a way to leave it out', () => {
     render(<CompareView names={['a', 'b', 'c']} />);
     socketFor('a').open();

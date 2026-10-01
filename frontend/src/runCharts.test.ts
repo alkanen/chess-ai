@@ -6,7 +6,9 @@ import {
   chartData,
   comparisonData,
   formatPositions,
+  gradientClip,
   latestValues,
+  logs,
   placeRecords,
 } from './runCharts';
 import { formatAgo, formatDuration, formatNumber, formatPercent, runState } from './runFormat';
@@ -46,6 +48,33 @@ describe('chartData', () => {
     const accuracy = CHARTS.find((chart) => chart.id === 'accuracy')!;
 
     expect(chartData([{ step: 1, split: 'train', loss: 3.0 }], accuracy)).toEqual([[], [], []]);
+  });
+
+  it('draws a level across the chart wherever its first line has a value', () => {
+    const gradient = CHARTS.find((chart) => chart.id === 'gradient-norm')!;
+    const records: MetricsRecord[] = [
+      { step: 50, split: 'train', gradient_norm: 2.5 },
+      { step: 100, split: 'validation', loss: 2.0 },
+      { step: 100, split: 'train', gradient_norm: 0.8 },
+    ];
+
+    expect(chartData(records, gradient, 'step', null, 1.0)).toEqual([
+      [50, 100],
+      [2.5, 0.8],
+      [1.0, 1.0],
+    ]);
+    expect(chartData(records, gradient)).toEqual([
+      [50, 100],
+      [2.5, 0.8],
+    ]);
+  });
+
+  it('says whether a log has a metric at all, which an optional chart is shown for', () => {
+    const records: MetricsRecord[] = [{ step: 50, split: 'train', loss: 3.0 }];
+
+    expect(logs(records, { split: 'train', metric: 'loss' })).toBe(true);
+    expect(logs(records, { split: 'train', metric: 'gradient_norm' })).toBe(false);
+    expect(logs(records, { split: 'validation', metric: 'loss' })).toBe(false);
   });
 
   it('finds the last value of each series, wherever it was logged', () => {
@@ -161,5 +190,25 @@ describe('formatting', () => {
     expect(formatAgo('2026-10-01T12:00:00Z', Date.parse('2026-10-01T12:00:30Z'))).toBe(
       '30s ago',
     );
+  });
+});
+
+describe('gradientClip', () => {
+  const run = {
+    name: 'a',
+    created: '2026-10-01T10:00:00Z',
+    seed: 1,
+    code_version: 'test',
+    device: 'cpu',
+    dataset: { name: 'd', positions: 1, train_positions: 1 },
+    model: { architecture: 'mlp', options: {}, parameter_count: 1 },
+    steps: 1,
+    batch_size: 1,
+  };
+
+  it('is the threshold a run clips at, and nothing for a run that does not clip', () => {
+    expect(gradientClip({ ...run, config: { optimizer: { gradient_clip: 1.0 } } })).toBe(1.0);
+    expect(gradientClip({ ...run, config: { optimizer: { gradient_clip: 0 } } })).toBeNull();
+    expect(gradientClip(run)).toBeNull();
   });
 });

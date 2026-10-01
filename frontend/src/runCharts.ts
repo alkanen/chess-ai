@@ -1,4 +1,4 @@
-import type { MetricsRecord } from './api';
+import type { MetricsRecord, RunInfo } from './api';
 import { formatCount, formatDuration, formatNumber, formatPercent } from './runFormat';
 
 /**
@@ -25,10 +25,29 @@ export interface ChartLook {
   format: (value: number) => string;
   /** Whether the y-axis is logarithmic, which keeps a loss's early drop from flattening the rest. */
   logarithmic?: boolean;
+  /**
+   * Whether the chart is left out for a log that has none of its metric, rather than shown
+   * empty: a metric runs did not always log, which an older run will never have.
+   */
+  optional?: boolean;
+}
+
+/** A level drawn across a run's chart, from the run's own settings rather than its log. */
+export interface Reference {
+  label: string;
+  /** The level for this run, or null for a run that has none. */
+  value: (info: RunInfo) => number | null;
 }
 
 export interface ChartSpec extends ChartLook {
   series: SeriesSpec[];
+  reference?: Reference;
+}
+
+/** The gradient norm a run clips at, or null for a run that does not clip. */
+export function gradientClip(info: RunInfo): number | null {
+  const clip = info.config?.optimizer?.gradient_clip;
+  return typeof clip === 'number' && clip > 0 ? clip : null;
 }
 
 /** The charts of a run, in the order they are shown. */
@@ -63,6 +82,22 @@ export const CHARTS: ChartSpec[] = [
     title: 'Illegal top-move rate (validation)',
     series: [{ label: 'illegal top move', split: 'validation', metric: 'illegal_top_move_rate' }],
     format: formatPercent,
+  },
+  {
+    id: 'gradient-norm',
+    title: 'Gradient norm, before clipping',
+    series: [{ label: 'gradient norm', split: 'train', metric: 'gradient_norm' }],
+    reference: { label: 'clipped above', value: gradientClip },
+    format: (value) => formatNumber(value, 3),
+    logarithmic: true,
+    optional: true,
+  },
+  {
+    id: 'clipped',
+    title: 'Steps clipped',
+    series: [{ label: 'clipped', split: 'train', metric: 'clipped_fraction' }],
+    format: formatPercent,
+    optional: true,
   },
 ];
 
@@ -206,15 +241,29 @@ function line(records: MetricsRecord[], xs: (number | null)[], series: Metric): 
   return found;
 }
 
-/** The lines of one run's chart, against `axis`. */
+/** Whether any line of `records` has `metric`, which an optional chart is shown for. */
+export function logs(records: MetricsRecord[], metric: Metric): boolean {
+  return records.some((record) => record.split === metric.split && metric.metric in record);
+}
+
+/**
+ * The lines of one run's chart, against `axis`, and then a level across it at `reference` if
+ * that is not null. The level is drawn wherever the chart's first line has a value, so it
+ * spans what the run has logged rather than an axis of its own.
+ */
 export function chartData(
   records: MetricsRecord[],
   spec: ChartSpec,
   axis: XAxisId = 'step',
   batchSize: number | null = null,
+  reference: number | null = null,
 ): ChartData {
   const xs = placeRecords(records, axis, batchSize);
-  return alignLines(spec.series.map((series) => line(records, xs, series)));
+  const lines = spec.series.map((series) => line(records, xs, series));
+  if (reference !== null) {
+    lines.push(lines[0].map(([x]): [number, number] => [x, reference]));
+  }
+  return alignLines(lines);
 }
 
 /** A chart of runs side by side: one metric, a line for each run. */
@@ -261,6 +310,21 @@ export const COMPARISON_CHARTS: ComparisonChart[] = [
     title: 'Learning rate',
     metric: { split: 'train', metric: 'learning_rate' },
     format: (value) => formatNumber(value, 3),
+  },
+  {
+    id: 'gradient-norm',
+    title: 'Gradient norm, before clipping',
+    metric: { split: 'train', metric: 'gradient_norm' },
+    format: (value) => formatNumber(value, 3),
+    logarithmic: true,
+    optional: true,
+  },
+  {
+    id: 'clipped',
+    title: 'Steps clipped',
+    metric: { split: 'train', metric: 'clipped_fraction' },
+    format: formatPercent,
+    optional: true,
   },
 ];
 

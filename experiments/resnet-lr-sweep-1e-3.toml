@@ -1,6 +1,6 @@
 # An experiment config: everything one training run depends on, in one file.
 #
-#   chess-ai train experiments/mlp-lichess.toml
+#   chess-ai train experiments/resnet-lr-sweep-1e-3.toml
 #
 # The file is copied into the run directory as it is, comments and all, so a run can
 # always be traced back to what produced it. Only [dataset] has to be filled in.
@@ -12,10 +12,14 @@
 # The run is named after this file unless `name` says otherwise, and `--name` on the
 # command line overrides both, which is how the same config is run more than once.
 #
-# The settings of the best MLP run on lichess-2017-01 (top-1 45.9%, top-5 83.2%): the
-# reference a new architecture or encoder option is compared against, on the same data.
+# One of four short runs that look for the ResNet's learning rate: resnet-lr-sweep-5e-4,
+# -1e-3, -2e-3 and -4e-3 are resnet-lichess.toml with a 20,000-step schedule, and differ
+# from each other only in learning_rate. Each takes about 20 minutes on an RTX 4090.
+#
+# Compare them with each other, not with the long runs: a short schedule decays its
+# learning rate far sooner, which flatters it at any step a long run is also at.
 
-name = "mlp-lichess"
+name = "resnet-lr-sweep-1e-3"
 
 # Draws the initial weights and the order positions are visited in. The same seed on
 # the same data and the same code gives the same run.
@@ -52,11 +56,17 @@ orientation = "side-to-move"               # default: "absolute"
 [model]
 # Which architecture, by its registered name. Everything below this line is that
 # architecture's own hyperparameters, so a typo is refused rather than ignored.
-architecture = "mlp"                       # default: "mlp"
+architecture = "resnet"                    # default: "mlp"
 
-depth = 6                                  # default: 3
-width = 4096                               # default: 1024
-dropout = 0.0                              # default: 0.0
+# Residual blocks of two 3x3 convolutions each, and how many planes every one of them has.
+blocks = 6                                 # default: 6
+channels = 64                              # default: 64
+
+# How the tower takes in what is not on the board (side to move, castling, ratings...).
+# "planes" paints each feature over a whole 8x8 plane next to the board's planes, for the
+# first convolution to read. "film" lets the features scale and shift every channel of
+# every block instead, so a rating can steer the whole tower rather than only its input.
+globals = "planes"                         # default: "planes"
 
 [training]
 # "auto" uses the GPU when there is one and the CPU when there is not. Naming "cuda"
@@ -97,11 +107,12 @@ gradient_clip = 1.0                        # default: 1.0
 [schedule]
 # How long the run is. One step is one batch, so steps * batch_size / positions is
 # how many times over the data it goes; the run prints that before it starts. Here about
-# four epochs of the 704M training positions at batch 8192.
-steps = 344000                             # default: 10000
+# a quarter of an epoch of the 704M training positions at batch 8192: enough to tell the
+# learning rates apart, short enough to try four of them in an evening.
+steps = 20000                              # default: 10000
 
 # Linear warmup, then cosine decay to min_learning_rate_fraction of the learning rate.
-warmup_steps = 3000                        # default: 500
+warmup_steps = 1000                        # default: 500
 min_learning_rate_fraction = 0.1           # default: 0.1
 
 [validation]

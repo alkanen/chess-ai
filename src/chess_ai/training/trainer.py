@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from math import lcm
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 import torch
 from torch import nn
@@ -38,7 +38,7 @@ from chess_ai.move_codec import VOCABULARY_SIZE
 from chess_ai.registry import RegistryError
 from chess_ai.training import checkpoint
 from chess_ai.training.batches import Batch, PositionBatches, batch_loader
-from chess_ai.training.experiment import ExperimentConfig
+from chess_ai.training.experiment import ExperimentConfig, OptimizerSection
 from chess_ai.training.hardware import (
     HardwareError,
     autocast_dtype,
@@ -229,12 +229,33 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path) -> _Run:
 def _optimizer(run: _Run) -> torch.optim.Optimizer:
     settings = run.config.optimizer
     return torch.optim.AdamW(
-        run.model.parameters(),
+        _parameter_groups(run.model, settings),
         lr=settings.learning_rate,
         betas=(settings.beta1, settings.beta2),
         eps=settings.epsilon,
-        weight_decay=settings.weight_decay,
     )
+
+
+def _parameter_groups(model: nn.Module, settings: OptimizerSection) -> list[dict[str, Any]]:
+    """The model's parameters, split into those weight decay shrinks and those it leaves alone.
+
+    Decay is for weight matrices and convolution kernels, the parameters that multiply an input.
+    A bias or a normalization layer's scale and shift only moves or rescales what comes out, and
+    pulling those towards zero is not regularization but a bias towards an arbitrary output; for
+    a scale it also undoes the normalization's own say over how loud a channel is. They are the
+    one-dimensional parameters, in every architecture here, which is the rule used to find them.
+
+    ``decay_biases_and_norms`` puts everything back in one decayed group, as runs before this
+    rule were trained, so that those runs can still be reproduced.
+    """
+    if settings.decay_biases_and_norms:
+        return [{"params": list(model.parameters()), "weight_decay": settings.weight_decay}]
+    decayed = [p for p in model.parameters() if p.ndim > 1]
+    undecayed = [p for p in model.parameters() if p.ndim <= 1]
+    return [
+        {"params": decayed, "weight_decay": settings.weight_decay},
+        {"params": undecayed, "weight_decay": 0.0},
+    ]
 
 
 def _schedule(run: _Run, optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LambdaLR:
@@ -263,16 +284,38 @@ def _losses(run: _Run, batch: Batch) -> tuple[torch.Tensor, torch.Tensor, torch.
     return total, policy_loss.detach(), value_loss.detach()
 
 
-def _step(run: _Run, batch: Batch, optimizer: torch.optim.Optimizer) -> tuple[torch.Tensor, ...]:
-    """One optimizer step. Returns the losses as tensors, unread, so as not to stall on them."""
+class _StepResult(NamedTuple):
+    """What one step measured, as tensors still on the device."""
+
+    loss: torch.Tensor
+    policy_loss: torch.Tensor
+    value_loss: torch.Tensor
+    gradient_norm: torch.Tensor
+    """The total norm of the gradient before any clipping."""
+    clipped: torch.Tensor
+    """1 if clipping scaled this step's gradient down, else 0."""
+
+
+def _step(run: _Run, batch: Batch, optimizer: torch.optim.Optimizer) -> _StepResult:
+    """One optimizer step. Returns what it measured as tensors, unread, so as not to stall."""
     total, policy_loss, value_loss = _losses(run, batch)
     optimizer.zero_grad(set_to_none=True)
     total.backward()
+    parameters = [p for p in run.model.parameters() if p.grad is not None]
+    # Measured whether or not anything is clipped: how large the gradient is says as much about
+    # the learning rate as the loss does, and it is the number that says whether a clip
+    # threshold is doing anything at all.
+    norm = nn.utils.get_total_norm([p.grad for p in parameters])
     clip = run.config.optimizer.gradient_clip
     if clip:
-        nn.utils.clip_grad_norm_(run.model.parameters(), clip)
+        # The parameters, not their gradients: handed the gradients, this looks for *their*
+        # gradients, finds none, and clips nothing without a word.
+        nn.utils.clip_grads_with_norm_(parameters, clip, norm)
+        clipped = norm > clip
+    else:
+        clipped = torch.zeros((), device=norm.device)
     optimizer.step()
-    return total.detach(), policy_loss, value_loss
+    return _StepResult(total.detach(), policy_loss, value_loss, norm, clipped)
 
 
 def _probe(run: _Run) -> float | None:
@@ -341,7 +384,7 @@ def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[s
         # Read before the scheduler moves on: this is the rate the weights just moved by, and
         # get_last_lr() after scheduler.step() is already the next step's.
         learning_rate = scheduler.get_last_lr()[0]
-        window.add(*_step(run, batch, optimizer), positions=len(batch))
+        window.add(_step(run, batch, optimizer), positions=len(batch))
         scheduler.step()
         step += 1
         positions_seen += len(batch)
@@ -451,7 +494,7 @@ def _stream(run: _Run) -> Iterator[Batch]:
 
 
 class _Window:
-    """The losses and positions since the last log line, summed on the device.
+    """What the steps since the last log line measured, summed on the device.
 
     Kept as tensors and added to without being read, because reading one back from a GPU waits
     for every kernel queued behind it. One read per log line costs nothing; one per step costs a
@@ -463,7 +506,7 @@ class _Window:
         self._reset()
 
     def _reset(self) -> None:
-        self._sums = torch.zeros(3, dtype=torch.float64, device=self._device)
+        self._sums = torch.zeros(len(_StepResult._fields), dtype=torch.float64, device=self._device)
         self._steps = 0
         self._positions = 0
         self._since = time.perf_counter()
@@ -483,26 +526,23 @@ class _Window:
         finally:
             self._paused += time.perf_counter() - started
 
-    def add(
-        self,
-        total: torch.Tensor,
-        policy_loss: torch.Tensor,
-        value_loss: torch.Tensor,
-        *,
-        positions: int,
-    ) -> None:
-        self._sums += torch.stack((total, policy_loss, value_loss)).double()
+    def add(self, measured: _StepResult, *, positions: int) -> None:
+        self._sums += torch.stack([value.double() for value in measured])
         self._steps += 1
         self._positions += positions
 
     def take(self) -> dict[str, float]:
         """The means since the last call, and how fast training produced them."""
         elapsed = time.perf_counter() - self._since - self._paused
-        loss, policy_loss, value_loss = (self._sums / max(1, self._steps)).tolist()
+        loss, policy_loss, value_loss, gradient_norm, clipped = (
+            self._sums / max(1, self._steps)
+        ).tolist()
         means = {
             "loss": loss,
             "policy_loss": policy_loss,
             "value_loss": value_loss,
+            "gradient_norm": gradient_norm,
+            "clipped_fraction": clipped,
             "positions_per_second": self._positions / elapsed if elapsed > 0 else 0.0,
         }
         self._reset()
@@ -638,6 +678,7 @@ def _summary(run: _Run, estimate: float | None) -> list[str]:
         f"  schedule   {steps:,} steps of {config.training.batch_size} "
         f"({epochs:.1f} epochs), lr {config.optimizer.learning_rate:g} "
         f"warmup {config.schedule.warmup_steps:,} then cosine",
+        f"  optimizer  {_describe_optimizer(run)}",
     ]
     if estimate:
         seconds = steps * config.training.batch_size / estimate
@@ -659,6 +700,21 @@ def _summary(run: _Run, estimate: float | None) -> list[str]:
             "checkpoint validates to be judged on its own"
         )
     return lines
+
+
+def _describe_optimizer(run: _Run) -> str:
+    """AdamW's settings, and how many parameters its weight decay reaches."""
+    settings = run.config.optimizer
+    clip = f"clip {settings.gradient_clip:g}" if settings.gradient_clip else "no clipping"
+    if not settings.weight_decay:
+        return f"AdamW, no weight decay, {clip}"
+    decayed, *undecayed = (
+        sum(p.numel() for p in group["params"]) for group in _parameter_groups(run.model, settings)
+    )
+    decay = f"weight decay {settings.weight_decay:g} on {decayed:,} parameters"
+    if undecayed:
+        decay += f", none on {undecayed[0]:,} biases and norms"
+    return f"AdamW, {decay}, {clip}"
 
 
 def _extra_validations(config: ExperimentConfig) -> int:

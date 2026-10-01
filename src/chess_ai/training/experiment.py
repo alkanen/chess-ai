@@ -110,6 +110,11 @@ class OptimizerSection(_Section):
 
     learning_rate: float = Field(default=1e-3, gt=0.0)
     weight_decay: float = Field(default=0.01, ge=0.0)
+    decay_biases_and_norms: bool = False
+    """Whether weight decay also shrinks biases and normalization scales and shifts.
+
+    Off by default, as is usual: decay is for the weights that multiply an input. Runs made
+    before the trainer told the two apart decayed everything, and this brings that back."""
     beta1: float = Field(default=0.9, ge=0.0, lt=1.0)
     beta2: float = Field(default=0.95, ge=0.0, lt=1.0)
     epsilon: float = Field(default=1e-8, gt=0.0)

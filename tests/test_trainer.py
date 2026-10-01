@@ -1,6 +1,9 @@
 """A whole training run, small enough to be a test: what it writes, and that it is repeatable."""
 
+import copy
+import dataclasses
 import json
+import math
 import pickle
 import tempfile
 import tracemalloc
@@ -9,18 +12,23 @@ from pathlib import Path
 import chess
 import pytest
 import torch
+from torch import nn
 from training_helpers import dataset, experiment
 
 from chess_ai.dataset import open_dataset
+from chess_ai.encoders import create_encoder
 from chess_ai.inference import load_engine
+from chess_ai.models import create_model
 from chess_ai.training import (
     RunStatus,
     TrainingError,
     load_experiment,
     open_run,
     train,
+    trainer,
 )
 from chess_ai.training import checkpoint as checkpoints
+from chess_ai.training.experiment import OptimizerSection
 from chess_ai.training.run_store import CHECKPOINTS_DIR, RunError, RunWriter, checkpoint_file
 
 
@@ -692,3 +700,107 @@ def test_a_resnet_trains_validates_and_plays_with_nothing_else_changed(tmp_path,
     board = chess.Board()
     board.push_san("e4")
     assert engine.evaluate(board).best in board.legal_moves
+
+
+def train_lines(reader) -> list[dict]:
+    return [line for line in reader.metrics() if line["split"] == "train"]
+
+
+def test_training_lines_say_how_large_the_gradient_was_and_how_often_it_was_clipped(
+    tmp_path, data_dir
+):
+    lines = train_lines(run(tmp_path, data_dir))
+
+    assert lines
+    for line in lines:
+        assert math.isfinite(line["gradient_norm"]) and line["gradient_norm"] > 0
+        assert 0.0 <= line["clipped_fraction"] <= 1.0
+
+
+@pytest.mark.parametrize(("clip", "clipped"), [("0", 0.0), ("1e-9", 1.0)])
+def test_the_clipped_fraction_follows_the_threshold(tmp_path, data_dir, clip, clipped):
+    """Off clips nothing and still measures the norm; a threshold nothing fits under clips all."""
+    lines = train_lines(run(tmp_path, data_dir, optimizer=f"gradient_clip = {clip}"))
+
+    assert lines
+    assert all(line["clipped_fraction"] == clipped for line in lines)
+    assert all(line["gradient_norm"] > 0 for line in lines)
+
+
+def test_a_step_measures_and_clips_the_gradient_as_clip_grad_norm_does(tmp_path, data_dir):
+    """The norm logged is the one clipping acted on, and the weights move as they always did."""
+    config = load_experiment(experiment(tmp_path / "tiny.toml", optimizer="gradient_clip = 0.05"))
+    prepared = trainer._prepare(config, data_dir=data_dir)
+    batch = prepared.batches[0].to(prepared.device)
+    twin = dataclasses.replace(prepared, model=copy.deepcopy(prepared.model))
+    twin_optimizer = trainer._optimizer(twin)
+    total, *_ = trainer._losses(twin, batch)
+    total.backward()
+    expected = nn.utils.clip_grad_norm_(twin.model.parameters(), 0.05)
+    twin_optimizer.step()
+
+    measured = trainer._step(prepared, batch, trainer._optimizer(prepared))
+
+    assert expected > 0.05, "the test needs a gradient the threshold clips"
+    torch.testing.assert_close(measured.gradient_norm, expected)
+    assert measured.clipped.item() == 1
+    for name, value in prepared.model.state_dict().items():
+        torch.testing.assert_close(value, twin.model.state_dict()[name])
+
+
+DECAY_VARIANTS = [
+    pytest.param("mlp", {"depth": 2, "width": 8}, id="mlp"),
+    pytest.param("resnet", {"blocks": 1, "channels": 4, "globals": "planes"}, id="resnet-planes"),
+    pytest.param("resnet", {"blocks": 1, "channels": 4, "globals": "film"}, id="resnet-film"),
+]
+
+
+def biases_and_norms(model: nn.Module) -> set[int]:
+    """The parameters that are a bias, or belong to a normalization layer, by identity."""
+    found = {id(p) for name, p in model.named_parameters() if name.endswith("bias")}
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._NormBase | nn.LayerNorm):
+            found |= {id(p) for p in module.parameters()}
+    return found
+
+
+@pytest.mark.parametrize(("architecture", "options"), DECAY_VARIANTS)
+def test_weight_decay_shrinks_weights_and_leaves_biases_and_norms_alone(architecture, options):
+    model = create_model(architecture, create_encoder("board-planes").spec, **options)
+
+    decayed, undecayed = trainer._parameter_groups(model, OptimizerSection(weight_decay=0.02))
+
+    assert decayed["weight_decay"] == 0.02 and undecayed["weight_decay"] == 0.0
+    grouped = [id(p) for group in (decayed, undecayed) for p in group["params"]]
+    assert sorted(grouped) == sorted(id(p) for p in model.parameters()), "each exactly once"
+    assert {id(p) for p in undecayed["params"]} == biases_and_norms(model)
+
+
+@pytest.mark.parametrize(("architecture", "options"), DECAY_VARIANTS)
+def test_decaying_everything_is_still_there_for_the_runs_made_that_way(architecture, options):
+    model = create_model(architecture, create_encoder("board-planes").spec, **options)
+
+    (group,) = trainer._parameter_groups(
+        model, OptimizerSection(weight_decay=0.02, decay_biases_and_norms=True)
+    )
+
+    assert group["weight_decay"] == 0.02
+    assert [id(p) for p in group["params"]] == [id(p) for p in model.parameters()]
+
+
+def test_the_summary_says_what_weight_decay_reaches(tmp_path, data_dir):
+    lines = said_by(tmp_path, data_dir, model='architecture = "mlp"\ndepth = 1\nwidth = 8')
+
+    # Weights (12 * 64 + 11) * 8 + 8 * 1968 + 8 * 3, and a bias for each of the 8 + 1968 + 3
+    # units, which is all this MLP has.
+    (line,) = [line for line in lines if line.startswith("  optimizer")]
+    assert line == (
+        "  optimizer  AdamW, weight decay 0.01 on 22,000 parameters, "
+        "none on 1,979 biases and norms, clip 1"
+    )
+
+
+def test_the_summary_says_when_there_is_no_weight_decay_or_clipping(tmp_path, data_dir):
+    lines = said_by(tmp_path, data_dir, optimizer="weight_decay = 0\ngradient_clip = 0")
+
+    assert "  optimizer  AdamW, no weight decay, no clipping" in lines
