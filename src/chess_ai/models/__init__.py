@@ -14,6 +14,7 @@ from chess_ai.models.registry import (
     architecture_names,
     create_model,
 )
+from chess_ai.models.resnet import ResNet
 
 __all__ = [
     "MLP",
@@ -21,6 +22,7 @@ __all__ = [
     "VALUE_CLASSES",
     "ChessModel",
     "ModelOutput",
+    "ResNet",
     "architecture_defaults",
     "architecture_names",
     "create_model",

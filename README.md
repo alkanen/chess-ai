@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP on them from an experiment config file, and a runs dashboard follows training live in the browser; more architectures and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, and a runs dashboard follows training live in the browser; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -267,6 +267,21 @@ Two `[encoder]` options change what the model is shown, and both are off by defa
   pieces are always on the same planes and always play up the board. The castling features and
   the move indices are mirrored along with it, and predictions are mirrored back before a move
   is played, so nothing outside the encoder sees the difference.
+
+`[model] architecture` chooses the network, and the rest of `[model]` is that architecture's own
+size settings:
+
+- `"mlp"` flattens the planes, appends the global features and puts `depth` dense layers of
+  `width` units on them. It ignores the board's geometry, which makes it the floor every other
+  architecture has to beat.
+- `"resnet"` is the AlphaZero and Maia residual tower: a 3×3 convolution into `channels` planes,
+  `blocks` residual blocks of two more, and small policy and value heads.
+  [experiments/resnet-lichess.toml](experiments/resnet-lichess.toml) trains one on the same
+  data and schedule as the MLP in [experiments/mlp-lichess.toml](experiments/mlp-lichess.toml).
+  A convolution has nowhere to put the global features, so `globals` says how they get in:
+  `"planes"` paints each one over a whole 8×8 plane next to the board's, and `"film"`
+  (feature-wise linear modulation) has them scale and shift every channel of every block, so
+  that a rating can steer the whole tower rather than only its first layer.
 
 Validation runs on the held-back games at `[validation] every_steps`, on the same positions every
 time so the curve means something, and prints and logs five numbers:
