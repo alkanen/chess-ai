@@ -58,3 +58,9 @@ device = "cpu"
 # which a game never is and an evaluation suite will be. Small, for the same
 # reason as the device above.
 batch_size = 32
+
+[stockfish]
+# The Stockfish binary that games can be played against: a path, or a bare name
+# looked up on PATH. A leading ~ is your home directory. Not needed unless a game
+# asks for Stockfish; see the README for installing it.
+path = "stockfish"

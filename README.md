@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between random movers and human players with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, and a runs dashboard follows training live in the browser; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, and a runs dashboard follows training live in the browser; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -61,6 +61,7 @@ Running the system needs only Python and the built frontend. Node.js is only nee
 
 - [uv](https://docs.astral.sh/uv/getting-started/installation/). It installs Python 3.12 for the project by itself; the system Python is not used.
 - [Node.js](https://nodejs.org/) 22.12 or later with npm, only to build the frontend.
+- [Stockfish](https://stockfishchess.org/download/), only to play against it. `sudo apt install stockfish` on Debian and Ubuntu, or a release binary from its site; it needs a version with the `UCI_Elo` strength limit, which every recent one has. The server finds it on `PATH`, or wherever `[stockfish] path` says.
 - For training, an NVIDIA GPU with a recent driver. Not needed to serve the UI, and not needed to train either — training falls back to the CPU, slowly. PyTorch's wheels bring their own CUDA runtime, so no CUDA toolkit is needed. Under WSL2, install the NVIDIA driver on the Windows side only, never inside WSL; `nvidia-smi` in WSL should then list the GPU.
 
 ### Install
@@ -100,6 +101,7 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[paths] runs` | `CHESS_AI_PATHS_RUNS` | `runs`, in the working directory |
 | `[inference] device` | `CHESS_AI_INFERENCE_DEVICE` | `cpu` |
 | `[inference] batch_size` | `CHESS_AI_INFERENCE_BATCH_SIZE` | `32` |
+| `[stockfish] path` | `CHESS_AI_STOCKFISH_PATH` | `stockfish`, looked up on `PATH` |
 
 ### Serve
 
@@ -109,7 +111,7 @@ uv run chess-ai serve
 
 Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets, the API (`…/api/`, with interactive docs at `…/api/docs`) and the WebSocket that streams the game (`…/api/game/ws`) are all served under the prefix.
 
-The server holds one game, which every open browser shows. Start a game from the page, choosing a human player, a random mover or a model for each colour, with a delay between moves so that a game between players that move instantly can be followed; starting another game replaces it for everyone.
+The server holds one game, which every open browser shows. Start a game from the page, choosing a human player, a random mover, a model or Stockfish for each colour, with a delay between moves so that a game between players that move instantly can be followed; starting another game replaces it for everyone.
 
 ### Follow training
 
@@ -146,6 +148,14 @@ The network runs on the CPU unless `[inference] device` says otherwise, so a gam
 On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. A pawn reaching the last rank asks which piece to promote it to, and nothing is submitted until you pick one, by clicking it or with Enter or Space on the choice the picker opens on. Clicking elsewhere on the board, or pressing Escape, puts the pawn back.
 
 Every game that reaches a result is saved as PGN in the games directory, one file per game, named after the moment it ended: nothing has to be asked for, and the file replays in any other chess tool. A game that was aborted reached no result and is not kept. **Export PGN** downloads the game on show whenever you like, a game still being played included, with the moves played so far and the result `*` that PGN gives a game that has not ended.
+
+### Play Stockfish
+
+Choosing **Stockfish** for a colour plays the engine at the **Elo** you type, held there by its own calibrated strength limit, thinking for the **time a move** you choose. Stockfish only plays a range of strengths, which the form shows as soon as Stockfish is chosen: 1350 to 2850 for the Stockfish 14.1 that `apt` installs on this kind of machine, 1320 to 3190 for Stockfish 19. An Elo outside it is played at the nearer end, and the game names Stockfish by the strength it actually plays at and says what was asked for. Stockfish can play either colour, or both at two strengths, against a person, the random mover or a checkpoint.
+
+Stockfish's documentation says the levels were calibrated at two minutes a game plus a second a move and anchored to the CCRL 40/4 engine rating list. A move time well under a second plays below the level, and neither is a Lichess or FIDE rating.
+
+Each Stockfish side is an engine process of its own, started with the game and stopped when the game ends, is replaced, or the server shuts down. A game that cannot find Stockfish is refused with a message saying where it looked. The PGN of a game Stockfish played records its strength as `WhiteElo` and its time a move as `WhiteMoveTime` (and the same for Black).
 
 ### Build a dataset
 

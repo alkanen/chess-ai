@@ -6,6 +6,7 @@ import pytest
 from game_helpers import (
     ScriptedModelPlayer,
     ScriptedPlayer,
+    ScriptedStockfishPlayer,
     playing,
     scripted_players,
     settled,
@@ -14,7 +15,7 @@ from pgn_helpers import read_back, replayed
 
 from chess_ai.game_session import GameSession, GameState
 from chess_ai.pgn import game_pgn, pgn_filename, save_game
-from chess_ai.players import HumanPlayer, ModelDescription
+from chess_ai.players import HumanPlayer, ModelDescription, StockfishDescription
 from chess_ai.position_view import GameOver, GameOverReason
 
 pytestmark = pytest.mark.anyio
@@ -265,3 +266,22 @@ async def test_a_side_no_checkpoint_played_carries_no_model_tags():
     headers = read_back(game_pgn(game)).headers
 
     assert not [tag for tag in headers if tag.startswith(("WhiteRun", "BlackRun"))]
+
+
+async def test_a_side_stockfish_played_says_the_strength_it_played_at_and_its_time_a_move():
+    stockfish = StockfishDescription(
+        elo=1320, requested_elo=800, min_elo=1320, max_elo=3190, move_time=0.5
+    )
+    session = GameSession(
+        ScriptedPlayer(["e2e4"]), ScriptedStockfishPlayer(["e7e5"], stockfish), id=GAME_ID
+    )
+    async with playing(session):
+        await settled()
+        headers = read_back(game_pgn(session.state)).headers
+
+    assert headers["Black"] == "Stockfish 1320"
+    assert headers["BlackType"] == "program"
+    # The strength it played at, not the one it could not be asked for.
+    assert headers["BlackElo"] == "1320"
+    assert headers["BlackMoveTime"] == "0.5"
+    assert "WhiteElo" not in headers

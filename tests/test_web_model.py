@@ -4,6 +4,7 @@ The runs here are written straight into the runs directory rather than trained, 
 the web server ever sees of a run anyway: a directory of files it only reads.
 """
 
+import asyncio
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal
@@ -268,7 +269,7 @@ def test_the_inference_batch_the_config_names_is_the_one_the_engine_uses():
 
 
 def test_a_player_kind_nothing_here_makes_fails_where_the_mistake_is():
-    """A fourth kind of player added without a case here is a mistake worth hearing about.
+    """A fifth kind of player added without a case here is a mistake worth hearing about.
 
     Reached by calling the maker directly, because it cannot be reached through the API: a
     kind the request model does not know is refused by the request model. What is being
@@ -276,11 +277,11 @@ def test_a_player_kind_nothing_here_makes_fails_where_the_mistake_is():
     game a player of ``None`` that breaks on its first move, a task away from the cause.
     """
 
-    class StockfishSpec(app_module.PlayerSpec):
-        kind: Literal["stockfish"]
+    class OracleSpec(app_module.PlayerSpec):
+        kind: Literal["oracle"]
 
-    with pytest.raises(AssertionError, match="stockfish"):
-        app_module._player(StockfishSpec(kind="stockfish"), Config(), {})
+    with pytest.raises(AssertionError, match="oracle"):
+        asyncio.run(app_module._player(OracleSpec(kind="oracle"), Config(), {}))
 
 
 def test_one_checkpoint_playing_itself_is_loaded_once(client, monkeypatch):

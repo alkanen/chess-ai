@@ -13,9 +13,14 @@ import chess
 from pydantic import BaseModel
 
 from chess_ai.game_session import ActionRejectedError, GameEvent, GameSession, GameState
+from chess_ai.players import close_players, wait_players_closed
 from chess_ai.position_view import Color, PositionSnapshot, snapshot
 
 logger = logging.getLogger(__name__)
+
+
+CLOSE_TIMEOUT = 5.0
+"""How long a game that has stopped waits for its players' engines to exit."""
 
 
 class GameChannelClosedError(RuntimeError):
@@ -46,6 +51,10 @@ class GameChannel:
         self._on_finished = on_finished
         self._session: GameSession | None = None
         self._task: asyncio.Task[None] | None = None
+        # Every game still on its way out, not only the current one: a game that has been
+        # replaced is stopped but not waited for, and the server going down meanwhile has to
+        # wait for it all the same, or its engine processes would outlive the server.
+        self._playing: set[asyncio.Task[None]] = set()
         self._new_game = asyncio.Event()
         self._closed = False
 
@@ -62,6 +71,11 @@ class GameChannel:
         self._session = session
         self._task = asyncio.create_task(self._play(session))
         self._task.add_done_callback(_log_failure)
+        # A callback as well as a `finally` in the game, because a game replaced before it
+        # got its first turn is cancelled without ever running, `finally` and all.
+        self._task.add_done_callback(lambda _: _close_players(session))
+        self._playing.add(self._task)
+        self._task.add_done_callback(self._playing.discard)
         self._new_game.set()
         self._new_game = asyncio.Event()
 
@@ -109,10 +123,8 @@ class GameChannel:
         """Stop the current game and end every viewer's events, as when the server shuts down."""
         self._closed = True
         self._new_game.set()  # Wakes the viewers waiting for a game, so they can finish.
-        task = self._task
         self._stop_current()
-        if task is not None:
-            await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(*self._playing, return_exceptions=True)
 
     async def events(self) -> AsyncIterator[ChannelEvent]:
         """Follow the current game, and every game that replaces it, until the channel closes."""
@@ -139,7 +151,15 @@ class GameChannel:
         try:
             await session.play()
         finally:
+            _close_players(session)
             self._keep(session)
+            # Waited for here, so that a server going down, which waits for its games, also
+            # waits for their engines to have exited. Not for ever, though: a player that
+            # could not be closed must not keep the server from going down.
+            try:
+                await asyncio.wait_for(wait_players_closed(*session.players), CLOSE_TIMEOUT)
+            except TimeoutError:
+                logger.warning("The players of a game had not let go after %gs", CLOSE_TIMEOUT)
 
     def _keep(self, session: GameSession) -> None:
         """Hand a game that reached a result to whoever keeps the games."""
@@ -178,6 +198,14 @@ class GameChannel:
             self._session.close()
         if self._task is not None:
             self._task.cancel()
+
+
+def _close_players(session: GameSession) -> None:
+    """Let go of whatever the players of a game that has stopped hold, such as an engine."""
+    try:
+        close_players(*session.players)
+    except Exception:
+        logger.exception("Could not close the players of a game")
 
 
 def _log_failure(task: asyncio.Task[None]) -> None:

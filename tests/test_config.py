@@ -148,3 +148,15 @@ def test_the_devices_a_network_can_be_asked_to_run_on(tmp_path, device):
     path = write(tmp_path / "chess-ai.toml", f'[inference]\ndevice = "{device}"\n')
 
     assert load_config(path, environ={}).inference.device == device
+
+
+def test_stockfish_is_looked_up_on_the_path_by_default():
+    assert load_config(environ={}).stockfish.path == "stockfish"
+
+
+def test_where_stockfish_is_can_be_set_in_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config = load_config(environ={"CHESS_AI_STOCKFISH_PATH": "~/engines/stockfish"})
+
+    assert config.stockfish.path == str(tmp_path / "engines" / "stockfish")

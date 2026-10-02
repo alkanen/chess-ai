@@ -7,8 +7,8 @@ import startPosition from './test/fixtures/start-position.json';
 const PGN = '[Event "chess-ai game"]\n[Result "*"]\n\n1. e4 *\n';
 
 const PLAYERS = {
-  human: { name: 'Human', accepts_moves: true, model: null },
-  random: { name: 'Random mover', accepts_moves: false, model: null },
+  human: { name: 'Human', accepts_moves: true, model: null, stockfish: null },
+  random: { name: 'Random mover', accepts_moves: false, model: null, stockfish: null },
 } satisfies Record<string, PlayerInfo>;
 
 /** The kinds of player these tests set a game up between. */

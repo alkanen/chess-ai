@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CheckpointSummary, RunSummary } from './api';
 import { NewGameForm } from './NewGameForm';
@@ -42,6 +42,11 @@ function serving(runs: RunSummary[] = RUNS) {
   return vi.fn((url: string) => {
     if (url.endsWith('/api/runs')) {
       return Promise.resolve(Response.json(runs));
+    }
+    if (url.endsWith('/api/stockfish')) {
+      return Promise.resolve(
+        Response.json({ name: 'Stockfish 14.1', min_elo: 1350, max_elo: 2850 }),
+      );
     }
     const asked = /\/api\/runs\/([^/]+)\/checkpoints$/.exec(url);
     if (asked !== null) {
@@ -336,6 +341,35 @@ describe('NewGameForm', () => {
       expect(await start(fetch)).toMatchObject({ white: { run: 'mlp-baseline', rating: 1200 } });
     });
 
+    it('lets any whole rating through the browser’s own checks', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1337' } });
+
+      expect(screen.getByLabelText('White rating')).toBeValid();
+    });
+
+    it('keeps the runs that arrive after the side was given back to a person', async () => {
+      let answer: (response: Response) => void = () => {};
+      const answering = serving();
+      fetch.mockImplementation((url: string) =>
+        url.endsWith('/api/runs')
+          ? new Promise<Response>((resolve) => (answer = resolve))
+          : answering(url),
+      );
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'model' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
+      await act(async () => answer(Response.json(RUNS)));
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'model' } });
+
+      await vi.waitFor(() =>
+        expect(screen.getByLabelText('White run')).toHaveValue('mlp-baseline'),
+      );
+    });
+
     it('says when there is nothing here to play against, and will not start', async () => {
       vi.stubGlobal('fetch', serving([]));
       render(<NewGameForm />);
@@ -356,6 +390,134 @@ describe('NewGameForm', () => {
         await screen.findByText(/Could not list the training runs/),
       ).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+    });
+  });
+
+  describe('playing Stockfish', () => {
+    it('plays either side at the Elo typed in, for the time a move chosen', async () => {
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'stockfish' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+      fireEvent.change(screen.getByLabelText('White Elo'), { target: { value: '1800' } });
+      fireEvent.change(screen.getByLabelText('Black time a move'), { target: { value: '0.25' } });
+
+      expect(await start(fetch)).toMatchObject({
+        white: { kind: 'stockfish', elo: 1800, move_time: 1 },
+        black: { kind: 'stockfish', elo: 1500, move_time: 0.25 },
+      });
+    });
+
+    it('asks the server which Stockfish it has, once, and nothing about runs', async () => {
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'stockfish' } });
+
+      await screen.findAllByText(/Stockfish 14.1 plays/);
+      const asked = (fetch.mock.calls as [string][]).map(([url]) => new URL(url).pathname);
+      expect(asked).toEqual(['/chess/api/stockfish']);
+    });
+
+    it('will not start without an Elo to play at', () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      fireEvent.change(screen.getByLabelText('Black Elo'), { target: { value: '' } });
+
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+    });
+
+    it('says which strengths the Stockfish here plays, moving others into range', async () => {
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      expect(
+        await screen.findByText(/Stockfish 14.1 plays from 1350 to 2850/),
+      ).toBeInTheDocument();
+    });
+
+    it('asks for an Elo out of that range all the same, to be played at the nearest', async () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+      await screen.findByText(/Stockfish 14.1 plays/);
+
+      fireEvent.change(screen.getByLabelText('Black Elo'), { target: { value: '800' } });
+
+      expect(await start(fetch)).toMatchObject({ black: { kind: 'stockfish', elo: 800 } });
+    });
+
+    it('lets any whole Elo through the browser’s own checks, not only multiples of 50', () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      for (const elo of ['1320', '1337', '3190']) {
+        fireEvent.change(screen.getByLabelText('Black Elo'), { target: { value: elo } });
+        // A step mismatch here is a form the browser will not submit, with no game started.
+        expect(screen.getByLabelText('Black Elo')).toBeValid();
+      }
+    });
+
+    it('keeps the answer that arrives after the side was given to someone else', async () => {
+      let answer: (response: Response) => void = () => {};
+      fetch.mockImplementation(
+        (url: string) =>
+          new Promise<Response>((resolve) => {
+            answer = resolve;
+            expect(url).toMatch(/\/api\/stockfish$/);
+          }),
+      );
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+      // Changed back before the server has started the engine to answer.
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+      await act(async () => {
+        answer(Response.json({ name: 'Stockfish 14.1', min_elo: 1350, max_elo: 2850 }));
+      });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      expect(await screen.findByText(/Stockfish 14.1 plays from 1350/)).toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('still says there is no Stockfish when the answer came after the side was changed', async () => {
+      let answer: (response: Response) => void = () => {};
+      fetch.mockImplementation(
+        () => new Promise<Response>((resolve) => (answer = resolve)),
+      );
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+      await act(async () => {
+        answer(Response.json({ detail: 'Stockfish was not found' }, { status: 500 }));
+      });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      expect(await screen.findByText(/There is no Stockfish to play/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+    });
+
+    it('says why there is no Stockfish to play, and will not start', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn().mockResolvedValue(
+          Response.json({ detail: "Stockfish was not found at 'stockfish'" }, { status: 500 }),
+        ),
+      );
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      expect(
+        await screen.findByText(/There is no Stockfish to play: .*not found/),
+      ).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+      // Given to someone else, the side no longer needs it, and the game can start.
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+      expect(screen.getByRole('button', { name: 'Start' })).toBeEnabled();
     });
   });
 });

@@ -111,12 +111,30 @@ class InferenceConfig(BaseModel):
     """How many positions go through the network at once when several are asked about."""
 
 
+class StockfishConfig(BaseModel):
+    """Where the Stockfish engine is, for the games and evaluations that play against it."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str = "stockfish"
+    """The Stockfish binary: a path, or a bare name looked up on ``PATH`` as a shell would.
+
+    A string rather than a ``Path``, because the default is a command to look up rather than a
+    file here, and a ``Path`` would turn it into ``./stockfish``."""
+
+    @field_validator("path")
+    @classmethod
+    def _expand_user(cls, value: str) -> str:
+        return os.path.expanduser(value)
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     server: ServerConfig = ServerConfig()
     paths: PathsConfig = PathsConfig()
     inference: InferenceConfig = InferenceConfig()
+    stockfish: StockfishConfig = StockfishConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> Config:

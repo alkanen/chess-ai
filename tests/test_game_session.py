@@ -77,13 +77,16 @@ async def test_state_names_the_players_and_says_who_takes_submitted_moves():
     assert state.white.model_dump() == {
         "name": "Random mover",
         "accepts_moves": False,
-        # Neither side is a checkpoint, and a viewer is told so rather than left to guess.
+        # Neither side is a checkpoint or an engine, and a viewer is told so rather than
+        # left to guess.
         "model": None,
+        "stockfish": None,
     }
     assert state.black.model_dump() == {
         "name": "Human",
         "accepts_moves": True,
         "model": None,
+        "stockfish": None,
     }
 
 

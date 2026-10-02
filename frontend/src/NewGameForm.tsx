@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { fetchRuns, startGame, type RunSummary } from './api';
+import { fetchRuns, fetchStockfish, startGame, type RunSummary, type StockfishInfo } from './api';
 import {
   isPlayable,
   NO_MODEL,
@@ -15,6 +15,42 @@ const MOVE_DELAYS = [0, 0.1, 0.25, 0.5, 1, 2, 5];
 const DEFAULT_MOVE_DELAY = 0.5;
 
 /**
+ * What `ask` answers, or null until it does, and why it could not; asked the first time
+ * `wanted` is true, and only then.
+ *
+ * The answer is kept however long it takes to arrive, even if whatever wanted it has been
+ * changed back meanwhile: it is no less true for that, and the next time it is wanted it is
+ * already here. Dropping it instead would leave the question asked and unanswered for good,
+ * since a question is only asked once.
+ */
+function useAskedOnce<T>(wanted: boolean, ask: () => Promise<T>): [T | null, string | null] {
+  const [answer, setAnswer] = useState<T | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const asked = useRef(false);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!wanted || asked.current) {
+      return;
+    }
+    asked.current = true;
+    ask().then(
+      (found) => mounted.current && setAnswer(found),
+      (e: unknown) => mounted.current && setError(e instanceof Error ? e.message : String(e)),
+    );
+  }, [wanted, ask]);
+
+  return [answer, error];
+}
+
+/**
  * The runs there are to play against, or null until they arrive, and why there are none.
  *
  * Asked for the first time a side is given to a model, and not before: most games started
@@ -23,33 +59,21 @@ const DEFAULT_MOVE_DELAY = 0.5;
  * reload away and nothing here is worth polling the server for.
  */
 function useRuns(wanted: boolean): [RunSummary[] | null, string | null] {
-  const [runs, setRuns] = useState<RunSummary[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const asked = useRef(false);
+  const [runs, error] = useAskedOnce(wanted, fetchRuns);
+  // An empty list rather than no list when they could not be had: the form has an answer to
+  // give, which is that there is nothing here to play against.
+  return [error !== null ? [] : runs, error];
+}
 
-  useEffect(() => {
-    if (!wanted || asked.current) {
-      return;
-    }
-    asked.current = true;
-    let dropped = false;
-    fetchRuns().then(
-      (found) => !dropped && setRuns(found),
-      (e: unknown) => {
-        if (!dropped) {
-          // An empty list rather than no list: the form has an answer to give, which is
-          // that there is nothing here to play against.
-          setRuns([]);
-          setError(e instanceof Error ? e.message : String(e));
-        }
-      },
-    );
-    return () => {
-      dropped = true;
-    };
-  }, [wanted]);
-
-  return [runs, error];
+/**
+ * The Stockfish there is to play, or null until the server says, and why there is none.
+ *
+ * Asked the first time a side is given to Stockfish, and once, as the runs are: the server
+ * starts the engine to answer, and the answer is the range of strengths to offer, which
+ * differs between versions of Stockfish.
+ */
+function useStockfish(wanted: boolean): [StockfishInfo | null, string | null] {
+  return useAskedOnce(wanted, fetchStockfish);
 }
 
 /** Starts a new game on the server, replacing the current one for every viewer. */
@@ -61,6 +85,8 @@ export function NewGameForm() {
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runs, runsError] = useRuns(white.kind === 'model' || black.kind === 'model');
+  const wantsStockfish = white.kind === 'stockfish' || black.kind === 'stockfish';
+  const [stockfish, stockfishError] = useStockfish(wantsStockfish);
 
   // What is actually being asked for: a model chosen before the runs arrived means the
   // run it is being shown, which is the first of them.
@@ -68,8 +94,12 @@ export function NewGameForm() {
   // The delay holds back a move a player works out for itself, so two people at the
   // board have nothing to hold back. The setting is kept, just switched off.
   const pacesNothing = sides.white.kind === 'human' && sides.black.kind === 'human';
-  // A model with no run to play is not a player, and the server would only refuse it.
-  const ready = isPlayable(sides.white) && isPlayable(sides.black);
+  // A model with no run to play is not a player, and neither is a Stockfish the server has
+  // said it does not have: the server would only refuse either.
+  const ready =
+    isPlayable(sides.white) &&
+    isPlayable(sides.black) &&
+    !(wantsStockfish && stockfishError !== null);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -93,10 +123,25 @@ export function NewGameForm() {
   return (
     <form className="new-game" aria-labelledby="new-game-heading" onSubmit={submit}>
       <h2 id="new-game-heading">New game</h2>
-      <PlayerPicker label="White" value={white} onChange={setWhite} runs={runs} />
-      <PlayerPicker label="Black" value={black} onChange={setBlack} runs={runs} />
+      <PlayerPicker
+        label="White"
+        value={white}
+        onChange={setWhite}
+        runs={runs}
+        stockfish={stockfish}
+      />
+      <PlayerPicker
+        label="Black"
+        value={black}
+        onChange={setBlack}
+        runs={runs}
+        stockfish={stockfish}
+      />
       {runsError !== null && (
         <p className="note">Could not list the training runs: {runsError}</p>
+      )}
+      {wantsStockfish && stockfishError !== null && (
+        <p className="note">There is no Stockfish to play: {stockfishError}</p>
       )}
       <label>
         Delay between moves{' '}

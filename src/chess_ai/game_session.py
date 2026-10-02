@@ -23,6 +23,8 @@ from chess_ai.players import (
     MoveRejectedError,
     Player,
     PlayerMove,
+    StockfishBackedPlayer,
+    StockfishDescription,
     SubmittedMovePlayer,
     Thoughts,
 )
@@ -64,6 +66,8 @@ class PlayerInfo(BaseModel):
     The name alone cannot carry it: a viewer comparing two checkpoints wants to see which run,
     which step and which rating each side is, and the PGN of the game has to say the same
     things six months later."""
+    stockfish: StockfishDescription | None = None
+    """How strong Stockfish plays this side, for a side Stockfish is playing."""
 
 
 class GameState(BaseModel):
@@ -157,6 +161,11 @@ class GameSession:
         # answer to a question that has since gone stale is thrown away.
         self._takebacks = 0
         self._asking: asyncio.Future[PlayerMove] | None = None
+
+    @property
+    def players(self) -> tuple[Player, Player]:
+        """White and Black, for whoever made them to close once the game is over."""
+        return self._players[chess.WHITE], self._players[chess.BLACK]
 
     @property
     def state(self) -> GameState:
@@ -419,6 +428,7 @@ def _describe(player: Player) -> PlayerInfo:
         name=player.name,
         accepts_moves=isinstance(player, SubmittedMovePlayer),
         model=player.model if isinstance(player, ModelBackedPlayer) else None,
+        stockfish=player.stockfish if isinstance(player, StockfishBackedPlayer) else None,
     )
 
 

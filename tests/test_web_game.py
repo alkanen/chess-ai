@@ -111,7 +111,7 @@ def test_random_game_streams_live_to_the_end(chess_client):
 
     assert response.status_code == 200
     started = response.json()
-    mover = {"name": "Random mover", "accepts_moves": False, "model": None}
+    mover = {"name": "Random mover", "accepts_moves": False, "model": None, "stockfish": None}
     assert (started["white"], started["black"]) == (mover, mover)
     assert started["position"]["fen"] == chess.STARTING_FEN
     assert events[0].type == "state"
@@ -193,11 +193,17 @@ def test_a_human_move_submitted_over_the_websocket_is_played(chess_client):
         ask(websocket, response.json()["id"], type="move", uci="e2e4")
         played, answered = receive(websocket), receive(websocket)
 
-    assert response.json()["white"] == {"name": "Human", "accepts_moves": True, "model": None}
+    assert response.json()["white"] == {
+        "name": "Human",
+        "accepts_moves": True,
+        "model": None,
+        "stockfish": None,
+    }
     assert response.json()["black"] == {
         "name": "Random mover",
         "accepts_moves": False,
         "model": None,
+        "stockfish": None,
     }
     assert played.type == "move"
     assert (played.ply, played.move.uci) == (1, "e2e4")
@@ -858,15 +864,16 @@ async def test_two_games_started_at_once_leave_the_one_asked_for_last_playing(
     entered, release = threading.Event(), threading.Event()
     build, made, guard = app_module._players, [], threading.Lock()
 
-    def slowly(request, config):
+    async def slowly(request, config):
         """The first game's players take as long as a real checkpoint would."""
         with guard:
             first = not made
             made.append(request)
         if first:
             entered.set()
-            assert release.wait(timeout=10), "the slow game was never released"
-        return build(request, config)
+            released = await asyncio.to_thread(release.wait, 10)
+            assert released, "the slow game was never released"
+        return await build(request, config)
 
     monkeypatch.setattr(app_module, "_players", slowly)
 

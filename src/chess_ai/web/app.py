@@ -47,6 +47,7 @@ from chess_ai.players import (
     Player,
     RandomPlayer,
     SelectionStrategy,
+    close_players,
 )
 from chess_ai.position_view import (
     Color,
@@ -54,6 +55,15 @@ from chess_ai.position_view import (
     PositionSnapshot,
     board_from_fen,
     snapshot,
+)
+from chess_ai.stockfish import (
+    DEFAULT_MOVE_TIME,
+    MAX_MOVE_TIME,
+    MIN_MOVE_TIME,
+    StockfishError,
+    StockfishInfo,
+    describe_stockfish,
+    start_stockfish,
 )
 from chess_ai.training.run_store import (
     CheckpointChoice,
@@ -158,7 +168,22 @@ class ModelSpec(PlayerSpec):
     """Fixes the sampling, so that the same game can be played twice. Left out, it is not."""
 
 
-AnyPlayer = Annotated[HumanSpec | RandomSpec | ModelSpec, Field(discriminator="kind")]
+class StockfishSpec(PlayerSpec):
+    """Stockfish, held to a strength by its calibrated limit."""
+
+    kind: Literal["stockfish"]
+
+    elo: int = Field(ge=0, le=4000)
+    """The Elo to play at. Stockfish only supports a range (1320 to 3190 in Stockfish 19,
+    for one); a strength outside it is played at the nearer end, and the game's state says so."""
+    move_time: float = Field(default=DEFAULT_MOVE_TIME, ge=MIN_MOVE_TIME, le=MAX_MOVE_TIME)
+    """Seconds Stockfish thinks about each move. Its levels assume a few seconds a move; much
+    less and it plays below the level asked for."""
+
+
+AnyPlayer = Annotated[
+    HumanSpec | RandomSpec | ModelSpec | StockfishSpec, Field(discriminator="kind")
+]
 """What either colour may be played by; see :class:`PlayerSpec`."""
 
 
@@ -286,7 +311,8 @@ def create_app(
             },
             500: {
                 "description": "A model was asked for and the inference device this server "
-                "is configured with is not there on this machine"
+                "is configured with is not there on this machine, or Stockfish was asked for "
+                "and the configured binary is missing or is not Stockfish"
             },
             503: {"description": "The server is shutting down and is starting no more games"},
         },
@@ -298,8 +324,11 @@ def create_app(
         Anything that would stop the game being started is refused, and the current game
         plays on: a FEN that cannot be played from, or a checkpoint that is not there. Not
         every refusal is the asker's doing — a configured inference device that this machine
-        does not have is answered as the server's own fault, and a server on its way down
-        starts nothing at all.
+        does not have, or a Stockfish that is not installed where the config says, is answered
+        as the server's own fault, and a server on its way down starts nothing at all.
+
+        Every Stockfish side is an engine process of its own, which is stopped when its game
+        ends, is replaced, or the server goes down, and at once if the game is refused.
         """
         # The position is checked before the players are made, so that a mistyped FEN is
         # answered at once rather than after tens of megabytes of checkpoint have been read.
@@ -309,18 +338,36 @@ def create_app(
             except InvalidFenError as invalid:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, str(invalid)) from invalid
         async with starting:
-            # Making the players happens on a worker thread: a model player reads a checkpoint
-            # off the disk and builds a network from it, which the game being played meanwhile,
-            # and every viewer watching it, should not be held up by.
-            white, black = await run_in_threadpool(_players, request, config)
-            session = GameSession(white, black, move_delay=request.move_delay, fen=request.fen)
+            white, black = await _players(request, config)
             try:
+                session = GameSession(white, black, move_delay=request.move_delay, fen=request.fen)
                 game_channel.start(session)
             except GameChannelClosedError as closed:
+                close_players(white, black)
                 raise HTTPException(
                     status.HTTP_503_SERVICE_UNAVAILABLE, "the server is shutting down"
                 ) from closed
+            except BaseException:
+                close_players(white, black)
+                raise
         return session.state
+
+    @api.get(
+        "/stockfish",
+        responses={500: {"description": "The configured Stockfish is missing or is not Stockfish"}},
+    )
+    async def stockfish() -> StockfishInfo:
+        """Which Stockfish games are played against here, and the strengths it plays at.
+
+        Asked of the engine itself, by starting it, since the range differs between versions;
+        so this is also how to find out, before starting a game, whether there is one.
+        """
+        try:
+            return await describe_stockfish(config.stockfish.path)
+        except StockfishError as unavailable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unavailable)
+            ) from unavailable
 
     # The run routes below read run directories, which the trainer may be writing to at this
     # moment. Plain `def`, so that FastAPI runs them in a worker thread: the reads are small,
@@ -587,8 +634,11 @@ def create_app(
     return app
 
 
-def _players(request: NewGameRequest, config: Config) -> tuple[Player, Player]:
+async def _players(request: NewGameRequest, config: Config) -> tuple[Player, Player]:
     """Both sides of a new game, made from what was asked for.
+
+    Whatever the first side holds is let go of again if the second cannot be made, so that a
+    refused game leaves no engine process running.
 
     Raises:
         HTTPException: a player cannot be made. A run, a checkpoint or the weights in it that
@@ -596,30 +646,47 @@ def _players(request: NewGameRequest, config: Config) -> tuple[Player, Player]:
             the server's: the person who asked chose the run and the checkpoint, and the
             message names what was wrong with the choice. The one refusal that is not theirs
             is an inference device this machine does not have, which nobody choosing a player
-            picked; :func:`_model_player` answers that as the server's own fault.
+            picked; :func:`_model_player` answers that as the server's own fault. A Stockfish
+            that is not there, or is not Stockfish, is the same kind of fault.
     """
     # One engine per checkpoint rather than per player: a checkpoint playing itself at two
     # ratings, or its best move against its own sampling, is one set of weights and two ways
     # of choosing from them. Everything a player was asked for — the rating, the strategy,
     # its generator — lives in the player, so the engine has nothing of either side in it.
     engines: dict[tuple[str, int], Any] = {}
+    white = await _player(request.white, config, engines)
     try:
-        return (
-            _player(request.white, config, engines),
-            _player(request.black, config, engines),
-        )
-    except RunError as missing:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(missing)) from missing
+        black = await _player(request.black, config, engines)
+    except BaseException:
+        close_players(white)
+        raise
+    return white, black
 
 
-def _player(spec: AnyPlayer, config: Config, engines: dict[tuple[str, int], Any]) -> Player:
+async def _player(spec: AnyPlayer, config: Config, engines: dict[tuple[str, int], Any]) -> Player:
     match spec:
         case HumanSpec():
             return HumanPlayer()
         case RandomSpec():
             return RandomPlayer()
         case ModelSpec():
-            return _model_player(spec, config, engines)
+            # On a worker thread: a model player reads a checkpoint off the disk and builds a
+            # network from it, which the game being played meanwhile, and every viewer watching
+            # it, should not be held up by.
+            try:
+                return await run_in_threadpool(_model_player, spec, config, engines)
+            except RunError as missing:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, str(missing)) from missing
+        case StockfishSpec():
+            try:
+                return await start_stockfish(
+                    config.stockfish.path, elo=spec.elo, move_time=spec.move_time
+                )
+            except StockfishError as unavailable:
+                # Nobody who clicked Start installed the engine or wrote the config.
+                raise HTTPException(
+                    status.HTTP_500_INTERNAL_SERVER_ERROR, str(unavailable)
+                ) from unavailable
         case _:
             # The union is closed, so this is unreachable until somebody adds a kind of
             # player and not the case that makes it. Said here, where the omission is, rather

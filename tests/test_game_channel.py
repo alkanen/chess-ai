@@ -387,3 +387,66 @@ async def test_a_game_that_cannot_be_kept_is_reported_and_the_next_game_still_pl
     assert second.state.position.game_over is not None
     assert "Could not keep the finished game" in caplog.text
     assert "the disk is full" in caplog.text
+
+
+class HeldPlayer(ScriptedPlayer):
+    """A scripted player holding something to let go of, as an engine process is held.
+
+    Out of moves to play, it waits to be stopped, as a player thinking for a long time would.
+    """
+
+    def __init__(self, moves: str = "") -> None:
+        super().__init__(moves.split())
+        self._left = len(moves.split())
+        self.closed = False
+
+    async def choose_move(self, context):
+        if self._left == 0:
+            await asyncio.Event().wait()
+        self._left -= 1
+        return await super().choose_move(context)
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+async def test_the_players_of_a_game_played_to_its_end_are_let_go_of():
+    white, black = HeldPlayer("f2f3 g2g4"), HeldPlayer("e7e5 d8h4")
+    channel = GameChannel()
+    session = GameSession(white, black)
+
+    channel.start(session)
+    async with asyncio.timeout(5):
+        while session.state.position.game_over is None:
+            await asyncio.sleep(0)
+    await settled()
+
+    assert white.closed and black.closed
+    await channel.close()
+
+
+async def test_the_players_of_a_game_replaced_before_its_first_turn_are_let_go_of():
+    held = HeldPlayer()
+    channel = GameChannel()
+
+    channel.start(GameSession(held, HumanPlayer()))
+    # Replaced at once, so that the first game is cancelled before it has run at all.
+    channel.start(GameSession(HumanPlayer(), HumanPlayer()))
+    await settled()
+
+    assert held.closed
+    await channel.close()
+
+
+async def test_the_players_of_the_game_on_show_are_let_go_of_when_the_channel_closes():
+    white = HeldPlayer()  # With no moves to play, so the game waits on it until stopped.
+    channel = GameChannel()
+    channel.start(GameSession(white, HumanPlayer()))
+    await settled()
+
+    await channel.close()
+
+    assert white.closed

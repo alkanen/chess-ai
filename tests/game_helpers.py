@@ -7,7 +7,13 @@ from contextlib import asynccontextmanager
 import chess
 
 from chess_ai.game_session import GameEvent, GameSession, GameState
-from chess_ai.players import GameContext, ModelDescription, PlayerMove, Thoughts
+from chess_ai.players import (
+    GameContext,
+    ModelDescription,
+    PlayerMove,
+    StockfishDescription,
+    Thoughts,
+)
 
 
 class ScriptedPlayer:
@@ -42,6 +48,19 @@ class ScriptedModelPlayer(ScriptedPlayer):
     @property
     def model(self) -> ModelDescription:
         return self._model
+
+
+class ScriptedStockfishPlayer(ScriptedPlayer):
+    """A scripted player that says it is Stockfish at a strength, without the engine."""
+
+    def __init__(self, moves: Sequence[str], stockfish: StockfishDescription) -> None:
+        super().__init__(moves)
+        self.name = f"Stockfish {stockfish.elo}"
+        self._stockfish = stockfish
+
+    @property
+    def stockfish(self) -> StockfishDescription:
+        return self._stockfish
 
 
 class PlayerBroke(Exception):
