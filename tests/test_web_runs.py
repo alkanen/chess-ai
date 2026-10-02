@@ -22,6 +22,7 @@ from chess_ai.training.run_store import (
     STATUS_FILE,
     CheckpointPolicy,
     DatasetReference,
+    GpuStats,
     Heartbeat,
     ModelReference,
     RunInfo,
@@ -402,6 +403,64 @@ def test_a_viewer_hears_when_the_heartbeat_changes(client, runs):
             changed = next_of(websocket, "run")
             assert changed["heartbeat"]["status"] == "finished"
             assert changed["heartbeat"]["step"] == 100
+
+
+def test_a_viewer_is_sent_the_throughput_time_left_and_gpu_statistics(client, runs):
+    gpu = GpuStats(
+        name="NVIDIA GeForce RTX 4090",
+        utilization_percent=87.0,
+        memory_used_bytes=20 * 2**30,
+        memory_total_bytes=24 * 2**30,
+        process_memory_bytes=6 * 2**30,
+        temperature_celsius=64.0,
+    )
+    with new_run(runs) as run:
+        run.heartbeat(
+            RunStatus.RUNNING,
+            step=40,
+            steps=100,
+            epoch=0.25,
+            positions_per_second=344_538.5,
+            eta_seconds=3_900.0,
+            gpu=gpu,
+        )
+
+        with follow(client) as websocket:
+            heartbeat = websocket.receive_json()["heartbeat"]
+
+    assert (heartbeat["step"], heartbeat["steps"], heartbeat["epoch"]) == (40, 100, 0.25)
+    assert heartbeat["positions_per_second"] == 344_538.5
+    assert heartbeat["eta_seconds"] == 3_900.0
+    assert heartbeat["gpu"] == gpu.model_dump()
+
+
+def test_gpu_statistics_nvml_could_not_give_are_sent_as_missing(client, runs):
+    with new_run(runs) as run:
+        run.heartbeat(
+            RunStatus.RUNNING,
+            steps=100,
+            gpu=GpuStats(memory_used_bytes=20 * 2**30, memory_total_bytes=24 * 2**30),
+        )
+
+        with follow(client) as websocket:
+            gpu = websocket.receive_json()["heartbeat"]["gpu"]
+
+    assert gpu == {
+        "name": None,
+        "utilization_percent": None,
+        "memory_used_bytes": 20 * 2**30,
+        "memory_total_bytes": 24 * 2**30,
+        "process_memory_bytes": None,
+        "temperature_celsius": None,
+    }
+
+
+def test_a_run_on_the_cpu_is_sent_no_gpu(client, runs):
+    with new_run(runs) as run:
+        run.heartbeat(RunStatus.RUNNING, steps=100)
+
+        with follow(client) as websocket:
+            assert websocket.receive_json()["heartbeat"]["gpu"] is None
 
 
 def test_a_viewer_hears_when_the_notes_change(client, runs):

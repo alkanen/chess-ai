@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Heartbeat, RunEvent, RunInfo } from './api';
+import type { GpuStats, Heartbeat, RunEvent, RunInfo } from './api';
 import { RunView } from './RunView';
 import { FakeUPlot } from './test/fakeUPlot';
 import { FakeWebSocket } from './test/fakeWebSocket';
@@ -12,12 +12,29 @@ const INFO: RunInfo = {
   created: '2026-10-01T10:00:00Z',
   seed: 7,
   code_version: 'git abc1234',
-  device: 'cuda',
+  device: 'cuda:0 NVIDIA GeForce RTX 4090, 24 GiB',
   dataset: { name: 'lichess-2024', positions: 1_000_000, train_positions: 950_000 },
   model: { architecture: 'mlp', options: { width: 2048 }, parameter_count: 12_345_678 },
   steps: 15_000,
   batch_size: 16_384,
 };
+
+const GIB = 2 ** 30;
+
+const GPU: GpuStats = {
+  name: 'NVIDIA GeForce RTX 4090',
+  utilization_percent: 87,
+  memory_used_bytes: 20 * GIB,
+  memory_total_bytes: 24 * GIB,
+  process_memory_bytes: 6 * GIB,
+  temperature_celsius: 64,
+};
+
+/** What the run's facts say against `label`. */
+function fact(label: string): string | null {
+  const term = screen.getByText(label, { selector: 'dt' });
+  return term.nextElementSibling?.textContent ?? null;
+}
 
 function heartbeat(changes: Partial<Heartbeat> = {}): Heartbeat {
   return {
@@ -86,6 +103,87 @@ describe('RunView', () => {
     expect(screen.getByText('1,000 of 15,000, epoch 0.25')).toBeInTheDocument();
     expect(screen.getByText('345k positions/s')).toBeInTheDocument();
     expect(screen.getByText('1h 05m')).toBeInTheDocument();
+  });
+
+  it('shows what the GPU says about itself, and follows it as the heartbeat changes', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ heartbeat: heartbeat({ gpu: GPU }) }));
+
+    expect(fact('Device')).toBe('cuda:0 NVIDIA GeForce RTX 4090, 24 GiB');
+    expect(fact('GPU busy')).toBe('87%');
+    expect(fact('GPU memory')).toBe('6.0 GiB held by the run, 20.0 of 24.0 GiB in use on the card');
+    expect(fact('GPU temperature')).toBe('64 °C');
+
+    socket.deliver(
+      runEvent({
+        heartbeat: heartbeat({
+          step: 2_000,
+          gpu: { ...GPU, utilization_percent: 12.4, temperature_celsius: 71.6 },
+        }),
+      }),
+    );
+
+    expect(fact('Step')).toBe('2,000 of 15,000, epoch 0.25');
+    expect(fact('GPU busy')).toBe('12%');
+    expect(fact('GPU temperature')).toBe('72 °C');
+  });
+
+  it('shows the memory figures of a GPU that NVML could not be asked about', () => {
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(
+      runEvent({
+        heartbeat: heartbeat({
+          gpu: {
+            ...GPU,
+            name: null,
+            utilization_percent: null,
+            temperature_celsius: null,
+          },
+        }),
+      }),
+    );
+
+    expect(fact('GPU busy')).toBe('–');
+    expect(fact('GPU memory')).toBe('6.0 GiB held by the run, 20.0 of 24.0 GiB in use on the card');
+    expect(fact('GPU temperature')).toBe('–');
+  });
+
+  it.each([
+    [{ process_memory_bytes: null }, '20.0 of 24.0 GiB in use on the card'],
+    [{ memory_total_bytes: null }, '6.0 GiB held by the run, 20.0 GiB in use on the card'],
+    [{ memory_used_bytes: null, memory_total_bytes: null }, '6.0 GiB held by the run'],
+    [{ memory_used_bytes: null, memory_total_bytes: null, process_memory_bytes: null }, '–'],
+  ])('says only what it was told about GPU memory: %o', (missing, shown) => {
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(runEvent({ heartbeat: heartbeat({ gpu: { ...GPU, ...missing } }) }));
+
+    expect(fact('GPU memory')).toBe(shown);
+  });
+
+  it('shows no GPU figures for a run on the CPU, but says what it runs on', () => {
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(
+      runEvent({ info: { ...INFO, device: 'cpu (16 threads)' }, heartbeat: heartbeat({ gpu: null }) }),
+    );
+
+    expect(fact('Device')).toBe('cpu (16 threads)');
+    expect(screen.queryByText('GPU busy')).not.toBeInTheDocument();
+    expect(screen.queryByText('GPU memory')).not.toBeInTheDocument();
+  });
+
+  it('does not pass a dead run’s last GPU figures off as current', () => {
+    render(<RunView name="mlp-big" />);
+    FakeWebSocket.latest.open();
+    FakeWebSocket.latest.deliver(runEvent({ stale: true, heartbeat: heartbeat({ gpu: GPU }) }));
+
+    expect(screen.queryByText('GPU busy')).not.toBeInTheDocument();
+    expect(screen.queryByText('GPU memory')).not.toBeInTheDocument();
+    expect(screen.queryByText('GPU temperature')).not.toBeInTheDocument();
   });
 
   it('charts the whole log, and then what is appended to it, without reloading', () => {
