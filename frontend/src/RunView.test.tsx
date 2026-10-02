@@ -135,6 +135,81 @@ describe('RunView', () => {
     expect(screen.getByText('top-1 30.0% at step 100; top-5 60.0% at step 100')).toBeInTheDocument();
   });
 
+  it('charts the gradient norm against the clip threshold, and how often it was clipped', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ info: { ...INFO, config: { optimizer: { gradient_clip: 1.0 } } } }));
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [
+        { step: 50, split: 'train', loss: 3.0, gradient_norm: 2.5, clipped_fraction: 1.0 },
+        { step: 100, split: 'train', loss: 2.5, gradient_norm: 0.8, clipped_fraction: 0.25 },
+      ],
+    });
+
+    expect(FakeUPlot.withSeries('gradient norm').data).toEqual([
+      [50, 100],
+      [2.5, 0.8],
+      [1.0, 1.0],
+    ]);
+    expect(screen.getByText('gradient norm 0.8 at step 100; clipped above 1 at step 100')).toBeInTheDocument();
+    expect(FakeUPlot.withSeries('clipped').data).toEqual([
+      [50, 100],
+      [1.0, 0.25],
+    ]);
+  });
+
+  it('draws no threshold for a run that does not clip', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ info: { ...INFO, config: { optimizer: { gradient_clip: 0 } } } }));
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [{ step: 50, split: 'train', loss: 3.0, gradient_norm: 2.5, clipped_fraction: 0 }],
+    });
+
+    expect(FakeUPlot.withSeries('gradient norm').options.series).toHaveLength(2);
+    expect(FakeUPlot.withSeries('gradient norm').data).toEqual([[50], [2.5]]);
+  });
+
+  it('leaves out the gradient charts for a run logged before there were any', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ info: { ...INFO, config: { optimizer: { gradient_clip: 1.0 } } } }));
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [{ step: 50, split: 'train', loss: 3.0, learning_rate: 0.001 }],
+    });
+
+    expect(() => FakeUPlot.withSeries('gradient norm')).toThrow();
+    expect(screen.queryByText('Gradient norm, before clipping')).toBeNull();
+    expect(screen.queryByText('Steps clipped')).toBeNull();
+  });
+
+  it('works out no chart again when a heartbeat brings the same run in a new object', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    const configured = { ...INFO, config: { optimizer: { gradient_clip: 1.0 } } };
+    socket.open();
+    socket.deliver(runEvent({ info: configured }));
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [{ step: 50, split: 'train', loss: 3.0, gradient_norm: 2.5, clipped_fraction: 1 }],
+    });
+    const drawn = FakeUPlot.live().map((chart) => chart.data);
+
+    socket.deliver(runEvent({ info: structuredClone(configured), heartbeat: heartbeat({ step: 60 }) }));
+
+    FakeUPlot.live().forEach((chart, index) => expect(chart.data).toBe(drawn[index]));
+  });
+
   it('follows the run again on a chart made anew after a zoom', () => {
     render(<RunView name="mlp-big" />);
     const socket = FakeWebSocket.latest;

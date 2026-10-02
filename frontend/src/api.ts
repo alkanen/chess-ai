@@ -338,6 +338,8 @@ export interface RunInfo {
   model: { architecture: string; options: Record<string, unknown>; parameter_count: number };
   steps: number;
   batch_size: number;
+  /** The run's config with every default filled in; only the parts the dashboard reads. */
+  config?: { optimizer?: { gradient_clip?: number } };
 }
 
 /**

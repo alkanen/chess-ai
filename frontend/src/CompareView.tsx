@@ -3,6 +3,7 @@ import type { MetricsRecord } from './api';
 import { MetricChart } from './MetricChart';
 import {
   COMPARISON_CHARTS,
+  logs,
   comparisonData,
   MAX_SERIES,
   xAxis,
@@ -67,7 +68,10 @@ export function CompareView({ names }: CompareViewProps) {
     })),
   );
   const charts = useMemo(
-    () => COMPARISON_CHARTS.map((chart) => ({ chart, data: comparisonData(runs, chart, axis) })),
+    () =>
+      COMPARISON_CHARTS.filter(
+        (chart) => !chart.optional || runs.some(({ records }) => logs(records, chart.metric)),
+      ).map((chart) => ({ chart, data: comparisonData(runs, chart, axis) })),
     [runs, axis],
   );
 

@@ -113,7 +113,7 @@ The server holds one game, which every open browser shows. Start a game from the
 
 ### Follow training
 
-**Runs** lists every training run with its state, architecture, dataset, progress and latest losses, top-1 accuracy and illegal-move rate, refreshed every few seconds. Opening a run shows its step, epoch, throughput, time left and GPU statistics, and charts its loss (on a log scale), validation accuracy, learning rate and illegal-move rate against the step. The charts follow the run over a WebSocket (`…/api/runs/<name>/ws`) as the trainer logs, so they update without reloading; a finished run shows the same charts for its whole history. Drag across a chart to zoom in, and double-click to let it follow the run again. Every chart can be drawn against the step, the positions seen (which lines up runs with different batch sizes) or the wall time; the choice is remembered in the browser.
+**Runs** lists every training run with its state, architecture, dataset, progress and latest losses, top-1 accuracy and illegal-move rate, refreshed every few seconds. Opening a run shows its step, epoch, throughput, time left and GPU statistics, and charts its loss (on a log scale), validation accuracy, learning rate and illegal-move rate against the step, and the gradient norm before clipping, with the threshold it is clipped at, and how many steps were clipped. Runs logged before the trainer measured gradients have no gradient charts. The charts follow the run over a WebSocket (`…/api/runs/<name>/ws`) as the trainer logs, so they update without reloading; a finished run shows the same charts for its whole history. Drag across a chart to zoom in, and double-click to let it follow the run again. Every chart can be drawn against the step, the positions seen (which lines up runs with different batch sizes) or the wall time; the choice is remembered in the browser.
 
 Tick two or more runs in the list (up to eight) and choose **Compare** to overlay them on the same charts, one line per run: training and validation loss, top-1 and top-5 accuracy, illegal-move rate and learning rate, all followed live.
 
@@ -247,6 +247,7 @@ chess-ai: run mlp-baseline, seed 1234
   encoder    board-planes: spatial 12x8x8, globals 11, policy 1968
   model      mlp, 4,918,195 parameters (depth=3, dropout=0.0, width=1024)
   schedule   10,000 steps of 1024 (30.9 epochs), lr 0.001 warmup 500 then cosine
+  optimizer  AdamW, weight decay 0.01 on 4,913,152 parameters, none on 5,043 biases and norms, clip 1
   throughput 240,000 positions/s measured, about 43s for the run
 ```
 
@@ -282,6 +283,16 @@ size settings:
   `"planes"` paints each one over a whole 8×8 plane next to the board's, and `"film"`
   (feature-wise linear modulation) has them scale and shift every channel of every block, so
   that a rating can steer the whole tower rather than only its first layer.
+
+Weight decay shrinks the weights that multiply an input, and leaves biases and the
+normalization layers' scales and shifts alone, as is usual. Runs made before the trainer told
+the two apart decayed everything; `[optimizer] decay_biases_and_norms = true` brings that
+back, to reproduce one of them.
+
+The four `experiments/resnet-lr-sweep-*.toml` configs look for the ResNet's learning rate: they
+are `resnet-lichess.toml` cut to 20,000 steps, at learning rates 5e-4, 1e-3, 2e-3 and 4e-3, about
+20 minutes each on an RTX 4090. Compare them with each other rather than with a long run, whose
+learning rate decays far more slowly.
 
 Validation runs on the held-back games at `[validation] every_steps`, on the same positions every
 time so the curve means something, and prints and logs five numbers:

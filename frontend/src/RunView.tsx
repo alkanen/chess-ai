@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { GpuStats } from './api';
 import { MetricChart } from './MetricChart';
-import { CHARTS, chartData, xAxis } from './runCharts';
+import { CHARTS, chartData, logs, xAxis } from './runCharts';
 import { RunStateBadge } from './RunState';
 import {
   formatAgo,
@@ -60,15 +60,26 @@ export function RunView({ name }: RunViewProps) {
   const metrics = run?.metrics;
   const info = run?.info ?? null;
   const batchSize = info?.batch_size ?? null;
-  const charts = useMemo(
-    () =>
-      CHARTS.map((spec) => ({
-        spec,
-        labels: spec.series.map((series) => series.label),
-        data: chartData(metrics ?? [], spec, axis, batchSize),
-      })),
-    [metrics, axis, batchSize],
+  // As one string, so that the charts are worked out again when a level changes rather than
+  // whenever a heartbeat brings the same info in a new object.
+  const referenceKey = JSON.stringify(
+    CHARTS.map((spec) => (spec.reference && info ? spec.reference.value(info) : null)),
   );
+  const charts = useMemo(() => {
+    const references = JSON.parse(referenceKey) as (number | null)[];
+    const records = metrics ?? [];
+    return CHARTS.flatMap((spec, index) => {
+      if (spec.optional && !logs(records, spec.series[0])) {
+        return [];
+      }
+      const reference = references[index];
+      const labels = spec.series.map((series) => series.label);
+      if (reference !== null && spec.reference) {
+        labels.push(spec.reference.label);
+      }
+      return [{ spec, labels, data: chartData(records, spec, axis, batchSize, reference) }];
+    });
+  }, [metrics, axis, batchSize, referenceKey]);
   const [notes, showSaved] = useShownNotes(run?.notes ?? null);
   const title = notes?.title ?? null;
   const beat = run?.heartbeat ?? null;
