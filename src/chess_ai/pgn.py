@@ -79,6 +79,7 @@ def game_pgn(game: GameState, *, now: datetime | None = None) -> str:
         record.headers["Termination"] = TERMINATIONS[over.reason]
     for color, player in (("White", game.white), ("Black", game.black)):
         record.headers.update(_model_tags(color, player))
+        record.headers.update(_stockfish_tags(color, player))
     node: chess.pgn.GameNode = record
     for move in game.moves:
         node = node.add_main_variation(chess.Move.from_uci(move.uci))
@@ -141,6 +142,19 @@ def _model_tags(color: str, player: PlayerInfo) -> dict[str, str]:
         "Selection": _selection(model.strategy, model.temperature),
     }
     return {f"{color}{tag}": value for tag, value in tags.items() if value is not None}
+
+
+def _stockfish_tags(color: str, player: PlayerInfo) -> dict[str, str]:
+    """How strong Stockfish played this side: ``WhiteElo`` and its time a move.
+
+    ``WhiteElo`` here, unlike for a model, because the number is a strength: the level Stockfish
+    is calibrated to play at. The level actually played is written, not the one asked for, which
+    differs only when the request was out of Stockfish's range.
+    """
+    stockfish = player.stockfish
+    if stockfish is None:
+        return {}
+    return {f"{color}Elo": str(stockfish.elo), f"{color}MoveTime": f"{stockfish.move_time:g}"}
 
 
 def _selection(strategy: str, temperature: float | None) -> str:

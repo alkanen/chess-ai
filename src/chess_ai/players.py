@@ -126,6 +126,80 @@ class ModelBackedPlayer(Protocol):
         ...
 
 
+class StockfishDescription(BaseModel):
+    """How strong a Stockfish player was asked to be, and how strong it plays.
+
+    The two Elo figures differ when the one asked for was outside the range Stockfish's
+    strength limit is calibrated over, and the viewer has to be told so: a game against "800"
+    that was really played against Stockfish's floor would teach them the wrong thing.
+    """
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    elo: int
+    """The strength it plays at, within the range Stockfish supports."""
+    requested_elo: int
+    """The strength that was asked for, which is ``elo`` unless it had to be moved into range."""
+    min_elo: int
+    """The weakest Stockfish will play, which a request below it was raised to."""
+    max_elo: int
+    """The strongest calibrated level, which a request above it was lowered to."""
+    move_time: float
+    """How many seconds it thinks about each move."""
+
+    @property
+    def clamped(self) -> bool:
+        return self.elo != self.requested_elo
+
+
+@runtime_checkable
+class StockfishBackedPlayer(Protocol):
+    """A player whose moves come from Stockfish, recognized as a model player is."""
+
+    @property
+    def stockfish(self) -> StockfishDescription: ...
+
+
+@runtime_checkable
+class ClosablePlayer(Protocol):
+    """A player holding something that has to be let go of when its game is over.
+
+    An engine process, for instance: whoever made the player closes it once the game it was
+    made for has stopped being played, however it stopped. Closing twice is harmless.
+
+    Not a coroutine, deliberately. Closing happens on the way out of a game that may be being
+    cancelled, and on the way down of a server that may be cancelling everything; anything
+    that had to be awaited could be interrupted half-way and leave a process running. Waiting
+    for what was closed to be gone is a step of its own, which can be skipped.
+    """
+
+    def close(self) -> None: ...
+
+    async def wait_closed(self) -> None:
+        """Return once whatever :meth:`close` let go of is gone, such as an exited process."""
+        ...
+
+
+def close_players(*players: Player) -> None:
+    """Let go of whatever each of ``players`` holds, all of them even if one fails to."""
+    failures = []
+    for player in players:
+        if isinstance(player, ClosablePlayer):
+            try:
+                player.close()
+            except Exception as failed:  # noqa: BLE001 - the rest still have to be closed
+                failures.append(failed)
+    if failures:
+        raise ExceptionGroup("players could not be closed", failures)
+
+
+async def wait_players_closed(*players: Player) -> None:
+    """Wait until whatever :func:`close_players` let go of for ``players`` is gone."""
+    for player in players:
+        if isinstance(player, ClosablePlayer):
+            await player.wait_closed()
+
+
 @runtime_checkable
 class SubmittedMovePlayer(Protocol):
     """A player whose moves come from outside the game, rather than being computed.

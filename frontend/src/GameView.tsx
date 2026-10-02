@@ -63,13 +63,34 @@ function describeModel(player: PlayerInfo): string | null {
   return `${rating}, ${choosing}`;
 }
 
+/**
+ * How long Stockfish thinks, for a side Stockfish is playing, and whether it plays at the
+ * strength asked for. Its levels only cover a range, and a game against "800" that is really
+ * played against its floor has to say so, or the viewer learns the wrong thing from it.
+ */
+function describeStockfish(player: PlayerInfo): string | null {
+  const stockfish = player.stockfish;
+  if (stockfish === null) {
+    return null;
+  }
+  const pace = `${stockfish.move_time} s a move`;
+  if (stockfish.elo === stockfish.requested_elo) {
+    return pace;
+  }
+  const limit =
+    stockfish.requested_elo < stockfish.elo
+      ? `plays no weaker than ${stockfish.min_elo}`
+      : `plays no stronger than ${stockfish.max_elo}`;
+  return `${pace}; ${stockfish.requested_elo} was asked for, and Stockfish ${limit}`;
+}
+
 /** One side of the game: who is playing it, and how they were asked to. */
 function Player({ player }: { player: PlayerInfo }) {
-  const model = describeModel(player);
+  const note = describeModel(player) ?? describeStockfish(player);
   return (
     <dd>
       {player.name}
-      {model !== null && <span className="model-note">{model}</span>}
+      {note !== null && <span className="model-note">{note}</span>}
     </dd>
   );
 }

@@ -19,8 +19,8 @@ import { castling, check, drawnByFiftyMoves, promotion } from './test/positions'
 vi.mock('uplot', async () => ({ default: (await import('./test/fakeUPlot')).FakeUPlot }));
 
 const PLAYERS = {
-  human: { name: 'Human', accepts_moves: true, model: null },
-  random: { name: 'Random mover', accepts_moves: false, model: null },
+  human: { name: 'Human', accepts_moves: true, model: null, stockfish: null },
+  random: { name: 'Random mover', accepts_moves: false, model: null, stockfish: null },
 } satisfies Record<string, PlayerInfo>;
 
 /** The kinds of player these tests set a game up between. */
@@ -262,8 +262,8 @@ describe('App', () => {
       type: 'state',
       game: {
         ...foolsMateStart.game,
-        white: { name: 'Random mover', accepts_moves: false, model: null },
-        black: { name: 'Someone else', accepts_moves: false, model: null },
+        white: { name: 'Random mover', accepts_moves: false, model: null, stockfish: null },
+        black: { name: 'Someone else', accepts_moves: false, model: null, stockfish: null },
       },
     });
 
@@ -289,6 +289,7 @@ describe('App', () => {
             strategy: 'argmax',
             temperature: null,
           },
+          stockfish: null,
         },
         black: {
           name: 'mlp-baseline step 6000',
@@ -300,6 +301,7 @@ describe('App', () => {
             strategy: 'sample',
             temperature: 1.5,
           },
+          stockfish: null,
         },
       },
     });
@@ -308,6 +310,37 @@ describe('App', () => {
     expect(players).toEqual([
       'mlp-baseline step 12000plays like 1600, plays its best move',
       'mlp-baseline step 6000no rating, samples at 1.5',
+    ]);
+  });
+
+  it('says how strong Stockfish plays, and when that is not the strength asked for', () => {
+    render(<App />);
+    FakeWebSocket.latest.open();
+    const stockfish = { min_elo: 1320, max_elo: 3190, move_time: 1 };
+
+    FakeWebSocket.latest.deliver({
+      type: 'state',
+      game: {
+        ...foolsMateStart.game,
+        white: {
+          name: 'Stockfish 1500',
+          accepts_moves: false,
+          model: null,
+          stockfish: { ...stockfish, elo: 1500, requested_elo: 1500 },
+        },
+        black: {
+          name: 'Stockfish 1320',
+          accepts_moves: false,
+          model: null,
+          stockfish: { ...stockfish, elo: 1320, requested_elo: 800, move_time: 0.25 },
+        },
+      },
+    });
+
+    const players = screen.getAllByRole('definition').map((element) => element.textContent);
+    expect(players).toEqual([
+      'Stockfish 15001 s a move',
+      'Stockfish 13200.25 s a move; 800 was asked for, and Stockfish plays no weaker than 1320',
     ]);
   });
 

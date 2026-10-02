@@ -102,6 +102,18 @@ export interface ModelDescription {
   temperature: number | null;
 }
 
+/** How strong a Stockfish side plays: mirrors chess_ai.players.StockfishDescription. */
+export interface StockfishDescription {
+  /** The strength it plays at, within the range Stockfish supports. */
+  elo: number;
+  /** The strength that was asked for, which is `elo` unless it was out of range. */
+  requested_elo: number;
+  min_elo: number;
+  max_elo: number;
+  /** Seconds it thinks about each move. */
+  move_time: number;
+}
+
 export interface PlayerInfo {
   /** Shown to viewers, such as "Random mover". */
   name: string;
@@ -109,6 +121,8 @@ export interface PlayerInfo {
   accepts_moves: boolean;
   /** Which checkpoint is playing this side, for a side a checkpoint is playing. */
   model: ModelDescription | null;
+  /** How strong Stockfish plays this side, for a side Stockfish is playing. */
+  stockfish: StockfishDescription | null;
 }
 
 /** Mirrors chess_ai.game_session.GameState. */
@@ -200,13 +214,14 @@ export interface SavedGame {
   result: Result;
 }
 
-export type PlayerKind = 'human' | 'random' | 'model';
+export type PlayerKind = 'human' | 'random' | 'model' | 'stockfish';
 
 /** What each player kind is called in the new-game form. */
 export const PLAYER_NAMES: Record<PlayerKind, string> = {
   human: 'Human',
   random: 'Random mover',
   model: 'Model',
+  stockfish: 'Stockfish',
 };
 
 /** Which checkpoint of a run to play: its newest, its best, or the one from a step. */
@@ -226,11 +241,24 @@ export interface ModelPlayerSpec {
   seed?: number | null;
 }
 
+/** Stockfish, held to a strength by its calibrated limit. */
+export interface StockfishPlayerSpec {
+  kind: 'stockfish';
+  /** The Elo to play at; one Stockfish does not support is played at the nearest it does. */
+  elo: number;
+  /** Seconds Stockfish thinks about each move. */
+  move_time: number;
+}
+
 /**
  * What one side of a new game is to be played by. A tagged union, because the kinds do
  * not take the same settings; mirrors the server's own.
  */
-export type PlayerSpec = { kind: 'human' } | { kind: 'random' } | ModelPlayerSpec;
+export type PlayerSpec =
+  | { kind: 'human' }
+  | { kind: 'random' }
+  | ModelPlayerSpec
+  | StockfishPlayerSpec;
 
 export interface NewGameRequest {
   white: PlayerSpec;
@@ -497,6 +525,25 @@ async function replayed(url: URL, init?: RequestInit): Promise<ReplayFile> {
     throw new Error(await refusal(response));
   }
   return (await response.json()) as ReplayFile;
+}
+
+/** Which Stockfish games are played against here: mirrors chess_ai.stockfish.StockfishInfo. */
+export interface StockfishInfo {
+  /** What the engine calls itself, such as "Stockfish 17". */
+  name: string;
+  /** The weakest level it plays, which a lower Elo is raised to. */
+  min_elo: number;
+  /** The strongest level it plays, which a higher Elo is lowered to. */
+  max_elo: number;
+}
+
+/** The Stockfish this server plays, or why there is none to play. */
+export async function fetchStockfish(): Promise<StockfishInfo> {
+  const response = await fetch(apiUrl('stockfish'));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as StockfishInfo;
 }
 
 /** Every training run on this server, newest first, with where each has got to. */
