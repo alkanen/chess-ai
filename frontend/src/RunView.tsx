@@ -16,19 +16,31 @@ import { useXAxis, XAxisPicker } from './XAxisPicker';
 import './RunsView.css';
 import './RunView.css';
 
-function gibibytes(bytes: number | null): string {
-  return bytes == null ? '–' : `${(bytes / 2 ** 30).toFixed(1)} GiB`;
+function gibibytes(bytes: number): string {
+  return (bytes / 2 ** 30).toFixed(1);
 }
 
-function describeGpu(gpu: GpuStats): string {
+/**
+ * The GPU's memory as far as the heartbeat knows it. What the run holds says whether a bigger
+ * batch would fit, and what the card has in use says whether something else is crowding it,
+ * so both are shown; any of the three figures may be missing.
+ */
+function describeGpuMemory(gpu: GpuStats): string {
+  const used = gpu.memory_used_bytes;
+  const total = gpu.memory_total_bytes;
   const parts = [
-    gpu.utilization_percent != null && `${Math.round(gpu.utilization_percent)}% busy`,
-    gpu.process_memory_bytes != null && `${gibibytes(gpu.process_memory_bytes)} held by the run`,
-    gpu.memory_used_bytes != null &&
-      `${gibibytes(gpu.memory_used_bytes)} / ${gibibytes(gpu.memory_total_bytes)} in use`,
-    gpu.temperature_celsius != null && `${Math.round(gpu.temperature_celsius)} °C`,
+    gpu.process_memory_bytes != null && `${gibibytes(gpu.process_memory_bytes)} GiB held by the run`,
+    used != null &&
+      (total != null
+        ? `${gibibytes(used)} of ${gibibytes(total)} GiB in use on the card`
+        : `${gibibytes(used)} GiB in use on the card`),
   ].filter(Boolean);
-  return [gpu.name, parts.join(', ')].filter(Boolean).join(': ') || '–';
+  return parts.join(', ') || '–';
+}
+
+/** A figure NVML may not have given, rounded and with its unit, or a dash. */
+function rounded(value: number | null, unit: string): string {
+  return value == null ? '–' : `${Math.round(value)}${unit}`;
 }
 
 /**
@@ -138,10 +150,17 @@ export function RunView({ name }: RunViewProps) {
                 <dd>{formatDuration(beat.eta_seconds)}</dd>
               </>
             )}
-            {beat?.gpu != null && (
+            <dt>Device</dt>
+            <dd>{info?.device ?? '–'}</dd>
+            {/* Like the time left, a dead run's last figures are not shown as if current. */}
+            {running && beat.gpu != null && (
               <>
-                <dt>GPU</dt>
-                <dd>{describeGpu(beat.gpu)}</dd>
+                <dt>GPU busy</dt>
+                <dd>{rounded(beat.gpu.utilization_percent, '%')}</dd>
+                <dt>GPU memory</dt>
+                <dd>{describeGpuMemory(beat.gpu)}</dd>
+                <dt>GPU temperature</dt>
+                <dd>{rounded(beat.gpu.temperature_celsius, ' °C')}</dd>
               </>
             )}
             <dt>Heartbeat</dt>
