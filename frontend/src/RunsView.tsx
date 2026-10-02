@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 import { fetchRuns, type RunSummary } from './api';
 import { MAX_SERIES } from './runCharts';
 import { RunStateBadge } from './RunState';
@@ -48,6 +48,9 @@ function useRunList(): [RunSummary[] | null, string | null] {
   return [runs, error];
 }
 
+/** The columns of a run's second row, which its name above them spans: tags to heartbeat. */
+const COLUMNS_UNDER_NAME = 9;
+
 /** Where a run has got to, as steps done of steps asked for. */
 function progress(run: RunSummary): string {
   if (run.step == null) {
@@ -62,6 +65,24 @@ function progress(run: RunSummary): string {
 function metric(record: RunSummary['latest_train'], name: string): number | null {
   const value = record?.[name];
   return typeof value === 'number' ? value : null;
+}
+
+/**
+ * A run's name with a place to break the line after every underscore, which is where its
+ * parts end: a long name wraps between "lr1e-3_" and "epochs4" rather than inside a word.
+ */
+function breakable(name: string) {
+  const parts = name.split('_');
+  return parts.map((part, index) => (
+    <Fragment key={index}>
+      {part}
+      {index < parts.length - 1 && (
+        <>
+          _<wbr />
+        </>
+      )}
+    </Fragment>
+  ));
 }
 
 /** Where the runs called `names` are compared, in the address. */
@@ -145,7 +166,6 @@ export function RunsView() {
                   <span className="visually-hidden">Compare</span>
                 </th>
                 <th scope="col">State</th>
-                <th scope="col">Run</th>
                 <th scope="col">Tags</th>
                 <th scope="col">Architecture</th>
                 <th scope="col">Dataset</th>
@@ -165,10 +185,15 @@ export function RunsView() {
                 <th scope="col">Heartbeat</th>
               </tr>
             </thead>
-            <tbody>
-              {shown.map((run) => (
-                <tr key={run.name}>
-                  <td>
+            {/*
+              A run is two rows, as a group: its title, with its name under it, across the whole
+              width, where a long name has room, and its facts and numbers under the column headers. The
+              checkbox and the state belong to both and span them.
+            */}
+            {shown.map((run) => (
+              <tbody key={run.name} className="run">
+                <tr>
+                  <td rowSpan={2} className="choose">
                     <input
                       type="checkbox"
                       aria-label={`Compare ${run.name}`}
@@ -182,13 +207,15 @@ export function RunsView() {
                       onChange={(e) => choose(run.name, e.target.checked)}
                     />
                   </td>
-                  <td>
+                  <td rowSpan={2} className="state">
                     <RunStateBadge status={run.status} stale={run.stale} />
                   </td>
-                  <th scope="row" className="name">
+                  <th scope="rowgroup" colSpan={COLUMNS_UNDER_NAME} className="name">
                     <a href={`#runs/${encodeURIComponent(run.name)}`}>{run.title ?? run.name}</a>
-                    {run.title != null && <span className="run-name">{run.name}</span>}
+                    {run.title != null && <span className="run-name">{breakable(run.name)}</span>}
                   </th>
+                </tr>
+                <tr className="facts">
                   <td>
                     <TagList tags={run.tags ?? []} picked={filter} onPick={setTag} />
                   </td>
@@ -207,8 +234,8 @@ export function RunsView() {
                   </td>
                   <td className="updated">{formatAgo(run.updated)}</td>
                 </tr>
-              ))}
-            </tbody>
+              </tbody>
+            ))}
           </table>
         </div>
       )}
