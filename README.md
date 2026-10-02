@@ -278,7 +278,8 @@ size settings:
 - `"resnet"` is the AlphaZero and Maia residual tower: a 3×3 convolution into `channels` planes,
   `blocks` residual blocks of two more, and small policy and value heads.
   [experiments/resnet-lichess.toml](experiments/resnet-lichess.toml) trains one on the same
-  data and schedule as the MLP in [experiments/mlp-lichess.toml](experiments/mlp-lichess.toml).
+  data and schedule as the MLP in [experiments/mlp-lichess.toml](experiments/mlp-lichess.toml),
+  at a higher learning rate that a sweep of short runs found suits it better.
   A convolution has nowhere to put the global features, so `globals` says how they get in:
   `"planes"` paints each one over a whole 8×8 plane next to the board's, and `"film"`
   (feature-wise linear modulation) has them scale and shift every channel of every block, so
@@ -288,11 +289,6 @@ Weight decay shrinks the weights that multiply an input, and leaves biases and t
 normalization layers' scales and shifts alone, as is usual. Runs made before the trainer told
 the two apart decayed everything; `[optimizer] decay_biases_and_norms = true` brings that
 back, to reproduce one of them.
-
-The four `experiments/resnet-lr-sweep-*.toml` configs look for the ResNet's learning rate: they
-are `resnet-lichess.toml` cut to 20,000 steps, at learning rates 5e-4, 1e-3, 2e-3 and 4e-3, about
-20 minutes each on an RTX 4090. Compare them with each other rather than with a long run, whose
-learning rate decays far more slowly.
 
 Validation runs on the held-back games at `[validation] every_steps`, on the same positions every
 time so the curve means something, and prints and logs five numbers:

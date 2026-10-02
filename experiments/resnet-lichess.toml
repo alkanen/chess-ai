@@ -12,10 +12,10 @@
 # The run is named after this file unless `name` says otherwise, and `--name` on the
 # command line overrides both, which is how the same config is run more than once.
 #
-# A residual tower on the same data, encoder and schedule as mlp-lichess.toml, so that the
-# two runs line up on the dashboard and differ only in the model section. A small tower to
-# start with: on an RTX 4090 it trains about 160,000 positions a second (140,000 with
-# globals = "film") against the MLP's 220,000, so the four epochs take about five hours.
+# A residual tower on the same data, encoder and schedule as mlp-lichess.toml. At the MLP's
+# learning rate of 1e-3 it reached top-1 50.2% against the MLP's 45.9%, in 5.7 hours on an
+# RTX 4090 at about 160,000 positions a second. globals = "film" did exactly as well, 10%
+# slower, and made no more use of the ratings than "planes" does.
 
 name = "resnet-lichess"
 
@@ -87,7 +87,10 @@ data_workers = 4                           # default: 4
 log_every_steps = 50                       # default: 50
 
 [optimizer]
-learning_rate = 1e-3                       # default: 0.001
+# From a sweep of 20,000-step runs from 5e-4 to 1.6e-2: 8e-3 and 1.6e-2 came out best and
+# tied, and 1.6e-2 already needed clipping to stay steady. 4e-3 was within 0.011 of them
+# and two doublings clear of that edge, which a run this long and a wider tower both want.
+learning_rate = 4e-3                       # default: 0.001
 weight_decay = 0.01                        # default: 0.01
 
 # Whether weight decay also shrinks biases and the normalization layers' scales and
