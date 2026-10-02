@@ -43,9 +43,9 @@ function serving(...answers: RunSummary[][]) {
   return fetch;
 }
 
-/** The cells of the row for the run called `name`. */
+/** The cells of the rows for the run called `name`. */
 function row(name: string) {
-  return within(screen.getByRole('rowheader', { name }).closest('tr')!);
+  return within(screen.getByRole('rowheader', { name }).closest('tbody')!);
 }
 
 describe('RunsView', () => {
@@ -59,6 +59,28 @@ describe('RunsView', () => {
     document.head.querySelector('base')?.remove();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it('gives each run two rows: its title and name across the table, its numbers under the headers', async () => {
+    serving([summary({ title: 'MLP baseline' }), summary({ name: 'old', status: 'finished' })]);
+
+    render(<RunsView />);
+
+    const header = await screen.findByRole('rowheader', { name: /MLP baseline/ });
+    const headers = screen.getAllByRole('columnheader').map((cell) => cell.textContent);
+    expect(headers).not.toContain('Run');
+    const group = header.closest('tbody')!;
+    const [top, facts] = within(group).getAllByRole('row');
+    // The checkbox and the state span both rows; the name spans every column after them.
+    const spanning = within(top).getAllByRole('cell');
+    expect(spanning.map((cell) => cell.getAttribute('rowspan'))).toEqual(['2', '2']);
+    expect(within(spanning[1]).getByText('running')).toBeInTheDocument();
+    expect(Number(header.getAttribute('colspan'))).toBe(headers.indexOf('Heartbeat') - headers.indexOf('State'));
+    expect(within(facts).getAllByRole('cell')).toHaveLength(Number(header.getAttribute('colspan')));
+    expect(within(header).getByRole('link', { name: 'MLP baseline' })).toBeInTheDocument();
+    expect(within(header).getByText('mlp-big')).toBeInTheDocument();
+    // One group per run, so that a run's two rows are never split between runs.
+    expect(screen.getAllByRole('rowgroup')).toHaveLength(3);
   });
 
   it('lists every run with its state, what it is, and its latest metrics', async () => {
@@ -134,7 +156,7 @@ describe('RunsView', () => {
 
     const link = await screen.findByRole('link', { name: 'Wide MLP' });
     expect(link).toHaveAttribute('href', '#runs/mlp-big');
-    const named = within(link.closest('tr')!);
+    const named = within(link.closest('tbody')!);
     expect(named.getByText('mlp-big')).toBeInTheDocument();
     expect(within(named.getByRole('list', { name: 'Tags' })).getAllByRole('listitem')).toHaveLength(2);
   });

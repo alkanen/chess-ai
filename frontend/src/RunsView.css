@@ -40,18 +40,35 @@
   border-bottom: 1px solid rgb(128 128 128 / 35%);
 }
 
-.runs-view tbody tr + tr {
+/* A run's two rows are one thing: the line goes between runs, and so does the highlight. */
+.runs-view tbody.run + tbody.run {
   border-top: 1px solid rgb(128 128 128 / 18%);
 }
 
-.runs-view tbody tr:hover {
+.runs-view tbody.run:hover {
   background: rgb(128 128 128 / 10%);
 }
 
+.runs-view .choose,
+.runs-view .state {
+  vertical-align: middle;
+}
+
+/* The title and the name on one line across the table, wrapping only when even that is short. */
 .runs-view .name {
+  padding-bottom: 0;
   font-weight: 500;
   white-space: normal;
   overflow-wrap: anywhere;
+}
+
+.runs-view .facts td {
+  padding-top: 0.2rem;
+}
+
+/* Side by side, so that a run with several tags is not several lines tall. */
+.runs-view .facts .tag-list {
+  flex-wrap: nowrap;
 }
 
 .runs-view a {
@@ -72,6 +89,7 @@
   opacity: 0.75;
 }
 
+/* Under the title, a line of its own, so that the title is what the eye finds first. */
 .runs-view .run-name {
   display: block;
   font-family: ui-monospace, monospace;
