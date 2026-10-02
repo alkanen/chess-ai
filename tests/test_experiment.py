@@ -4,6 +4,7 @@ import json
 import re
 import textwrap
 import tomllib
+import typing
 from pathlib import Path
 
 import pytest
@@ -180,6 +181,43 @@ def test_the_resolved_config_has_every_default_filled_in(tmp_path):
     json.dumps(resolved)  # It goes into run.json and into every checkpoint.
 
 
+def test_a_run_starts_from_its_seed_unless_told_otherwise(tmp_path):
+    assert config(tmp_path, MINIMAL).initialize_from is None
+
+
+@pytest.mark.parametrize(
+    ("written", "chosen"),
+    [("", "best"), ('checkpoint = "latest"', "latest"), ("checkpoint = 3000", 3000)],
+)
+def test_a_run_can_start_from_another_runs_checkpoint(tmp_path, written, chosen):
+    loaded = config(tmp_path, MINIMAL + f'[initialize_from]\nrun = "pretrained"\n{written}\n')
+
+    assert loaded.initialize_from.run == "pretrained"
+    assert loaded.initialize_from.checkpoint == chosen
+
+
+@pytest.mark.parametrize(
+    ("written", "complaint"),
+    [
+        ("checkpoint = -1", "not negative"),
+        ('checkpoint = "worst"', "initialize_from.checkpoint"),
+        ('run = "../elsewhere"', "invalid run name"),
+        ("", "initialize_from.run: Field required"),
+    ],
+)
+def test_a_checkpoint_to_start_from_that_cannot_be_one_is_refused(tmp_path, written, complaint):
+    body = (
+        MINIMAL
+        + "[initialize_from]\n"
+        + ('run = "pretrained"\n' if "run" not in written and written else "")
+        + written
+        + "\n"
+    )
+
+    with pytest.raises(ExperimentError, match=re.escape(complaint)):
+        config(tmp_path, body)
+
+
 EXPERIMENTS = Path(__file__).parent.parent / "experiments"
 """The configs shipped with the repo, by absolute path: the suite runs elsewhere."""
 
@@ -187,11 +225,13 @@ DEFAULT_NOTE = re.compile(
     r"^(?P<key>[a-z_0-9]+) = (?P<value>.*?)\s*#\s*default:\s*(?P<default>.+)$"
 )
 SETTING = re.compile(r"^(?P<key>[a-z_0-9]+) = (?P<value>.*?)\s*(?:#.*)?$")
-SECTION = re.compile(r"^\[(?P<name>[a-z]+)\]")
+SECTION = re.compile(r"^\[(?P<name>[a-z_]+)\]")
+COMMENTED_SECTION = re.compile(r"^# \[(?P<name>[a-z_]+)\]")
+"""An optional section, shown commented out: a config documents it without asking for it."""
 
-NO_DEFAULT = {"name", "dataset.name"}
-"""Settings with nothing to compare against: the run's name follows the file, and the
-dataset has to be named."""
+NO_DEFAULT = {"name", "dataset.name", "initialize_from.run"}
+"""Settings with nothing to compare against: the run's name follows the file, the dataset has to
+be named, and so does a run to initialize from."""
 
 
 def shipped() -> list[Path]:
@@ -201,12 +241,13 @@ def shipped() -> list[Path]:
 
 
 def sections() -> dict[str, type]:
-    """The config's sections, by the table name they appear under."""
-    return {
-        name: field.annotation
-        for name, field in ExperimentConfig.model_fields.items()
-        if hasattr(field.annotation, "model_fields")
-    }
+    """The config's sections, by the table name they appear under, the optional ones included."""
+    found = {}
+    for name, field in ExperimentConfig.model_fields.items():
+        for candidate in (field.annotation, *typing.get_args(field.annotation)):
+            if hasattr(candidate, "model_fields"):
+                found[name] = candidate
+    return found
 
 
 def settable(section: str, data: dict) -> set[str]:
@@ -225,11 +266,16 @@ def written(path: Path) -> dict[str, dict[str, str]]:
     """The settings each section of ``path`` writes, with the default each one notes."""
     found: dict[str, dict[str, str]] = {"": {}}
     section = ""
+    commented = False
     for line in path.read_text().splitlines():
-        if heading := SECTION.match(line):
+        if heading := SECTION.match(line) or COMMENTED_SECTION.match(line):
             section = heading.group("name")
+            commented = line.startswith("#")
             found.setdefault(section, {})
-        elif setting := SETTING.match(line):
+            continue
+        if commented:
+            line = line.removeprefix("# ")
+        if setting := SETTING.match(line):
             note = DEFAULT_NOTE.match(line)
             found[section][setting.group("key")] = note.group("default") if note else None
     return found

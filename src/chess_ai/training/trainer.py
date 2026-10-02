@@ -10,14 +10,25 @@ crash would lose: metrics are appended as they are measured, the heartbeat is re
 moves, and checkpoints are written as they are made. A run is therefore worth exactly as much
 after it crashes as it was a moment before.
 
+A run can be stopped and carried on. SIGINT or SIGTERM asks it to stop: it finishes the step it
+is on, saves a checkpoint and says it stopped, and :func:`resume` later carries on from that
+checkpoint — or from the last one a crashed run saved — exactly where it was, weights, optimizer,
+schedule, data order and random state and all, so that a run stopped and resumed learns what it
+would have learned in one go. A new run can also start from another run's weights instead of
+from its seed (``[initialize_from]``), which is how fine-tuning works: weights only, into a run
+with a dataset, an optimizer and a schedule of its own.
+
 The loop keeps two things honest about speed. It never reads a loss back from the GPU except when
 it is about to log one, because every read is a stall; and before it starts it measures a few real
 steps and says how fast they were, so a two-day run can be recognised as a two-day run before it
 is two days in.
 """
 
+import copy
 import logging
 import math
+import signal
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -28,8 +39,10 @@ from pathlib import Path
 from typing import Any, Final, NamedTuple
 
 import torch
+from pydantic import ValidationError
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import Subset
 
 from chess_ai.dataset import TRAIN, VALIDATION, Dataset, DatasetError, ManifestError, open_dataset
 from chess_ai.encoders import Encoder, EncoderSpec, create_encoder
@@ -37,7 +50,15 @@ from chess_ai.models import ChessModel, create_model
 from chess_ai.move_codec import VOCABULARY_SIZE
 from chess_ai.registry import RegistryError
 from chess_ai.training import checkpoint
-from chess_ai.training.batches import Batch, PositionBatches, batch_loader
+from chess_ai.training.batches import (
+    STOP_SIGNALS,
+    Batch,
+    PositionBatches,
+    batch_loader,
+    holding_stop_signals,
+    iterate,
+)
+from chess_ai.training.checkpoint import CheckpointError
 from chess_ai.training.experiment import ExperimentConfig, OptimizerSection
 from chess_ai.training.hardware import (
     HardwareError,
@@ -49,7 +70,9 @@ from chess_ai.training.hardware import (
 from chess_ai.training.run_store import TRAIN as TRAIN_SPLIT
 from chess_ai.training.run_store import VALIDATION as VALIDATION_SPLIT
 from chess_ai.training.run_store import (
+    CheckpointPolicy,
     DatasetReference,
+    Lineage,
     ModelReference,
     RunError,
     RunInfo,
@@ -57,7 +80,9 @@ from chess_ai.training.run_store import (
     RunStatus,
     RunWriter,
     check_available,
+    choose_checkpoint,
     code_version,
+    open_run,
     run_path,
 )
 from chess_ai.training.validate import validate
@@ -75,6 +100,20 @@ class TrainingError(Exception):
     """Something about this run cannot work, and the person who asked for it can fix it."""
 
 
+class TrainingStopped(Exception):  # noqa: N818 - it is not an error, and saying so is the point
+    """A run was asked to stop by a signal, and did: its checkpoint is saved, and it says so.
+
+    Raised rather than returned, so that nothing that waits for a run can take a run that
+    stopped half-way for one that finished.
+    """
+
+    def __init__(self, directory: Path, step: int, signal_number: int) -> None:
+        super().__init__(f"stopped by {signal.Signals(signal_number).name} at step {step:,}")
+        self.directory = directory
+        self.step = step
+        self.signal = signal_number
+
+
 @dataclass
 class _Progress:
     """Where the loop has got to, for a heartbeat written by whoever catches the way it ended.
@@ -86,6 +125,17 @@ class _Progress:
 
     step: int = 0
     epoch: float = 0.0
+
+
+@dataclass
+class _Start:
+    """Where the loop starts: at the beginning, or where a resumed run's checkpoint left off."""
+
+    step: int = 0
+    elapsed: float = 0.0
+    """Seconds the run had trained for by ``step``, so that its clock carries on from there."""
+    rng_state: dict[str, torch.Tensor] | None = None
+    """The random state to carry on from; ``None`` to keep what the seed gave."""
 
 
 @dataclass
@@ -125,14 +175,16 @@ def train(
         raise TrainingError(e) from e
 
     run = _prepare(config, data_dir=data_dir)
+    # Before the probe, which puts back whatever weights it found: these are the ones to keep.
+    lineage = _initialize(run, runs_dir=runs_dir) if config.initialize_from else None
     estimate = _probe(run)
-    for line in _summary(run, estimate):
+    for line in _summary(run, estimate, lineage=lineage):
         say(line)
 
     try:
         writer = RunWriter.create(
             directory,
-            _info(run, estimate=estimate),
+            _info(run, estimate=estimate, lineage=lineage),
             config_text=config_text,
             policy=config.checkpoints.policy(),
             overwrite=overwrite,
@@ -140,16 +192,262 @@ def train(
     except RunError as e:
         raise TrainingError(e) from e
     say(f"chess-ai: run {config.name} in {directory}")
+    _train_to_end(run, writer, _optimizer(run), _Start(), say=say)
+    return directory
 
-    progress = _Progress()
-    with writer:
+
+def resume(
+    name: str, *, data_dir: Path, runs_dir: Path, say: Callable[[str], None] = print
+) -> Path:
+    """Carry on training the run called ``name`` from its latest checkpoint, to the end.
+
+    Everything comes from the checkpoint — the config, the weights, the optimizer's moments, the
+    step, the random state and how long the run had been going — and the dataset is opened by
+    name again and checked to be the one the run was trained on, since the order positions are
+    visited in is a function of the dataset, the seed and the step. The learning rate schedule is
+    a function of the step too, so it carries on as it was: a run resumes the schedule it was
+    started with, and cannot be made longer by resuming it.
+
+    Raises:
+        TrainingError: the run cannot be resumed, and the message says why.
+        TrainingStopped: it was stopped again.
+    """
+    try:
+        directory = open_run(runs_dir, name).directory
+        # Taken before anything is read, so that what is read cannot change underneath: a
+        # trainer still writing this run would be saving checkpoints past the one chosen here.
+        writer = RunWriter.reopen(directory, policy=CheckpointPolicy())
+    except RunError as e:
+        raise TrainingError(e) from e
+    try:
+        run, optimizer, start = _resumable(RunReader(directory), data_dir=data_dir, say=say)
+        writer.policy = run.config.checkpoints.policy()
+        writer.rewind(start.step)
+    except RunError as e:
+        writer.close()
+        raise TrainingError(e) from e
+    except BaseException:
+        writer.close()
+        raise
+    say(f"chess-ai: resuming run {name} in {directory}")
+    _train_to_end(run, writer, optimizer, start, say=say)
+    return directory
+
+
+def _resumable(
+    reader: RunReader, *, data_dir: Path, say: Callable[[str], None]
+) -> tuple[_Run, torch.optim.Optimizer, _Start]:
+    """The run in ``reader`` put back as its latest checkpoint left it, ready to carry on."""
+    name = reader.name
+    status = reader.status
+    if status is not None and status.status == RunStatus.FINISHED:
+        raise TrainingError(f"run {name!r} has already finished all {status.steps:,} steps")
+    latest = reader.latest_checkpoint()
+    if latest is None:
+        raise TrainingError(
+            f"run {name!r} saved no checkpoint, so there is nothing to resume it from; "
+            "start it again with 'chess-ai train --overwrite'"
+        )
+    payload = _load(reader.checkpoint_path(latest), doing=f"resume run {name!r}")
+    config = _config_of(payload, name)
+    run = _prepare(config, data_dir=data_dir)
+    _same_dataset(run, reader)
+    doing = f"resume run {name!r} from step {latest.step:,}"
+    _check_compatible(run, payload, doing=doing)
+    estimate = _probe(run)
+    # After the probe, which puts back the weights it found rather than the ones it left.
+    _load_weights(run, payload, doing=doing)
+    optimizer = _optimizer(run)
+    try:
+        optimizer.load_state_dict(payload["optimizer_state"])
+    except (KeyError, ValueError) as e:
+        raise TrainingError(
+            f"cannot {doing}: its optimizer state does not fit this run's optimizer: {e}"
+        ) from e
+    start = _Start(
+        step=latest.step,
+        elapsed=_elapsed_at(payload, reader, latest.step),
+        rng_state=payload.get("rng_state") or None,
+    )
+    for line in _summary(run, estimate, start=start):
+        say(line)
+    return run, optimizer, start
+
+
+def _config_of(payload: dict[str, Any], name: str) -> ExperimentConfig:
+    """The config a checkpoint was trained with, as this code reads configs.
+
+    Runs made before weight decay left biases and norms alone decayed everything, and their
+    optimizer state has the one parameter group to show for it; their config does not say so,
+    because the setting did not exist. The new default would build two groups and fail to load
+    the state, so a config without the setting gets the behaviour it was trained with.
+    """
+    data = copy.deepcopy(payload.get("config") or {})
+    if isinstance(data.get("optimizer"), dict):
+        data["optimizer"].setdefault("decay_biases_and_norms", True)
+    data["name"] = name
+    try:
+        return ExperimentConfig.model_validate(data)
+    except ValidationError as e:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}"
+            for error in e.errors()
+        )
+        raise TrainingError(
+            f"run {name!r} was trained with a config this code no longer accepts: {problems}"
+        ) from e
+
+
+def _same_dataset(run: _Run, reader: RunReader) -> None:
+    """Refuse to resume on a dataset other than the one the run was training on.
+
+    A dataset rebuilt under the same name has other positions in its train split, or the same
+    ones in another order, and a resumed run would visit them in an order the steps before it
+    never saw — revisiting some and skipping others, which is not the run that was stopped.
+    """
+    recorded = reader.info.dataset
+    manifest = run.dataset.manifest
+    there = (recorded.train_positions, recorded.created)
+    here = (_split_positions(manifest, TRAIN), manifest.created)
+    if there != here:
+        raise TrainingError(
+            f"dataset {manifest.name!r} is not the one run {reader.name!r} was training on "
+            f"({there[0]:,} train positions, built {there[1]}; now {here[0]:,}, built {here[1]}), "
+            "so a resumed run would not carry on where it was. Start a new run with "
+            "[initialize_from] to train its weights on this dataset instead"
+        )
+
+
+def _elapsed_at(payload: dict[str, Any], reader: RunReader, step: int) -> float:
+    """How long the run had trained for by ``step``, so that its clock carries on from there.
+
+    Checkpoints written before they recorded it leave the metrics log to say, which has the
+    time of every line it wrote; the last one up to ``step`` is close enough for a chart.
+    """
+    elapsed = payload.get("elapsed")
+    if isinstance(elapsed, int | float):
+        return float(elapsed)
+    times = [
+        line["elapsed"]
+        for line in reader.stream_metrics()
+        if isinstance(line.get("step"), int)
+        and line["step"] <= step
+        and isinstance(line.get("elapsed"), int | float)
+    ]
+    return float(max(times, default=0.0))
+
+
+def _initialize(run: _Run, *, runs_dir: Path) -> Lineage:
+    """Load the weights ``[initialize_from]`` names into ``run``, and say where they came from."""
+    source = run.config.initialize_from
+    assert source is not None
+    if source.run == run.config.name:
+        raise TrainingError(
+            f"run {run.config.name!r} cannot be initialized from itself; give it another name"
+        )
+    try:
+        reader = open_run(runs_dir, source.run)
+        chosen = choose_checkpoint(reader, source.checkpoint)
+    except RunError as e:
+        raise TrainingError(f"cannot initialize from run {source.run!r}: {e}") from e
+    doing = f"initialize from run {source.run!r} at step {chosen.step:,}"
+    payload = _load(reader.checkpoint_path(chosen), doing=doing)
+    _check_compatible(run, payload, doing=doing)
+    _load_weights(run, payload, doing=doing)
+    trained_on = (payload.get("config") or {}).get("dataset") or {}
+    return Lineage(
+        run=source.run,
+        step=chosen.step,
+        checkpoint=source.checkpoint,
+        dataset=trained_on.get("name") if isinstance(trained_on, dict) else None,
+    )
+
+
+def _load(path: Path, *, doing: str) -> dict[str, Any]:
+    try:
+        return checkpoint.load(path)
+    except CheckpointError as e:
+        raise TrainingError(f"cannot {doing}: {e}") from e
+
+
+def _check_compatible(run: _Run, payload: dict[str, Any], *, doing: str) -> None:
+    """Refuse a checkpoint whose weights were trained for another architecture or input.
+
+    Asked before the weights are loaded, because the answer is worth more than the shape error
+    loading them would give — and because an encoder with the same shapes and other options
+    (another rating scale, another orientation) would load without one, into a model that then
+    reads every input differently from how it learned to.
+    """
+    problems = []
+    architecture = payload.get("architecture")
+    if architecture != run.config.model.architecture:
+        problems.append(
+            f"it is a {architecture!r} and this run trains a {run.config.model.architecture!r}"
+        )
+    try:
+        spec = checkpoint.spec_of(payload)
+    except CheckpointError as e:
+        problems.append(str(e))
+    else:
+        if spec != run.spec:
+            problems.append(
+                f"it was trained on {_describe_spec(spec)} and this run's encoder gives "
+                f"{_describe_spec(run.spec)}"
+            )
+    if problems:
+        raise TrainingError(f"cannot {doing}: {'; '.join(problems)}")
+
+
+def _load_weights(run: _Run, payload: dict[str, Any], *, doing: str) -> None:
+    """Load a checkpoint's weights, or say which model options they were trained with.
+
+    Options that leave the weights' shapes alone, such as dropout, may differ: fine-tuning with
+    more of it is an ordinary thing to want.
+    """
+    try:
+        run.model.load_state_dict(payload["model_state"])
+    except (KeyError, RuntimeError) as e:
+        raise TrainingError(
+            f"cannot {doing}: its weights do not fit this model "
+            f"(trained with{_options(payload.get('model_options') or {}) or ' no options'}, "
+            f"and this run has{_options(run.config.model.options) or ' none'}): {e}"
+        ) from e
+
+
+def _describe_spec(spec: EncoderSpec) -> str:
+    return f"{spec.describe()}{_options(spec.options)}"
+
+
+def _train_to_end(
+    run: _Run,
+    writer: RunWriter,
+    optimizer: torch.optim.Optimizer,
+    start: _Start,
+    *,
+    say: Callable[[str], None],
+) -> None:
+    """Run the loop with ``writer``, and have the run say how it ended whichever way it does."""
+    progress = _Progress(step=start.step, epoch=_epoch(run, start.step))
+    with writer, _stop_signals() as stop:
         try:
-            _loop(run, writer, progress, say=say)
+            stopped_by = _loop(run, writer, progress, optimizer, start, stop=stop, say=say)
         except KeyboardInterrupt:
-            # A checkpoint on the way out, and a resume that picks it up, is its own slice of
-            # work; all this can promise is that the run does not go on claiming to be running.
-            _ended(writer, RunStatus.STOPPED, run, progress, "interrupted")
-            raise
+            # Only a second ctrl-c, or one that came before there was a loop to stop: the
+            # first is caught and stops the run at the end of its step, with a checkpoint.
+            steps = run.config.schedule.steps
+            if progress.step == steps and _saved_at(writer, steps):
+                # The last step's checkpoint is saved, so the run had finished, and all that
+                # was interrupted was tidying up after it.
+                _finished_anyway(writer, run, progress, say=say)
+                return
+            if not _saved_at(writer, progress.step):
+                message = "interrupted before a checkpoint could be saved"
+                _ended(writer, RunStatus.STOPPED, run, progress, message)
+                raise
+            # A checkpoint of the step the run had got to is on the disk, so whatever was
+            # interrupted, such as letting go of the loader after the stop checkpoint, cost
+            # nothing: the run stopped there, and a resume carries on from it.
+            stopped_by = stop.signal or signal.SIGINT
         except RunError as e:
             # A disk filling up an hour into a run is an ordinary accident: the run says it
             # crashed, and the person running it gets a sentence rather than a traceback.
@@ -158,7 +456,85 @@ def train(
         except Exception as e:
             _ended(writer, RunStatus.CRASHED, run, progress, f"{type(e).__name__}: {e}")
             raise
-    return directory
+        if stopped_by is not None:
+            message = f"stopped by {signal.Signals(stopped_by).name}"
+            _ended(writer, RunStatus.STOPPED, run, progress, message)
+            raise TrainingStopped(writer.directory, progress.step, stopped_by)
+
+
+def _finished_anyway(
+    writer: RunWriter, run: _Run, progress: _Progress, *, say: Callable[[str], None]
+) -> None:
+    """Say a run that was interrupted after its last checkpoint finished, unless it already has.
+
+    Asked of the heartbeat rather than remembered, for the same reason as :func:`_saved_at`: the
+    interruption can fall after the run said it finished and before anything here noted it,
+    and the heartbeat it wrote then has the whole run's throughput, which this one cannot.
+    """
+    try:
+        status = RunReader(writer.directory).status
+    except RunError:
+        status = None
+    if status is None or status.status != RunStatus.FINISHED:
+        steps = run.config.schedule.steps
+        writer.finish(RunStatus.FINISHED, step=steps, steps=steps, epoch=round(progress.epoch, 4))
+    say(f"chess-ai: finished {run.config.schedule.steps:,} steps")
+
+
+def _saved_at(writer: RunWriter, step: int) -> bool:
+    """Whether the run has a checkpoint of ``step`` on the disk.
+
+    Asked of the disk rather than remembered, because what it answers is how a run that was
+    interrupted ended, and an interruption can fall between a checkpoint landing and anything
+    here noting that it did. A checkpoint file is only there once it is whole, and the loop
+    holds stop signals back until its save is done, index and all, so a file that is there
+    is a checkpoint that was saved.
+    """
+    latest = RunReader(writer.directory).latest_checkpoint()
+    return latest is not None and latest.step == step
+
+
+class _StopRequest:
+    """Which signal asked the run to stop, once one has."""
+
+    def __init__(self) -> None:
+        self.signal: int | None = None
+
+
+@contextmanager
+def _stop_signals() -> Iterator[_StopRequest]:
+    """Turn SIGINT and SIGTERM into a request the loop answers at the end of its step.
+
+    A step interrupted half-way would leave the optimizer half-updated, which is no state to
+    save. So the first signal only says the run should stop, and the loop stops when the step is
+    whole. A second ctrl-c is somebody who will not wait, and interrupts at once, as ctrl-c
+    always did. A second SIGTERM is not: it comes from a machine, and often twice — ``uv run``
+    forwards it to the trainer, so one sent to the process group, as a service manager stopping
+    the run sends it, arrives twice — and SIGKILL is there for a stop that cannot wait.
+
+    Nothing is printed from the handler, which can run in the middle of another print. Python
+    only lets the main thread handle signals, so anywhere else this does nothing, and the
+    handlers there were before are put back afterwards.
+    """
+    request = _StopRequest()
+    if threading.current_thread() is not threading.main_thread():
+        yield request
+        return
+
+    def now(signal_number: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    def stop(signal_number: int, frame: Any) -> None:
+        if request.signal is None:
+            request.signal = signal_number
+        signal.signal(signal.SIGINT, now)
+
+    previous = {each: signal.signal(each, stop) for each in STOP_SIGNALS}
+    try:
+        yield request
+    finally:
+        for each, handler in previous.items():
+            signal.signal(each, handler)
 
 
 def _ended(
@@ -258,8 +634,16 @@ def _parameter_groups(model: nn.Module, settings: OptimizerSection) -> list[dict
     ]
 
 
-def _schedule(run: _Run, optimizer: torch.optim.Optimizer) -> torch.optim.lr_scheduler.LambdaLR:
-    """Linear warmup, then cosine decay to a fraction of the learning rate."""
+def _schedule(
+    run: _Run, optimizer: torch.optim.Optimizer, *, completed: int = 0
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Linear warmup, then cosine decay to a fraction of the learning rate.
+
+    ``completed`` is how many steps have already been taken, for a resumed run. The schedule is
+    a function of the step and nothing else, so starting it there is restoring it exactly; it
+    reads each group's starting rate from ``initial_lr``, which the optimizer state it was
+    loaded from carries.
+    """
     schedule = run.config.schedule
     warmup = schedule.warmup_steps
     floor = schedule.min_learning_rate_fraction
@@ -271,7 +655,7 @@ def _schedule(run: _Run, optimizer: torch.optim.Optimizer) -> torch.optim.lr_sch
         progress = min(1.0, (completed - warmup) / decaying)
         return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor, last_epoch=completed - 1)
 
 
 def _losses(run: _Run, batch: Batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -356,30 +740,45 @@ def _probe(run: _Run) -> float | None:
     return PROBE_STEPS * run.config.training.batch_size / elapsed if elapsed > 0 else None
 
 
-def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[str], None]) -> None:
-    """Train to the end of the schedule, logging, validating and checkpointing as it goes."""
+def _loop(
+    run: _Run,
+    writer: RunWriter,
+    progress: _Progress,
+    optimizer: torch.optim.Optimizer,
+    start: _Start,
+    *,
+    stop: _StopRequest,
+    say: Callable[[str], None],
+) -> int | None:
+    """Train to the end of the schedule, logging, validating and checkpointing as it goes.
+
+    Returns ``None`` at the end of the schedule, or the signal that stopped it before then,
+    once the checkpoint of the step it stopped at is saved.
+    """
     config = run.config
     steps = config.schedule.steps
-    optimizer = _optimizer(run)
-    scheduler = _schedule(run, optimizer)
+    scheduler = _schedule(run, optimizer, completed=start.step)
     validation = _validation_split(run, say=say)
 
     run.model.train()
-    started = time.perf_counter()
+    started = time.perf_counter() - start.elapsed
     window = _Window(run.device)
     latest: dict[str, float] = {}
     measured_at: int | None = None
     """The step ``latest`` was measured at, so a checkpoint is never indexed with another's."""
     throughput: float | None = None
-    step = 0
-    positions_seen = 0
+    step = start.step
+    positions_seen = step * run.batches.positions_per_batch
     """How many training positions the weights have been moved by, which is what a chart of
     runs with different batch sizes compares them on. Not ``positions``: a validation line
     already says how many positions it measured under that name."""
     beat = _Beat(writer, steps=steps)
-    beat.write(RunStatus.RUNNING, step=0, epoch=0.0, device=run.device, force=True)
+    beat.write(RunStatus.RUNNING, step=step, epoch=progress.epoch, device=run.device, force=True)
+    if start.rng_state is not None:
+        # Last, so that nothing between here and the first step draws from it.
+        _restore_rng(start.rng_state, run.device)
 
-    for batch in _stream(run):
+    for batch in _stream(run, first=start.step):
         batch = batch.to(run.device, non_blocking=run.device.type == "cuda")
         # Read before the scheduler moves on: this is the rate the weights just moved by, and
         # get_last_lr() after scheduler.step() is already the next step's.
@@ -440,13 +839,36 @@ def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[s
             say(_validation_line(step, steps, latest))
             measured_at = step
 
+        # A stop asked for at the last step is a run that finished.
+        stopping = stop.signal is not None and step < steps
+        if stop.signal is not None and step == steps:
+            say(f"chess-ai: {signal.Signals(stop.signal).name} at the last step: finishing the run")
+        if stopping:
+            say(
+                f"chess-ai: {signal.Signals(stop.signal).name} at step {step:,}: "
+                "saving a checkpoint and stopping"
+            )
+            saving = True
+
         if saving:
             metrics = latest if measured_at == step else {}
             with window.paused():
-                path = writer.save_checkpoint(
-                    step, _writer(run, optimizer, step=step, metrics=metrics), metrics=metrics
+                save = _writer(
+                    run,
+                    optimizer,
+                    step=step,
+                    metrics=metrics,
+                    elapsed=time.perf_counter() - started,
                 )
+                # Whole or not at all: the file lands before the index records it, prunes
+                # and picks the best, and a checkpoint the index never heard of has no
+                # metrics and can never be the best. A ctrl-c waits the seconds it takes.
+                with holding_stop_signals():
+                    path = writer.save_checkpoint(step, save, metrics=metrics)
             LOGGER.info("saved %s", path)
+
+        if stopping:
+            return stop.signal
 
     elapsed = time.perf_counter() - started
     writer.finish(
@@ -457,6 +879,7 @@ def _loop(run: _Run, writer: RunWriter, progress: _Progress, *, say: Callable[[s
         positions_per_second=step * config.training.batch_size / elapsed if elapsed else None,
     )
     say(f"chess-ai: finished {steps:,} steps in {_duration(elapsed)}{_best(writer, config)}")
+    return None
 
 
 def _best(writer: RunWriter, config: ExperimentConfig) -> str:
@@ -482,11 +905,17 @@ def _best(writer: RunWriter, config: ExperimentConfig) -> str:
     return f", best {config.checkpoints.metric} {value:.4f} at step {best.step:,}"
 
 
-def _stream(run: _Run) -> Iterator[Batch]:
-    """Every batch of the run, in one pass over one loader; see :mod:`chess_ai.training.batches`."""
-    loader = batch_loader(run.batches, workers=run.config.training.data_workers, device=run.device)
+def _stream(run: _Run, *, first: int = 0) -> Iterator[Batch]:
+    """Every batch of the run from ``first`` on, in one pass over one loader.
+
+    A batch is numbered over the whole run, and which positions it holds is a function of that
+    number and the seed, so a resumed run starts at the batch it would have trained on next and
+    sees exactly what it would have seen. See :mod:`chess_ai.training.batches`.
+    """
+    batches = run.batches if not first else Subset(run.batches, range(first, len(run.batches)))
+    loader = batch_loader(batches, workers=run.config.training.data_workers, device=run.device)
     try:
-        yield from loader
+        yield from iterate(loader)
     finally:
         # Lets the worker processes go rather than leaving them to a finalizer, which matters
         # when the run is ending because something went wrong.
@@ -609,7 +1038,12 @@ def _validate(run: _Run, split) -> dict[str, float]:
 
 
 def _writer(
-    run: _Run, optimizer: torch.optim.Optimizer, *, step: int, metrics: dict[str, float]
+    run: _Run,
+    optimizer: torch.optim.Optimizer,
+    *,
+    step: int,
+    metrics: dict[str, float],
+    elapsed: float,
 ) -> Callable[[Path], None]:
     """A function that writes this step's checkpoint wherever the run store puts it."""
     payload = checkpoint.build(
@@ -623,11 +1057,32 @@ def _writer(
         model_state=run.model.state_dict(),
         optimizer_state=optimizer.state_dict(),
         metrics=metrics,
+        rng_state=_rng_state(run.device),
+        elapsed=round(elapsed, 3),
     )
     return lambda path: checkpoint.save(payload, path)
 
 
-def _info(run: _Run, *, estimate: float | None) -> RunInfo:
+def _rng_state(device: torch.device) -> dict[str, torch.Tensor]:
+    """The state of every random generator training draws from, which is dropout's.
+
+    The order positions are visited in is not among them: it is a function of the seed and the
+    epoch, and is worked out again rather than restored. The loader has a generator of its own.
+    """
+    state = {"cpu": torch.get_rng_state()}
+    if device.type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state(device)
+    return state
+
+
+def _restore_rng(state: dict[str, torch.Tensor], device: torch.device) -> None:
+    if "cpu" in state:
+        torch.set_rng_state(state["cpu"])
+    if device.type == "cuda" and "cuda" in state:
+        torch.cuda.set_rng_state(state["cuda"], device)
+
+
+def _info(run: _Run, *, estimate: float | None, lineage: Lineage | None) -> RunInfo:
     """What ``run.json`` records: the config, and everything it resolved against."""
     manifest = run.dataset.manifest
     return RunInfo(
@@ -656,19 +1111,28 @@ def _info(run: _Run, *, estimate: float | None) -> RunInfo:
         steps=run.config.schedule.steps,
         batch_size=run.config.training.batch_size,
         positions_per_second_estimate=estimate,
+        initialized_from=lineage,
     )
 
 
-def _summary(run: _Run, estimate: float | None) -> list[str]:
+def _summary(
+    run: _Run,
+    estimate: float | None,
+    *,
+    lineage: Lineage | None = None,
+    start: _Start | None = None,
+) -> list[str]:
     """What a run says about itself before it starts, so it can be stopped before it is too late."""
     config = run.config
     manifest = run.dataset.manifest
     positions = run.batches.positions
     steps = config.schedule.steps
+    first = start.step if start else 0
     epochs = steps * config.training.batch_size / positions
     precision = "bf16" if run.dtype is torch.bfloat16 else "fp32"
     lines = [
-        f"chess-ai: run {config.name}, seed {config.seed}",
+        f"chess-ai: run {config.name}, seed {config.seed}"
+        + (f", resuming at step {first:,}" if start else ""),
         f"  device     {describe_device(run.device)}, {precision}",
         f"  dataset    {manifest.name}: {manifest.games:,} games, {positions:,} train positions, "
         f"{_split_positions(manifest, VALIDATION):,} validation",
@@ -680,11 +1144,19 @@ def _summary(run: _Run, estimate: float | None) -> list[str]:
         f"warmup {config.schedule.warmup_steps:,} then cosine",
         f"  optimizer  {_describe_optimizer(run)}",
     ]
+    if lineage is not None:
+        trained_on = f", trained on {lineage.dataset}" if lineage.dataset else ""
+        lines.append(f"  weights    from run {lineage.run} at step {lineage.step:,}{trained_on}")
+    if start is not None and start.rng_state is None:
+        lines.append(
+            "  note       the checkpoint predates saving the random state, so dropout will not "
+            "draw what it would have"
+        )
     if estimate:
-        seconds = steps * config.training.batch_size / estimate
+        seconds = (steps - first) * config.training.batch_size / estimate
         lines.append(
             f"  throughput {estimate:,.0f} positions/s measured, "
-            f"about {_duration(seconds)} for the run"
+            f"about {_duration(seconds)} for {'the rest of ' if start else ''}the run"
         )
     # Only when this run will validate at all: whether it does is decided from the manifest,
     # not from the schedules, and a note about extra passes two lines above the warning that

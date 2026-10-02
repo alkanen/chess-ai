@@ -17,6 +17,7 @@ a pawn reaching the last rank must promote. Such an index exists all the same, a
 queen move it also is, and simply never comes up as a pawn's.
 """
 
+import hashlib
 from typing import Final
 
 import chess
@@ -78,6 +79,18 @@ VOCABULARY: Final = _vocabulary()
 
 VOCABULARY_SIZE: Final = len(VOCABULARY)
 """How many moves there are, which is how wide a policy output is."""
+
+
+def _fingerprint() -> str:
+    """A short hash of every move in order, so that a reordering is caught as well as a resize."""
+    return hashlib.sha256(" ".join(move.uci() for move in VOCABULARY).encode()).hexdigest()[:16]
+
+
+VOCABULARY_FINGERPRINT: Final = _fingerprint()
+"""What a checkpoint records about the vocabulary its policy head was trained in.
+
+The size alone says too little: the same moves in another order give a head of the same shape,
+which would load without complaint and play a different move than the one it scored."""
 
 _INDICES: Final = {move: index for index, move in enumerate(VOCABULARY)}
 

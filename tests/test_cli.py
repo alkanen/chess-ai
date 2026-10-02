@@ -705,6 +705,50 @@ def test_train_reports_a_missing_config_file(tmp_path, capsys):
     assert "cannot read experiment config" in capsys.readouterr().err
 
 
+def test_a_stopped_run_says_how_to_carry_on_and_resume_does(tmp_path, capsys, monkeypatch):
+    import signal
+
+    from training_helpers import dataset, experiment
+
+    from chess_ai.training import RunStatus, open_run, trainer
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+    real = trainer._step
+    calls = {"n": 0}
+
+    def stop_on_the_run_s_second_step(*args, **kwargs):
+        result = real(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == trainer.PROBE_STEPS + 1 + 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return result
+
+    monkeypatch.setattr(trainer, "_step", stop_on_the_run_s_second_step)
+
+    assert main(["train", str(config)]) == 128 + signal.SIGTERM, "a stop is not a finish"
+    err = capsys.readouterr().err
+    assert "stopped by SIGTERM at step 2; 'chess-ai resume tiny' carries on from there" in err
+    monkeypatch.setattr(trainer, "_step", real)
+
+    assert main(["resume", "tiny"]) == 0
+    assert open_run(tmp_path / "runs", "tiny").status.status == RunStatus.FINISHED
+    assert "resuming at step 2" in capsys.readouterr().out
+
+
+def test_resume_says_why_a_run_cannot_be_resumed_without_a_traceback(tmp_path, capsys):
+    from training_helpers import dataset, experiment
+
+    dataset(tmp_path / "data")
+    assert main(["train", str(experiment(tmp_path / "tiny.toml"))]) == 0
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["resume", "tiny"])
+
+    assert exit_info.value.code == 2
+    assert "already finished" in capsys.readouterr().err
+
+
 def annotated_run(tmp_path, name: str = "tiny") -> Path:
     """A run directory with nothing in it but its name, which is all annotating it needs."""
     directory = tmp_path / "runs" / name

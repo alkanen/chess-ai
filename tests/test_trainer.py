@@ -1,11 +1,15 @@
 """A whole training run, small enough to be a test: what it writes, and that it is repeatable."""
 
+import contextlib
 import copy
 import dataclasses
 import json
 import math
+import os
 import pickle
+import signal
 import tempfile
+import time
 import tracemalloc
 from pathlib import Path
 
@@ -22,14 +26,22 @@ from chess_ai.models import create_model
 from chess_ai.training import (
     RunStatus,
     TrainingError,
+    TrainingStopped,
     load_experiment,
     open_run,
+    resume,
     train,
     trainer,
 )
 from chess_ai.training import checkpoint as checkpoints
 from chess_ai.training.experiment import OptimizerSection
-from chess_ai.training.run_store import CHECKPOINTS_DIR, RunError, RunWriter, checkpoint_file
+from chess_ai.training.run_store import (
+    CHECKPOINTS_DIR,
+    CheckpointPolicy,
+    RunError,
+    RunWriter,
+    checkpoint_file,
+)
 
 
 @pytest.fixture
@@ -356,6 +368,7 @@ def test_nothing_is_left_half_written_in_the_run_directory(tmp_path, data_dir):
         "metrics.jsonl",
         "run.json",
         "status.json",
+        "writer.lock",
     ]
     assert (reader.directory / CHECKPOINTS_DIR / checkpoint_file(6)).is_file()
 
@@ -386,7 +399,7 @@ def test_an_interrupted_run_says_where_it_got_to(tmp_path, data_dir, monkeypatch
     assert status.status == RunStatus.STOPPED
     assert status.step == 2, "the step it had finished, not zero"
     assert status.epoch > 0
-    assert status.message == "interrupted"
+    assert status.message == "interrupted before a checkpoint could be saved"
 
 
 def test_the_probe_does_not_leave_the_dataset_open_for_the_loader(tmp_path, data_dir, monkeypatch):
@@ -804,3 +817,609 @@ def test_the_summary_says_when_there_is_no_weight_decay_or_clipping(tmp_path, da
     lines = said_by(tmp_path, data_dir, optimizer="weight_decay = 0\ngradient_clip = 0")
 
     assert "  optimizer  AdamW, no weight decay, no clipping" in lines
+
+
+# Stopping, resuming, and starting from another run's weights.
+
+DROPOUT = 'architecture = "mlp"\ndepth = 2\nwidth = 16\ndropout = 0.2'
+"""A model that draws random numbers at every step, so that a resume has to restore them."""
+
+REAL_STEP = trainer._step
+"""For putting the step back once a test has stopped a run with it, and wants to resume."""
+
+RESUMABLE = {
+    "model": DROPOUT,
+    "schedule": "steps = 9\nwarmup_steps = 2",
+    "validation": "every_steps = 4\npositions = 16",
+    "checkpoints": "every_steps = 4\nkeep = 5",
+}
+
+
+def after_steps(monkeypatch, steps: int, then) -> None:
+    """Call ``then`` once the run's own step number ``steps`` is done, and never again."""
+    real = trainer._step
+    # The throughput probe takes steps of its own first, and they come through here too.
+    calls = {"n": -(trainer.PROBE_STEPS + 1)}
+
+    def counted(*args, **kwargs):
+        result = real(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == steps:
+            then()
+        return result
+
+    monkeypatch.setattr(trainer, "_step", counted)
+
+
+def signal_after(monkeypatch, steps: int, number: int = signal.SIGTERM) -> None:
+    after_steps(monkeypatch, steps, lambda: os.kill(os.getpid(), number))
+
+
+def resumed(tmp_path, data_dir, name: str, say=lambda line: None):
+    resume(name, data_dir=data_dir, runs_dir=tmp_path / "runs", say=say)
+    return open_run(tmp_path / "runs", name)
+
+
+def final_payload(reader) -> dict:
+    return checkpoints.load(reader.checkpoint_path(reader.latest_checkpoint()))
+
+
+def assert_same_state(first: dict, second: dict) -> None:
+    for name, value in first["model_state"].items():
+        assert torch.equal(value, second["model_state"][name]), name
+    moments = [
+        (first["optimizer_state"]["state"][key], second["optimizer_state"]["state"][key])
+        for key in first["optimizer_state"]["state"]
+    ]
+    for ours, theirs in moments:
+        for name, value in ours.items():
+            assert torch.equal(value, theirs[name]), name
+
+
+def lines_of(reader, split: str) -> list[dict]:
+    return [line for line in reader.metrics() if line["split"] == split]
+
+
+@pytest.mark.parametrize("number", [signal.SIGTERM, signal.SIGINT])
+def test_a_stop_signal_saves_a_checkpoint_and_says_the_run_stopped(
+    tmp_path, data_dir, monkeypatch, number
+):
+    signal_after(monkeypatch, 5, number)
+    said: list[str] = []
+    config = load_experiment(experiment(tmp_path / "tiny.toml", **RESUMABLE))
+
+    with pytest.raises(TrainingStopped) as stopped:
+        train(
+            config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=said.append
+        )
+
+    assert (stopped.value.step, stopped.value.signal) == (5, number)
+    reader = open_run(tmp_path / "runs", "tiny")
+    status = reader.status
+    assert status.status == RunStatus.STOPPED
+    assert status.step == 5
+    assert status.message == f"stopped by {signal.Signals(number).name}"
+    assert [info.step for info in reader.checkpoints()] == [4, 5], "saved at the step it stopped"
+    assert final_payload(reader)["step"] == 5
+    assert any("saving a checkpoint and stopping" in line for line in said), said
+
+
+def test_a_second_sigterm_still_lets_the_run_save_its_checkpoint(tmp_path, data_dir, monkeypatch):
+    """SIGTERM comes from machines, and often twice.
+
+    ``uv run`` forwards a SIGTERM to the trainer, so one sent to the process group — as a
+    service manager stopping the run does — arrives twice. Taking the second for impatience
+    would throw away the checkpoint the first asked for.
+    """
+
+    def twice():
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    after_steps(monkeypatch, 5, twice)
+
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+
+    reader = open_run(tmp_path / "runs", "tiny")
+    assert reader.status.message == "stopped by SIGTERM"
+    assert reader.latest_checkpoint().step == 5
+
+
+@pytest.mark.parametrize("first", [signal.SIGINT, signal.SIGTERM])
+def test_a_second_ctrl_c_stops_the_run_at_once(tmp_path, data_dir, monkeypatch, first):
+    """Somebody who presses it again does not want to wait for the checkpoint."""
+
+    def impatiently():
+        os.kill(os.getpid(), first)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    # During the sixth step, with the last checkpoint at the fourth.
+    after_steps(monkeypatch, 6, impatiently)
+
+    with pytest.raises(KeyboardInterrupt):
+        run(tmp_path, data_dir, **RESUMABLE)
+
+    reader = open_run(tmp_path / "runs", "tiny")
+    assert reader.status.status == RunStatus.STOPPED
+    assert reader.status.message == "interrupted before a checkpoint could be saved"
+    assert reader.latest_checkpoint().step == 4
+
+
+def test_a_second_ctrl_c_just_after_a_checkpoint_is_a_stop_at_that_checkpoint(
+    tmp_path, data_dir, monkeypatch
+):
+    """Nothing the run had done was lost, so it says it stopped, and where to carry on from."""
+
+    def impatiently():
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    # During the fifth step, which has not counted yet, just after the checkpoint at the fourth.
+    after_steps(monkeypatch, 5, impatiently)
+
+    with pytest.raises(TrainingStopped) as stopped:
+        run(tmp_path, data_dir, **RESUMABLE)
+
+    assert stopped.value.step == 4
+    reader = open_run(tmp_path / "runs", "tiny")
+    assert reader.status.message == "stopped by SIGTERM"
+    assert reader.latest_checkpoint().step == 4
+
+
+def test_a_second_ctrl_c_once_the_checkpoint_is_saved_still_says_the_run_stopped_with_it(
+    tmp_path, data_dir, monkeypatch
+):
+    """Interrupting what is left after the stop checkpoint costs nothing, and must not say so."""
+    signal_after(monkeypatch, 5, signal.SIGINT)
+    real = RunWriter.save_checkpoint
+
+    def impatient(self, step, write, **options):
+        saved = real(self, step, write, **options)
+        if step == 5:
+            os.kill(os.getpid(), signal.SIGINT)
+        return saved
+
+    monkeypatch.setattr(RunWriter, "save_checkpoint", impatient)
+
+    with pytest.raises(TrainingStopped) as stopped:
+        run(tmp_path, data_dir, **RESUMABLE)
+
+    assert (stopped.value.step, stopped.value.signal) == (5, signal.SIGINT)
+    reader = open_run(tmp_path / "runs", "tiny")
+    assert reader.status.message == "stopped by SIGINT"
+    assert reader.latest_checkpoint().step == 5
+
+
+def test_a_run_trains_off_the_main_thread_without_stop_signals(tmp_path, data_dir):
+    """As a run started from a web request would be: there is no ctrl-c to answer there."""
+    import threading
+
+    failures = []
+
+    def training():
+        try:
+            run(tmp_path, data_dir, training='device = "cpu"\nbatch_size = 8\ndata_workers = 2')
+        except Exception as e:  # noqa: BLE001 - reported to the test's own thread
+            failures.append(e)
+
+    thread = threading.Thread(target=training)
+    thread.start()
+    thread.join()
+
+    assert failures == []
+    assert open_run(tmp_path / "runs", "tiny").status.status == RunStatus.FINISHED
+
+
+def test_ctrl_c_twice_at_the_last_step_still_finishes_the_run(tmp_path, data_dir, monkeypatch):
+    """A stop asked for at the last step is a run that finished, and a second one after its
+    last checkpoint, while it lets go of its loader, interrupts nothing that was left to do."""
+    signal_after(monkeypatch, 9, signal.SIGINT)
+    real = RunWriter.save_checkpoint
+
+    def impatient(self, step, write, **options):
+        saved = real(self, step, write, **options)
+        if step == 9:
+            os.kill(os.getpid(), signal.SIGINT)
+        return saved
+
+    monkeypatch.setattr(RunWriter, "save_checkpoint", impatient)
+
+    reader = run(tmp_path, data_dir, **RESUMABLE)
+
+    assert reader.status.status == RunStatus.FINISHED
+    assert reader.status.step == 9
+
+
+def test_ctrl_c_after_the_run_has_said_it_finished_leaves_it_finished(
+    tmp_path, data_dir, monkeypatch
+):
+    signal_after(monkeypatch, 9, signal.SIGINT)
+    real = RunWriter.finish
+
+    def impatient(self, status, **fields):
+        real(self, status, **fields)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    monkeypatch.setattr(RunWriter, "finish", impatient)
+
+    reader = run(tmp_path, data_dir, **RESUMABLE)
+
+    assert reader.status.status == RunStatus.FINISHED
+    assert reader.status.positions_per_second > 0, "the heartbeat finish wrote, not another"
+
+
+@pytest.mark.parametrize(("first_at", "step", "status"), [(9, 9, "finished"), (5, 5, "stopped")])
+def test_a_ctrl_c_while_a_checkpoint_is_indexed_waits_until_it_is(
+    tmp_path, data_dir, monkeypatch, first_at, step, status
+):
+    """The file lands before the index records it, prunes and picks the best; a checkpoint the
+    index never heard of has no metrics, so it could never be the run's best."""
+    signal_after(monkeypatch, first_at, signal.SIGTERM)
+    real = RunWriter._reindex
+
+    def impatient(self, saved, metrics):
+        if saved == step:
+            os.kill(os.getpid(), signal.SIGINT)
+        real(self, saved, metrics)
+
+    monkeypatch.setattr(RunWriter, "_reindex", impatient)
+
+    with contextlib.suppress(TrainingStopped, KeyboardInterrupt):
+        run(tmp_path, data_dir, **RESUMABLE)
+
+    reader = open_run(tmp_path / "runs", "tiny")
+    index = json.loads((reader.directory / CHECKPOINTS_DIR / "index.json").read_text())
+    assert step in [entry["step"] for entry in index["checkpoints"]], "the index has it"
+    assert reader.status.status == status
+
+
+def test_the_handlers_there_were_are_put_back_after_a_run(tmp_path, data_dir):
+    before = {number: signal.getsignal(number) for number in trainer.STOP_SIGNALS}
+
+    run(tmp_path, data_dir)
+
+    assert {number: signal.getsignal(number) for number in trainer.STOP_SIGNALS} == before
+
+
+def test_a_run_stopped_and_resumed_learns_what_it_would_have_in_one_go(
+    tmp_path, data_dir, monkeypatch
+):
+    """Weights, optimizer, schedule, data order and dropout's random draws all carry on."""
+    whole = run(tmp_path, data_dir, name="whole", **RESUMABLE)
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="halves", **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+
+    halves = resumed(tmp_path, data_dir, "halves")
+
+    assert halves.status.status == RunStatus.FINISHED
+    assert halves.status.step == 9
+    assert_same_state(final_payload(whole), final_payload(halves))
+    assert [
+        (line["step"], line["policy_loss"], line["top1"]) for line in lines_of(halves, "validation")
+    ] == [
+        (line["step"], line["policy_loss"], line["top1"]) for line in lines_of(whole, "validation")
+    ]
+    # The first window after the resume covers fewer steps; the ones after it are the same.
+    for ours, theirs in zip(lines_of(halves, "train"), lines_of(whole, "train"), strict=True):
+        assert ours["step"] == theirs["step"]
+        assert ours["positions_seen"] == theirs["positions_seen"]
+        assert ours["learning_rate"] == theirs["learning_rate"]
+        if ours["step"] > 6:
+            assert ours["loss"] == theirs["loss"], ours["step"]
+
+
+def test_a_crashed_run_resumes_from_its_last_checkpoint_and_forgets_what_came_after(
+    tmp_path, data_dir, monkeypatch
+):
+    whole = run(tmp_path, data_dir, name="whole", **RESUMABLE)
+
+    def crash():
+        raise RuntimeError("the GPU fell over")
+
+    after_steps(monkeypatch, 7, crash)
+    with pytest.raises(RuntimeError, match="fell over"):
+        run(tmp_path, data_dir, name="crashed", **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    crashed = open_run(tmp_path / "runs", "crashed")
+    assert crashed.status.status == RunStatus.CRASHED
+    assert max(line["step"] for line in crashed.metrics()) == 6, "it logged past its checkpoint"
+
+    crashed = resumed(tmp_path, data_dir, "crashed")
+
+    assert crashed.status.status == RunStatus.FINISHED
+    assert_same_state(final_payload(whole), final_payload(crashed))
+    logged = [(line["step"], line["split"]) for line in crashed.metrics()]
+    assert logged == [(line["step"], line["split"]) for line in whole.metrics()], (
+        "each step logged once, in order"
+    )
+    elapsed = [line["elapsed"] for line in crashed.metrics()]
+    assert elapsed == sorted(elapsed), "and the clock carries on rather than starting again"
+
+
+def test_a_resumed_run_says_where_it_carries_on_from(tmp_path, data_dir, monkeypatch):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    said: list[str] = []
+
+    resumed(tmp_path, data_dir, "tiny", say=said.append)
+
+    assert said[0] == "chess-ai: run tiny, seed 7, resuming at step 5", said
+    assert not [line for line in said if "predates" in line], said
+
+
+def test_a_run_can_be_stopped_and_resumed_more_than_once(tmp_path, data_dir, monkeypatch):
+    whole = run(tmp_path, data_dir, name="whole", **RESUMABLE)
+    signal_after(monkeypatch, 2)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="thirds", **RESUMABLE)
+    signal_after(monkeypatch, 3)  # Three steps into the resumed run, so at step 5.
+    with pytest.raises(TrainingStopped) as stopped:
+        resumed(tmp_path, data_dir, "thirds")
+    assert stopped.value.step == 5
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+
+    thirds = resumed(tmp_path, data_dir, "thirds")
+
+    assert_same_state(final_payload(whole), final_payload(thirds))
+
+
+@pytest.mark.parametrize("number", [signal.SIGINT, signal.SIGTERM])
+def test_workers_leave_stopping_to_the_trainer(tmp_path, data_dir, monkeypatch, number):
+    """Ctrl-C reaches every process in the terminal's group, the loader's workers included,
+    and a service manager stopping a run sends SIGTERM to all of its processes.
+
+    A worker that died of it would make the loader raise in the trainer, at whatever it was
+    doing — which may be saving the very checkpoint the signal asked for.
+    """
+    import multiprocessing
+    import subprocess
+
+    def signal_everyone():
+        # From a process of its own, as a terminal or a service manager would: a worker
+        # signalled by its own parent is let off by torch, which would hide what this is about.
+        workers = [str(child.pid) for child in multiprocessing.active_children()]
+        assert workers, "the loader's workers are running"
+        subprocess.run(["kill", "-s", signal.Signals(number).name[3:], *workers], check=True)
+        os.kill(os.getpid(), number)
+        # As long as saving a large checkpoint takes, which is when the loader would hear of a
+        # worker that died, and raise.
+        time.sleep(0.5)
+
+    after_steps(monkeypatch, 3, signal_everyone)
+    workers = 'device = "cpu"\nbatch_size = 8\ndata_workers = 2\nlog_every_steps = 2'
+
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, training=workers, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+
+    reader = open_run(tmp_path / "runs", "tiny")
+    assert reader.status.status == RunStatus.STOPPED
+    assert reader.latest_checkpoint().step == 3
+    assert resumed(tmp_path, data_dir, "tiny").status.status == RunStatus.FINISHED
+
+
+def test_a_finished_run_is_not_resumed(tmp_path, data_dir):
+    run(tmp_path, data_dir)
+
+    with pytest.raises(TrainingError, match="already finished all 6 steps"):
+        resumed(tmp_path, data_dir, "tiny")
+
+
+def test_a_run_with_no_checkpoint_cannot_be_resumed(tmp_path, data_dir, monkeypatch):
+    def crash():
+        raise RuntimeError("the GPU fell over")
+
+    after_steps(monkeypatch, 1, crash)
+    with pytest.raises(RuntimeError):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+
+    with pytest.raises(TrainingError, match="saved no checkpoint.*--overwrite"):
+        resumed(tmp_path, data_dir, "tiny")
+
+
+def test_a_run_that_is_not_there_cannot_be_resumed(tmp_path, data_dir):
+    with pytest.raises(TrainingError, match="no run called 'nope'"):
+        resumed(tmp_path, data_dir, "nope")
+
+
+def test_a_run_still_being_written_is_not_resumed_under_it(tmp_path, data_dir, monkeypatch):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    reader = open_run(tmp_path / "runs", "tiny")
+    before = reader.metrics()
+
+    with (
+        RunWriter.reopen(reader.directory, policy=CheckpointPolicy()),
+        pytest.raises(TrainingError, match="being written by another process"),
+    ):
+        resumed(tmp_path, data_dir, "tiny")
+
+    assert reader.metrics() == before
+    assert reader.status.status == RunStatus.STOPPED
+
+
+def test_a_run_whose_dataset_was_rebuilt_is_not_resumed(tmp_path, data_dir, monkeypatch):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    dataset(data_dir, validation_fraction=0.5, overwrite=True)
+
+    with pytest.raises(
+        TrainingError, match=r"not the one run 'tiny' was training on.*initialize_from"
+    ):
+        resumed(tmp_path, data_dir, "tiny")
+
+    assert open_run(tmp_path / "runs", "tiny").status.status == RunStatus.STOPPED
+
+
+def test_a_run_from_before_biases_went_undecayed_resumes_with_everything_decayed(
+    tmp_path, data_dir, monkeypatch
+):
+    """Its config does not mention the setting, and its optimizer state has one group."""
+    sections = {**RESUMABLE, "optimizer": "decay_biases_and_norms = true"}
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **sections)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    reader = open_run(tmp_path / "runs", "tiny")
+    path = reader.checkpoint_path(reader.latest_checkpoint())
+    payload = checkpoints.load(path)
+    del payload["config"]["optimizer"]["decay_biases_and_norms"]
+    checkpoints.save(payload, path)
+
+    assert resumed(tmp_path, data_dir, "tiny").status.status == RunStatus.FINISHED
+
+
+def test_a_checkpoint_from_before_the_random_state_was_saved_still_resumes(
+    tmp_path, data_dir, monkeypatch
+):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    reader = open_run(tmp_path / "runs", "tiny")
+    path = reader.checkpoint_path(reader.latest_checkpoint())
+    payload = checkpoints.load(path)
+    del payload["rng_state"], payload["elapsed"], payload["move_vocabulary"]
+    checkpoints.save(payload, path)
+    said: list[str] = []
+
+    reader = resumed(tmp_path, data_dir, "tiny", say=said.append)
+
+    assert reader.status.status == RunStatus.FINISHED
+    assert [line for line in said if "predates saving the random state" in line], said
+
+
+def test_a_checkpoint_from_another_move_vocabulary_is_refused(tmp_path, data_dir):
+    """A reordered vocabulary has the same size, and would load and play nonsense."""
+    reader = run(tmp_path, data_dir)
+    path = reader.checkpoint_path(reader.latest_checkpoint())
+    payload = checkpoints.load(path)
+    payload["move_vocabulary"] = "0123456789abcdef"
+    checkpoints.save(payload, path)
+
+    with pytest.raises(checkpoints.CheckpointError, match="another move vocabulary"):
+        checkpoints.load(path)
+
+
+def test_a_new_run_starts_from_another_runs_weights(tmp_path, data_dir):
+    source = run(tmp_path, data_dir, name="pretrained")
+    config = load_experiment(
+        experiment(
+            tmp_path / "tuned.toml",
+            initialize_from='run = "pretrained"\ncheckpoint = "latest"',
+        )
+    )
+    prepared = trainer._prepare(config, data_dir=data_dir)
+
+    lineage = trainer._initialize(prepared, runs_dir=tmp_path / "runs")
+
+    assert lineage.run == "pretrained" and lineage.step == 6 and lineage.dataset == "test"
+    for name, value in final_payload(source)["model_state"].items():
+        assert torch.equal(value, prepared.model.state_dict()[name]), name
+
+
+def test_a_fine_tuning_run_records_where_its_weights_came_from(tmp_path, data_dir):
+    run(tmp_path, data_dir, name="pretrained")
+    from_seed = run(tmp_path, data_dir, name="from-seed")
+    said: list[str] = []
+    config = load_experiment(
+        experiment(tmp_path / "tuned.toml", initialize_from='run = "pretrained"\ncheckpoint = 3')
+    )
+
+    train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=said.append)
+
+    tuned = open_run(tmp_path / "runs", "tuned")
+    assert tuned.info.initialized_from.model_dump() == {
+        "run": "pretrained",
+        "step": 3,
+        "checkpoint": 3,
+        "dataset": "test",
+    }
+    assert "  weights    from run pretrained at step 3, trained on test" in said
+    assert final_payload(tuned)["step"] == 6, "with a step count of its own"
+    assert [line["loss"] for line in lines_of(tuned, "train")] != [
+        line["loss"] for line in lines_of(from_seed, "train")
+    ], "and it trained from those weights rather than the seed's"
+
+
+@pytest.mark.parametrize(
+    ("sections", "complaint"),
+    [
+        (
+            {"model": 'architecture = "resnet"\nblocks = 1\nchannels = 4'},
+            "it is a 'mlp' and this run trains a 'resnet'",
+        ),
+        ({"encoder": "history = 1"}, "trained on board-planes: spatial 12x8x8.*spatial 24x8x8"),
+        ({"encoder": "rating_scale = 3000.0"}, "rating_scale=5000.0.*rating_scale=3000.0"),
+        ({"model": 'architecture = "mlp"\ndepth = 1\nwidth = 16'}, "do not fit this model"),
+    ],
+)
+def test_weights_from_another_architecture_or_input_are_refused_with_a_reason(
+    tmp_path, data_dir, sections, complaint
+):
+    run(tmp_path, data_dir, name="pretrained")
+    config = load_experiment(
+        experiment(tmp_path / "tuned.toml", initialize_from='run = "pretrained"', **sections)
+    )
+
+    with pytest.raises(
+        TrainingError, match=f"cannot initialize from run 'pretrained'.*{complaint}"
+    ):
+        train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="")
+
+    assert not (tmp_path / "runs" / "tuned").exists(), "refused before anything was written"
+
+
+def test_dropout_may_change_when_fine_tuning(tmp_path, data_dir):
+    """Options that leave the weights' shapes alone are the fine-tuning run's own business."""
+    run(tmp_path, data_dir, name="pretrained", model=DROPOUT)
+    reader = run(
+        tmp_path,
+        data_dir,
+        name="tuned",
+        model='architecture = "mlp"\ndepth = 2\nwidth = 16\ndropout = 0.5',
+        initialize_from='run = "pretrained"',
+    )
+
+    assert reader.info.initialized_from.run == "pretrained"
+
+
+def test_initializing_from_a_run_that_is_not_there_says_so(tmp_path, data_dir):
+    config = load_experiment(experiment(tmp_path / "tuned.toml", initialize_from='run = "nope"'))
+
+    with pytest.raises(TrainingError, match="cannot initialize from run 'nope': no run called"):
+        train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="")
+
+
+def test_initializing_from_a_step_that_was_not_kept_says_so(tmp_path, data_dir):
+    run(tmp_path, data_dir, name="pretrained")
+    config = load_experiment(
+        experiment(tmp_path / "tuned.toml", initialize_from='run = "pretrained"\ncheckpoint = 1')
+    )
+
+    with pytest.raises(TrainingError, match="no checkpoint from step 1"):
+        train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="")
+
+
+def test_a_run_cannot_be_initialized_from_itself(tmp_path, data_dir):
+    run(tmp_path, data_dir)
+    config = load_experiment(experiment(tmp_path / "tiny.toml", initialize_from='run = "tiny"'))
+
+    with pytest.raises(TrainingError, match="cannot be initialized from itself"):
+        train(
+            config,
+            data_dir=data_dir,
+            runs_dir=tmp_path / "runs",
+            config_text="",
+            overwrite=True,
+        )

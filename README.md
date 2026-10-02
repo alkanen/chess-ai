@@ -312,14 +312,15 @@ runs/mlp-baseline/run.json           the same config resolved, the code version,
 runs/mlp-baseline/metrics.jsonl      append-only, one JSON object per measurement
 runs/mlp-baseline/status.json        the heartbeat: step, epoch, positions/s, ETA, GPU
 runs/mlp-baseline/checkpoints/       step-<step>.pt, plus an index naming the best
+runs/mlp-baseline/writer.lock        locked by the process training the run, while it does
 ```
 
 Nothing is rewritten in place: the metrics log is appended to and everything else is written to a
 temporary name and renamed over the old one, so the run directory can be read at any moment —
 which is how the web server follows a run without ever talking to the trainer. Checkpoints
-hold the weights, the optimizer state, the config and the encoder spec, so one is enough on its
-own; `[checkpoints] keep` bounds how many are kept, and the best one by `[checkpoints] metric` is
-kept however old it gets.
+hold the weights, the optimizer state, the random state, the config and the encoder spec, so one
+is enough on its own; `[checkpoints] keep` bounds how many are kept, and the best one by
+`[checkpoints] metric` is kept however old it gets.
 
 A run directory is never written into twice. Give the run another name, in the config or with
 `--name`, or pass `--overwrite` to replace one:
@@ -328,8 +329,46 @@ A run directory is never written into twice. Give the run another name, in the c
 uv run chess-ai train experiments/mlp-baseline.toml --name mlp-baseline-lr3
 ```
 
-Resuming a stopped run and fine-tuning from another run's checkpoint are next. To watch a run as
-it trains, open **Runs** in the browser (see [Follow training](#follow-training)).
+To watch a run as it trains, open **Runs** in the browser (see [Follow training](#follow-training)).
+
+#### Stop and resume
+
+Ctrl-C, or `kill -INT` or `kill -TERM` on the trainer's process, stops a run cleanly: it
+finishes the step it is on, saves a checkpoint, marks the run **stopped**, and exits with
+status 130 or 143. A second ctrl-c stops it at once, without that checkpoint. To carry on:
+
+```sh
+uv run chess-ai resume mlp-baseline
+```
+
+A resumed run picks up its latest checkpoint and carries on exactly where it was: the same
+weights, optimizer state, learning rate schedule, random state and data order, so a run that was
+stopped and resumed ends up with the same weights as one that never stopped. A run that crashed
+or was killed resumes the same way, from the last checkpoint it saved; whatever it logged after
+that checkpoint is dropped from its metrics, since those steps are trained again. The schedule
+is the one the run started with, so resuming finishes a run but cannot make it longer.
+
+A run is resumed on the dataset of the same name, and is refused if that dataset has been
+rebuilt since, because its positions would come in a different order. It is also refused while
+another process is still writing it.
+
+#### Fine-tune from another run
+
+An `[initialize_from]` section starts a new run from another run's weights instead of from its
+seed:
+
+```toml
+[initialize_from]
+run = "mlp-pretrained"
+checkpoint = "best"    # or "latest", or a step number
+```
+
+Only the weights are taken. The new run has its own dataset, optimizer, schedule and step count,
+which is how a curriculum goes from every game to the strongest players. The architecture, its
+size and the encoder settings have to match the ones the other run trained with. A checkpoint
+that does not match is refused, with a message saying what differs. Settings that do not change
+the shape of the weights, such as `dropout`, may differ. `run.json` records the run, step and
+dataset the weights came from, under `initialized_from`.
 
 ### Shortcuts with make
 

@@ -4,7 +4,7 @@ import argparse
 import atexit
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import TextIO
@@ -217,6 +217,17 @@ def _add_train_command(commands: argparse._SubParsersAction) -> None:
     )
     train.set_defaults(handler=_train)
 
+    resume = commands.add_parser(
+        "resume",
+        help="carry on training a stopped or crashed run",
+        description="Carry on training a run from its latest checkpoint, with the config, "
+        "weights, optimizer state, schedule and data order it had, to the end of its schedule. "
+        "A run stops at the end of a step and saves a checkpoint on ctrl-c or SIGTERM; a run "
+        "that crashed carries on from the last checkpoint it saved.",
+    )
+    resume.add_argument("name", help="the run")
+    resume.set_defaults(handler=_resume)
+
 
 def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
     """``chess-ai runs ...``: finding training runs, and naming, tagging and annotating them."""
@@ -351,7 +362,7 @@ def _read_notes(path: Path) -> str:
 
 
 def _train(config: Config, args: argparse.Namespace) -> int:
-    from chess_ai.training import ExperimentError, RunError, TrainingError, load_experiment, train
+    from chess_ai.training import ExperimentError, load_experiment, train
 
     try:
         experiment = load_experiment(args.config_file, name=args.name)
@@ -361,21 +372,52 @@ def _train(config: Config, args: argparse.Namespace) -> int:
         config_text = args.config_file.read_text(encoding="utf-8")
     except OSError as e:
         raise _UserError(f"cannot read {args.config_file}: {e.strerror}") from e
-    try:
-        train(
+    return _training(
+        experiment.name,
+        lambda: train(
             experiment,
             data_dir=config.paths.data,
             runs_dir=config.paths.runs,
             config_text=config_text,
             overwrite=args.overwrite,
             say=_say,
-        )
+        ),
+    )
+
+
+def _resume(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.training import resume
+
+    return _training(
+        args.name,
+        lambda: resume(args.name, data_dir=config.paths.data, runs_dir=config.paths.runs, say=_say),
+    )
+
+
+def _training(name: str, run: Callable[[], object]) -> int:
+    """Run a training job, and answer for how it ended in words and in the exit status.
+
+    A run that was stopped exits with the usual status for the signal that stopped it, so that a
+    script waiting on it can tell a stop from a finish.
+    """
+    from chess_ai.training import RunError, TrainingError, TrainingStopped
+
+    try:
+        run()
     except (TrainingError, RunError) as e:
-        # train() turns the run store's errors into TrainingError; RunError is caught as well
-        # so that a path it does not cover cannot become a traceback either.
+        # The trainer turns the run store's errors into TrainingError; RunError is caught as
+        # well so that a path it does not cover cannot become a traceback either.
         raise _UserError(e) from e
+    except TrainingStopped as e:
+        _say(
+            f"chess-ai: {e}; 'chess-ai resume {name}' carries on from there",
+            err=True,
+        )
+        return 128 + e.signal
     except KeyboardInterrupt:
-        # Not an error: somebody pressed ctrl-c. The run has already said it stopped.
+        # Not an error: ctrl-c twice, or once before the run had started. No hint about
+        # resuming, since in the second case there may be no run to resume; a run that had
+        # started has already said it stopped.
         _say("chess-ai: interrupted", err=True)
         return 130
     except OSError as e:
