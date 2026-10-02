@@ -24,6 +24,7 @@ from chess_ai.training.run_store import (
     CheckpointPolicy,
     GpuStats,
     Heartbeat,
+    Lineage,
     RunError,
     RunInfo,
     RunNotes,
@@ -36,7 +37,7 @@ from chess_ai.training.run_store import (
     run_path,
     save_notes,
 )
-from chess_ai.training.trainer import TrainingError, train
+from chess_ai.training.trainer import TrainingError, TrainingStopped, resume, train
 from chess_ai.training.validate import validate
 
 __all__ = [
@@ -50,6 +51,7 @@ __all__ = [
     "GpuStats",
     "HardwareError",
     "Heartbeat",
+    "Lineage",
     "PositionBatches",
     "RunError",
     "RunInfo",
@@ -58,6 +60,7 @@ __all__ = [
     "RunStatus",
     "RunWriter",
     "TrainingError",
+    "TrainingStopped",
     "batch_loader",
     "choose_checkpoint",
     "describe_device",
@@ -65,6 +68,7 @@ __all__ = [
     "load_experiment",
     "open_run",
     "resolve_device",
+    "resume",
     "run_path",
     "save_notes",
     "train",

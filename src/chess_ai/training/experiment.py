@@ -32,7 +32,7 @@ stops the run instead of quietly training at a default; see :mod:`chess_ai.regis
 import re
 import tomllib
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -187,6 +187,36 @@ class CheckpointSection(_Section):
         )
 
 
+class InitializeSection(_Section):
+    """Another run's checkpoint to start the weights from, instead of drawing them from the seed.
+
+    Weights only: the optimizer, the schedule and the step all start afresh, on whatever dataset
+    this config names. That is fine-tuning, and it is how a curriculum goes from everything to
+    the strongest players. The architecture, its options and the encoder have to be the ones the
+    checkpoint was trained with, because the weights only mean anything in the shapes they were
+    trained in.
+    """
+
+    run: str
+    """The run to take the weights from, by name, in the runs directory."""
+    checkpoint: Literal["best", "latest"] | int = "best"
+    """Which of its checkpoints: its best by its own metric, its newest, or the one from a step."""
+
+    @field_validator("run")
+    @classmethod
+    def _plain_name(cls, value: str) -> str:
+        if not _NAME.fullmatch(value):
+            raise ValueError(f"invalid run name {value!r}")
+        return value
+
+    @field_validator("checkpoint")
+    @classmethod
+    def _a_step(cls, value: str | int) -> str | int:
+        if isinstance(value, int) and value < 0:
+            raise ValueError(f"a checkpoint step is not negative, and {value} is")
+        return value
+
+
 class ExperimentConfig(BaseModel):
     """A whole experiment: what to train, on what, how, and for how long."""
 
@@ -213,6 +243,7 @@ class ExperimentConfig(BaseModel):
     schedule: ScheduleSection = ScheduleSection()
     validation: ValidationSection = ValidationSection()
     checkpoints: CheckpointSection = CheckpointSection()
+    initialize_from: InitializeSection | None = None
 
     @field_validator("name")
     @classmethod

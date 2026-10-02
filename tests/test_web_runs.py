@@ -446,6 +446,9 @@ def test_a_viewer_starts_again_when_the_run_is_started_again(client, runs):
             websocket.receive_json()
             assert len(websocket.receive_json()["records"]) == 3
 
+            # The first trainer is gone before the second can have the directory: two at once
+            # is what the writer's lock refuses.
+            run.close()
             with new_run(runs, created=NOW + timedelta(hours=1)) as again:
                 again.log(step=1, split="train", loss=5.0)
 

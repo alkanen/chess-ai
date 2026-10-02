@@ -13,6 +13,7 @@ kills a run nor loses track of one, and a run from six months ago is still brows
     <runs>/<name>/status.json       the heartbeat: replaced whole, never appended to
     <runs>/<name>/checkpoints/      step-<step>.pt, and an index naming the best of them
     <runs>/<name>/notes.json        a title, tags and notes: written by people, never by the trainer
+    <runs>/<name>/writer.lock       locked by the one process writing the run, while it does
 
 Two write disciplines, because two kinds of reader:
 
@@ -24,26 +25,34 @@ Two write disciplines, because two kinds of reader:
   previous version intact.
 
 No file here is ever rewritten in place, which is what makes concurrent reading safe without a
-lock between processes that do not otherwise know about each other.
+lock between processes that do not otherwise know about each other. Writing is another matter:
+two trainers in one run directory would interleave two runs' metrics and prune each other's
+checkpoints, so the process writing a run holds a lock on it for as long as it does — and a
+process that dies, however it dies, lets go of it with the rest of its files.
 """
 
+import fcntl
 import json
+import logging
 import os
 import re
 import subprocess
 import threading
 import uuid
 from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import suppress
 from datetime import UTC, datetime
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
-from typing import Any, Final, Literal, Self
+from typing import Any, ClassVar, Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from chess_ai.dataset.files import sync_directory, sync_file
 from chess_ai.encoders import EncoderSpec
+
+LOGGER = logging.getLogger(__name__)
 
 FORMAT_VERSION: Final = 1
 """The version of this layout, recorded in every file it writes and checked when reading."""
@@ -53,6 +62,7 @@ CONFIG_FILE: Final = "config.toml"
 METRICS_FILE: Final = "metrics.jsonl"
 STATUS_FILE: Final = "status.json"
 NOTES_FILE: Final = "notes.json"
+LOCK_FILE: Final = "writer.lock"
 CHECKPOINTS_DIR: Final = "checkpoints"
 CHECKPOINT_INDEX: Final = "index.json"
 CHECKPOINT_SUFFIX: Final = ".pt"
@@ -138,6 +148,24 @@ class ModelReference(BaseModel):
     parameter_count: int
 
 
+class Lineage(BaseModel):
+    """The run and checkpoint a run's weights started from, rather than from the seed.
+
+    This is how a fine-tuning run says what it was fine-tuned from, and following ``run`` back
+    through each run's own lineage gives the whole curriculum a model went through.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run: str
+    step: int
+    """The step of the checkpoint the weights came from."""
+    checkpoint: CheckpointChoice
+    """The checkpoint as the config asked for it: ``best``, ``latest`` or a step."""
+    dataset: str | None = None
+    """The dataset the run they came from was trained on."""
+
+
 class RunInfo(BaseModel):
     """``run.json``: everything about a run that does not change once it has started.
 
@@ -164,6 +192,8 @@ class RunInfo(BaseModel):
     batch_size: int
     positions_per_second_estimate: float | None = None
     """What a short probe measured before training started; see the trainer."""
+    initialized_from: Lineage | None = None
+    """Where the weights started, for a run that did not start from its seed."""
 
 
 class Heartbeat(BaseModel):
@@ -373,9 +403,10 @@ def code_version() -> str:
 class RunWriter:
     """The trainer's end of a run directory: everything a run produces goes through here."""
 
-    def __init__(self, directory: Path, policy: CheckpointPolicy) -> None:
+    def __init__(self, directory: Path, policy: CheckpointPolicy, *, lock: "_WriterLock") -> None:
         self.directory = directory
         self.policy = policy
+        self._lock = lock
         self._metrics = (directory / METRICS_FILE).open("a", encoding="utf-8")
         self._started = _now()
 
@@ -399,14 +430,63 @@ class RunWriter:
         try:
             directory.mkdir(parents=True, exist_ok=True)
             (directory / CHECKPOINTS_DIR).mkdir(exist_ok=True)
+        except OSError as e:
+            raise RunError(f"cannot create run directory {directory}: {e.strerror or e}") from e
+        lock = _WriterLock.acquire(directory, info.name)
+        try:
+            # Again, now that nobody else can be writing it: a run of this name may have been
+            # started and finished between the first look and the lock.
+            check_available(directory, info.name, overwrite=overwrite)
             if overwrite:
                 cls._clear(directory)
             _replace_file(directory / CONFIG_FILE, config_text)
             _replace_file(directory / RUN_FILE, _as_json(info))
             (directory / METRICS_FILE).touch()
+            return cls(directory, policy, lock=lock)
         except OSError as e:
+            lock.release()
             raise RunError(f"cannot create run directory {directory}: {e.strerror or e}") from e
-        return cls(directory, policy)
+        except BaseException:
+            lock.release()
+            raise
+
+    @classmethod
+    def reopen(cls, directory: Path, *, policy: CheckpointPolicy) -> Self:
+        """Take over writing the run in ``directory`` again, which is how a run resumes.
+
+        Locked before anything in it is read, so that nothing read can change underneath:
+        a trainer still writing the run would be saving checkpoints past the one a resume
+        chooses. See :meth:`rewind` for putting the run back to that checkpoint.
+        """
+        if not (directory / RUN_FILE).is_file():
+            raise RunError(f"no run in {directory}")
+        lock = _WriterLock.acquire(directory, directory.name)
+        try:
+            return cls(directory, policy, lock=lock)
+        except OSError as e:
+            lock.release()
+            raise RunError(f"cannot open the run in {directory}: {e.strerror or e}") from e
+        except BaseException:
+            lock.release()
+            raise
+
+    def rewind(self, step: int) -> None:
+        """Put the run back to where it was at ``step``, to carry on from there.
+
+        Whatever the run logged after ``step`` is dropped from the metrics log, since the run
+        is about to train those steps again and a chart with both would show two histories
+        laid over each other. That is the one time the log is replaced rather than appended to,
+        and it is replaced whole, which a reader following it notices as it notices an
+        overwrite. A checkpoint a crash left half-written is thrown away too.
+        """
+        try:
+            self._metrics.close()
+            _keep_metrics_until(self.directory / METRICS_FILE, step)
+            self._metrics = (self.directory / METRICS_FILE).open("a", encoding="utf-8")
+            for path in (self.directory / CHECKPOINTS_DIR).glob(f"*{TEMPORARY_SUFFIX}"):
+                path.unlink(missing_ok=True)
+        except OSError as e:
+            raise RunError(f"cannot rewind the run in {self.directory}: {e.strerror or e}") from e
 
     @staticmethod
     def _clear(directory: Path) -> None:
@@ -541,16 +621,105 @@ class RunWriter:
         self.close()
 
     def close(self) -> None:
-        if not self._metrics.closed:
-            self._metrics.flush()
-            sync_file(self._metrics)
-            self._metrics.close()
+        try:
+            if not self._metrics.closed:
+                self._metrics.flush()
+                sync_file(self._metrics)
+                self._metrics.close()
+        finally:
+            self._lock.release()
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         self.close()
+
+
+class _WriterLock:
+    """The lock that makes one process the only writer of a run directory.
+
+    An ``flock`` on a file of its own, which the kernel lets go of when the process holding it
+    ends — however it ends, SIGKILL and the OOM killer included — so a crashed run never leaves
+    a lock behind that somebody has to know to delete. The file itself stays: deleting a lock
+    file is a race between one process unlinking it and another locking what it just opened.
+
+    A file system that cannot lock at all is let through with a warning, rather than every run
+    on it refused for something it never did.
+
+    A process forked while the lock is held — every data-loader worker is one — shares it, and
+    a lock is only let go of once every process sharing it has closed it; a worker orphaned by a
+    trainer killed outright would keep the run locked until it noticed. So a forked child closes
+    its copy straight away, which leaves the lock with the process that took it.
+    """
+
+    held: ClassVar[set[int]] = set()
+    """The descriptors this process holds locks through, for a forked child to close."""
+
+    def __init__(self, descriptor: int | None) -> None:
+        self._descriptor = descriptor
+        if descriptor is not None:
+            self.held.add(descriptor)
+
+    @classmethod
+    def acquire(cls, directory: Path, name: str) -> "_WriterLock":
+        """Lock ``directory`` for this process, or raise :exc:`RunError` if another has it."""
+        path = directory / LOCK_FILE
+        try:
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError as e:
+            raise RunError(f"cannot open {path}: {e.strerror or e}") from e
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            raise RunError(
+                f"run {name!r} is being written by another process; stop that one first"
+            ) from None
+        except OSError as e:
+            os.close(descriptor)
+            LOGGER.warning("cannot lock %s, so nothing stops a second writer: %s", path, e)
+            return cls(None)
+        return cls(descriptor)
+
+    def release(self) -> None:
+        if self._descriptor is not None:
+            self.held.discard(self._descriptor)
+            os.close(self._descriptor)
+            self._descriptor = None
+
+    @classmethod
+    def _let_go_in_child(cls) -> None:
+        for descriptor in cls.held:
+            with suppress(OSError):
+                os.close(descriptor)
+        cls.held = set()
+
+
+os.register_at_fork(after_in_child=_WriterLock._let_go_in_child)
+
+
+def _keep_metrics_until(path: Path, step: int) -> None:
+    """Drop the lines of the metrics log at ``path`` from after ``step``.
+
+    A line still being written when the run died goes too, since the next line appended would
+    otherwise be joined onto it. Left alone when there is nothing to drop, so that resuming a
+    run that stopped cleanly does not make every reader start the log again.
+    """
+    try:
+        lines = path.read_bytes().splitlines(keepends=True)
+    except FileNotFoundError:
+        path.touch()
+        return
+    kept = [line for line in lines if line.endswith(b"\n") and _logged_at(line) <= step]
+    if kept != lines:
+        _replace_file(path, b"".join(kept).decode("utf-8", errors="replace"))
+
+
+def _logged_at(line: bytes) -> int:
+    """The step a metrics line was logged at; 0 for one that does not say."""
+    step = (_parse_metrics_line(line) or {}).get("step")
+    return step if isinstance(step, int) else 0
 
 
 class RunReader:

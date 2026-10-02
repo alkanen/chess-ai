@@ -127,3 +127,15 @@ keep = 3                                   # default: 3
 # Which validation metric decides "best": loss, policy_loss, value_loss, top1, top5
 # or illegal_top_move_rate.
 metric = "policy_loss"                     # default: "policy_loss"
+
+# Uncomment to start the weights from another run's checkpoint instead of from the seed:
+# fine-tuning. Weights only — the optimizer, the schedule and the step start afresh, on the
+# dataset above. The architecture, its size and the encoder have to be the ones that run
+# trained, and a run that does not match is refused. run.json records where the weights
+# came from.
+#
+# [initialize_from]
+# run = "a-pretrained-run"
+#
+# Which of its checkpoints: "best" by its own metric, "latest", or a step number.
+# checkpoint = "best"                      # default: "best"

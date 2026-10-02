@@ -2,6 +2,9 @@
 
 import json
 import os
+import subprocess
+import sys
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -11,11 +14,13 @@ from chess_ai.training import run_store
 from chess_ai.training.run_store import (
     CHECKPOINT_INDEX,
     CHECKPOINTS_DIR,
+    CONFIG_FILE,
     METRICS_FILE,
     NOTES_FILE,
     STATUS_FILE,
     CheckpointPolicy,
     DatasetReference,
+    Lineage,
     ModelReference,
     RunError,
     RunInfo,
@@ -787,3 +792,154 @@ def test_overwriting_throws_away_what_crashes_mid_write_left_behind(tmp_path):
         pass
 
     assert not list(directory.rglob("*.writing"))
+
+
+# One writer at a time, and taking a run up again.
+
+
+def test_a_run_being_written_cannot_be_written_by_another(tmp_path):
+    first = writer(tmp_path)
+
+    with pytest.raises(RunError, match="'test' is being written by another process"):
+        RunWriter.create(
+            run_path(tmp_path, "test"),
+            info(),
+            config_text="",
+            policy=CheckpointPolicy(),
+            overwrite=True,
+        )
+    with pytest.raises(RunError, match="being written by another process"):
+        RunWriter.reopen(run_path(tmp_path, "test"), policy=CheckpointPolicy())
+
+    assert (run_path(tmp_path, "test") / CONFIG_FILE).read_text() == "# the config as written\n"
+    first.close()
+
+
+def test_a_run_is_free_to_write_again_once_its_writer_is_done(tmp_path):
+    writer(tmp_path).close()
+
+    with RunWriter.reopen(run_path(tmp_path, "test"), policy=CheckpointPolicy()) as again:
+        again.log(step=1, split="train")
+
+    assert steps(RunReader(run_path(tmp_path, "test")).metrics()) == [1]
+
+
+def test_a_writer_that_died_leaves_no_lock_behind(tmp_path):
+    """SIGKILL and the OOM killer give a trainer no chance to tidy up after itself."""
+    writer(tmp_path).close()
+    directory = run_path(tmp_path, "test")
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from chess_ai.training.run_store import CheckpointPolicy, RunWriter\n"
+            "RunWriter.reopen(Path(sys.argv[1]), policy=CheckpointPolicy())\n"
+            "print('locked', flush=True)\n"
+            "time.sleep(60)\n",
+            str(directory),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        with pytest.raises(RunError, match="being written by another process"):
+            RunWriter.reopen(directory, policy=CheckpointPolicy())
+    finally:
+        holder.kill()
+        holder.wait()
+
+    RunWriter.reopen(directory, policy=CheckpointPolicy()).close()
+
+
+def test_a_process_forked_by_the_writer_does_not_keep_its_run_locked(tmp_path):
+    """Data-loader workers are forked by the trainer, and can outlive it by a few seconds."""
+    import multiprocessing
+
+    first = writer(tmp_path)
+    child = multiprocessing.get_context("fork").Process(target=time.sleep, args=(30,))
+    child.start()
+    try:
+        first.close()
+        RunWriter.reopen(run_path(tmp_path, "test"), policy=CheckpointPolicy()).close()
+    finally:
+        child.kill()
+        child.join()
+
+
+def test_reopening_a_directory_that_is_not_a_run_says_so(tmp_path):
+    (tmp_path / "empty").mkdir()
+
+    with pytest.raises(RunError, match="no run in"):
+        RunWriter.reopen(tmp_path / "empty", policy=CheckpointPolicy())
+
+
+def test_rewinding_drops_what_was_logged_after_the_step(tmp_path):
+    with writer(tmp_path) as run:
+        for step in (1, 2, 3, 4):
+            run.log(step=step, split="train")
+    directory = run_path(tmp_path, "test")
+    with (directory / METRICS_FILE).open("a") as f:
+        f.write('{"step": 5, "split": "tr')  # The line a crash cut off.
+
+    with RunWriter.reopen(directory, policy=CheckpointPolicy()) as again:
+        again.rewind(2)
+        again.log(step=3, split="train", loss=1.0)
+
+    assert steps(RunReader(directory).metrics()) == [1, 2, 3]
+    assert (directory / METRICS_FILE).read_text().endswith('"loss": 1.0}\n'), "on a line of its own"
+
+
+def test_a_tail_starts_again_when_the_run_is_rewound(tmp_path):
+    with writer(tmp_path) as run:
+        for step in (1, 2, 3):
+            run.log(step=step, split="train")
+    directory = run_path(tmp_path, "test")
+    tail = RunReader(directory).tail_metrics()
+    assert steps(tail.read()[0]) == [1, 2, 3]
+
+    with RunWriter.reopen(directory, policy=CheckpointPolicy()) as again:
+        again.rewind(1)
+        again.log(step=2, split="train")
+
+    records, replace = tail.read()
+    assert replace, "the lines it had for steps 2 and 3 are gone"
+    assert steps(records) == [1, 2]
+
+
+def test_rewinding_to_where_the_log_ends_leaves_it_alone(tmp_path):
+    """A run that stopped cleanly has nothing to drop, and readers need not start again."""
+    with writer(tmp_path) as run:
+        run.log(step=1, split="train")
+        run.log(step=2, split="validation")
+    path = run_path(tmp_path, "test") / METRICS_FILE
+    before = os.stat(path).st_ino
+
+    with RunWriter.reopen(run_path(tmp_path, "test"), policy=CheckpointPolicy()) as again:
+        again.rewind(2)
+
+    assert os.stat(path).st_ino == before
+
+
+def test_rewinding_throws_away_a_half_written_checkpoint(tmp_path):
+    with writer(tmp_path) as run:
+        save(run, 2)
+    checkpoints = run_path(tmp_path, "test") / CHECKPOINTS_DIR
+    (checkpoints / f"{checkpoint_file(4)}.writing").write_text("half of it")
+
+    with RunWriter.reopen(run_path(tmp_path, "test"), policy=CheckpointPolicy()) as again:
+        again.rewind(2)
+
+    assert sorted(path.name for path in checkpoints.iterdir()) == [
+        CHECKPOINT_INDEX,
+        checkpoint_file(2),
+    ]
+
+
+def test_a_run_says_whose_weights_it_started_from(tmp_path):
+    lineage = Lineage(run="pretrained", step=3000, checkpoint="best", dataset="everything")
+    writer(tmp_path, initialized_from=lineage).close()
+
+    assert RunReader(run_path(tmp_path, "test")).info.initialized_from == lineage

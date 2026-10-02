@@ -1,16 +1,24 @@
 """Batches: what order positions are visited in, and that a worker process sees the same one."""
 
+import multiprocessing
+import os
 import pickle
+import signal
+import subprocess
+import sys
+import threading
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+from signal_helpers import SignalledWhileStarting
 from training_helpers import dataset
 
 from chess_ai.dataset import Result, open_dataset
 from chess_ai.encoders import create_encoder
 from chess_ai.move_codec import MIRRORED_INDEX, VOCABULARY_SIZE
-from chess_ai.training.batches import PositionBatches, batch_loader
+from chess_ai.training.batches import PositionBatches, batch_loader, iterate
 
 
 @pytest.fixture
@@ -217,3 +225,216 @@ def test_the_planes_travel_as_bytes_and_arrive_on_the_device_as_floats(directory
     assert moved.spatial.dtype == torch.float32
     assert torch.equal(moved.spatial, batch.spatial.float())
     assert moved.move.dtype == torch.int64, "only the planes are converted"
+
+
+# The loader's workers and the signals that stop a run.
+
+
+@pytest.fixture(params=["spawn", "forkserver"])
+def start_method(request):
+    """Start the loader's workers as macOS does, and as Linux does from Python 3.14 on.
+
+    Both start each worker as a fresh interpreter, which spends seconds importing before its
+    ``worker_init_fn`` runs, with whatever signal handlers it was born with.
+    """
+    before = multiprocessing.get_start_method(allow_none=True)
+    multiprocessing.set_start_method(request.param, force=True)
+    yield request.param
+    multiprocessing.set_start_method(before, force=True)
+
+
+def test_a_worker_signalled_while_it_starts_up_survives(start_method):
+    """Ctrl-C in the first moments of a run reaches workers that are still starting."""
+    loader = batch_loader(SignalledWhileStarting(), workers=2, device=torch.device("cpu"))
+
+    assert sorted(int(item) for item in iterate(loader)) == list(range(8))
+
+
+FRESH_START = """
+import signal, sys
+from multiprocessing import resource_tracker
+
+import torch
+
+from chess_ai.training.batches import batch_loader, iterate
+from signal_helpers import SignalledWhileStarting
+
+# Python 3.12.0 to 3.12.9 and 3.13.0 start the resource tracker by blocking SIGINT and SIGTERM
+# and then unblocking them, whatever the caller had blocked; later releases put the caller's
+# mask back. The older way is reproduced here, so that this means the same on every release.
+class OlderSignal:
+    def __getattr__(self, name):
+        return getattr(signal, name)
+
+    def pthread_sigmask(self, how, mask):
+        if how == signal.SIG_SETMASK:
+            return signal.pthread_sigmask(signal.SIG_UNBLOCK, resource_tracker._IGNORED_SIGNALS)
+        return signal.pthread_sigmask(how, mask)
+
+resource_tracker.signal = OlderSignal()
+if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method(sys.argv[1], force=True)
+    loader = batch_loader(SignalledWhileStarting(), workers=2, device=torch.device("cpu"))
+    print(sorted(int(item) for item in iterate(loader)))
+"""
+
+
+@pytest.mark.parametrize("method", ["spawn", "forkserver"])
+def test_workers_are_protected_in_a_process_that_has_not_started_anything_yet(tmp_path, method):
+    """The first loader of a training process is also the first thing to start the resource
+    tracker, which some Python releases do by unblocking the very signals held back here.
+
+    In a fresh interpreter, since in this one an earlier test has started the tracker already.
+    """
+    script = tmp_path / "fresh_start.py"
+    script.write_text(FRESH_START)
+    tests = Path(__file__).parent
+
+    finished = subprocess.run(
+        [sys.executable, str(script), method],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "PYTHONPATH": str(tests)},
+    )
+
+    assert finished.returncode == 0, finished.stderr[-2000:]
+    assert finished.stdout.strip() == str(list(range(8)))
+
+
+def test_a_stop_signal_sent_while_the_workers_start_still_reaches_the_trainer(directory):
+    """The trainer may hold a stop signal back while its workers are born, but never lose it.
+
+    With another thread running, as torch's own pool is once a model has run, a signal the
+    trainer blocks is delivered to that thread instead; were it ignored rather than only held
+    back, that thread would drop it, and the run would never stop.
+    """
+    heard = []
+    previous = signal.signal(signal.SIGINT, lambda number, frame: heard.append(number))
+    real = torch.utils.data.DataLoader.__iter__
+    done = threading.Event()
+    other = threading.Thread(target=done.wait)
+    other.start()
+
+    def ctrl_c_while_starting(self):
+        iterator = real(self)
+        os.kill(os.getpid(), signal.SIGINT)
+        return iterator
+
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(torch.utils.data.DataLoader, "__iter__", ctrl_c_while_starting)
+            loader = batch_loader(batches(directory), workers=2, device=torch.device("cpu"))
+            assert len(list(iterate(loader))) == 10
+    finally:
+        done.set()
+        other.join()
+        signal.signal(signal.SIGINT, previous)
+
+    assert heard == [signal.SIGINT]
+
+
+def test_batches_can_be_read_off_the_main_thread(directory):
+    """Only the main thread may set a signal handler, and a run need not be on it."""
+    read = []
+
+    def reader():
+        loader = batch_loader(batches(directory), workers=2, device=torch.device("cpu"))
+        read.extend(iterate(loader))
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    thread.join()
+
+    assert len(read) == 10
+
+
+def test_no_worker_outlives_a_shutdown_that_was_interrupted(directory, monkeypatch):
+    """A second ctrl-c as the loader shuts down skips the message that tells workers to go.
+
+    The workers ignore SIGTERM, so the loader's own last resort of terminating them does
+    nothing, and the trainer would hang on its way out, waiting for workers that wait for it.
+    """
+    from torch.utils.data import dataloader
+
+    real = dataloader._MultiProcessingDataLoaderIter._shutdown_workers
+
+    def interrupted(self):
+        def ctrl_c():
+            raise KeyboardInterrupt
+
+        self._workers_done_event.set = ctrl_c
+        real(self)
+
+    monkeypatch.setattr(dataloader._MultiProcessingDataLoaderIter, "_shutdown_workers", interrupted)
+    before = set(multiprocessing.active_children())
+    stream = iterate(batch_loader(batches(directory), workers=2, device=torch.device("cpu")))
+    next(stream)
+    workers = [child for child in multiprocessing.active_children() if child not in before]
+    assert len(workers) == 2
+
+    try:
+        stream.close()
+        for worker in workers:
+            worker.join(timeout=10)
+        assert [worker.is_alive() for worker in workers] == [False, False]
+    finally:
+        for worker in workers:
+            worker.kill()
+
+
+def test_another_ctrl_c_while_stragglers_are_killed_waits_until_they_are(directory, monkeypatch):
+    """With another thread running, blocking a signal in this one does not keep its handler
+    out of it: Python runs handlers in the main thread whichever thread the kernel picked.
+
+    An interrupt half-way through killing the workers left the rest alive, ignoring the SIGTERM
+    that the interpreter's exit sends them, and the process hung on its way out.
+    """
+    from torch.utils.data import dataloader
+
+    real_shutdown = dataloader._MultiProcessingDataLoaderIter._shutdown_workers
+
+    def interrupted(self):
+        def ctrl_c():
+            raise KeyboardInterrupt
+
+        self._workers_done_event.set = ctrl_c
+        real_shutdown(self)
+
+    def now(number, frame):
+        raise KeyboardInterrupt
+
+    real_kill = multiprocessing.process.BaseProcess.kill
+    pressed = []
+
+    def ctrl_c_while_killing(self):
+        if not pressed:
+            pressed.append(True)
+            os.kill(os.getpid(), signal.SIGINT)
+        real_kill(self)
+
+    monkeypatch.setattr(dataloader._MultiProcessingDataLoaderIter, "_shutdown_workers", interrupted)
+    previous = signal.signal(signal.SIGINT, now)
+    done = threading.Event()
+    other = threading.Thread(target=done.wait)
+    other.start()
+    before = set(multiprocessing.active_children())
+    stream = iterate(batch_loader(batches(directory), workers=2, device=torch.device("cpu")))
+    next(stream)
+    workers = [child for child in multiprocessing.active_children() if child not in before]
+    try:
+        monkeypatch.setattr(multiprocessing.process.BaseProcess, "kill", ctrl_c_while_killing)
+        with pytest.raises(KeyboardInterrupt):
+            stream.close()
+        for worker in workers:
+            worker.join(timeout=10)
+        assert pressed, "the interrupt was sent"
+        assert [worker.is_alive() for worker in workers] == [False, False]
+    finally:
+        monkeypatch.setattr(multiprocessing.process.BaseProcess, "kill", real_kill)
+        for worker in workers:
+            worker.kill()
+        done.set()
+        other.join()
+        signal.signal(signal.SIGINT, previous)
