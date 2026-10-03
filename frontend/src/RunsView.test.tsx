@@ -89,7 +89,7 @@ describe('RunsView', () => {
     render(<RunsView />);
 
     expect(await screen.findByRole('rowheader', { name: 'mlp-big' })).toBeInTheDocument();
-    expect(fetch).toHaveBeenCalledWith('http://localhost:3000/chess/api/runs');
+    expect(fetch).toHaveBeenCalledWith('http://localhost:3000/chess/api/runs?archived=true');
     const running = row('mlp-big');
     expect(running.getByText('running')).toBeInTheDocument();
     expect(running.getByText('mlp')).toBeInTheDocument();
@@ -187,6 +187,67 @@ describe('RunsView', () => {
     fireEvent.click(filter.getByRole('button', { name: 'All' }));
 
     expect(screen.getAllByRole('rowheader')).toHaveLength(3);
+  });
+
+  it('asks for archived runs too, but shows them only when asked to', async () => {
+    const fetch = serving([
+      summary({ name: 'shelved', tags: ['sweep', 'archived'] }),
+      summary({ name: 'kept' }),
+    ]);
+    render(<RunsView />);
+
+    await screen.findByRole('rowheader', { name: 'kept' });
+    expect(new URL(fetch.mock.calls[0][0] as string).searchParams.get('archived')).toBe('true');
+    expect(screen.queryByRole('rowheader', { name: 'shelved' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Show 1 archived run' }));
+
+    expect(screen.getAllByRole('rowheader').map((header) => header.textContent)).toEqual([
+      'shelved',
+      'kept',
+    ]);
+    // Shown, an archived run can be ticked and compared like any other.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Compare shelved' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Compare kept' }));
+    expect(screen.getByRole('link', { name: 'Compare 2 runs' })).toBeInTheDocument();
+  });
+
+  it('shows the archived runs when filtered by the archived tag', async () => {
+    serving([summary({ name: 'shelved', tags: ['archived'] }), summary({ name: 'kept' })]);
+    render(<RunsView />);
+    await screen.findByRole('rowheader', { name: 'kept' });
+
+    fireEvent.click(
+      within(screen.getByRole('group', { name: 'Filter by tag' })).getByRole('button', {
+        name: 'archived',
+      }),
+    );
+
+    expect(screen.getAllByRole('rowheader').map((header) => header.textContent)).toEqual([
+      'shelved',
+    ]);
+  });
+
+  it('says so when every run with the tag picked is archived', async () => {
+    serving([summary({ name: 'shelved', tags: ['sweep', 'archived'] }), summary({ name: 'kept' })]);
+    render(<RunsView />);
+    await screen.findByRole('rowheader', { name: 'kept' });
+
+    fireEvent.click(
+      within(screen.getByRole('group', { name: 'Filter by tag' })).getByRole('button', {
+        name: 'sweep',
+      }),
+    );
+
+    expect(screen.getByText(/Every run tagged sweep is archived/)).toBeInTheDocument();
+  });
+
+  it('says so when every run there is has been archived', async () => {
+    serving([summary({ name: 'a', tags: ['archived'] }), summary({ name: 'b', tags: ['archived'] })]);
+    render(<RunsView />);
+
+    expect(await screen.findByText(/Every run here is archived/)).toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Show 2 archived runs' })).not.toBeChecked();
   });
 
   it('offers to compare the runs ticked, once there are two of them', async () => {

@@ -546,9 +546,23 @@ export async function fetchStockfish(): Promise<StockfishInfo> {
   return (await response.json()) as StockfishInfo;
 }
 
-/** Every training run on this server, newest first, with where each has got to. */
-export async function fetchRuns(): Promise<RunSummary[]> {
-  const response = await fetch(apiUrl('runs'));
+/**
+ * The tag that sets a run aside: left out of lists unless asked for, never offered to play.
+ * Mirrors chess_ai.training.run_store.ARCHIVED_TAG.
+ */
+export const ARCHIVED_TAG = 'archived';
+
+/** Whether a run has been set aside with the archived tag. */
+export function isArchived(run: RunSummary): boolean {
+  return (run.tags ?? []).includes(ARCHIVED_TAG);
+}
+
+/**
+ * Every training run on this server, newest first, with where each has got to. Archived runs
+ * are left out unless `archived` asks for them.
+ */
+export async function fetchRuns({ archived = false } = {}): Promise<RunSummary[]> {
+  const response = await fetch(apiUrl(archived ? 'runs?archived=true' : 'runs'));
   if (!response.ok) {
     throw new Error(await refusal(response));
   }

@@ -128,6 +128,8 @@ uv run chess-ai runs annotate mlp-baseline     # shows what it has
 uv run chess-ai runs list --tag mlp
 ```
 
+To set a run aside without deleting it, tag it `archived`: `uv run chess-ai runs annotate NAME --tag archived`, and `--untag archived` to bring it back. An archived run is left out of `chess-ai runs list` (unless `--archived` or `--tag archived` asks for it), hidden on the dashboard behind a **Show archived runs** box, and never offered to play against; it can still be opened and compared. That is the place for a sweep's runs, whose curves are worth keeping and whose checkpoints nobody will play.
+
 The web server never talks to a trainer: it reads the run directory, so it can be restarted at any time without affecting a run. A trainer that dies without saying so — killed, out of memory, or the machine gone — leaves a heartbeat that claims it is still running. Once that heartbeat is older than `[server] stale_after_seconds` (two minutes by default), the run is flagged **stale**. A trainer rewrites its heartbeat every couple of seconds, but not while it starts up, validates or saves a checkpoint, so keep the threshold well above those.
 
 The charts are drawn with [uPlot](https://github.com/leeoniya/uPlot): it is about 50 kB, draws on a canvas, and redraws the tens of thousands of points a long run logs without slowing the page, which SVG charting libraries struggle with.

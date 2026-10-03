@@ -72,6 +72,7 @@ from chess_ai.training.run_store import (
     RunReader,
     choose_checkpoint,
     list_runs,
+    listed,
     open_run,
     save_notes,
 )
@@ -380,6 +381,13 @@ def create_app(
             list[str] | None,
             Query(description="Only the runs tagged with this; given more than once, with all."),
         ] = None,
+        archived: Annotated[
+            bool,
+            Query(
+                description="Include the runs tagged archived, which are otherwise left out "
+                "unless that tag is asked for."
+            ),
+        ] = False,
     ) -> list[RunSummary]:
         """Every training run here, newest first: where each has got to and what it measured.
 
@@ -397,7 +405,7 @@ def create_app(
         ]
         # Filtered after describing rather than before, so that the metrics of the runs left
         # out go on being followed and the next unfiltered list does not read them whole.
-        found = [run for run in found if set(tag or ()) <= set(run.tags)]
+        found = [run for run in found if listed(run.tags, wanted=tag or (), archived=archived)]
         # Newest first, because the run someone wants to play against is almost always the
         # one they are training now. A run that does not say when it began sorts last.
         found.sort(key=lambda run: run.created.timestamp() if run.created else 0.0, reverse=True)

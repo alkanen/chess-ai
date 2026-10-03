@@ -859,6 +859,41 @@ def test_runs_list_shows_every_run_or_those_with_a_tag(tmp_path, capsys):
     assert "no runs tagged resnet" in capsys.readouterr().err
 
 
+def test_runs_list_leaves_out_archived_runs_unless_asked_for(tmp_path, capsys):
+    from chess_ai.training.run_store import RunNotes, open_run, save_notes
+
+    for name, tags in [("kept", []), ("shelved", ["sweep", "archived"])]:
+        annotated_run(tmp_path, name)
+        save_notes(open_run(tmp_path / "runs", name), RunNotes(tags=tags))
+
+    def names(*options: str) -> list[str]:
+        assert main(["runs", "list", *options]) == 0
+        return [line.split()[0] for line in capsys.readouterr().out.splitlines()]
+
+    assert names() == ["kept"]
+    assert names("--archived") == ["kept", "shelved"]
+    assert names("--tag", "archived") == ["shelved"]
+    assert names("--tag", "sweep") == []
+    assert names("--tag", "sweep", "--archived") == ["shelved"]
+
+
+def test_runs_list_says_when_the_only_runs_it_left_out_are_archived(tmp_path, capsys):
+    from chess_ai.training.run_store import RunNotes, open_run, save_notes
+
+    for name in ("a", "b"):
+        annotated_run(tmp_path, name)
+        save_notes(open_run(tmp_path / "runs", name), RunNotes(tags=["sweep", "archived"]))
+    annotated_run(tmp_path, "kept")
+
+    assert main(["runs", "list", "--tag", "sweep"]) == 0
+    # Not "no runs tagged sweep", which would read as if they had been deleted.
+    assert "no runs tagged sweep in" in (err := capsys.readouterr().err)
+    assert "(2 archived; --archived shows them)" in err
+
+    assert main(["runs", "list", "--tag", "resnet"]) == 0
+    assert "archived" not in capsys.readouterr().err
+
+
 def test_runs_list_still_lists_a_run_whose_notes_cannot_be_read(tmp_path, capsys):
     (annotated_run(tmp_path) / "notes.json").write_text("{not json")
 
