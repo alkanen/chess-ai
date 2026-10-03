@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useState } from 'react';
-import { fetchRuns, type RunSummary } from './api';
+import { ARCHIVED_TAG, fetchRuns, isArchived, type RunSummary } from './api';
 import { MAX_SERIES } from './runCharts';
 import { RunStateBadge } from './RunState';
 import { formatAgo, formatCount, formatNumber, formatPercent } from './runFormat';
@@ -21,7 +21,8 @@ function useRunList(): [RunSummary[] | null, string | null] {
     let dropped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     function refresh() {
-      fetchRuns()
+      // Archived runs too, so that showing them is instant, and comparing them is possible.
+      fetchRuns({ archived: true })
         .then(
           (found) => {
             if (!dropped) {
@@ -103,10 +104,18 @@ export function RunsView() {
   const [runs, error] = useRunList();
   const [tag, setTag] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string[]>([]);
+  const [showArchived, setShowArchived] = useState(false);
   const tags = runs === null ? [] : allTags(runs);
   // A tag no run has any more filters nothing out, rather than everything.
   const filter = tag !== null && tags.includes(tag) ? tag : null;
-  const shown = runs?.filter((run) => filter === null || (run.tags ?? []).includes(filter)) ?? [];
+  const archived = runs?.filter(isArchived).length ?? 0;
+  // Picking the archived tag is asking to see the archived runs, whatever the box says.
+  const hiding = !showArchived && filter !== ARCHIVED_TAG;
+  const shown =
+    runs?.filter(
+      (run) =>
+        (filter === null || (run.tags ?? []).includes(filter)) && !(hiding && isArchived(run)),
+    ) ?? [];
   // Only runs that are still there; chosen ones the filter hides stay chosen.
   const compared = chosen.filter((name) => runs?.some((run) => run.name === name));
   const full = compared.length >= MAX_SERIES;
@@ -138,6 +147,16 @@ export function RunsView() {
               />
             </div>
           )}
+          {archived > 0 && (
+            <label className="show-archived">
+              <input
+                type="checkbox"
+                checked={showArchived}
+                onChange={(e) => setShowArchived(e.target.checked)}
+              />{' '}
+              Show {archived} archived {archived === 1 ? 'run' : 'runs'}
+            </label>
+          )}
           <div className="compare-bar">
             {compared.length >= 2 ? (
               <a className="compare" href={compareHash(compared)}>
@@ -155,7 +174,13 @@ export function RunsView() {
         </div>
       )}
       {runs !== null && runs.length > 0 && shown.length === 0 && (
-        <p className="note">No run is tagged {filter}.</p>
+        <p className="note">
+          {filter === null
+            ? 'Every run here is archived. Tick the box above to show them.'
+            : runs.some((run) => (run.tags ?? []).includes(filter))
+              ? `Every run tagged ${filter} is archived. Tick the box above to show them.`
+              : `No run is tagged ${filter}.`}
+        </p>
       )}
       {shown.length > 0 && (
         <div className="table-frame">

@@ -271,6 +271,19 @@ describe('NewGameForm', () => {
       expect(screen.getByText('mlp-wider', { selector: '.run-name' })).toBeInTheDocument();
     });
 
+    it('never offers an archived run, even from a server that sends one', async () => {
+      vi.stubGlobal(
+        'fetch',
+        serving([{ ...RUNS[0], name: 'shelved', tags: ['archived'] }, ...RUNS]),
+      );
+      render(<NewGameForm />);
+
+      await chooseModel('Black');
+
+      expect(screen.queryByRole('option', { name: /shelved/ })).not.toBeInTheDocument();
+      expect(screen.getAllByRole('option', { name: /checkpoint/ })).toHaveLength(RUNS.length);
+    });
+
     it('offers the best and the latest checkpoint as well as each one by step', async () => {
       render(<NewGameForm />);
 

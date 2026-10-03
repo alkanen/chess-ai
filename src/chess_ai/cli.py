@@ -238,7 +238,7 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
         "list",
         help="list the training runs",
         description="List the training runs in the runs directory, with their state, tags "
-        "and titles.",
+        "and titles. Runs tagged archived are left out unless asked for.",
     )
     listing.add_argument(
         "--tag",
@@ -246,6 +246,12 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
         default=[],
         metavar="TAG",
         help="only the runs with this tag; given more than once, only those with all of them",
+    )
+    listing.add_argument(
+        "--archived",
+        action="store_true",
+        help="include the runs tagged archived, which are otherwise left out unless "
+        "--tag archived asks for them",
     )
     listing.set_defaults(handler=_list_runs)
 
@@ -282,9 +288,9 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
 
 
 def _list_runs(config: Config, args: argparse.Namespace) -> int:
-    from chess_ai.training.run_store import RunError, RunNotes, RunReader, list_runs
+    from chess_ai.training.run_store import RunError, RunNotes, RunReader, list_runs, listed
 
-    shown = 0
+    shown = archived = 0
     for name in list_runs(config.paths.runs):
         run = RunReader(config.paths.runs / name)
         try:
@@ -294,7 +300,10 @@ def _list_runs(config: Config, args: argparse.Namespace) -> int:
             # notes. Only a filter by tag has to leave it out, since its tags cannot be known.
             _say(f"chess-ai: warning: {e}", err=True)
             notes = RunNotes()
-        if not set(args.tag) <= set(notes.tags):
+        if not listed(notes.tags, wanted=args.tag, archived=args.archived):
+            # Counted, so that a list emptied by archiving does not read as if the runs had gone.
+            if listed(notes.tags, wanted=args.tag, archived=True):
+                archived += 1
             continue
         try:
             beat = run.status
@@ -307,7 +316,8 @@ def _list_runs(config: Config, args: argparse.Namespace) -> int:
         shown += 1
     if shown == 0:
         wanted = f" tagged {', '.join(args.tag)}" if args.tag else ""
-        _say(f"chess-ai: no runs{wanted} in {config.paths.runs}", err=True)
+        hidden = f" ({archived} archived; --archived shows them)" if archived else ""
+        _say(f"chess-ai: no runs{wanted} in {config.paths.runs}{hidden}", err=True)
     return 0
 
 

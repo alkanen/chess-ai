@@ -282,6 +282,21 @@ def test_the_run_list_can_be_filtered_by_tag(client, runs):
         assert names("resnet") == set()
 
 
+def test_archived_runs_are_left_out_unless_asked_for(client, runs):
+    with new_run(runs, "kept"), new_run(runs, "shelved"):
+        save_notes(RunReader(runs / "shelved"), RunNotes(tags=["sweep", "archived"]))
+
+        def names(**params) -> set[str]:
+            return {run["name"] for run in client.get(f"{PREFIX}/api/runs", params=params).json()}
+
+        assert names() == {"kept"}
+        assert names(archived="true") == {"kept", "shelved"}
+        # Asking for the tag is asking for the archived runs; nothing else could be meant.
+        assert names(tag="archived") == {"shelved"}
+        assert names(tag="sweep") == set()
+        assert names(tag="sweep", archived="true") == {"shelved"}
+
+
 def test_a_run_whose_notes_cannot_be_read_is_still_listed(client, runs):
     with new_run(runs):
         (runs / "live" / NOTES_FILE).write_text("{not json")

@@ -1,5 +1,12 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { fetchRuns, fetchStockfish, startGame, type RunSummary, type StockfishInfo } from './api';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import {
+  fetchRuns,
+  fetchStockfish,
+  isArchived,
+  startGame,
+  type RunSummary,
+  type StockfishInfo,
+} from './api';
 import {
   isPlayable,
   NO_MODEL,
@@ -60,9 +67,12 @@ function useAskedOnce<T>(wanted: boolean, ask: () => Promise<T>): [T | null, str
  */
 function useRuns(wanted: boolean): [RunSummary[] | null, string | null] {
   const [runs, error] = useAskedOnce(wanted, fetchRuns);
+  // Archived runs are left out here as well as by the server, so that a server still running
+  // code from before there were archived runs does not offer them either.
+  const playable = useMemo(() => runs?.filter((run) => !isArchived(run)) ?? null, [runs]);
   // An empty list rather than no list when they could not be had: the form has an answer to
   // give, which is that there is nothing here to play against.
-  return [error !== null ? [] : runs, error];
+  return [error !== null ? [] : playable, error];
 }
 
 /**

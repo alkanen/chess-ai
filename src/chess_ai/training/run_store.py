@@ -949,6 +949,27 @@ def open_run(runs_dir: Path, name: str) -> RunReader:
     return run
 
 
+ARCHIVED_TAG: Final = "archived"
+"""The tag that sets a run aside without deleting it.
+
+An archived run is left out of every list of runs unless it is asked for, and never offered to
+play against, but it is still there to open and compare: a sweep's runs are seldom worth playing
+and their curves often worth looking at again. Archiving is adding the tag, so nothing else is
+needed to do or undo it.
+"""
+
+
+def listed(tags: Collection[str], *, wanted: Collection[str], archived: bool) -> bool:
+    """Whether a run with ``tags`` belongs in a list of runs with all the ``wanted`` tags.
+
+    An archived run belongs in it only when ``archived`` asks for them, or when the archived
+    tag is among those wanted, since asking for that tag can mean nothing else.
+    """
+    if not set(wanted) <= set(tags):
+        return False
+    return archived or ARCHIVED_TAG in wanted or ARCHIVED_TAG not in tags
+
+
 def save_notes(run: RunReader, notes: RunNotes) -> RunNotes:
     """Replace ``run``'s title, tags and notes with ``notes``, and return them as kept.
 
