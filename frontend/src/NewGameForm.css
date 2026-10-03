@@ -49,3 +49,19 @@
   width: 6rem;
   font: inherit;
 }
+
+/* A select is as wide as its longest option unless told otherwise, and a run's is long: held
+   to the width of the panel, everything it sits in included, it shows what fits instead. */
+.new-game .player,
+.new-game .model-settings,
+.new-game label,
+.new-game select {
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+/* The run chosen, named in full under a select that may be too narrow to show it. */
+.new-game .run-name {
+  font-family: ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}

@@ -134,7 +134,7 @@ The charts are drawn with [uPlot](https://github.com/leeoniya/uPlot): it is abou
 
 ### Play a checkpoint
 
-Choosing **Model** for a colour asks the server which training runs it keeps, and offers the run's checkpoints: its **best** one by the run's own validation metric, its **latest**, or any step it has saved. Two more settings say how it plays:
+Choosing **Model** for a colour asks the server which training runs it keeps. Each run is offered by its title, if it has one (`chess-ai runs annotate NAME --title ...`, or the run's page), and otherwise by its name without the leading timestamp, cut down to the experiment when it is long; two runs that would look the same are told apart by when they started, and the chosen run's full name is shown under the list. The form then offers the run's checkpoints: its **best** one by the run's own validation metric, its **latest**, or any step it has saved. Two more settings say how it plays:
 
 - **rating** is what the model is asked to play like, given to the network as both sides' rating — the whole point of training on rated games. Left empty, the position claims no rating at all, which is also something the model was trained on.
 - **plays** is either its best move every time, which makes the same position give the same move, or a sample from its distribution at a **temperature**: below 1 sharpens towards the best move, above 1 flattens towards a coin toss.

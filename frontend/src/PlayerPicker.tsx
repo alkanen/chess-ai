@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   fetchCheckpoints,
   PLAYER_NAMES,
@@ -10,6 +10,7 @@ import {
   type SelectionStrategy,
   type StockfishInfo,
 } from './api';
+import { describeRun, runLabels } from './runLabels';
 
 const PLAYER_KINDS = Object.keys(PLAYER_NAMES) as PlayerKind[];
 
@@ -242,6 +243,7 @@ interface ModelFieldsProps extends Omit<PlayerPickerProps, 'stockfish'> {
 
 /** Which checkpoint plays this side, how well it should play, and how it picks its move. */
 function ModelFields({ label, value, onChange, runs, checkpoints }: ModelFieldsProps) {
+  const labels = useMemo(() => runLabels(runs ?? []), [runs]);
   if (runs !== null && runs.length === 0) {
     return <p className="note">No training runs have been kept here yet.</p>;
   }
@@ -259,12 +261,15 @@ function ModelFields({ label, value, onChange, runs, checkpoints }: ModelFieldsP
         >
           {runs === null && <option value="">Looking…</option>}
           {runs?.map((run) => (
-            <option key={run.name} value={run.name}>
-              {describeRun(run)}
+            <option key={run.name} value={run.name} title={run.name}>
+              {describeRun(run, labels.get(run.name) ?? run.name)}
             </option>
           ))}
         </select>
       </label>
+      {/* In full, since the select may well be too narrow to show it, and the label it is
+          shown by there is only what the run is called, not what it is. */}
+      {value.run !== '' && <p className="note run-name">{value.run}</p>}
       <label>
         {label} checkpoint{' '}
         <select
@@ -325,12 +330,6 @@ function ModelFields({ label, value, onChange, runs, checkpoints }: ModelFieldsP
       )}
     </div>
   );
-}
-
-/** A run in one line: its name, and how far it has got. */
-function describeRun(run: RunSummary): string {
-  const steps = run.steps !== null ? `, ${run.step ?? 0}/${run.steps} steps` : '';
-  return `${run.name} (${run.checkpoints} checkpoints${steps})`;
 }
 
 /** A checkpoint in one line: which step it is, and whether it is the best or the newest. */
