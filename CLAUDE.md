@@ -6,12 +6,12 @@ The design is in the PRD, [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-train
 
 - Never create branches or commits, and never push, open or edit pull requests, merge, or create or change issues or labels. The user does all of these by hand.
 - The only things you write to GitHub are PR review comments and replies to them (see [Review rounds](#review-rounds)).
-- Reading is fine: `git status`/`log`/`diff`/`fetch`, and `gh api` GET requests.
+- Reading is fine: `git status`/`log`/`diff`/`fetch`, and read-only `gh` commands such as `gh issue view`, `gh pr view` and `gh api` GET requests.
 - Leave all your work as uncommitted changes in the working tree, and hand it over with a suggested branch name and commit message (see [Handing over](#handing-over)).
 
 ## Working on an issue
 
-- Read the issue and the parts of the PRD it references. Use `gh api repos/alkanen/chess-ai/issues/N`, because `gh issue view` fails with older gh versions.
+- Read the issue and the parts of the PRD it references, for example with `gh issue view N`. Inline review comments are only available through `gh api` (see [Review rounds](#review-rounds)).
 - Before changing anything, check with `git fetch` and `git status` that the working tree is clean and on an up-to-date `main`. If it isn't, ask the user.
 - Implement, run the [checks](#checks), then stop and hand over.
 
