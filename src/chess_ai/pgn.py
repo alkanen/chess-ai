@@ -7,6 +7,7 @@ the position it started from when that was not the usual one.
 """
 
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -44,7 +45,9 @@ word PGN has that says what it means: the game was given up rather than played o
 _UNNAMEABLE = re.compile(r"[^A-Za-z0-9-]+")
 
 
-def game_pgn(game: GameState, *, now: datetime | None = None) -> str:
+def game_pgn(
+    game: GameState, *, now: datetime | None = None, headers: Mapping[str, str] | None = None
+) -> str:
     """``game`` as PGN, ready to be written to a file or sent to a browser.
 
     Any game can be written out, finished or not: a game still being played is given the
@@ -54,6 +57,10 @@ def game_pgn(game: GameState, *, now: datetime | None = None) -> str:
 
     ``now`` is the moment the game is written out, which for a game saved as it ends is
     when it ended. It dates the game; tests give a fixed one.
+
+    ``headers`` are tags of the caller's own, which take the place of any written here: a
+    match names its own ``Event`` and numbers its ``Round``s, and says which opening each
+    game began with.
     """
     when = now if now is not None else datetime.now()
     record = chess.pgn.Game()
@@ -80,6 +87,7 @@ def game_pgn(game: GameState, *, now: datetime | None = None) -> str:
     for color, player in (("White", game.white), ("Black", game.black)):
         record.headers.update(_model_tags(color, player))
         record.headers.update(_stockfish_tags(color, player))
+    record.headers.update(headers or {})
     node: chess.pgn.GameNode = record
     for move in game.moves:
         node = node.add_main_variation(chess.Move.from_uci(move.uci))

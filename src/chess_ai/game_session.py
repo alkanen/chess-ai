@@ -8,7 +8,7 @@ or an abort.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import contextmanager
 from typing import Literal
 from uuid import uuid4
@@ -130,6 +130,7 @@ class GameSession:
         move_delay: float = 0.0,
         id: str | None = None,
         fen: str | None = None,
+        opening: Sequence[chess.Move] = (),
     ) -> None:
         """A game from the starting position, or from ``fen`` when one is given.
 
@@ -145,6 +146,14 @@ class GameSession:
         ``fen`` must be a position a game can be played from; see
         ``position_view.board_from_fen``, which is what turns what a viewer typed into
         one. The side it gives the move has the first move of the game.
+
+        ``opening`` is moves already played when the players sit down, as a match starts its
+        games from a book line. They are the game's first moves like any other, in its history
+        and its PGN, so that the game replays from where it really started and a repetition
+        counts the positions they passed through.
+
+        Raises:
+            ValueError: a move of ``opening`` is not legal where it would be played.
         """
         self.id = id if id is not None else uuid4().hex
         self._players = {chess.WHITE: white, chess.BLACK: black}
@@ -152,6 +161,11 @@ class GameSession:
         self._board = chess.Board() if fen is None else board_from_fen(fen)
         self._start_fen = self._board.fen()
         self._moves: list[MoveRecord] = []
+        for move in opening:
+            if not self._board.is_legal(move):
+                raise ValueError(f"{move.uci()} is not a legal move in {self._board.fen()}")
+            self._moves.append(MoveRecord(uci=move.uci(), san=self._board.san(move)))
+            self._board.push(move)
         self._position = snapshot(self._board)
         self._subscribers: set[asyncio.Queue[GameEvent | None]] = set()
         self._started = False

@@ -986,3 +986,40 @@ async def test_a_takeback_does_not_silence_a_failure_the_game_never_reads():
     gc.collect()
     await asyncio.sleep(0)
     assert [type(failure) for failure in reported] == [PlayerBroke]
+
+
+async def test_a_game_can_start_with_an_opening_already_played():
+    """As a match starts its games: the line is the game's first moves, not a new start."""
+    opening = [chess.Move.from_uci(uci) for uci in ("f2f3", "e7e5", "g2g4")]
+    session = GameSession(ScriptedPlayer([]), ScriptedPlayer(["d8h4"]), opening=opening)
+
+    started = session.state
+    await session.play()
+
+    assert started.start_fen == chess.STARTING_FEN
+    assert [move.san for move in started.moves] == ["f3", "e5", "g4"]
+    assert started.position.turn == "black"
+    assert [move.san for move in session.state.moves] == ["f3", "e5", "g4", "Qh4#"]
+
+
+async def test_an_opening_that_cannot_be_played_is_refused():
+    opening = [chess.Move.from_uci("e2e4"), chess.Move.from_uci("e2e4")]
+
+    with pytest.raises(ValueError, match="e2e4 is not a legal move"):
+        GameSession(ScriptedPlayer([]), ScriptedPlayer([]), opening=opening)
+
+
+async def test_a_repetition_counts_the_positions_the_opening_passed_through():
+    # The opening goes out and back once; the players do it once more, which is the third time
+    # the starting position stands on the board.
+    opening = [chess.Move.from_uci(uci) for uci in ("g1f3", "g8f6", "f3g1", "f6g8")]
+    session = GameSession(
+        ScriptedPlayer(["g1f3", "f3g1"]), ScriptedPlayer(["g8f6", "f6g8"]), opening=opening
+    )
+
+    await session.play()
+
+    game_over = session.state.position.game_over
+    assert game_over is not None
+    assert game_over.reason == "threefold_repetition"
+    assert len(session.state.moves) <= 8

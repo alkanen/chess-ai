@@ -1,0 +1,418 @@
+# The standard opening set: where the games of a match start.
+#
+# Argmax play is deterministic, so two checkpoints that start every game from the starting
+# position play the same game every time. Each game of a match starts from one of these lines
+# instead, and each line is played twice, once with either player on either side.
+#
+# The lines are main-line theory, a few moves deep, chosen to cover the openings people
+# actually play rather than to test anything in particular. Each was checked with Stockfish
+# when it was added: none leaves either side much more than a pawn worse, and no two reach the
+# same position. Their order mixes the openings up, so that a short match still plays a spread
+# of them rather than ten Sicilians.
+#
+# The set is versioned: two matches that name the same set and version started from the same
+# positions, in the same order. Changing, adding, removing or reordering a line changes what a
+# match plays, so it raises the version, and the test that pins this set's contents with it.
+
+name = "standard"
+version = 1
+
+[[openings]]
+name = "Ruy Lopez"
+moves = "e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6"
+
+[[openings]]
+name = "Queen's Gambit Declined"
+moves = "d4 d5 c4 e6 Nc3 Nf6 Nf3 Be7"
+
+[[openings]]
+name = "Sicilian Defence, Najdorf Variation"
+moves = "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6"
+
+[[openings]]
+name = "King's Indian Defence"
+moves = "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6 Nf3 O-O"
+
+[[openings]]
+name = "English Opening, Symmetrical Variation"
+moves = "c4 c5 Nc3 Nc6 g3 g6 Bg2 Bg7"
+
+[[openings]]
+name = "French Defence, Winawer Variation"
+moves = "e4 e6 d4 d5 Nc3 Bb4 e5 c5"
+
+[[openings]]
+name = "Slav Defence"
+moves = "d4 d5 c4 c6 Nf3 Nf6 Nc3 dxc4"
+
+[[openings]]
+name = "Caro-Kann Defence, Advance Variation"
+moves = "e4 c6 d4 d5 e5 Bf5 Nf3 e6"
+
+[[openings]]
+name = "Nimzo-Indian Defence, Rubinstein Variation"
+moves = "d4 Nf6 c4 e6 Nc3 Bb4 e3 O-O"
+
+[[openings]]
+name = "Italian Game, Giuoco Pianissimo"
+moves = "e4 e5 Nf3 Nc6 Bc4 Bc5 c3 Nf6 d3 d6"
+
+[[openings]]
+name = "Réti Opening"
+moves = "Nf3 d5 g3 Nf6 Bg2 c6 O-O Bg4"
+
+[[openings]]
+name = "Sicilian Defence, Sveshnikov Variation"
+moves = "e4 c5 Nf3 Nc6 d4 cxd4 Nxd4 Nf6 Nc3 e5"
+
+[[openings]]
+name = "Grünfeld Defence, Exchange Variation"
+moves = "d4 Nf6 c4 g6 Nc3 d5 cxd5 Nxd5 e4 Nxc3 bxc3 Bg7"
+
+[[openings]]
+name = "Petrov's Defence"
+moves = "e4 e5 Nf3 Nf6 Nxe5 d6 Nf3 Nxe4 d4 d5"
+
+[[openings]]
+name = "Queen's Indian Defence"
+moves = "d4 Nf6 c4 e6 Nf3 b6 g3 Ba6"
+
+[[openings]]
+name = "Pirc Defence, Classical Variation"
+moves = "e4 d6 d4 Nf6 Nc3 g6 Nf3 Bg7 Be2 O-O"
+
+[[openings]]
+name = "Ruy Lopez, Berlin Defence"
+moves = "e4 e5 Nf3 Nc6 Bb5 Nf6 O-O Nxe4 d4 Nd6"
+
+[[openings]]
+name = "London System"
+moves = "d4 d5 Nf3 Nf6 Bf4 e6 e3 c5"
+
+[[openings]]
+name = "Sicilian Defence, Alapin Variation"
+moves = "e4 c5 c3 Nf6 e5 Nd5 d4 cxd4 Nf3 Nc6"
+
+[[openings]]
+name = "Dutch Defence, Classical Variation"
+moves = "d4 f5 g3 Nf6 Bg2 e6 Nf3 Be7 O-O O-O"
+
+[[openings]]
+name = "French Defence, Classical Variation"
+moves = "e4 e6 d4 d5 Nc3 Nf6 Bg5 Be7 e5 Nfd7"
+
+[[openings]]
+name = "Queen's Gambit Declined, Tartakower Variation"
+moves = "d4 d5 c4 e6 Nc3 Nf6 Bg5 Be7 e3 O-O Nf3 h6 Bh4 b6"
+
+[[openings]]
+name = "Caro-Kann Defence, Classical Variation"
+moves = "e4 c6 d4 d5 Nc3 dxe4 Nxe4 Bf5 Ng3 Bg6"
+
+[[openings]]
+name = "Queen's Gambit Accepted"
+moves = "d4 d5 c4 dxc4 Nf3 Nf6 e3 e6 Bxc4 c5"
+
+[[openings]]
+name = "Scotch Game"
+moves = "e4 e5 Nf3 Nc6 d4 exd4 Nxd4 Nf6 Nxc6 bxc6"
+
+[[openings]]
+name = "King's Indian Defence, Averbakh Variation"
+moves = "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6 Be2 O-O Bg5"
+
+[[openings]]
+name = "Sicilian Defence, Dragon Variation"
+moves = "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 g6"
+
+[[openings]]
+name = "English Opening, Reversed Sicilian"
+moves = "c4 e5 Nc3 Nf6 g3 d5 cxd5 Nxd5 Bg2 Nb6"
+
+[[openings]]
+name = "Semi-Slav Defence"
+moves = "d4 d5 c4 c6 Nf3 Nf6 Nc3 e6 e3 Nbd7"
+
+[[openings]]
+name = "Ruy Lopez, Closed Variation"
+moves = "e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Be7 Re1 b5 Bb3 d6"
+
+[[openings]]
+name = "Scandinavian Defence"
+moves = "e4 d5 exd5 Qxd5 Nc3 Qa5 d4 Nf6 Nf3 c6"
+
+[[openings]]
+name = "Nimzo-Indian Defence, Classical Variation"
+moves = "d4 Nf6 c4 e6 Nc3 Bb4 Qc2 O-O a3 Bxc3+ Qxc3"
+
+[[openings]]
+name = "Sicilian Defence, Taimanov Variation"
+moves = "e4 c5 Nf3 e6 d4 cxd4 Nxd4 Nc6 Nc3 Qc7"
+
+[[openings]]
+name = "Trompowsky Attack"
+moves = "d4 Nf6 Bg5 Ne4 Bf4 c5 f3 Qa5+ c3 Nf6"
+
+[[openings]]
+name = "French Defence, Advance Variation"
+moves = "e4 e6 d4 d5 e5 c5 c3 Nc6 Nf3 Qb6"
+
+[[openings]]
+name = "Queen's Gambit Declined, Exchange Variation"
+moves = "d4 d5 c4 e6 Nc3 Nf6 cxd5 exd5 Bg5 Be7"
+
+[[openings]]
+name = "Italian Game, Two Knights Defence, Modern Bishop's Opening"
+moves = "e4 e5 Nf3 Nc6 Bc4 Nf6 d3 Be7 O-O O-O"
+
+[[openings]]
+name = "Modern Benoni"
+moves = "d4 Nf6 c4 c5 d5 e6 Nc3 exd5 cxd5 d6"
+
+[[openings]]
+name = "Modern Defence"
+moves = "e4 g6 d4 Bg7 Nc3 d6 Be3 a6"
+
+[[openings]]
+name = "Sicilian Defence, English Attack"
+moves = "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 e6 Be3 a6"
+
+[[openings]]
+name = "King's Indian Attack"
+moves = "Nf3 d5 g3 c5 Bg2 Nc6 O-O e5 d3 Nf6"
+
+[[openings]]
+name = "Catalan Opening, Open Variation"
+moves = "d4 Nf6 c4 e6 g3 d5 Bg2 dxc4 Nf3 c5"
+
+[[openings]]
+name = "Philidor Defence"
+moves = "e4 e5 Nf3 d6 d4 Nf6 Nc3 Nbd7 Bc4 Be7"
+
+[[openings]]
+name = "Caro-Kann Defence, Two Knights Variation"
+moves = "e4 c6 Nc3 d5 Nf3 Bg4 h3 Bxf3 Qxf3 e6"
+
+[[openings]]
+name = "Bogo-Indian Defence"
+moves = "d4 Nf6 c4 e6 Nf3 Bb4+ Bd2 Qe7 g3 Nc6"
+
+[[openings]]
+name = "Ruy Lopez, Exchange Variation"
+moves = "e4 e5 Nf3 Nc6 Bb5 a6 Bxc6 dxc6 O-O f6"
+
+[[openings]]
+name = "English Opening, Anglo-Indian Defence"
+moves = "c4 Nf6 g3 e6 Bg2 d5 Nf3 Be7 O-O O-O"
+
+[[openings]]
+name = "Queen's Gambit Accepted, Central Variation"
+moves = "d4 d5 c4 dxc4 e4 e5 Nf3 exd4 Bxc4 Bb4+"
+
+[[openings]]
+name = "Sicilian Defence, Closed Variation"
+moves = "e4 c5 Nc3 Nc6 g3 g6 Bg2 Bg7 d3 d6"
+
+[[openings]]
+name = "Four Knights Game, Scotch Variation"
+moves = "e4 e5 Nf3 Nc6 Nc3 Nf6 d4 exd4 Nxd4 Bb4 Nxc6 bxc6 Bd3 d5"
+
+[[openings]]
+name = "Torre Attack"
+moves = "d4 Nf6 Nf3 e6 Bg5 c5 e3 h6 Bh4"
+
+[[openings]]
+name = "French Defence, Tarrasch Variation"
+moves = "e4 e6 d4 d5 Nd2 c5 exd5 exd5 Ngf3 Nc6"
+
+[[openings]]
+name = "Slav Defence, Exchange Variation"
+moves = "d4 d5 c4 c6 cxd5 cxd5 Nc3 Nf6 Nf3 Nc6"
+
+[[openings]]
+name = "Sicilian Defence, Rossolimo Variation"
+moves = "e4 c5 Nf3 Nc6 Bb5 g6 O-O Bg7 Re1 Nf6"
+
+[[openings]]
+name = "King's Indian Defence, Sämisch Variation"
+moves = "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6 f3 O-O Be3 c5"
+
+[[openings]]
+name = "Vienna Game"
+moves = "e4 e5 Nc3 Nf6 g3 d5 exd5 Nxd5 Bg2 Nxc3 bxc3 Bd6"
+
+[[openings]]
+name = "Nimzowitsch-Larsen Attack"
+moves = "b3 e5 Bb2 Nc6 e3 d5 Bb5 Bd6"
+
+[[openings]]
+name = "Veresov Attack"
+moves = "d4 Nf6 Nc3 d5 Bg5 Bf5 f3 Nbd7"
+
+[[openings]]
+name = "Caro-Kann Defence, Panov Attack"
+moves = "e4 c6 d4 d5 exd5 cxd5 c4 Nf6 Nc3 e6 Nf3 Be7"
+
+[[openings]]
+name = "Budapest Gambit"
+moves = "d4 Nf6 c4 e5 dxe5 Ng4 Bf4 Nc6 Nf3 Bb4+"
+
+[[openings]]
+name = "Sicilian Defence, Accelerated Dragon, Maróczy Bind"
+moves = "e4 c5 Nf3 Nc6 d4 cxd4 Nxd4 g6 c4 Bg7 Be3 Nf6 Nc3 O-O"
+
+[[openings]]
+name = "Queen's Indian Defence, Petrosian Variation"
+moves = "d4 Nf6 c4 e6 Nf3 b6 a3 Bb7 Nc3 d5"
+
+[[openings]]
+name = "King's Gambit Accepted"
+moves = "e4 e5 f4 exf4 Nf3 d5 exd5 Nf6"
+
+[[openings]]
+name = "English Opening, Closed Variation"
+moves = "c4 e5 Nc3 Nc6 g3 g6 Bg2 Bg7 d3 d6"
+
+[[openings]]
+name = "Queen's Gambit Declined, Cambridge Springs Variation"
+moves = "d4 d5 c4 e6 Nc3 Nf6 Bg5 Nbd7 e3 c6 Nf3 Qa5"
+
+[[openings]]
+name = "French Defence, Rubinstein Variation"
+moves = "e4 e6 d4 d5 Nc3 dxe4 Nxe4 Nd7 Nf3 Ngf6"
+
+[[openings]]
+name = "Alekhine's Defence, Exchange Variation"
+moves = "e4 Nf6 e5 Nd5 d4 d6 c4 Nb6 exd6 cxd6"
+
+[[openings]]
+name = "London System against the King's Indian"
+moves = "d4 Nf6 Nf3 g6 Bf4 Bg7 e3 O-O Be2 d6"
+
+[[openings]]
+name = "Neo-Grünfeld Defence"
+moves = "d4 Nf6 c4 g6 g3 d5 Bg2 Bg7 Nf3 O-O O-O c6"
+
+[[openings]]
+name = "Evans Gambit"
+moves = "e4 e5 Nf3 Nc6 Bc4 Bc5 b4 Bxb4 c3 Ba5"
+
+[[openings]]
+name = "Sicilian Defence, Four Knights Variation"
+moves = "e4 c5 Nf3 e6 d4 cxd4 Nxd4 Nf6 Nc3 Nc6"
+
+[[openings]]
+name = "Dutch Defence, Stonewall Variation"
+moves = "d4 e6 c4 f5 Nf3 Nf6 g3 d5 Bg2 c6 O-O Bd6"
+
+[[openings]]
+name = "King's Indian Defence, Four Pawns Attack"
+moves = "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6 f4 O-O Nf3 c5 d5 e6"
+
+[[openings]]
+name = "Two Knights Defence, Knight Attack"
+moves = "e4 e5 Nf3 Nc6 Bc4 Nf6 Ng5 d5 exd5 Na5 Bb5+ c6 dxc6 bxc6"
+
+[[openings]]
+name = "Tarrasch Defence"
+moves = "d4 d5 c4 e6 Nc3 c5 cxd5 exd5 Nf3 Nc6 g3 Nf6"
+
+[[openings]]
+name = "Caro-Kann Defence, Karpov Variation"
+moves = "e4 c6 d4 d5 Nc3 dxe4 Nxe4 Nd7 Nf3 Ngf6 Nxf6+ Nxf6"
+
+[[openings]]
+name = "English Opening, Caro-Kann Defensive System"
+moves = "c4 c6 Nf3 d5 e3 Nf6 Nc3 e6 b3 Nbd7"
+
+[[openings]]
+name = "Nimzo-Indian Defence, Three Knights Variation"
+moves = "d4 Nf6 c4 e6 Nc3 Bb4 Nf3 c5 g3 cxd4 Nxd4 O-O"
+
+[[openings]]
+name = "Ruy Lopez, Open Variation"
+moves = "e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Nxe4 d4 b5 Bb3 d5 dxe5 Be6"
+
+[[openings]]
+name = "Sicilian Defence, Moscow Variation"
+moves = "e4 c5 Nf3 d6 Bb5+ Bd7 Bxd7+ Qxd7 O-O Nc6 c3 Nf6"
+
+[[openings]]
+name = "Slav Defence, Chebanenko Variation"
+moves = "d4 d5 c4 c6 Nf3 Nf6 Nc3 a6 e3 b5"
+
+[[openings]]
+name = "Colle System"
+moves = "d4 d5 Nf3 Nf6 e3 e6 Bd3 c5 c3 Nc6"
+
+[[openings]]
+name = "French Defence, Exchange Variation"
+moves = "e4 e6 d4 d5 exd5 exd5 Nf3 Nf6 Bd3 Bd6"
+
+[[openings]]
+name = "Pirc Defence, Austrian Attack"
+moves = "e4 d6 d4 Nf6 Nc3 g6 f4 Bg7 Nf3 c5"
+
+[[openings]]
+name = "Catalan Opening, Closed Variation"
+moves = "d4 Nf6 c4 e6 g3 d5 Nf3 Be7 Bg2 O-O O-O dxc4 Qc2 a6"
+
+[[openings]]
+name = "English Opening, Symmetrical Variation, Four Knights"
+moves = "c4 c5 Nf3 Nf6 Nc3 d5 cxd5 Nxd5 d4 cxd4 Qxd4 Nxc3 Qxc3"
+
+[[openings]]
+name = "Bishop's Opening"
+moves = "e4 e5 Bc4 Nf6 d3 c6 Nf3 d5 Bb3 Bd6"
+
+[[openings]]
+name = "Grünfeld Defence, Russian Variation"
+moves = "d4 Nf6 c4 g6 Nc3 d5 Nf3 Bg7 Qb3 dxc4 Qxc4 O-O e4 a6"
+
+[[openings]]
+name = "Sicilian Defence, Kan Variation"
+moves = "e4 c5 Nf3 e6 d4 cxd4 Nxd4 a6 Bd3 Nf6 O-O Qc7"
+
+[[openings]]
+name = "Réti Opening, King's Indian Setup"
+moves = "Nf3 Nf6 g3 g6 Bg2 Bg7 O-O O-O d3 d6"
+
+[[openings]]
+name = "Queen's Gambit Declined, Ragozin Defence"
+moves = "d4 d5 c4 e6 Nc3 Nf6 Nf3 Bb4 Bg5 Nbd7"
+
+[[openings]]
+name = "Ruy Lopez, Marshall Attack"
+moves = "e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Be7 Re1 b5 Bb3 O-O c3 d5 exd5 Nxd5 Nxe5 Nxe5 Rxe5 c6"
+
+[[openings]]
+name = "Caro-Kann Defence, Exchange Variation"
+moves = "e4 c6 d4 d5 exd5 cxd5 Bd3 Nc6 c3 Nf6 Bf4 Bg4"
+
+[[openings]]
+name = "Bird's Opening"
+moves = "f4 d5 Nf3 Nf6 e3 g6 Be2 Bg7 O-O O-O"
+
+[[openings]]
+name = "Centre Game"
+moves = "e4 e5 d4 exd4 Qxd4 Nc6 Qe3 Nf6 Nc3 Bb4 Bd2 O-O"
+
+[[openings]]
+name = "Slav Defence, Schlechter Variation"
+moves = "d4 d5 Nf3 Nf6 c4 c6 e3 Bf5 Nc3 e6 Nh4 Bg6"
+
+[[openings]]
+name = "Sicilian Defence, Classical Variation"
+moves = "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 Nc6 Bg5 e6"
+
+[[openings]]
+name = "English Opening, Four Knights Variation"
+moves = "c4 e5 Nc3 Nf6 Nf3 Nc6 g3 d5 cxd5 Nxd5 Bg2 Nb6"
+
+[[openings]]
+name = "King's Indian Defence, Fianchetto Variation"
+moves = "d4 Nf6 c4 g6 Nf3 Bg7 g3 O-O Bg2 d6 O-O Nc6"
+
+[[openings]]
+name = "Petrov's Defence, Steinitz Attack"
+moves = "e4 e5 Nf3 Nf6 d4 Nxe4 Bd3 d5 Nxe5 Nd7"

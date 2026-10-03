@@ -285,3 +285,19 @@ async def test_a_side_stockfish_played_says_the_strength_it_played_at_and_its_ti
     assert headers["BlackElo"] == "1320"
     assert headers["BlackMoveTime"] == "0.5"
     assert "WhiteElo" not in headers
+
+
+async def test_tags_of_the_callers_own_are_added_and_take_the_place_of_its_defaults():
+    pgn = game_pgn(
+        await fools_mate(),
+        now=WHEN,
+        headers={"Event": "chess-ai match", "Round": "7", "Opening": "Bird's Opening"},
+    )
+
+    headers = read_back(pgn).headers
+    assert (headers["Event"], headers["Round"], headers["Opening"]) == (
+        "chess-ai match",
+        "7",
+        "Bird's Opening",
+    )
+    assert headers["Result"] == "0-1", "and the rest are as they were"

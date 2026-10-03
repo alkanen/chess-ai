@@ -1,6 +1,7 @@
 import errno
 import io
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -555,6 +556,7 @@ def test_a_crash_keeps_its_exit_status_when_nothing_reads_anything(tmp_path):
 
 EMBEDDED = """
 import os
+import re
 import sys
 from chess_ai.cli import main
 
@@ -905,3 +907,338 @@ def test_runs_list_still_lists_a_run_whose_notes_cannot_be_read(tmp_path, capsys
 
     assert main(["runs", "list", "--tag", "mlp"]) == 0
     assert "tiny" not in capsys.readouterr().out, "its tags cannot be known, so no tag matches"
+
+
+def match_config(tmp_path, **sections) -> Path:
+    """A config with a run of tiny checkpoints (steps 2 and 4) and a games directory to fill."""
+    from training_helpers import model_run
+
+    model_run(tmp_path / "runs")
+    config = tmp_path / "match.toml"
+    text = f'[paths]\nruns = "{tmp_path / "runs"}"\ngames = "{tmp_path / "games"}"\n'
+    for section, body in sections.items():
+        text += f"\n[{section}]\n{body}\n"
+    config.write_text(text)
+    return config
+
+
+def match_games(tmp_path) -> list:
+    """The games of the one match file in the games directory, as python-chess reads them."""
+    import chess.pgn
+
+    (path,) = (tmp_path / "games").glob("*-match-*.pgn")
+    games = []
+    with path.open(encoding="utf-8") as file:
+        while (game := chess.pgn.read_game(file)) is not None:
+            assert game.errors == []
+            games.append(game)
+    return games
+
+
+def test_match_plays_two_checkpoints_and_prints_the_score_from_both_sides(tmp_path, capsys):
+    config = match_config(tmp_path)
+
+    status = main(["--config", str(config), "match", "tiny@2", "tiny@latest", "--games", "2"])
+
+    out = capsys.readouterr().out
+    assert status == 0
+    assert "tiny step 2 against tiny step 4, 2 games from opening set standard v1" in out
+    assert "game 1/2, Ruy Lopez: tiny step 2 – tiny step 4" in out
+    assert "game 2/2, Ruy Lopez: tiny step 4 – tiny step 2" in out
+    assert "\ntiny step 2: " in out and "\ntiny step 4: " in out
+    assert "as white" in out and "as black" in out
+    assert f"games saved in {tmp_path / 'games'}" in out
+    games = match_games(tmp_path)
+    assert len(games) == 2
+    assert [game.headers["WhiteCheckpoint"] for game in games] == ["2", "4"]
+    assert [game.headers["BlackCheckpoint"] for game in games] == ["4", "2"]
+    assert {game.headers["WhiteRun"] for game in games} == {"tiny"}
+    assert [game.headers["Round"] for game in games] == ["1", "2"]
+
+
+def test_a_seeded_match_with_a_temperature_is_played_again_move_for_move(tmp_path, capsys):
+    config = match_config(tmp_path)
+    command = ["--config", str(config), "match", "tiny@2", "tiny@4", "--games", "2"]
+
+    def played(*extra: str) -> list[list[str]]:
+        assert main([*command, *extra]) == 0
+        games = match_games(tmp_path)
+        for path in (tmp_path / "games").iterdir():
+            path.unlink()
+        assert {game.headers["WhiteSelection"] for game in games} == {"sample 0.5"}
+        return [[move.uci() for move in game.mainline_moves()] for game in games]
+
+    once = played("--temperature", "0.5", "--seed", "11")
+    again = played("--temperature", "0.5", "--seed", "11")
+    otherwise = played("--temperature", "0.5", "--seed", "12")
+
+    assert once == again
+    assert once != otherwise
+    assert "seed 11" in capsys.readouterr().out
+
+
+def test_a_match_without_a_seed_says_which_seed_it_drew(tmp_path, capsys):
+    config = match_config(tmp_path)
+
+    assert (
+        main(["--config", str(config), "match", "tiny", "tiny@4,temperature=2", "--games", "1"])
+        == 0
+    )
+
+    out = capsys.readouterr().out
+    assert re.search(r"seed \d+", out)
+    (game,) = match_games(tmp_path)
+    assert (game.headers["WhiteSelection"], game.headers["BlackSelection"]) == (
+        "argmax",
+        "sample 2",
+    )
+
+
+def test_a_checkpoint_against_itself_is_told_apart_by_its_settings(tmp_path, capsys):
+    config = match_config(tmp_path)
+
+    status = main(
+        [
+            "--config",
+            str(config),
+            "match",
+            "tiny@2,rating=1200",
+            "tiny@2,rating=1800",
+            "--games",
+            "1",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert status == 0
+    assert "tiny step 2 (rating=1200) against tiny step 2 (rating=1800)" in out
+    (game,) = match_games(tmp_path)
+    assert (game.headers["WhiteRating"], game.headers["BlackRating"]) == ("1200", "1800")
+
+
+def test_a_titled_run_is_shown_by_its_title(tmp_path, capsys):
+    config = match_config(tmp_path)
+    assert main(["--config", str(config), "runs", "annotate", "tiny", "--title", "Tiny MLP"]) == 0
+
+    assert main(["--config", str(config), "match", "tiny@2", "tiny@4", "--games", "1"]) == 0
+
+    assert "Tiny MLP step 2 against Tiny MLP step 4" in capsys.readouterr().out
+    (game,) = match_games(tmp_path)
+    assert game.headers["White"] == "tiny step 2", "the PGN names the run itself"
+
+
+def test_a_match_longer_than_its_opening_set_warns_that_games_repeat(tmp_path, capsys):
+    config = match_config(tmp_path)
+    openings = tmp_path / "one.toml"
+    openings.write_text('name = "one"\nversion = 1\n[[openings]]\nname = "e4"\nmoves = "e4 e5"\n')
+
+    status = main(
+        [
+            "--config",
+            str(config),
+            "match",
+            "tiny@2",
+            "tiny@4",
+            "--games",
+            "3",
+            "--openings",
+            str(openings),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert status == 0
+    assert "opening set one v1 has 1 line, so from game 3 on" in captured.err
+    assert len(match_games(tmp_path)) == 3
+
+
+def test_match_against_stockfish_closes_the_engine_afterwards(tmp_path, capsys):
+    from stockfish_helpers import fake_engine, started, wait_until_gone
+
+    engine = fake_engine(tmp_path / "engine")
+    config = match_config(tmp_path, stockfish=f'path = "{engine}"')
+
+    status = main(
+        ["--config", str(config), "match", "stockfish:1500,move-time=0.01", "tiny", "--games", "2"]
+    )
+
+    out = capsys.readouterr().out
+    assert status == 0
+    assert "Stockfish 1500 against tiny step 2" in out
+    games = match_games(tmp_path)
+    assert [game.headers.get("WhiteElo") for game in games] == ["1500", None]
+    assert len(started(engine)) == 1, "one engine for the whole match"
+    wait_until_gone(*started(engine))
+
+
+@pytest.mark.parametrize(
+    ("player", "complaint"),
+    [
+        ("tiny,rating=strong", "a rating is a number from 0 to 4000, not 'strong'"),
+        ("tiny,rating=5000", "a rating is a number from 0 to 4000"),
+        ("tiny,rating", "'rating' in 'tiny,rating' is not KEY=VALUE"),
+        ("tiny,rating=1,rating=2", "rating is given twice"),
+        ("tiny,strategy=argmax,temperature=0.5", "playing its most likely move has no temperature"),
+        ("tiny,strategy=greedy", "the strategy is argmax or sample, not 'greedy'"),
+        ("tiny,temperature=0", "a temperature is a number from 0.01 to 10"),
+        ("tiny,colour=white", "colour is not a setting of this kind of player"),
+        ("tiny@soon", "a checkpoint is a number of at least 0, not 'soon'"),
+        ("@best", "names no run"),
+        ("stockfish:strong", "an Elo is a number from 0 to 4000, not 'strong'"),
+        ("stockfish:1500,rating=1500", "rating is not a setting of this kind of player"),
+        ("stockfish:1500,move-time=0", "a move time is a number from 0.01 to 60"),
+    ],
+)
+def test_match_refuses_a_player_it_cannot_read(tmp_path, capsys, player, complaint):
+    with pytest.raises(SystemExit) as exited:
+        main(["match", player, "tiny"])
+
+    assert exited.value.code == 2
+    assert complaint in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("players", "complaint"),
+    [
+        (["nonesuch", "tiny"], "nonesuch"),
+        (["tiny@3", "tiny"], "no checkpoint from step 3"),
+    ],
+)
+def test_match_refuses_a_checkpoint_that_is_not_there(tmp_path, capsys, players, complaint):
+    config = match_config(tmp_path)
+
+    with pytest.raises(SystemExit) as exited:
+        main(["--config", str(config), "match", *players])
+
+    assert exited.value.code == 2
+    assert complaint in capsys.readouterr().err
+    assert not (tmp_path / "games").exists(), "and no game was played"
+
+
+def test_match_refuses_an_opening_set_that_is_not_there(tmp_path, capsys):
+    config = match_config(tmp_path)
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config), "match", "tiny", "tiny", "--openings", "nonesuch"])
+
+    assert "no opening set 'nonesuch'" in capsys.readouterr().err
+
+
+def test_match_refuses_fewer_than_one_game(capsys):
+    with pytest.raises(SystemExit):
+        main(["match", "tiny", "tiny", "--games", "0"])
+
+    assert "a whole number of at least 1, not '0'" in capsys.readouterr().err
+
+
+def test_a_mistyped_run_is_refused_before_any_stockfish_is_started(tmp_path, capsys):
+    """The likeliest way a match fails, which must not leave an engine for nobody to reap."""
+    from stockfish_helpers import fake_engine, started
+
+    engine = fake_engine(tmp_path / "engine")
+    config = match_config(tmp_path, stockfish=f'path = "{engine}"')
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config), "match", "stockfish:1500", "tinyy"])
+
+    assert "no run called 'tinyy'" in capsys.readouterr().err
+    assert started(engine) == []
+
+
+def test_a_stockfish_that_could_not_be_partnered_is_waited_for(tmp_path, capsys, monkeypatch):
+    """Closed and then waited for, so that its process is reaped before the event loop goes."""
+    from stockfish_helpers import fake_engine, started, wait_until_gone
+
+    from chess_ai import stockfish
+
+    engine = fake_engine(tmp_path / "engine")
+    config = match_config(tmp_path, stockfish=f'path = "{engine}"')
+    starting = stockfish.start_stockfish
+    waited = []
+
+    async def start_once(*args, **kwargs):
+        if started(engine):
+            raise stockfish.StockfishError("no second engine today")
+        player = await starting(*args, **kwargs)
+        wait_closed = player.wait_closed
+
+        async def recorded():
+            await wait_closed()
+            waited.append(player.pid)
+
+        player.wait_closed = recorded
+        return player
+
+    monkeypatch.setattr(stockfish, "start_stockfish", start_once)
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config), "match", "stockfish:1500", "stockfish:1600"])
+
+    assert "no second engine today" in capsys.readouterr().err
+    assert waited == started(engine)
+    wait_until_gone(*started(engine))
+
+
+@pytest.mark.parametrize(
+    ("failure", "complaint"),
+    [
+        ("--exit-after", "Stockfish stopped"),
+        ("--hang-after", "Stockfish took more than"),
+    ],
+)
+def test_a_stockfish_that_fails_mid_match_is_reported_without_a_traceback(
+    tmp_path, capsys, monkeypatch, failure, complaint
+):
+    from stockfish_helpers import fake_engine, started, wait_until_gone
+
+    from chess_ai import stockfish
+
+    monkeypatch.setattr(stockfish, "MOVE_GRACE", 0.2)
+    engine = fake_engine(tmp_path / "engine", failure, "3")
+    config = match_config(tmp_path, stockfish=f'path = "{engine}"')
+
+    with pytest.raises(SystemExit) as exited:
+        main(["--config", str(config), "match", "stockfish:1500,move-time=0.01", "tiny"])
+
+    captured = capsys.readouterr()
+    assert exited.value.code == 2
+    assert f"chess-ai: error: game 1 could not be finished: {complaint}" in captured.err
+    wait_until_gone(*started(engine))
+
+
+def test_two_sides_naming_one_checkpoint_play_the_same_one_while_the_run_saves(
+    tmp_path, capsys, monkeypatch
+):
+    """A run still training can save a checkpoint while the first side is being loaded."""
+    import shutil
+
+    import chess_ai.inference as inference
+    from chess_ai.training.run_store import checkpoint_file
+
+    config = match_config(tmp_path)
+    checkpoints = tmp_path / "runs" / "tiny" / "checkpoints"
+    loading = inference.load_engine
+
+    def load_while_the_run_saves(path, **kwargs):
+        newer = checkpoints / checkpoint_file(6)
+        if not newer.exists():
+            shutil.copy(checkpoints / checkpoint_file(4), newer)
+        return loading(path, **kwargs)
+
+    monkeypatch.setattr(inference, "load_engine", load_while_the_run_saves)
+
+    status = main(
+        [
+            "--config",
+            str(config),
+            "match",
+            "tiny@latest,rating=1200",
+            "tiny@latest,rating=1800",
+            "--games",
+            "1",
+        ]
+    )
+
+    assert status == 0
+    (game,) = match_games(tmp_path)
+    assert (game.headers["WhiteCheckpoint"], game.headers["BlackCheckpoint"]) == ("4", "4")

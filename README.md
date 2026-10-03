@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, and a runs dashboard follows training live in the browser; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, a runs dashboard follows training live in the browser, and `chess-ai match` plays two checkpoints (or a checkpoint and Stockfish) against each other over a set of openings; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -158,6 +158,24 @@ Choosing **Stockfish** for a colour plays the engine at the **Elo** you type, he
 Stockfish's documentation says the levels were calibrated at two minutes a game plus a second a move and anchored to the CCRL 40/4 engine rating list. A move time well under a second plays below the level, and neither is a Lichess or FIDE rating.
 
 Each Stockfish side is an engine process of its own, started with the game and stopped when the game ends, is replaced, or the server shuts down. A game that cannot find Stockfish is refused with a message saying where it looked. The PGN of a game Stockfish played records its strength as `WhiteElo` and its time a move as `WhiteMoveTime` (and the same for Black).
+
+### Play a match
+
+Validation metrics stop telling two checkpoints apart once they get close; games do. `chess-ai match` plays a number of games between two players and prints the score from each side's point of view:
+
+```sh
+uv run chess-ai match resnet10x128 resnet6x64 --games 100
+uv run chess-ai match resnet10x128@latest,rating=1500 stockfish:1350,move-time=0.5
+uv run chess-ai match mlp@24000 mlp@48000 --temperature 0.25 --seed 7
+```
+
+A player is a run, optionally with `@best` (the default), `@latest` or `@STEP`, followed by any of `rating=R`, `strategy=argmax|sample` and `temperature=T`, all separated by commas; or `stockfish:ELO`, optionally with `move-time=SECONDS`. `--temperature` makes every checkpoint that names no strategy of its own sample at that temperature. `chess-ai match --help` has the details.
+
+Playing its best move, a checkpoint plays the same game from the same position every time, so the games start from the lines of a curated opening set instead: `standard`, 100 main lines a few moves deep, kept in `src/chess_ai/opening_sets/` and versioned, so that two matches on the same set started from the same positions. Each line is played twice in a row with the colours swapped, which also keeps a player that is better only as White from looking better outright, and the score is printed as White and as Black as well as overall. `--openings PATH` plays a set of your own, in the same TOML form. A match longer than twice the set starts repeating its openings, and warns that deterministic players will repeat their games too.
+
+Sampling with `--temperature` or `temperature=` varies the games further, and `--seed` (printed when it was not given) replays a match move for move. A low temperature such as 0.25 only changes a game where the moves are close, so on its own it can give near-copies; the openings are what make the games differ. Stockfish's own play is not seeded, so a match against it does not replay exactly.
+
+The `±` after each score is a rough 95% range from how the games went: about ±14 points of score over 50 games and ±7 over 200, less with draws. It says how much a rerun might differ, not an Elo difference. Every game is appended as it ends to one PGN file in the games directory, `YYYYMMDD-HHMMSS-match-ID.pgn`, so a match stopped with ctrl-c keeps the games it finished; the replay view opens the file as a list of its games. The games carry the usual model and Stockfish headers, plus `Event` "chess-ai match", the game's number as `Round`, the line as `Opening` and the set as `OpeningSet`.
 
 ### Build a dataset
 

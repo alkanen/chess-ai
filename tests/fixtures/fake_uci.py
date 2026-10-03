@@ -8,6 +8,8 @@ file given by ``--log``, so a test can see which strength it was asked for.
 
 ``--no-elo`` leaves out the strength options, as an engine that is not Stockfish might, and
 ``--mute`` never answers at all, as a binary that is not a UCI engine would not.
+``--exit-after N`` plays N moves and exits when asked for another, as an engine that crashes or
+is killed would, and ``--hang-after N`` plays N moves and then never answers again.
 """
 
 import argparse
@@ -23,7 +25,10 @@ def main() -> None:
     parser.add_argument("--elo-range", nargs=2, type=int, default=[1320, 3190])
     parser.add_argument("--no-elo", action="store_true")
     parser.add_argument("--mute", action="store_true")
+    parser.add_argument("--exit-after", type=int)
+    parser.add_argument("--hang-after", type=int)
     args = parser.parse_args()
+    moves = 0
     log = open(args.log, "a", buffering=1) if args.log else None  # noqa: SIM115
     board = chess.Board()
     stop = threading.Event()
@@ -55,6 +60,11 @@ def main() -> None:
         elif command == "position":
             board = _position(words[1:])
         elif command == "go":
+            moves += 1
+            if args.exit_after is not None and moves > args.exit_after:
+                sys.exit(1)
+            if args.hang_after is not None and moves > args.hang_after:
+                continue
             seconds = int(words[words.index("movetime") + 1]) / 1000 if "movetime" in words else 0
             stop.clear()
             thinking = threading.Thread(target=think, args=(board.copy(), seconds))
