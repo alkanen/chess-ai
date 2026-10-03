@@ -59,6 +59,9 @@
   flex: 0 1 18rem;
   flex-direction: column;
   gap: 1.25rem;
+  /* Never wider than its share because of what is in it, such as a select whose longest
+     option is a run name of a hundred characters, which would push it under the board. */
+  min-width: 0;
 }
 
 .side-panel p[role='alert'] {

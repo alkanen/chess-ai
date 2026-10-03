@@ -229,10 +229,10 @@ describe('NewGameForm', () => {
       await chooseModel('Black');
 
       expect(screen.getByLabelText('Black run')).toHaveDisplayValue(
-        'mlp-baseline (2 checkpoints, 12000/12000 steps)',
+        'mlp-baseline · 12k steps, 2 checkpoints',
       );
       expect(
-        screen.getByRole('option', { name: 'mlp-wider (1 checkpoints, 400/8000 steps)' }),
+        screen.getByRole('option', { name: 'mlp-wider · 400/8k steps, 1 checkpoint' }),
       ).toBeInTheDocument();
       expect(await start(fetch)).toEqual({
         white: HUMAN,
@@ -247,6 +247,28 @@ describe('NewGameForm', () => {
         move_delay: 0.5,
         fen: null,
       });
+    });
+
+    it('shows a run by its title, and its whole name where it can be read', async () => {
+      const long =
+        '2026-10-02T19h17m_resnet-lichess_b8k_lr4e-3_epochs4_blocks10_channels128_globals-planes';
+      vi.stubGlobal(
+        'fetch',
+        serving([{ ...RUNS[0], name: long, title: 'resnet10x128' }, RUNS[1]]),
+      );
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'model' } });
+
+      const option = await screen.findByRole('option', {
+        name: 'resnet10x128 · 12k steps, 2 checkpoints',
+      });
+      expect(option).toHaveAttribute('title', long);
+      // The run chosen is named in full under the select, which may be too narrow to say.
+      expect(screen.getByText(long)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText('Black run'), { target: { value: 'mlp-wider' } });
+      expect(screen.queryByText(long)).not.toBeInTheDocument();
+      expect(screen.getByText('mlp-wider', { selector: '.run-name' })).toBeInTheDocument();
     });
 
     it('offers the best and the latest checkpoint as well as each one by step', async () => {
