@@ -116,6 +116,32 @@ def test_api_docs_under_prefix(chess_client):
     assert chess_client.get("/chess/api/docs").status_code == 200
 
 
+@pytest.mark.parametrize("prefix", ["/chess", ""])
+@pytest.mark.parametrize("path", ["/api/game/ws", "/api/runs/some-run/ws"])
+def test_a_websocket_path_asked_without_the_upgrade_says_what_is_missing(static_dir, prefix, path):
+    """What a proxy that drops the upgrade headers passes on: not a 404, which reads as a
+    routing mistake under the prefix, but 426 and the headers to forward."""
+    response = client(prefix, static_dir).get(f"{prefix}{path}")
+
+    assert response.status_code == 426
+    assert response.headers["upgrade"] == "websocket"
+    detail = response.json()["detail"]
+    assert "Upgrade" in detail
+    assert "Connection" in detail
+    assert "README" in detail
+
+
+@pytest.mark.parametrize("path", ["/api/game/ws", "/api/runs/some-run/ws"])
+def test_a_websocket_path_still_upgrades(chess_client, path):
+    with chess_client.websocket_connect(f"/chess{path}") as websocket:
+        assert websocket.receive_json()["type"] in {"no_game", "error"}
+
+
+@pytest.mark.parametrize("path", ["/api/game/wss", "/api/nothing-here", "/api/game/ws/more"])
+def test_an_unknown_api_path_is_still_not_found(chess_client, path):
+    assert chess_client.get(f"/chess{path}").status_code == 404
+
+
 def test_nested_prefix(static_dir):
     apps_client = client("/apps/chess", static_dir)
 
