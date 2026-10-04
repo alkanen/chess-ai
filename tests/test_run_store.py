@@ -2,10 +2,12 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -572,6 +574,249 @@ def test_the_code_version_says_which_commit_or_which_release():
     version = code_version()
 
     assert version.startswith(("git ", "version ")), version
+
+
+def _fake_git(answers):
+    """A ``subprocess.run`` that answers each git command with its canned output, or raises it."""
+
+    def run(command, **kwargs):
+        answer = answers[command[1]]
+        if isinstance(answer, BaseException):
+            raise answer
+        return subprocess.CompletedProcess(command, 0, stdout=answer, stderr="")
+
+    return run
+
+
+def _git_checkout(**answers):
+    """Git in a checkout of this code, with some of its answers replaced."""
+    return _fake_git(
+        {"rev-parse": "abc1234\n", "ls-files": "run_store.py\n", "status": ""} | answers
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("", "git abc1234"), (" M src/chess_ai/cli.py\n", "git abc1234-dirty")],
+)
+def test_in_a_git_checkout_the_code_version_is_the_commit_and_whether_it_was_edited(
+    monkeypatch, status, expected
+):
+    monkeypatch.setattr(run_store.subprocess, "run", _git_checkout(status=status))
+
+    assert code_version() == expected
+
+
+@pytest.mark.parametrize(
+    ("failure", "why"),
+    [
+        (subprocess.TimeoutExpired(["git", "status", "--porcelain"], 10), "git status timed out"),
+        (
+            subprocess.CalledProcessError(
+                128, ["git", "status", "--porcelain"], stderr="fatal: detected dubious ownership\n"
+            ),
+            "git status: detected dubious ownership",
+        ),
+        (
+            subprocess.CalledProcessError(
+                128,
+                ["git", "status", "--porcelain"],
+                stderr=(
+                    "warning: unable to access '/root/.config/git/attributes': Permission denied\n"
+                    "fatal: detected dubious ownership in repository at '/src/chess-ai'\n"
+                    "To add an exception for this directory, call:\n"
+                ),
+            ),
+            "git status: detected dubious ownership in repository at '/src/chess-ai'",
+        ),
+        (
+            subprocess.CalledProcessError(
+                1, ["git", "status", "--porcelain"], stderr="oops\nmore\n"
+            ),
+            "git status: oops",
+        ),
+        (
+            subprocess.CalledProcessError(1, ["git", "status", "--porcelain"], stderr=""),
+            "git status: exit code 1",
+        ),
+    ],
+    ids=["timeout", "refused", "warned first", "no fatal line", "nothing said"],
+)
+def test_a_commit_is_kept_when_only_whether_it_was_edited_cannot_be_told(monkeypatch, failure, why):
+    """The commit is the part that says what ran; a slow or refused status must not lose it."""
+    monkeypatch.setattr(run_store.subprocess, "run", _git_checkout(status=failure))
+
+    assert code_version() == f"git abc1234, edits unknown ({why})"
+
+
+class _Installed:
+    """A stand-in for the installed distribution's metadata."""
+
+    def __init__(self, *, editable=False, source=None):
+        self.version = "1.2.3"
+        self._editable = editable
+        self._source = source
+
+    def read_text(self, name):
+        assert name == "direct_url.json"
+        if self._editable:
+            return json.dumps({"url": self._source.as_uri(), "dir_info": {"editable": True}})
+        return None
+
+    def locate_file(self, path):
+        return self._source / path
+
+
+@pytest.fixture
+def this_code():
+    """Where this code's package sits: what an install of it has to point at."""
+    return Path(run_store.__file__).resolve().parents[2]
+
+
+def _no_git(command, **kwargs):
+    raise FileNotFoundError(2, "No such file or directory", command[0])
+
+
+@pytest.mark.parametrize(
+    ("git", "why"),
+    [
+        (_no_git, "git not found"),
+        (
+            _git_checkout(
+                **{
+                    "rev-parse": subprocess.CalledProcessError(
+                        128, ["git", "rev-parse"], stderr="fatal: not a git repository\n"
+                    )
+                }
+            ),
+            "git rev-parse: not a git repository",
+        ),
+        (
+            _git_checkout(
+                **{"ls-files": subprocess.CalledProcessError(1, ["git", "ls-files"], stderr="")}
+            ),
+            "not tracked by the git repository around it",
+        ),
+    ],
+    ids=["no git", "not a repository", "inside another repository"],
+)
+def test_without_git_the_code_version_is_the_installed_version_and_why(
+    monkeypatch, this_code, git, why
+):
+    monkeypatch.setattr(run_store.subprocess, "run", git)
+    monkeypatch.setattr(
+        run_store.metadata, "distribution", lambda name: _Installed(source=this_code)
+    )
+
+    assert code_version() == f"version 1.2.3 ({why})"
+
+
+def test_an_editable_install_says_so_since_its_version_does_not_change_with_the_code(
+    monkeypatch, this_code
+):
+    """In a checkout whose git failed, the version from pyproject.toml names no commit."""
+    monkeypatch.setattr(run_store.subprocess, "run", _no_git)
+    monkeypatch.setattr(
+        run_store.metadata,
+        "distribution",
+        lambda name: _Installed(editable=True, source=this_code.parent),
+    )
+
+    assert code_version() == "version 1.2.3, editable install (git not found)"
+
+
+@pytest.mark.parametrize("editable", [False, True], ids=["installed", "editable"])
+def test_an_installed_package_that_is_not_this_code_does_not_give_its_version(
+    monkeypatch, tmp_path, editable
+):
+    """Code run from elsewhere, say a copy on the PYTHONPATH, is not what the install holds."""
+    monkeypatch.setattr(run_store.subprocess, "run", _no_git)
+    monkeypatch.setattr(
+        run_store.metadata,
+        "distribution",
+        lambda name: _Installed(editable=editable, source=tmp_path),
+    )
+
+    assert code_version() == "version unknown (git not found)"
+
+
+def test_without_git_or_an_installed_package_the_code_version_says_it_is_unknown(monkeypatch):
+    """A run whose code version is unknown is still worth keeping, so this must not raise."""
+
+    def not_installed(name):
+        raise run_store.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(run_store.subprocess, "run", _no_git)
+    monkeypatch.setattr(run_store.metadata, "distribution", not_installed)
+
+    assert code_version() == "version unknown (git not found)"
+
+
+def _code_version_in_a_subprocess(**kwargs):
+    return subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from chess_ai.training.run_store import code_version; print(code_version())",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+        **kwargs,
+    ).stdout.strip()
+
+
+def _make_repository(directory):
+    """A git repository with one commit in ``directory``, whatever the user's own git config says.
+
+    Their global config can sign commits (no key, or a pinentry prompt with no timeout), run
+    hooks or copy a template in, none of which this test is about.
+    """
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    for command in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "x"]):
+        subprocess.run(["git", *command], cwd=directory, env=env, check=True, timeout=60)
+
+
+def test_the_test_repository_is_made_whatever_the_global_git_config_says(tmp_path, monkeypatch):
+    signing = tmp_path / "gitconfig"
+    signing.write_text("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(signing))
+    (tmp_path / "repository").mkdir()
+
+    _make_repository(tmp_path / "repository")
+
+
+def test_a_copy_of_the_code_inside_another_repository_does_not_take_that_repository_s_commit(
+    tmp_path,
+):
+    """A ``git archive`` copy unpacked inside some other checkout, for one."""
+    _make_repository(tmp_path)
+    package = Path(run_store.__file__).resolve().parents[1]
+    shutil.copytree(
+        package, tmp_path / "copy" / "chess_ai", ignore=shutil.ignore_patterns("__pycache__")
+    )
+
+    version = _code_version_in_a_subprocess(
+        env={**os.environ, "PYTHONPATH": str(tmp_path / "copy")}
+    )
+
+    assert version == "version unknown (not tracked by the git repository around it)"
+
+
+def test_the_code_version_falls_back_for_real_when_git_is_not_on_the_path():
+    """The way it was found: a run started where ``git`` cannot be run at all."""
+    version = _code_version_in_a_subprocess(env={**os.environ, "PATH": "/nonexistent"})
+
+    assert version.startswith("version ") and version.endswith("(git not found)"), version
 
 
 def test_opening_a_run_that_is_not_kept_here(tmp_path):

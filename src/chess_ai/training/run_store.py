@@ -43,9 +43,12 @@ from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
 from enum import StrEnum
+from importlib import metadata
 from math import isfinite
 from pathlib import Path
 from typing import Any, ClassVar, Final, Literal, Self
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -370,34 +373,87 @@ def list_runs(runs_dir: Path) -> list[str]:
     return [name for name in entries if (runs_dir / name / RUN_FILE).is_file()]
 
 
+_HERE: Final = Path(__file__).resolve()
+"""This file, which a checkout has to track for its commit to be this code's."""
+
+_GIT_TIMEOUT: Final = 10
+"""Seconds a git command gets before the code version gives up on it."""
+
+
 def code_version() -> str:
     """What the code was when a run started: the git commit, and whether it was edited.
 
-    Falls back to the installed version, because a run from an installed package is still a run
-    and its results still have to say what produced them.
+    Falls back to the installed version when git cannot say (not a checkout, no ``git`` on the
+    ``PATH``, or this code is not tracked by the repository it sits in, such as a copy unpacked
+    inside another checkout), because a run from an installed package or a copy of the code is
+    still a run and its results still have to say what produced them. The fallback says why git
+    could not answer, and marks an editable install, whose version stays the same whatever is
+    checked out. An install that is not this code gives no version at all: a run whose code
+    version is unknown is still worth keeping.
     """
     try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=Path(__file__).resolve().parent,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        from chess_ai import __version__
-
-        return f"version {__version__}"
+        revision = _git("rev-parse", "--short", "HEAD")
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"{_installed_version()} ({_git_failure(error)})"
+    try:
+        _git("ls-files", "--error-unmatch", _HERE.name)
+    except subprocess.CalledProcessError:
+        return f"{_installed_version()} (not tracked by the git repository around it)"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"{_installed_version()} ({_git_failure(error)})"
+    try:
+        dirty = _git("status", "--porcelain")
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"git {revision}, edits unknown ({_git_failure(error)})"
     return f"git {revision}{'-dirty' if dirty else ''}"
+
+
+def _git(*arguments: str) -> str:
+    """What a git command prints, run where this code is."""
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=_HERE.parent,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT,
+        check=True,
+    ).stdout.strip()
+
+
+def _git_failure(error: OSError | subprocess.SubprocessError) -> str:
+    """Why git could not answer, in a few words for the code version."""
+    if isinstance(error, FileNotFoundError):
+        return "git not found"
+    if isinstance(error, subprocess.TimeoutExpired):
+        return f"git {error.cmd[1]} timed out"
+    if isinstance(error, subprocess.CalledProcessError):
+        # Git can warn before it fails (an unreadable config under sudo, say), and hints after.
+        lines = (error.stderr or "").strip().splitlines()
+        fatal = [line.removeprefix("fatal: ") for line in lines if line.startswith("fatal: ")]
+        message = fatal[-1] if fatal else lines[0] if lines else f"exit code {error.returncode}"
+        return f"git {error.cmd[1]}: {message}"
+    return f"git: {error}"
+
+
+def _installed_version() -> str:
+    """The installed package's version, if the install is this code."""
+    try:
+        distribution = metadata.distribution("chess-ai")
+    except metadata.PackageNotFoundError:
+        return "version unknown"
+    try:
+        direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
+    except ValueError:
+        direct_url = {}
+    if direct_url.get("dir_info", {}).get("editable", False):
+        url = urlparse(direct_url.get("url", ""))
+        if url.scheme != "file" or not _HERE.is_relative_to(Path(url2pathname(url.path)).resolve()):
+            return "version unknown"
+        return f"version {distribution.version}, editable install"
+    installed = Path(distribution.locate_file("chess_ai/training/run_store.py")).resolve()
+    if installed != _HERE:
+        return "version unknown"
+    return f"version {distribution.version}"
 
 
 class RunWriter:
