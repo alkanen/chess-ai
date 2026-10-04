@@ -7,11 +7,13 @@ import json
 import math
 import os
 import pickle
+import re
 import signal
 import tempfile
 import time
 import tracemalloc
 from pathlib import Path
+from types import SimpleNamespace
 
 import chess
 import pytest
@@ -1080,6 +1082,121 @@ def test_the_handlers_there_were_are_put_back_after_a_run(tmp_path, data_dir):
     run(tmp_path, data_dir)
 
     assert {number: signal.getsignal(number) for number in trainer.STOP_SIGNALS} == before
+
+
+@pytest.mark.parametrize(
+    ("seconds", "shown"),
+    [
+        (0, "0:00:00"),
+        (59.4, "0:00:59"),
+        (61, "0:01:01"),
+        (11 * 3600 + 7 * 60 + 9, "11:07:09"),
+        (24 * 3600 - 1, "23:59:59"),
+        (24 * 3600, "1d 00:00:00"),
+        (26 * 3600 + 3 * 60 + 9, "1d 02:03:09"),
+        (12 * 86400 + 5, "12d 00:00:05"),
+    ],
+)
+def test_a_validation_line_shows_durations_to_the_second(seconds, shown):
+    assert trainer._clock(seconds) == shown
+
+
+def clocked(monkeypatch, seconds_per_step: float) -> dict[str, float]:
+    """Fake the trainer's clock so that every step it takes costs ``seconds_per_step``.
+
+    Returns the clock, so that a test can move it on between runs as well.
+    """
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(trainer, "time", SimpleNamespace(perf_counter=lambda: clock["now"]))
+    real = trainer._step
+
+    def slow(*args, **kwargs):
+        clock["now"] += seconds_per_step
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_step", slow)
+    return clock
+
+
+def timings(lines: list[str]) -> list[tuple[str, str, str]]:
+    """Each validation line's step, running time and time left."""
+    pattern = re.compile(r"^  step (\d+)/9  .*  running (\S+)  left (\S+)$")
+    return [match.groups() for line in lines if (match := pattern.match(line))]
+
+
+def test_a_validation_line_says_how_long_the_run_has_been_going_and_has_left(
+    tmp_path, data_dir, monkeypatch
+):
+    clocked(monkeypatch, 1000)
+    said: list[str] = []
+    config = load_experiment(experiment(tmp_path / "tiny.toml", **RESUMABLE))
+
+    train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=said.append)
+
+    # Validated at 4, at 8 and at the end, 1000 seconds a step and nothing else costing any.
+    assert timings(said) == [
+        ("4", "1:06:40", "1:23:20"),
+        ("8", "2:13:20", "0:16:40"),
+        ("9", "2:30:00", "0:00:00"),
+    ]
+
+
+def test_a_resumed_run_times_itself_from_the_resume(tmp_path, data_dir, monkeypatch):
+    """Neither the break before the resume nor the speed before it says anything about now."""
+    signal_after(monkeypatch, 1)
+    clock = clocked(monkeypatch, 1000)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="halves", **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    clock_after_the_break = clock["now"] + 3 * 86400
+    clock = clocked(monkeypatch, 3000)
+    clock["now"] = clock_after_the_break
+    said: list[str] = []
+
+    halves = resumed(tmp_path, data_dir, "halves", say=said.append)
+
+    # From step 1 at 3000 seconds a step: 7 steps by step 8, and one left. Step 4 is too few
+    # steps in to estimate from.
+    assert timings(said) == [
+        ("4", "2:30:00", "?"),
+        ("8", "5:50:00", "0:50:00"),
+        ("9", "6:40:00", "0:00:00"),
+    ]
+    # The run's own clock still carries on from where it stopped, breaks left out.
+    assert lines_of(halves, "validation")[-1]["elapsed"] == 1 * 1000 + 8 * 3000
+
+
+def test_a_resume_just_before_a_validation_gives_no_estimate_from_one_step(
+    tmp_path, data_dir, monkeypatch
+):
+    """One step, carrying a validation and the session's start-up, is no rate to go on.
+
+    A stop lands at any step, so one in every ``every_steps`` resumes validates after its first
+    step, and dividing all that by 1 promised weeks for a run with hours left.
+    """
+    signal_after(monkeypatch, 3)
+    clocked(monkeypatch, 1000)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="halves", **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    clock = clocked(monkeypatch, 1000)
+    real_validate = trainer._validate
+
+    def slow_validate(*args, **kwargs):
+        clock["now"] += 500
+        return real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_validate", slow_validate)
+    said: list[str] = []
+
+    resumed(tmp_path, data_dir, "halves", say=said.append)
+
+    # From step 3: step 4 is one step in. Step 8 is five, two validations among them.
+    assert timings(said) == [
+        ("4", "0:25:00", "?"),
+        ("8", "1:40:00", "0:20:00"),
+        ("9", "2:05:00", "0:00:00"),
+    ]
 
 
 def test_a_run_stopped_and_resumed_learns_what_it_would_have_in_one_go(

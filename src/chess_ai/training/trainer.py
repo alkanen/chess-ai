@@ -761,7 +761,10 @@ def _loop(
     validation = _validation_split(run, say=say)
 
     run.model.train()
-    started = time.perf_counter() - start.elapsed
+    session_started = time.perf_counter()
+    """When this process started stepping, which the console's running time and estimate count
+    from: a resumed run may be on another machine, or sharing it differently, than before."""
+    started = session_started - start.elapsed
     window = _Window(run.device)
     latest: dict[str, float] = {}
     measured_at: int | None = None
@@ -836,7 +839,17 @@ def _loop(
                 positions_seen=positions_seen,
                 **latest,
             )
-            say(_validation_line(step, steps, latest))
+            say(
+                _validation_line(
+                    step,
+                    steps,
+                    latest,
+                    first=start.step,
+                    running=time.perf_counter() - session_started,
+                    # The shortest gap between two validations, checkpoints validating too.
+                    settled=min(config.validation.every_steps, config.checkpoints.every_steps),
+                )
+            )
             measured_at = step
 
         # A stop asked for at the last step is a run that finished.
@@ -1231,12 +1244,36 @@ def _eta(step: int, steps: int, elapsed: float) -> float | None:
     return (steps - step) * elapsed / step
 
 
-def _validation_line(step: int, steps: int, metrics: dict[str, float]) -> str:
+def _validation_line(
+    step: int,
+    steps: int,
+    metrics: dict[str, float],
+    *,
+    first: int,
+    running: float,
+    settled: int,
+) -> str:
+    """One validation's results, and how long this session has been running and has left.
+
+    ``first`` is the step this session started from and ``running`` how long it has been going.
+    The estimate is ``_eta``'s, from this session alone: nothing from before a resume says how
+    fast the run goes now. It waits until the session is ``settled`` steps in, a whole gap
+    between validations, so that the validation just done and the session's start-up are
+    spread over at least as many steps as a validation is in a steady run. Before that, a
+    resume that stopped a step short of a validation would divide both by a single step.
+    """
+    if step == steps:
+        left = _clock(0)
+    elif step - first < settled:
+        left = "?"
+    else:
+        left = _clock((steps - step) * running / (step - first))
     return (
         f"  step {step:>{len(f'{steps:,}')},}/{steps:,}  "
         f"policy {metrics['policy_loss']:.4f}  value {metrics['value_loss']:.4f}  "
         f"top1 {metrics['top1']:.1%}  top5 {metrics['top5']:.1%}  "
-        f"illegal {metrics['illegal_top_move_rate']:.1%}"
+        f"illegal {metrics['illegal_top_move_rate']:.1%}  "
+        f"running {_clock(running)}  left {left}"
     )
 
 
@@ -1264,6 +1301,16 @@ def _duration(seconds: float) -> str:
     if seconds < 48 * 3600:
         return f"{seconds / 3600:.1f}h"
     return f"{seconds / 86400:.1f} days"
+
+
+def _clock(seconds: float) -> str:
+    """A duration to the second, as ``H:MM:SS``, with whole days in front from 24 hours on."""
+    days, rest = divmod(round(seconds), 24 * 3600)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours:02}:{minutes:02}:{seconds:02}"
+    return f"{hours}:{minutes:02}:{seconds:02}"
 
 
 def _synchronize(device: torch.device) -> None:
