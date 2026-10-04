@@ -433,6 +433,7 @@ The web app serves everything (pages, assets, API and WebSockets) under the conf
 
 ```nginx
 location /chess/ {
+    # The port must be the one in [server] port.
     proxy_pass http://127.0.0.1:8000;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
@@ -443,6 +444,8 @@ location /chess/ {
 ```
 
 If nginx runs on another machine, or on the Windows side of a WSL2 setup, set `host = "0.0.0.0"` so the server accepts connections from outside, and point `proxy_pass` at an address nginx can reach.
+
+If the page loads but keeps saying it lost the connection to the server, and the server logs `GET …/api/game/ws` answered `426 Upgrade Required`, the WebSocket requests are reaching it without the upgrade: nginx is not forwarding the headers above (an `HTTP/1.0` in the log line means `proxy_http_version 1.1` is missing). A port in `proxy_pass` that does not match the server's shows up in nginx instead, as a refused connection.
 
 The app has no authentication. It will have a read-only mode that disables starting and stopping jobs from the browser.
 

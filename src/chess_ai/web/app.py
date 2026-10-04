@@ -616,6 +616,13 @@ def create_app(
             sending.cancel()
             waiting.cancel()
 
+    # A WebSocket route matches only an upgrade, so a plain request on its path would fall
+    # through to a 404 that reads as the API missing from under the prefix.
+    for websocket_path in ("/game/ws", "/runs/{name}/ws"):
+        api.add_api_route(
+            websocket_path, _upgrade_required, methods=["GET"], include_in_schema=False
+        )
+
     app.include_router(api, prefix=prefix)
 
     if prefix:
@@ -786,6 +793,22 @@ def _replayed(pgn: str | bytes, selected: int) -> replay.ReplayFile:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(malformed)) from malformed
     except replay.NoSuchGameError as missing:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
+
+
+_UPGRADE_REQUIRED = (
+    "This path is a WebSocket, and the request reached the server without the upgrade to "
+    "one. A reverse proxy in front of the server is the most likely reason: it has to "
+    "forward the Upgrade and Connection headers over HTTP/1.1. For nginx that is "
+    "'proxy_http_version 1.1', 'proxy_set_header Upgrade $http_upgrade' and "
+    "'proxy_set_header Connection \"upgrade\"', as in the deployment notes in the README."
+)
+
+
+def _upgrade_required() -> None:
+    """Answer a plain request on a WebSocket path with what it is missing."""
+    raise HTTPException(
+        status.HTTP_426_UPGRADE_REQUIRED, _UPGRADE_REQUIRED, headers={"Upgrade": "websocket"}
+    )
 
 
 class _Connection:
