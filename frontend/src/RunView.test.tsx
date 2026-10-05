@@ -259,6 +259,60 @@ describe('RunView', () => {
     ]);
   });
 
+  it('fits the y-axis of every chart to its data rather than to the clip threshold', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ info: { ...INFO, config: { optimizer: { gradient_clip: 1.0 } } } }));
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [
+        { step: 50, split: 'train', loss: 1.52, learning_rate: 0.001, gradient_norm: 0.35, clipped_fraction: 0 },
+        { step: 100, split: 'validation', loss: 1.44, top1: 0.3, top5: 0.6, illegal_top_move_rate: 0.1 },
+      ],
+    });
+
+    // The logarithmic charts fit their data rather than the powers of ten around it.
+    for (const label of ['validation', 'gradient norm']) {
+      const [low, high] = FakeUPlot.withSeries(label).yRange(1.44, 1.52)!;
+      expect(low).toBeGreaterThan(1.4);
+      expect(high).toBeLessThan(1.6);
+    }
+    // uPlot fits the linear ones to the data in view itself.
+    for (const label of ['top-1', 'learning rate', 'illegal top move', 'clipped']) {
+      expect(FakeUPlot.withSeries(label).yRange(0.3, 0.6)).toBeNull();
+    }
+    // The clip threshold is drawn, but the axis is fitted to the gradient norm alone.
+    const norm = FakeUPlot.withSeries('gradient norm').options.series;
+    expect(norm.map((series) => series.auto)).toEqual([undefined, true, false]);
+  });
+
+  it('fits the y-axis to the clip threshold when the gradient norm is hidden', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ info: { ...INFO, config: { optimizer: { gradient_clip: 1.0 } } } }));
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [{ step: 50, split: 'train', loss: 1.5, gradient_norm: 0.35 }],
+    });
+    const chart = FakeUPlot.withSeries('gradient norm');
+    // The viewer clicks the gradient norm in the legend, which leaves uPlot nothing to fit.
+    chart.options.series[1].show = false;
+
+    const [low, high] = chart.yRange(null, null)!;
+
+    expect(low).toBeLessThan(1);
+    expect(low).toBeGreaterThan(0.9);
+    expect(high).toBeGreaterThan(1);
+    expect(high).toBeLessThan(1.1);
+    // With both hidden there is nothing to fit, as uPlot has it.
+    chart.options.series[2].show = false;
+    expect(chart.yRange(null, null)).toEqual([null, null]);
+  });
+
   it('draws no threshold for a run that does not clip', () => {
     render(<RunView name="mlp-big" />);
     const socket = FakeWebSocket.latest;

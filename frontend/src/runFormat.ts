@@ -37,8 +37,21 @@ export function formatNumber(value: number | null | undefined, digits = 4): stri
 }
 
 /** A fraction as a percentage, such as 0.4594 as "45.9%". */
-export function formatPercent(value: number | null | undefined): string {
-  return value == null ? '–' : `${(value * 100).toFixed(1)}%`;
+export function formatPercent(value: number | null | undefined, decimals = 1): string {
+  return value == null ? '–' : `${(value * 100).toFixed(decimals)}%`;
+}
+
+/**
+ * How many decimals it takes to write `value` without float noise, such as 2 for 0.25 and 6
+ * for 2.5e-5: what ticks that far apart need to be told apart.
+ */
+export function decimalsOf(value: number): number {
+  if (!Number.isFinite(value) || value === 0) {
+    return 0;
+  }
+  const [mantissa, exponent = '0'] = Math.abs(value).toPrecision(6).split('e');
+  const fraction = mantissa.includes('.') ? mantissa.split('.')[1].replace(/0+$/, '') : '';
+  return Math.max(0, fraction.length - Number(exponent));
 }
 
 /** A count with its thousands separated, such as 15000 as "15,000". */
