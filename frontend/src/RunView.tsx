@@ -86,10 +86,12 @@ export function RunView({ name }: RunViewProps) {
       }
       const reference = references[index];
       const labels = spec.series.map((series) => series.label);
-      if (reference !== null && spec.reference) {
-        labels.push(spec.reference.label);
+      const level = reference !== null ? spec.reference : undefined;
+      if (level) {
+        labels.push(level.label);
       }
-      return [{ spec, labels, data: chartData(records, spec, axis, batchSize, reference) }];
+      const levels = level ? 1 : 0;
+      return [{ spec, labels, levels, data: chartData(records, spec, axis, batchSize, reference) }];
     });
   }, [metrics, axis, batchSize, referenceKey]);
   const [notes, showSaved] = useShownNotes(run?.notes ?? null);
@@ -169,11 +171,12 @@ export function RunView({ name }: RunViewProps) {
           <RunNotesPanel run={name} notes={notes} onSaved={showSaved} />
           <XAxisPicker value={axis} onChange={setAxis} />
           <div className="charts">
-            {charts.map(({ spec, labels, data }) => (
+            {charts.map(({ spec, labels, levels, data }) => (
               <MetricChart
                 key={spec.id}
                 chart={spec}
                 labels={labels}
+                levels={levels}
                 x={xAxis(axis)}
                 data={data}
               />

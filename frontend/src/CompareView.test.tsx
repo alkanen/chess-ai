@@ -105,6 +105,32 @@ describe('CompareView', () => {
     ]);
   });
 
+  it('fits the y-axis of the loss charts to the losses rather than to powers of ten', () => {
+    render(<CompareView names={['a', 'b']} />);
+    const a = socketFor('a');
+    a.open();
+    a.deliver(runEvent('a', 8));
+    a.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [
+        { step: 1, split: 'train', loss: 1.52, gradient_norm: 0.35 },
+        { step: 1, split: 'validation', loss: 1.44, top1: 0.3 },
+      ],
+    });
+
+    for (const title of ['Training loss', 'Validation loss', 'Gradient norm, before clipping']) {
+      const figure = screen.getByText(title).closest('figure')!;
+      const chart = FakeUPlot.live().find((candidate) => figure.contains(candidate.target))!;
+      const [low, high] = chart.yRange(1.44, 1.52)!;
+      expect(low).toBeGreaterThan(1.4);
+      expect(high).toBeLessThan(1.6);
+    }
+    const figure = screen.getByText('Top-1 accuracy (validation)').closest('figure')!;
+    const top1 = FakeUPlot.live().find((candidate) => figure.contains(candidate.target))!;
+    expect(top1.yRange(0.3, 0.4)).toBeNull();
+  });
+
   it('adds what each run logs as it trains', () => {
     render(<CompareView names={['a', 'b']} />);
     const a = socketFor('a');

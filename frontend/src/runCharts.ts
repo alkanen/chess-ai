@@ -1,5 +1,5 @@
 import type { MetricsRecord, RunInfo } from './api';
-import { formatCount, formatDuration, formatNumber, formatPercent } from './runFormat';
+import { decimalsOf, formatCount, formatDuration, formatNumber, formatPercent } from './runFormat';
 
 /**
  * The most lines a chart can tell apart. There are eight categorical colours and never more:
@@ -23,6 +23,11 @@ export interface ChartLook {
   id: string;
   title: string;
   format: (value: number) => string;
+  /**
+   * A value as a y-axis tick, with ticks `step` apart: as `format` puts it, or with more
+   * digits where a chart zoomed in has ticks closer together than `format` tells apart.
+   */
+  formatTick: (value: number, step: number) => string;
   /** Whether the y-axis is logarithmic, which keeps a loss's early drop from flattening the rest. */
   logarithmic?: boolean;
   /**
@@ -44,6 +49,25 @@ export interface ChartSpec extends ChartLook {
   reference?: Reference;
 }
 
+/** How a chart of plain numbers shows them, to `digits` significant digits or as ticks need. */
+function numbers(digits = 4): Pick<ChartLook, 'format' | 'formatTick'> {
+  return {
+    format: (value) => formatNumber(value, digits),
+    formatTick: (value, step) => {
+      // The digits from the value's first down to the step's last, and one to spare, since
+      // formatNumber writes a very small or large value in exponent form to one digit fewer.
+      const needed = value === 0 ? 0 : Math.floor(Math.log10(Math.abs(value))) + 2 + decimalsOf(step);
+      return formatNumber(value, Math.max(digits, needed));
+    },
+  };
+}
+
+/** How a chart of fractions shows them, as percentages to a decimal or as many as ticks need. */
+const PERCENTAGES: Pick<ChartLook, 'format' | 'formatTick'> = {
+  format: (value) => formatPercent(value),
+  formatTick: (value, step) => formatPercent(value, Math.max(1, decimalsOf(step * 100))),
+};
+
 /** The gradient norm a run clips at, or null for a run that does not clip. */
 export function gradientClip(info: RunInfo): number | null {
   const clip = info.config?.optimizer?.gradient_clip;
@@ -59,7 +83,7 @@ export const CHARTS: ChartSpec[] = [
       { label: 'train', split: 'train', metric: 'loss' },
       { label: 'validation', split: 'validation', metric: 'loss' },
     ],
-    format: (value) => formatNumber(value),
+    ...numbers(),
     logarithmic: true,
   },
   {
@@ -69,26 +93,26 @@ export const CHARTS: ChartSpec[] = [
       { label: 'top-1', split: 'validation', metric: 'top1' },
       { label: 'top-5', split: 'validation', metric: 'top5' },
     ],
-    format: formatPercent,
+    ...PERCENTAGES,
   },
   {
     id: 'learning-rate',
     title: 'Learning rate',
     series: [{ label: 'learning rate', split: 'train', metric: 'learning_rate' }],
-    format: (value) => formatNumber(value, 3),
+    ...numbers(3),
   },
   {
     id: 'illegal',
     title: 'Illegal top-move rate (validation)',
     series: [{ label: 'illegal top move', split: 'validation', metric: 'illegal_top_move_rate' }],
-    format: formatPercent,
+    ...PERCENTAGES,
   },
   {
     id: 'gradient-norm',
     title: 'Gradient norm, before clipping',
     series: [{ label: 'gradient norm', split: 'train', metric: 'gradient_norm' }],
     reference: { label: 'clipped above', value: gradientClip },
-    format: (value) => formatNumber(value, 3),
+    ...numbers(3),
     logarithmic: true,
     optional: true,
   },
@@ -96,7 +120,7 @@ export const CHARTS: ChartSpec[] = [
     id: 'clipped',
     title: 'Steps clipped',
     series: [{ label: 'clipped', split: 'train', metric: 'clipped_fraction' }],
-    format: formatPercent,
+    ...PERCENTAGES,
     optional: true,
   },
 ];
@@ -277,45 +301,45 @@ export const COMPARISON_CHARTS: ComparisonChart[] = [
     id: 'train-loss',
     title: 'Training loss',
     metric: { split: 'train', metric: 'loss' },
-    format: (value) => formatNumber(value),
+    ...numbers(),
     logarithmic: true,
   },
   {
     id: 'validation-loss',
     title: 'Validation loss',
     metric: { split: 'validation', metric: 'loss' },
-    format: (value) => formatNumber(value),
+    ...numbers(),
     logarithmic: true,
   },
   {
     id: 'top1',
     title: 'Top-1 accuracy (validation)',
     metric: { split: 'validation', metric: 'top1' },
-    format: formatPercent,
+    ...PERCENTAGES,
   },
   {
     id: 'top5',
     title: 'Top-5 accuracy (validation)',
     metric: { split: 'validation', metric: 'top5' },
-    format: formatPercent,
+    ...PERCENTAGES,
   },
   {
     id: 'illegal',
     title: 'Illegal top-move rate (validation)',
     metric: { split: 'validation', metric: 'illegal_top_move_rate' },
-    format: formatPercent,
+    ...PERCENTAGES,
   },
   {
     id: 'learning-rate',
     title: 'Learning rate',
     metric: { split: 'train', metric: 'learning_rate' },
-    format: (value) => formatNumber(value, 3),
+    ...numbers(3),
   },
   {
     id: 'gradient-norm',
     title: 'Gradient norm, before clipping',
     metric: { split: 'train', metric: 'gradient_norm' },
-    format: (value) => formatNumber(value, 3),
+    ...numbers(3),
     logarithmic: true,
     optional: true,
   },
@@ -323,7 +347,7 @@ export const COMPARISON_CHARTS: ComparisonChart[] = [
     id: 'clipped',
     title: 'Steps clipped',
     metric: { split: 'train', metric: 'clipped_fraction' },
-    format: formatPercent,
+    ...PERCENTAGES,
     optional: true,
   },
 ];

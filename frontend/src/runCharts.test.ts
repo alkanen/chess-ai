@@ -11,7 +11,14 @@ import {
   logs,
   placeRecords,
 } from './runCharts';
-import { formatAgo, formatDuration, formatNumber, formatPercent, runState } from './runFormat';
+import {
+  decimalsOf,
+  formatAgo,
+  formatDuration,
+  formatNumber,
+  formatPercent,
+  runState,
+} from './runFormat';
 
 const LOSS = CHARTS.find((chart) => chart.id === 'loss')!;
 
@@ -190,6 +197,39 @@ describe('formatting', () => {
     expect(formatAgo('2026-10-01T12:00:00Z', Date.parse('2026-10-01T12:00:30Z'))).toBe(
       '30s ago',
     );
+  });
+});
+
+describe('tick labels', () => {
+  const chart = (id: string) => [...CHARTS, ...COMPARISON_CHARTS].find((spec) => spec.id === id)!;
+  const labels = (id: string, ticks: number[]) =>
+    ticks.map((tick) => chart(id).formatTick(tick, ticks[1] - ticks[0]));
+
+  it('counts the decimals a step needs', () => {
+    expect(decimalsOf(0.02)).toBe(2);
+    expect(decimalsOf(0.025)).toBe(3);
+    expect(decimalsOf(2.5e-6)).toBe(7);
+    expect(decimalsOf(1e-7)).toBe(7);
+    expect(decimalsOf(0.1 + 0.2)).toBe(1);
+    expect(decimalsOf(500)).toBe(0);
+  });
+
+  it('writes ticks as the values are written while that tells them apart', () => {
+    expect(labels('loss', [1.82, 1.84, 1.86])).toEqual(['1.82', '1.84', '1.86']);
+    expect(labels('top1', [0.45, 0.5, 0.55])).toEqual(['45.0%', '50.0%', '55.0%']);
+    expect(labels('learning-rate', [0.001, 0.002, 0.003])).toEqual(['0.001', '0.002', '0.003']);
+  });
+
+  it('gives ticks of a zoomed chart the digits that tell them apart', () => {
+    expect(labels('illegal', [0.0001, 0.0002, 0.0003])).toEqual(['0.01%', '0.02%', '0.03%']);
+    expect(labels('illegal', [0.00025, 0.0005])).toEqual(['0.025%', '0.050%']);
+    expect(labels('learning-rate', [0.000405, 0.00041, 0.000415])).toEqual([
+      '4.05e-4',
+      '4.10e-4',
+      '4.15e-4',
+    ]);
+    expect(labels('loss', [1.8205, 1.821, 1.8215])).toEqual(['1.8205', '1.821', '1.8215']);
+    expect(labels('gradient-norm', [0.1, 0.15, 0.2])).toEqual(['0.1', '0.15', '0.2']);
   });
 });
 

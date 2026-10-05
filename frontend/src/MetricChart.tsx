@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
+import { logRange, logTicks } from './chartScale';
 import { latestValues, type ChartData, type ChartLook, type XAxis } from './runCharts';
 import './MetricChart.css';
 
@@ -57,12 +58,48 @@ function darkQuery(): MediaQueryList | null {
     : null;
 }
 
+/** The least distance between ticks next to each other, which their labels must tell apart. */
+function smallestGap(ticks: number[]): number {
+  let gap = Infinity;
+  for (let index = 1; index < ticks.length; index += 1) {
+    gap = Math.min(gap, Math.abs(ticks[index] - ticks[index - 1]));
+  }
+  return gap;
+}
+
+/**
+ * The least and greatest of the levels shown on `chart`, its last `levels` series, for a
+ * y-axis with no data series shown to fit: the viewer has hidden them in the legend.
+ */
+function shownLevels(chart: uPlot, levels: number): [number | null, number | null] {
+  let least: number | null = null;
+  let greatest: number | null = null;
+  for (let index = chart.series.length - levels; index < chart.series.length; index += 1) {
+    if (chart.series[index].show === false) {
+      continue;
+    }
+    for (const value of chart.data[index]) {
+      if (value != null) {
+        least = least === null ? value : Math.min(least, value);
+        greatest = greatest === null ? value : Math.max(greatest, value);
+      }
+    }
+  }
+  return [least, greatest];
+}
+
 interface MetricChartProps {
   chart: ChartLook;
   /** What each line is called, in the order of the series in `data`. */
   labels: string[];
   x: XAxis;
   data: ChartData;
+  /**
+   * How many of the last series are levels from the run's settings rather than its log,
+   * which the y-axis is not fitted to: a gradient norm far below where it would be clipped
+   * would otherwise be squashed at the bottom of the chart.
+   */
+  levels?: number;
 }
 
 /**
@@ -72,7 +109,7 @@ interface MetricChartProps {
  * in, and a zoomed chart stays where it was put while new lines arrive, until a double
  * click lets it follow the run again.
  */
-export function MetricChart({ chart: spec, labels, x, data }: MetricChartProps) {
+export function MetricChart({ chart: spec, labels, x, data, levels = 0 }: MetricChartProps) {
   const container = useRef<HTMLDivElement>(null);
   const chart = useRef<uPlot | null>(null);
   const zoomed = useRef(false);
@@ -102,19 +139,56 @@ export function MetricChart({ chart: spec, labels, x, data }: MetricChartProps) 
     const options: uPlot.Options = {
       width: element.clientWidth || 600,
       height: HEIGHT,
-      scales: { x: { time: false }, y: spec.logarithmic ? { distr: 3 } : {} },
+      // uPlot fits a linear y-axis to the data in view itself; a logarithmic one it would round
+      // out to powers of ten, so it is given a range and ticks that fit the data instead. Levels
+      // are left out of the fit, so where only levels are shown it fits them instead.
+      scales: {
+        x: { time: false },
+        y: {
+          ...(spec.logarithmic ? { distr: 3 } : {}),
+          ...(spec.logarithmic || levels > 0
+            ? {
+                // uPlot's types say otherwise, but it passes nulls for a y-axis with no data.
+                range: (made: uPlot, dataMin: number | null, dataMax: number | null) => {
+                  let [min, max] = [dataMin, dataMax];
+                  if (min === null && levels > 0) {
+                    [min, max] = shownLevels(made, levels);
+                  }
+                  if (spec.logarithmic) {
+                    return logRange(min, max);
+                  }
+                  // What uPlot gives a linear y-axis of its own.
+                  return min === null || max === null
+                    ? [null, null]
+                    : uPlot.rangeNum(min, max, 0.1, true);
+                },
+              }
+            : {}),
+        },
+      },
       axes: [
         {
           ...axis,
           values: (_, splits) => splits.map((value) => x.format(value)),
           ...(x.increments === undefined ? {} : { incrs: x.increments }),
         },
-        { ...axis, size: 64, values: (_, splits) => splits.map((value) => spec.format(value)) },
+        {
+          ...axis,
+          size: 64,
+          values: (_, splits) => {
+            const step = smallestGap(splits);
+            return splits.map((value) => spec.formatTick(value, step));
+          },
+          ...(spec.logarithmic
+            ? { splits: (_, __, min, max) => logTicks(min, max), filter: (_, splits) => splits }
+            : {}),
+        },
       ],
       series: [
         { label: x.label, value: (_, at) => (at == null ? '–' : x.format(at)) },
-        ...currentLabels.current.map((label, index) => ({
+        ...currentLabels.current.map((label, index, all) => ({
           label,
+          auto: index < all.length - levels,
           stroke: palette.series[index],
           width: 2,
           // Validation is measured every so many steps, and runs side by side are logged at
@@ -146,7 +220,7 @@ export function MetricChart({ chart: spec, labels, x, data }: MetricChartProps) 
       made.destroy();
       chart.current = null;
     };
-  }, [spec, x, named, dark, empty]);
+  }, [spec, x, named, dark, empty, levels]);
 
   useEffect(() => {
     chart.current?.setData(data as uPlot.AlignedData, !zoomed.current);

@@ -13,6 +13,11 @@ export class FakeUPlot {
   destroyed = false;
   readonly over = document.createElement('div');
 
+  /** The series as uPlot keeps them, which a range function looks at for what is shown. */
+  get series(): uPlot.Series[] {
+    return this.options.series;
+  }
+
   constructor(
     readonly options: uPlot.Options,
     data: uPlot.AlignedData,
@@ -36,6 +41,15 @@ export class FakeUPlot {
       throw new Error(`no chart has a series called ${label}`);
     }
     return chart;
+  }
+
+  /**
+   * The y-range the chart would give data from `min` to `max` in view, or null where it leaves
+   * that to uPlot, whose linear range fits the data in view already.
+   */
+  yRange(min: number | null, max: number | null): uPlot.Range.MinMax | null {
+    const range = this.options.scales?.y?.range;
+    return typeof range === 'function' ? range(this as unknown as uPlot, min as number, max as number, 'y') : null;
   }
 
   setData(data: uPlot.AlignedData, resetScales = true) {
