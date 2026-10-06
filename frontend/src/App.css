@@ -123,3 +123,32 @@
   margin: 0;
   opacity: 0.7;
 }
+
+/* A game waiting for another checkpoint: the picker stacks under what happened. */
+.request.paused {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.request.paused .model-settings {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+}
+
+.request.paused label,
+.request.paused select {
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+.request.paused input[type='number'] {
+  width: 6rem;
+  font: inherit;
+}
+
+.request.paused .run-name {
+  font-family: ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}

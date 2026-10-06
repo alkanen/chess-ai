@@ -356,7 +356,9 @@
         },
         "game_over": null
       },
-      "request": null
+      "request": null,
+      "paused": null,
+      "replacements": []
     }
   },
   {

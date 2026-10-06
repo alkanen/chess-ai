@@ -27,6 +27,15 @@ class MoveRejectedError(Exception):
     """
 
 
+class PlayerUnavailableError(Exception):
+    """The player can no longer play, because what it plays with is gone.
+
+    A checkpoint deleted, or replaced by other weights, since the game began with it. Unlike a
+    player that broke, nothing is wrong with the game: it waits for another player to take
+    this one's place.
+    """
+
+
 @dataclass(frozen=True)
 class GameContext:
     """What a player gets to see when it is asked for a move."""

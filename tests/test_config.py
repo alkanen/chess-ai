@@ -181,3 +181,29 @@ def test_the_example_config_is_the_defaults():
     example = Path(__file__).parents[1] / "chess-ai.example.toml"
 
     assert load_config(example, environ={}) == load_config(environ={})
+
+
+def test_ongoing_games_are_kept_apart_from_the_saved_ones_by_default():
+    assert load_config(environ={}).paths.ongoing_games == Path("ongoing-games")
+
+
+def test_the_ongoing_games_directory_can_be_set_and_expands_a_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    config = load_config(environ={"CHESS_AI_PATHS_ONGOING_GAMES": "~/chess/ongoing"})
+
+    assert config.paths.ongoing_games == tmp_path / "chess" / "ongoing"
+
+
+def test_a_game_is_kept_a_week_after_its_last_move_unless_the_config_says_otherwise(tmp_path):
+    assert load_config(environ={}).games.expire_after_days == 7
+    path = write(tmp_path / "custom.toml", "[games]\nexpire_after_days = 2.5\n")
+
+    assert load_config(path, environ={}).games.expire_after_days == 2.5
+
+
+def test_a_game_cannot_be_kept_for_no_time_at_all(tmp_path):
+    path = write(tmp_path / "custom.toml", "[games]\nexpire_after_days = 0\n")
+
+    with pytest.raises(ConfigError, match="expire_after_days"):
+        load_config(path, environ={})

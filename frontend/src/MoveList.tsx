@@ -6,6 +6,8 @@ interface Played {
   san: string;
   /** How many moves have been played once this one has, which is what it jumps to. */
   ply: number;
+  /** What happened in the game right after this move, such as a player taking over. */
+  marks: string[];
 }
 
 /** The moves of one full move: White's, and Black's, either of which may be missing. */
@@ -26,15 +28,20 @@ function firstMove(startFen: string): { number: number; black: boolean } {
  * The moves under the numbers they were played at. A game from a custom position starts
  * wherever that position stood, and can start with a move of Black's.
  */
-function pairs(moves: readonly { san: string }[], startFen: string): MovePair[] {
+function pairs(
+  moves: readonly { san: string }[],
+  startFen: string,
+  marks: readonly MoveMark[],
+): MovePair[] {
   const first = firstMove(startFen);
   const paired: MovePair[] = [];
   moves.forEach(({ san }, index) => {
-    const played = { san, ply: index + 1 };
+    const ply = index + 1;
+    const played = { san, ply, marks: marks.filter((mark) => mark.ply === ply).map(textOf) };
     // Counting from White's move of the first full move, even when it was never played.
-    const ply = index + (first.black ? 1 : 0);
-    const number = first.number + Math.floor(ply / 2);
-    if (ply % 2 === 0) {
+    const counted = index + (first.black ? 1 : 0);
+    const number = first.number + Math.floor(counted / 2);
+    if (counted % 2 === 0) {
       paired.push({ number, white: played, black: null });
     } else {
       const pair = paired.at(-1);
@@ -46,6 +53,17 @@ function pairs(moves: readonly { san: string }[], startFen: string): MovePair[] 
     }
   });
   return paired;
+}
+
+/** Something that happened in the game after a move, rather than a move itself. */
+export interface MoveMark {
+  /** How many moves had been played when it happened; 0 is before the first. */
+  ply: number;
+  text: string;
+}
+
+function textOf(mark: MoveMark): string {
+  return mark.text;
 }
 
 interface MoveListProps {
@@ -60,10 +78,12 @@ interface MoveListProps {
   current?: number;
   /** Jumps to the position a move leads to. Without it the moves are not for clicking. */
   onSelect?: (ply: number) => void;
+  /** What happened between the moves, marked after the move it followed. */
+  marks?: readonly MoveMark[];
 }
 
 /** The game so far in standard algebraic notation, a numbered move to a line. */
-export function MoveList({ moves, startFen, current, onSelect }: MoveListProps) {
+export function MoveList({ moves, startFen, current, onSelect, marks = [] }: MoveListProps) {
   const scroller = useRef<HTMLDivElement>(null);
 
   // A long game outgrows the panel: keep the move being looked at in sight. Watched on
@@ -92,10 +112,17 @@ export function MoveList({ moves, startFen, current, onSelect }: MoveListProps) 
     }
   }, [moves.length, current]);
 
-  const lines = pairs(moves, startFen);
+  const lines = pairs(moves, startFen, marks);
+  // Anything before the first move, or after the last there is, has no move to be marked on.
+  const unplaced = marks.filter((mark) => mark.ply < 1 || mark.ply > moves.length);
   return (
     <section className="move-list" aria-labelledby="move-list-heading">
       <h2 id="move-list-heading">Moves</h2>
+      {unplaced.map((mark, index) => (
+        <p key={index} className="note start-mark">
+          {mark.text}
+        </p>
+      ))}
       {lines.length === 0 ? (
         <p className="note">No moves yet.</p>
       ) : (
@@ -130,7 +157,12 @@ function Move({
     return <span className="san">…</span>;
   }
   if (onSelect === undefined) {
-    return <span className="san">{played.san}</span>;
+    return (
+      <span className="san">
+        {played.san}
+        {played.marks.length > 0 && <Marked marks={played.marks} />}
+      </span>
+    );
   }
   return (
     <button
@@ -142,5 +174,15 @@ function Move({
     >
       {played.san}
     </button>
+  );
+}
+
+/** A sign after a move that something happened there, which says what on hover. */
+function Marked({ marks }: { marks: string[] }) {
+  const text = marks.join('; ');
+  return (
+    <span className="move-mark" role="img" aria-label={text} title={text}>
+      ⇄
+    </span>
   );
 }

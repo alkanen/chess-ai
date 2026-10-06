@@ -119,6 +119,11 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
         moves: state.view.game.moves.slice(0, event.ply),
         position: event.position,
         request: null,
+        // A player that took over plays on from the position the game is back in.
+        replacements: state.view.game.replacements.map((replaced) => ({
+          ...replaced,
+          ply: Math.min(replaced.ply, event.ply),
+        })),
       };
       return {
         view: { ...state.view, game, position: event.position },
@@ -140,11 +145,32 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
         ...state.view.game,
         position: event.position,
         request: null,
+        paused: null,
       };
       return {
         view: { ...state.view, game, position: event.position },
         error: null,
       };
+    }
+    case 'paused': {
+      if (state.view === null) {
+        return state;
+      }
+      const game = { ...state.view.game, paused: event.paused };
+      return { view: { ...state.view, game }, error: state.error };
+    }
+    case 'replaced': {
+      if (state.view === null) {
+        return state;
+      }
+      const { replacement } = event;
+      const game = {
+        ...state.view.game,
+        [replacement.side]: replacement.new,
+        paused: null,
+        replacements: [...state.view.game.replacements, replacement],
+      };
+      return { view: { ...state.view, game }, error: null };
     }
     case 'error':
       return { ...state, error: event.message };

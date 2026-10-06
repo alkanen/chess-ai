@@ -6,6 +6,9 @@ is the server's side of it: which sides get an engine, what the game says about 
 no engine outlives the game it was started for, however that game ends.
 """
 
+import os
+import signal
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -279,3 +282,68 @@ def test_the_installed_stockfish_plays_through_the_server(tmp_path):
 
     assert game["white"]["stockfish"]["min_elo"] > 0
     assert chess.Board().is_legal(chess.Move.from_uci(moved["uci"]))
+
+
+def test_a_game_against_stockfish_carries_on_after_a_restart_starting_it_when_needed(
+    tmp_path, engine
+):
+    with serve(tmp_path, engine) as client:
+        game, links = start_with_links(client, HUMAN, stockfish(1400))
+        [before] = started(engine)
+    wait_until_gone(before)
+
+    with serve(tmp_path, engine) as client:
+        seen = client.get(f"{GAME}/{links['white']}").json()
+        assert started(engine) == [before], "Stockfish was started before the game needed it"
+        with connect(client, links["white"]) as websocket:
+            websocket.receive_json()
+            websocket.send_json({"type": "move", "uci": "e2e4"})
+            assert websocket.receive_json()["type"] == "move"
+            answered = websocket.receive_json()
+        pids = started(engine)
+
+    assert seen["game"]["black"] == game["black"]
+    assert answered["type"] == "move" and answered["ply"] == 2
+    assert len(pids) == 2
+    # Gone with the server, like any engine a game holds.
+    assert not any(running(pid) for pid in pids)
+
+
+def test_a_stockfish_on_move_when_the_server_restarts_is_started_at_once(tmp_path, engine):
+    with serve(tmp_path, engine) as client:
+        _, links = start_with_links(client, stockfish(move_time=30), HUMAN)
+
+    with serve(tmp_path, engine) as client:
+        deadline = time.monotonic() + 5
+        while len(started(engine)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        pids = started(engine)
+        assert running(pids[-1])
+        with connect(client, links["black"]) as websocket:
+            websocket.receive_json()
+            websocket.send_json({"type": "abort"})
+            assert websocket.receive_json()["type"] == "game_over"
+
+    wait_until_gone(*pids)
+
+
+def test_a_game_whose_stockfish_was_killed_carries_on_after_a_restart(tmp_path, engine):
+    """As when a service manager stops the server and its engines at once, for an update."""
+    with serve(tmp_path, engine) as client:
+        _, links = start_with_links(client, stockfish(move_time=30), HUMAN)
+        [killed] = started(engine)
+        with connect(client, links["watch"]) as websocket:
+            websocket.receive_json()
+            os.kill(killed, signal.SIGTERM)
+            stopped = websocket.receive_json()
+
+    with serve(tmp_path, engine) as client:
+        seen = client.get(f"{GAME}/{links['watch']}").json()
+        deadline = time.monotonic() + 5
+        while len(started(engine)) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        restarted = started(engine)
+
+    assert stopped["position"]["game_over"]["reason"] == "error"
+    assert seen["game"]["position"]["game_over"] is None
+    assert len(restarted) == 2

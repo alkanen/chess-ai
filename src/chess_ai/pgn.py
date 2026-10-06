@@ -3,7 +3,8 @@
 A game that reaches a result is saved in the games directory, one file per game, and any
 game can be downloaded from the browser at any point, finished or not. Either way the
 file carries what it takes to replay the game: who played it, when, how it ended, and
-the position it started from when that was not the usual one.
+the position it started from when that was not the usual one. A player that took over a side
+in the middle of the game, from one that could not go on, is noted where it did.
 """
 
 import re
@@ -89,9 +90,16 @@ def game_pgn(
         record.headers.update(_model_tags(color, player))
         record.headers.update(_stockfish_tags(color, player))
     record.headers.update(headers or {})
-    node: chess.pgn.GameNode = record
+    nodes: list[chess.pgn.GameNode] = [record]
     for move in game.moves:
-        node = node.add_main_variation(chess.Move.from_uci(move.uci))
+        nodes.append(nodes[-1].add_main_variation(chess.Move.from_uci(move.uci)))
+    # Where a player took over from one that could not go on: after the last move the old one
+    # was there for, or before the first move for one replaced before anything was played.
+    # The headers name only the player that finished the game.
+    for replaced in game.replacements:
+        node = nodes[min(replaced.ply, len(game.moves))]
+        said = f"{replaced.old.name} replaced by {replaced.new.name}"
+        node.comment = f"{node.comment}; {said}" if node.comment else said
     # Written out in the lines PGN asks for rather than python-chess's own single line
     # per game, so that the file reads in a text editor as well as in a chess program.
     written = record.accept(chess.pgn.StringExporter(columns=COLUMNS, headers=True))

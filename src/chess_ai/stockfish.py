@@ -232,3 +232,83 @@ class StockfishPlayer:
         """
         # Shielded, so that a wait that is given up on leaves the future for anyone else.
         await asyncio.shield(self._engine.returncode)
+
+
+class DeferredStockfishPlayer:
+    """Stockfish that is started only when it is first asked for a move.
+
+    For a game made again after the server restarted: the game may wait days for a person's
+    move, and an engine process held all that while would be held for nothing. Until it is
+    started it says it is what it was before the restart, ``description``; once started, what
+    the engine says.
+    """
+
+    def __init__(
+        self,
+        command: Command,
+        *,
+        elo: int,
+        move_time: float,
+        description: StockfishDescription,
+    ) -> None:
+        self._command = command
+        self._elo = elo
+        self._move_time = move_time
+        self._description = description
+        self._starting: asyncio.Task[StockfishPlayer] | None = None
+        self._closed = False
+
+    @property
+    def name(self) -> str:
+        return f"Stockfish {self.stockfish.elo}"
+
+    @property
+    def stockfish(self) -> StockfishDescription:
+        started = self._started()
+        return started.stockfish if started is not None else self._description
+
+    async def choose_move(self, context: GameContext) -> PlayerMove:
+        if self._closed:
+            raise StockfishError("Stockfish has been stopped")
+        if self._starting is None:
+            self._starting = asyncio.ensure_future(
+                start_stockfish(self._command, elo=self._elo, move_time=self._move_time)
+            )
+        # Shielded, so that a question dropped by a takeback while the engine is starting does
+        # not leave it half started: the next question waits for the same start.
+        engine = await asyncio.shield(self._starting)
+        return await engine.choose_move(context)
+
+    def close(self) -> None:
+        """Stop the engine, or have it stopped as soon as it has started if it is starting."""
+        self._closed = True
+        starting = self._starting
+        if starting is None:
+            return
+        if starting.done():
+            _close_started(starting)
+        else:
+            starting.add_done_callback(_close_started)
+
+    async def wait_closed(self) -> None:
+        starting = self._starting
+        if starting is None:
+            return
+        try:
+            engine = await asyncio.shield(starting)
+        except Exception:  # noqa: BLE001 - whoever asked for a move was told why already
+            return  # It never started, so there is nothing to wait for.
+        await engine.wait_closed()
+
+    def _started(self) -> "StockfishPlayer | None":
+        starting = self._starting
+        if starting is None or not starting.done() or starting.cancelled():
+            return None
+        return starting.result() if starting.exception() is None else None
+
+
+def _close_started(starting: "asyncio.Task[StockfishPlayer]") -> None:
+    # Read even when it failed, so that asyncio does not report a failure nobody looked at:
+    # whoever asked for a move was told of it already.
+    if not starting.cancelled() and starting.exception() is None:
+        starting.result().close()

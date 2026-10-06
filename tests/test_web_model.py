@@ -416,6 +416,7 @@ def test_a_checkpoint_replaced_while_a_game_waits_is_not_played_in_its_place(
 
     A game whose checkpoint was let go of in the meantime must not carry on with those as if
     they were the ones it began with, which it would go on naming in its state and its PGN.
+    It waits for somebody to choose a checkpoint to carry on with instead.
     """
     config = Config(
         server=ServerConfig(path_prefix=PREFIX),
@@ -435,7 +436,162 @@ def test_a_checkpoint_replaced_while_a_game_waits_is_not_played_in_its_place(
             assert websocket.receive_json()["type"] == "state"
             websocket.send_json({"type": "move", "uci": "e2e4"})
             assert websocket.receive_json()["type"] == "move"
-            ended = websocket.receive_json()
+            paused = websocket.receive_json()
 
-    assert ended["type"] == "game_over"
-    assert ended["position"]["game_over"]["reason"] == "error"
+    assert paused["type"] == "paused"
+    assert paused["paused"]["side"] == "black"
+    assert "has been replaced" in paused["paused"]["reason"]
+
+
+def pause(client: TestClient, links: dict, runs: Path) -> dict:
+    """Delete the checkpoint the model in ``links``' game plays, and have it asked to move."""
+    shutil.rmtree(runs / "tiny" / "checkpoints")
+    with client.websocket_connect(f"{PREFIX}/api/games/{links['white']}/ws") as websocket:
+        websocket.receive_json()
+        websocket.send_json({"type": "move", "uci": "e2e4"})
+        assert websocket.receive_json()["type"] == "move"
+        return websocket.receive_json()
+
+
+def replace(client: TestClient, link: str, **settings):
+    return client.post(f"{PREFIX}/api/games/{link}/replace", json=model(**settings))
+
+
+@pytest.fixture
+def small(tmp_path, runs) -> Iterator[TestClient]:
+    """A server that holds one checkpoint at a time, so that a deleted one is not still held.
+
+    There is a second run, ``other``, for another game to play, which takes that one place.
+    """
+    model_run(runs, "other")
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+        games=GamesConfig(max_loaded_checkpoints=1),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as serving:
+        yield serving
+
+
+def test_a_checkpoint_deleted_while_a_game_waits_pauses_the_game_for_another(small, runs):
+    links = start(small, {"kind": "human"}, model(checkpoint=2)).json()["links"]
+    # The game's checkpoint is let go of, so that it has to be read again for its next move.
+    assert start(small, {"kind": "human"}, model("other")).status_code == 200
+
+    paused = pause(small, links, runs)
+    seen = small.get(f"{PREFIX}/api/games/{links['watch']}").json()
+
+    assert paused["type"] == "paused"
+    assert seen["game"]["paused"] == paused["paused"]
+    assert seen["game"]["position"]["game_over"] is None
+
+
+def test_the_person_at_a_paused_game_chooses_another_checkpoint_and_plays_on(small, runs, tmp_path):
+    links = start(small, {"kind": "human"}, model(checkpoint=2)).json()["links"]
+    assert start(small, {"kind": "human"}, model("other")).status_code == 200
+    pause(small, links, runs)
+    # Somebody trains the run again, under the same name.
+    shutil.rmtree(runs / "tiny")
+    model_run(runs, seed=99)
+
+    with small.websocket_connect(f"{PREFIX}/api/games/{links['white']}/ws") as websocket:
+        assert websocket.receive_json()["game"]["paused"] is not None
+        answer = replace(small, links["white"], checkpoint="latest")
+        replaced = websocket.receive_json()
+        moved = websocket.receive_json()
+        websocket.send_json({"type": "resign"})
+        assert websocket.receive_json()["type"] == "game_over"
+
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["game"]["black"]["model"]["checkpoint"] == 4
+    assert replaced["type"] == "replaced"
+    assert replaced["replacement"]["ply"] == 1
+    assert replaced["replacement"]["old"]["name"] == "tiny step 2"
+    assert replaced["replacement"]["new"]["name"] == "tiny step 4"
+    assert moved["type"] == "move" and moved["ply"] == 2
+    [saved] = (tmp_path / "games").glob("*.pgn")
+    record = read_back(saved.read_text())
+    assert record.headers["BlackCheckpoint"] == "4"
+    assert record.next() is not None
+    assert record.next().comment == "tiny step 2 replaced by tiny step 4"
+
+
+def test_a_watch_link_cannot_choose_the_checkpoint_a_paused_game_goes_on_with(small, runs):
+    links = start(small, {"kind": "human"}, model(checkpoint=2)).json()["links"]
+    assert start(small, {"kind": "human"}, model("other")).status_code == 200
+    pause(small, links, runs)
+
+    refused = replace(small, links["watch"], run="other")
+
+    assert refused.status_code == 403
+
+
+def test_a_game_that_is_not_paused_has_no_checkpoint_to_replace(client):
+    links = start(client, {"kind": "human"}, model()).json()["links"]
+
+    refused = replace(client, links["white"])
+
+    assert refused.status_code == 409
+    assert "not waiting" in refused.json()["detail"]
+
+
+def test_a_checkpoint_that_cannot_take_over_is_refused_and_the_game_still_waits(small, runs):
+    links = start(small, {"kind": "human"}, model(checkpoint=2)).json()["links"]
+    assert start(small, {"kind": "human"}, model("other")).status_code == 200
+    pause(small, links, runs)
+
+    refused = replace(small, links["white"])
+
+    assert refused.status_code == 400
+    assert small.get(f"{PREFIX}/api/games/{links['white']}").json()["game"]["paused"] is not None
+
+
+def test_a_game_against_a_checkpoint_carries_on_after_a_restart_loading_it_when_needed(
+    tmp_path, runs, monkeypatch
+):
+    import chess_ai.inference as inference
+
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as before:
+        links = start(before, {"kind": "human"}, model(rating=1500)).json()["links"]
+
+    loaded = []
+    real = inference.load_engine
+    monkeypatch.setattr(
+        inference, "load_engine", lambda path, **kw: (loaded.append(path), real(path, **kw))[1]
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as after:
+        seen = after.get(f"{PREFIX}/api/games/{links['white']}").json()
+        assert loaded == [], "a checkpoint was loaded before any game needed it"
+        with after.websocket_connect(f"{PREFIX}/api/games/{links['white']}/ws") as websocket:
+            websocket.receive_json()
+            websocket.send_json({"type": "move", "uci": "e2e4"})
+            assert websocket.receive_json()["type"] == "move"
+            answered = websocket.receive_json()
+
+    assert seen["game"]["black"]["model"] == {
+        "run": "tiny",
+        "checkpoint": 2,
+        "rating": 1500,
+        "strategy": "argmax",
+        "temperature": None,
+    }
+    assert answered["type"] == "move"
+    assert len(loaded) == 1
+
+
+def test_a_checkpoint_deleted_while_the_server_was_down_pauses_the_game(tmp_path, runs):
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as before:
+        links = start(before, {"kind": "human"}, model()).json()["links"]
+
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as after:
+        paused = pause(after, links, runs)
+
+    assert paused["type"] == "paused"

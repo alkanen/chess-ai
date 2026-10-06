@@ -186,4 +186,30 @@ describe('MoveList', () => {
     expect(lines()).toEqual(['… Qxd5', 'Nc3 Qa5']);
     expect(firstNumber()).toBe(2);
   });
+
+  it('marks where a player took over, after the move before it', () => {
+    render(
+      <MoveList
+        moves={movesUpTo(3)}
+        startFen={START}
+        marks={[{ ply: 2, text: 'tiny step 2 replaced by tiny step 4' }]}
+      />,
+    );
+
+    const mark = screen.getByRole('img', { name: 'tiny step 2 replaced by tiny step 4' });
+    expect(mark.closest('.san')).toHaveTextContent(/^e5/);
+  });
+
+  it('says so above the moves when a player took over before the first', () => {
+    render(
+      <MoveList
+        moves={movesUpTo(1)}
+        startFen={START}
+        marks={[{ ply: 0, text: 'a replaced by b' }]}
+      />,
+    );
+
+    expect(screen.getByText('a replaced by b')).toBeInTheDocument();
+    expect(screen.queryByRole('img')).toBeNull();
+  });
 });

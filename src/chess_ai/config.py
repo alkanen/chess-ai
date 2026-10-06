@@ -81,8 +81,12 @@ class PathsConfig(BaseModel):
     """Directory the datasets built here are kept in, one directory per dataset."""
     runs: Path = Path("runs")
     """Directory training runs are kept in, one directory per run."""
+    ongoing_games: Path = Path("ongoing-games")
+    """Directory the games the server holds are kept in while they last, one file per game, so
+    that they outlive a restart. Not under ``games``: those are the PGN files of games that
+    ended, which are kept for good, and these are deleted once a game has expired."""
 
-    @field_validator("games", "data", "runs")
+    @field_validator("games", "data", "runs", "ongoing_games")
     @classmethod
     def _expand_user(cls, value: Path) -> Path:
         """Expand a leading ``~``, which a path in a config file may well be written with."""
@@ -142,6 +146,9 @@ class GamesConfig(BaseModel):
     loaded again when a game next needs it."""
     checkpoint_idle_hours: float = Field(default=24.0, gt=0)
     """How long a loaded checkpoint nobody has played with is kept before it is let go of."""
+    expire_after_days: float = Field(default=7.0, gt=0)
+    """How long a game is kept after its last move, finished or not, before it is deleted along
+    with its links. Starting a game, every move, and the game ending start the count again."""
 
 
 class Config(BaseModel):

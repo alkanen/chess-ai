@@ -1,12 +1,19 @@
 import { useEffect, useState } from 'react';
-import { type Access, type PlayerInfo, type PositionSnapshot, rematch } from './api';
+import {
+  type Access,
+  type PlayerInfo,
+  type PositionSnapshot,
+  rematch,
+  type Replacement,
+} from './api';
 import { Board } from './board/Board';
 import type { Orientation } from './board/geometry';
 import { GameControls } from './GameControls';
 import { GameLinks } from './GameLinks';
 import { GameStatus } from './GameStatus';
-import { MoveList } from './MoveList';
+import { MoveList, type MoveMark } from './MoveList';
 import { forgetGame, goToNewGame, rememberGame } from './myGames';
+import { PausedPanel } from './PausedPanel';
 import { RequestPanel } from './RequestPanel';
 import { useGameChannel } from './useGameChannel';
 import './App.css';
@@ -88,6 +95,14 @@ function Player({ player }: { player: PlayerInfo }) {
       {note !== null && <span className="model-note">{note}</span>}
     </dd>
   );
+}
+
+/** Where each player that took over did, for the move list to mark. */
+function replacementMarks(replacements: Replacement[]): MoveMark[] {
+  return replacements.map((replaced) => ({
+    ply: replaced.ply,
+    text: `${replaced.old.name} replaced by ${replaced.new.name}`,
+  }));
 }
 
 interface GameViewProps {
@@ -173,6 +188,17 @@ export function GameView({ link }: GameViewProps) {
               onAnswer={answer}
             />
           )}
+          {game.paused !== null && view.position.game_over === null && (
+            <PausedPanel
+              // A pause after another player took over is a new one, with a form of its own.
+              key={game.replacements.length}
+              link={link}
+              paused={game.paused}
+              player={game[game.paused.side]}
+              access={view.access}
+              disabled={!connected}
+            />
+          )}
           <GameControls
             orientation={orientation}
             onFlip={flip}
@@ -185,7 +211,11 @@ export function GameView({ link }: GameViewProps) {
             onTakeBack={takeBack}
             onPlayAgain={async () => goToNewGame(await rematch(link), view.access)}
           />
-          <MoveList moves={game.moves} startFen={game.start_fen} />
+          <MoveList
+            moves={game.moves}
+            startFen={game.start_fen}
+            marks={replacementMarks(game.replacements)}
+          />
           {!aborted && <GameLinks link={link} access={view.access} watch={view.watch} />}
         </aside>
       </div>

@@ -63,3 +63,14 @@ button.san[aria-current='step'] {
   border-radius: 3px;
   background: rgb(128 128 128 / 35%);
 }
+
+/* Where a player took over a side from one that could not go on. */
+.move-mark {
+  margin-left: 0.25rem;
+  color: rgb(200 120 0);
+  cursor: help;
+}
+
+.move-list .start-mark {
+  margin: 0 0 0.25rem;
+}

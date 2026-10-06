@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { GameState } from './api';
+import type { GameState, PositionSnapshot } from './api';
 import { FakeWebSocket } from './test/fakeWebSocket';
 import startPosition from './test/fixtures/start-position.json';
 import { useGameChannel } from './useGameChannel';
@@ -12,6 +12,8 @@ const GAME = {
   moves: [],
   position: startPosition,
   request: null,
+  paused: null,
+  replacements: [],
 } as unknown as GameState;
 
 /** A channel following a game, on an open connection. */
@@ -109,5 +111,40 @@ describe('useGameChannel', () => {
 
     expect(channel.result.current.movePending).toBe(false);
     expect(channel.result.current.error).toBe('e2e4 is not a legal move here');
+  });
+
+  it('follows a game that pauses for another player and plays on with one', () => {
+    const { channel, socket } = following();
+    const gone = { ...GAME.black, name: 'tiny step 2' };
+    const taking = { ...GAME.black, name: 'tiny step 4' };
+
+    socket.deliver({ type: 'paused', paused: { side: 'black', reason: 'it was deleted' } });
+    expect(channel.result.current.view?.game.paused).toEqual({
+      side: 'black',
+      reason: 'it was deleted',
+    });
+
+    const replacement = { ply: 0, side: 'black' as const, old: gone, new: taking };
+    socket.deliver({ type: 'replaced', replacement });
+
+    const game = channel.result.current.view?.game;
+    expect(game?.paused).toBeNull();
+    expect(game?.black.name).toBe('tiny step 4');
+    expect(game?.replacements).toEqual([replacement]);
+  });
+
+  it('moves a replacement back with a takeback to before it', () => {
+    const { channel, socket } = following();
+    const move = { uci: 'e2e4', san: 'e4', thoughts: null };
+    const position = startPosition as unknown as PositionSnapshot;
+    for (const ply of [1, 2, 3]) {
+      socket.deliver({ type: 'move', ply, move, position });
+    }
+    const replacement = { ply: 3, side: 'black' as const, old: GAME.black, new: GAME.black };
+    socket.deliver({ type: 'replaced', replacement });
+
+    socket.deliver({ type: 'takeback', ply: 1, position });
+
+    expect(channel.result.current.view?.game.replacements[0].ply).toBe(1);
   });
 });

@@ -8,7 +8,12 @@ a game has: whoever holds a link can do what it allows.
 
 A game that has ended stays to be looked at through its links; it no longer counts towards the
 number of games in progress. An aborted game is gone at once, links and all, since an abort is
-a game nobody wants kept.
+a game nobody wants kept. Any other game is gone once it has gone a while without a move,
+finished or not.
+
+Given a :class:`~chess_ai.web.game_store.GameStore`, the registry writes every game to it as the
+game changes, and deletes it from there when it is gone, so that the server can carry on with
+its games after a restart.
 """
 
 import asyncio
@@ -16,14 +21,15 @@ import logging
 import secrets
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from pydantic import BaseModel
 
 from chess_ai.game_session import ActionRejectedError, GameEvent, GameSession, GameState
-from chess_ai.players import close_players, wait_players_closed
+from chess_ai.players import Player, close_players, wait_players_closed
 from chess_ai.position_view import Color
+from chess_ai.web.game_store import GameLinks, GameStore, PlayerRecord, StoredGame
 
 logger = logging.getLogger(__name__)
 
@@ -50,35 +56,35 @@ class NoSuchGameError(Exception):
     """No game has this link: it never had one, or the game was aborted."""
 
 
-class GameLinks(BaseModel):
-    """The links to one game, as the person who started it is given them."""
-
-    watch: str
-    """Follows the game and can do nothing to it; for anybody."""
-    white: str | None = None
-    """Plays White, for a game in which a person plays White."""
-    black: str | None = None
-    """Plays Black, for a game in which a person plays Black."""
-    control: str | None = None
-    """Aborts the game, for a game in which nobody plays either side by hand."""
+__all__ = [
+    "Access",
+    "GameLinks",
+    "GameRegistry",
+    "GamesClosedError",
+    "NoSuchGameError",
+    "Seat",
+    "TooManyGamesError",
+]
 
 
 class _Hosted:
-    """One game the server holds, and the task playing it."""
+    """One game the server holds, and the task playing it, if it is being played."""
 
     def __init__(
         self,
         session: GameSession,
         links: GameLinks,
-        task: asyncio.Task[None],
         settings: BaseModel | None,
+        players: tuple[PlayerRecord, PlayerRecord] | None,
     ) -> None:
         self.session = session
         self.links = links
-        self.task = task
+        self.task: asyncio.Task[None] | None = None
         self.settings = settings
-        self.next: _Hosted | None = None
-        """The game started from this one once it ended, if one has been."""
+        self.players = players
+        """What it takes to make White and Black again, for a game that is kept on disk."""
+        self.next: str | None = None
+        """The id of the game started from this one once it ended, if one has been."""
 
 
 class Seat:
@@ -110,8 +116,8 @@ class Seat:
 
         Two people who both ask to play again want one game between them, not one each.
         """
-        following = self._hosted.next
-        if following is None or not self._registry._holds(following):
+        following = self._registry._held(self._hosted.next)
+        if following is None:
             return None
         if not _in_progress(following.session):
             return None
@@ -186,6 +192,20 @@ class Seat:
         self._hosted.session.answer(self._side("answer"), request_id, accept=accept)
         self._registry._after_action(self._hosted)
 
+    def replace(self, player: Player, record: PlayerRecord | None = None) -> None:
+        """Hand the side the game is waiting on to ``player``, which ``record`` makes again.
+
+        Any link but a watch link may: in a game against a model the person playing it is the
+        one waiting, and in a game nobody plays by hand it is whoever holds the control link.
+
+        Raises:
+            ActionRejectedError: the link only watches, the game has ended, or it is not
+                waiting for another player.
+        """
+        if self.access == "watch":
+            raise ActionRejectedError("you are watching this game and cannot choose its players")
+        self._registry._replace(self._hosted, player, record)
+
     def _side(self, doing: str) -> Color:
         if self.access == "watch":
             raise ActionRejectedError(f"you are watching this game and cannot {doing} in it")
@@ -200,18 +220,27 @@ class GameRegistry:
         on_finished: Callable[[GameState], None] | None = None,
         *,
         max_ongoing: int = 20,
+        store: GameStore | None = None,
+        expire_after: timedelta = timedelta(days=7),
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         """The games the server holds, keeping every game that reaches a result.
 
-        ``on_finished`` is handed each game that reached a result, once it has stopped being
-        played, which is where the server saves it as PGN. An aborted game reached no result
-        of its own and is not kept. Whatever keeping a game raises is logged and the games
-        play on.
+        ``on_finished`` is handed each game that reached a result, as it reaches it, which is
+        where the server saves it as PGN. An aborted game reached no result of its own and is
+        not kept. Whatever keeping a game raises is logged and the games play on.
+
+        ``store`` is where every game started with the records of its players is written as it
+        changes, and deleted from when it is gone. ``expire_after`` is how long a game is kept
+        after it last changed, by ``clock``'s time, before :meth:`expire` deletes it.
         """
         self._on_finished = on_finished
         self._max_ongoing = max_ongoing
+        self._store = store
+        self._expire_after = expire_after
+        self._clock = clock
         self._games: dict[str, tuple[_Hosted, Access]] = {}
-        self._hosted: set[_Hosted] = set()
+        self._hosted: dict[str, _Hosted] = {}
         # Every game still on its way out, so that the server going down waits for each of
         # them, or their engine processes would outlive the server.
         self._playing: set[asyncio.Task[None]] = set()
@@ -220,7 +249,7 @@ class GameRegistry:
     @property
     def ongoing(self) -> int:
         """How many games are being played, which is what the limit counts."""
-        return sum(1 for hosted in self._hosted if _in_progress(hosted.session))
+        return sum(1 for hosted in self._hosted.values() if _in_progress(hosted.session))
 
     def check_room(self) -> None:
         """Make sure another game may start.
@@ -240,12 +269,15 @@ class GameRegistry:
         *,
         settings: BaseModel | None = None,
         follows: Seat | None = None,
+        players: tuple[PlayerRecord, PlayerRecord] | None = None,
     ) -> GameLinks:
         """Start playing ``session``, and return the links that reach it.
 
         ``settings`` is what the game was asked for, kept with it so that another can be
         started the same way; the registry itself never reads it. ``follows`` is the game
         this one is played again from, which :meth:`Seat.next_game` then leads to it.
+        ``players`` is what it takes to make White and Black again, without which the game is
+        not written to the store, and so ends with the server.
 
         Raises:
             GamesClosedError: the server is going down.
@@ -262,22 +294,76 @@ class GameRegistry:
         )
         if links.white is None and links.black is None:
             links.control = _new_link()
-        task = asyncio.create_task(self._play(session))
-        hosted = _Hosted(session, links, task, settings)
-        if follows is not None:
-            follows._hosted.next = hosted
-        task.add_done_callback(_log_failure)
-        # A callback as well as a `finally` in the game, because a game stopped before it got
-        # its first turn is cancelled without ever running, `finally` and all.
-        task.add_done_callback(lambda _: _close_players(session))
-        self._playing.add(task)
-        task.add_done_callback(self._playing.discard)
-        self._hosted.add(hosted)
+        hosted = _Hosted(session, links, settings, players)
+        self._host(hosted)
+        self._save(hosted)
+        if follows is not None and self._held(follows._hosted.session.id) is follows._hosted:
+            follows._hosted.next = session.id
+            self._save(follows._hosted)
+        return links
+
+    def restore(
+        self,
+        stored: StoredGame,
+        white: Player,
+        black: Player,
+        settings: BaseModel | None = None,
+    ) -> None:
+        """Take back a game kept in the store, as the server starts, with these players in it.
+
+        A game still in progress is played on from where it was, and a game that had ended is
+        there to be looked at, as it was before. Neither is counted against the limit on games:
+        they were let in already, before the restart.
+
+        Raises:
+            GamesClosedError: the server is going down.
+            ValueError: the game's moves cannot be played over again.
+        """
+        if self._closed:
+            raise GamesClosedError("the server is shutting down")
+        session = GameSession.restore(white, black, stored.session)
+        hosted = _Hosted(session, stored.links, settings, (stored.white, stored.black))
+        hosted.next = stored.next
+        self._host(hosted)
+
+    def expire(self) -> int:
+        """Delete every game that has gone ``expire_after`` without changing, and say how many.
+
+        A game in progress is stopped where it is, as if aborted, and its viewers let go of.
+        """
+        now = self._clock()
+        expired = [
+            hosted
+            for hosted in self._hosted.values()
+            if now - hosted.session.updated >= self._expire_after
+        ]
+        for hosted in expired:
+            _stop(hosted)
+            self._forget(hosted)
+        if expired:
+            logger.info(
+                "Deleted %d games nobody had moved in for %s", len(expired), self._expire_after
+            )
+        return len(expired)
+
+    def _host(self, hosted: _Hosted) -> None:
+        """Hold ``hosted``, reached through its links, and play it if it is in progress."""
+        session = hosted.session
+        if _in_progress(session):
+            task = asyncio.create_task(self._play(session))
+            hosted.task = task
+            task.add_done_callback(_log_failure)
+            # A callback as well as a `finally` in the game, because a game stopped before it
+            # got its first turn is cancelled without ever running, `finally` and all.
+            task.add_done_callback(lambda _: _close_players(session))
+            self._playing.add(task)
+            task.add_done_callback(self._playing.discard)
+        session.listen(lambda event: self._changed(hosted, event))
+        self._hosted[session.id] = hosted
         for access in ("white", "black", "control", "watch"):
-            link = getattr(links, access)
+            link = getattr(hosted.links, access)
             if link is not None:
                 self._games[link] = (hosted, access)
-        return links
 
     def seat(self, link: str) -> Seat:
         """The game ``link`` reaches, with what the link may do in it.
@@ -294,7 +380,7 @@ class GameRegistry:
     async def close(self) -> None:
         """Stop every game and end every viewer's events, as when the server shuts down."""
         self._closed = True
-        for hosted in self._hosted:
+        for hosted in self._hosted.values():
             _stop(hosted)
         await asyncio.gather(*self._playing, return_exceptions=True)
 
@@ -307,13 +393,82 @@ class GameRegistry:
         if over.result == "*":
             self._forget(hosted)
 
-    def _holds(self, hosted: _Hosted) -> bool:
-        return hosted in self._hosted
+    def _held(self, game_id: str | None) -> _Hosted | None:
+        return None if game_id is None else self._hosted.get(game_id)
 
     def _forget(self, hosted: _Hosted) -> None:
-        self._hosted.discard(hosted)
+        """Let go of ``hosted`` and delete what is kept of it; doing it twice does nothing."""
+        game_id = hosted.session.id
+        if self._hosted.get(game_id) is not hosted:
+            return
+        del self._hosted[game_id]
         for link in [link for link, (held, _) in self._games.items() if held is hosted]:
             del self._games[link]
+        if self._store is not None:
+            try:
+                self._store.remove(game_id)
+            except OSError:
+                logger.exception("Could not delete game %s from %s", game_id, self._store.directory)
+
+    def _replace(self, hosted: _Hosted, player: Player, record: PlayerRecord | None) -> None:
+        session = hosted.session
+        paused = session.paused
+        if session.position.game_over is not None or paused is None:
+            raise ActionRejectedError("no player is waiting to be replaced")
+        before = hosted.players
+        # In place before the session says it has changed, which is when the game is written.
+        if before is not None and record is not None:
+            white, black = before
+            hosted.players = (record, black) if paused.side == "white" else (white, record)
+        try:
+            old = session.replace(player)
+        except BaseException:
+            hosted.players = before
+            raise
+        _close_players_of(old)
+
+    def _changed(self, hosted: _Hosted, event: GameEvent) -> None:
+        """Keep a game that has just changed: as PGN once it has a result, and in the store."""
+        if self._hosted.get(hosted.session.id) is not hosted:
+            return
+        over = hosted.session.position.game_over
+        if event.type in ("move", "game_over") and over is not None:
+            if over.reason == "abort":
+                # Nothing is kept of an aborted game, here or anywhere.
+                self._forget(hosted)
+                return
+            # Before the store, so that a server that dies in between has the PGN and plays
+            # the last move again, rather than having lost it.
+            self._keep(hosted.session)
+        self._save(hosted)
+
+    def _save(self, hosted: _Hosted) -> None:
+        if self._store is None or hosted.players is None:
+            return
+        white, black = hosted.players
+        settings = hosted.settings
+        record = hosted.session.record
+        failed = record.game_over is not None and record.game_over.reason == "error"
+        if failed and hosted.next is None:
+            # A player failing is not how the game ended. An engine killed along with a server
+            # going down for an update fails just the same, and a game that took days must not
+            # be lost to that: it is kept as it stood, and played on after the restart with
+            # players made afresh, where a player that is really broken fails again. Unless it
+            # has been played again: whoever did has moved on, and it stays ended.
+            record = record.model_copy(update={"game_over": None})
+        stored = StoredGame(
+            links=hosted.links,
+            white=white,
+            black=black,
+            session=record,
+            settings=settings.model_dump(mode="json") if settings is not None else None,
+            next=hosted.next,
+        )
+        try:
+            self._store.write(stored)
+        except (OSError, ValueError):
+            # The game goes on regardless; it is only a restart that it would not survive.
+            logger.exception("Could not write game %s to %s", stored.id, self._store.directory)
 
     async def _play(self, session: GameSession) -> None:
         """Play ``session`` to wherever it stops, and keep the game if it was finished."""
@@ -321,7 +476,6 @@ class GameRegistry:
             await session.play()
         finally:
             _close_players(session)
-            self._keep(session)
             # Waited for here, so that a server going down, which waits for its games, also
             # waits for their engines to have exited. Not for ever, though: a player that
             # could not be closed must not keep the server from going down.
@@ -354,19 +508,24 @@ def _in_progress(session: GameSession) -> bool:
 
 
 def _stop(hosted: _Hosted) -> None:
-    """Close a game and let go of the task driving it.
+    """Close a game and let go of the task driving it, if one is.
 
     A game the players did not finish leaves ``play()`` waiting for a move that will never
     come, so closing the session is not enough to stop it.
     """
     hosted.session.close()
-    hosted.task.cancel()
+    if hosted.task is not None:
+        hosted.task.cancel()
 
 
 def _close_players(session: GameSession) -> None:
     """Let go of whatever the players of a game that has stopped hold, such as an engine."""
+    _close_players_of(*session.players)
+
+
+def _close_players_of(*players: Player) -> None:
     try:
-        close_players(*session.players)
+        close_players(*players)
     except Exception:
         logger.exception("Could not close the players of a game")
 

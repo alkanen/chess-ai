@@ -11,6 +11,7 @@ from chess_ai.players import (
     GameContext,
     ModelDescription,
     PlayerMove,
+    PlayerUnavailableError,
     StockfishDescription,
     Thoughts,
 )
@@ -70,24 +71,41 @@ class PlayerBroke(Exception):
 class BrokenPlayer:
     """Fails when the test says so, in the middle of being asked for a move.
 
+    ``error`` is what it fails with: by default that it broke, but it can also be that it is
+    gone, as a checkpoint deleted while it was being loaded would be.
+
     Stands in for the players that are coming and can fail for real: an engine whose
     process has gone, a model that ran out of memory.
     """
 
     name = "Broken"
 
-    def __init__(self) -> None:
+    def __init__(self, error: Exception | None = None) -> None:
         self._asked: asyncio.Future[None] | None = None
+        self._error = error if error is not None else PlayerBroke("the player is gone")
 
     async def choose_move(self, context: GameContext) -> PlayerMove:
         self._asked = asyncio.get_running_loop().create_future()
         await self._asked
-        raise PlayerBroke("the player is gone")
+        raise self._error
 
     def fail(self) -> None:
         """Let the question this player is sitting on fail, on the next turn of the loop."""
         assert self._asked is not None, "the player has not been asked for a move"
         self._asked.set_result(None)
+
+
+class GoneModelPlayer:
+    """A checkpoint that is no longer there by the time it is asked for a move."""
+
+    def __init__(self, model: ModelDescription) -> None:
+        self.name = f"{model.run} step {model.checkpoint}"
+        self.model = model
+        self.asked = 0
+
+    async def choose_move(self, context: GameContext) -> PlayerMove:
+        self.asked += 1
+        raise PlayerUnavailableError(f"{self.name} has been deleted")
 
 
 def scripted_players(moves: str) -> tuple[ScriptedPlayer, ScriptedPlayer]:

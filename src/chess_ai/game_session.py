@@ -9,10 +9,17 @@ or an abort.
 Two people playing each other cannot undo each other's moves, or throw away a game they have
 both put days into, on their own: between them a takeback, and an abort once the game is under
 way, is a request that the other side answers.
+
+A checkpoint that is gone by the time its side has to move, deleted or replaced while the game
+waited, does not end the game: the game waits for another player to take its side over, which
+it records, and carries on from where it was.
+
+A session can be written down as a :class:`SessionRecord` and made again from one, which is how
+a game outlives the server being restarted.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Literal
@@ -28,6 +35,7 @@ from chess_ai.players import (
     MoveRejectedError,
     Player,
     PlayerMove,
+    PlayerUnavailableError,
     StockfishBackedPlayer,
     StockfishDescription,
     SubmittedMovePlayer,
@@ -89,6 +97,28 @@ class PendingRequest(BaseModel):
     """The side that asked."""
 
 
+class Paused(BaseModel):
+    """The game is waiting for a player to take over a side whose player cannot go on."""
+
+    side: Color
+    """The side to move, whose player is gone."""
+    reason: str
+    """Why it cannot play, in words for the people at the game."""
+
+
+class Replacement(BaseModel):
+    """One side's player was replaced in the middle of the game, and by which."""
+
+    ply: int
+    """How many moves had been played when the new player took over: it plays the next move
+    of its side. A takeback to before that moves it back with the game."""
+    side: Color
+    old: PlayerInfo
+    """The player that could not go on."""
+    new: PlayerInfo
+    """The player that took its place."""
+
+
 class GameState(BaseModel):
     id: str
     """Tells this game apart from the one that replaces it; see ``GameSession.id``."""
@@ -103,6 +133,10 @@ class GameState(BaseModel):
     position: PositionSnapshot
     request: PendingRequest | None = None
     """What one side has asked the other and is waiting to hear about, if anything."""
+    paused: Paused | None = None
+    """Set while the game waits for another player to take over a side that cannot go on."""
+    replacements: list[Replacement] = []
+    """Every player replaced so far, in the order it happened."""
 
 
 class GameStateEvent(BaseModel):
@@ -151,7 +185,50 @@ class GameOverEvent(BaseModel):
     """The position the game stopped in, with its ``game_over`` set."""
 
 
-GameEvent = GameStateEvent | MoveEvent | TakebackEvent | RequestEvent | GameOverEvent
+class PausedEvent(BaseModel):
+    """The player on move cannot go on, so the game waits for another to take its side."""
+
+    type: Literal["paused"] = "paused"
+    paused: Paused
+
+
+class ReplacedEvent(BaseModel):
+    """Another player has taken over a side, so the game is no longer paused."""
+
+    type: Literal["replaced"] = "replaced"
+    replacement: Replacement
+
+
+GameEvent = (
+    GameStateEvent
+    | MoveEvent
+    | TakebackEvent
+    | RequestEvent
+    | GameOverEvent
+    | PausedEvent
+    | ReplacedEvent
+)
+
+
+class SessionRecord(BaseModel):
+    """Everything a session is, but its players: what it is made again from after a restart.
+
+    The players are not in it, because what it takes to make one again (a checkpoint, an
+    engine) is the business of whoever made them in the first place.
+    """
+
+    id: str
+    start_fen: str
+    moves: list[MoveRecord]
+    move_delay: float
+    game_over: GameOver | None = None
+    """How the game ended, if it has; a game ended off the board says so nowhere else."""
+    request: PendingRequest | None = None
+    requests_made: int = 0
+    """How many requests have been made, so that a request after a restart has a new id."""
+    replacements: list[Replacement] = []
+    started: datetime
+    updated: datetime
 
 
 class GameSession:
@@ -210,8 +287,82 @@ class GameSession:
         self._asking: asyncio.Future[PlayerMove] | None = None
         self._request: PendingRequest | None = None
         self._requests_made = 0
-        self.updated = datetime.now(UTC)
-        """When the game last changed: when it began, or its last move or takeback."""
+        self._paused: Paused | None = None
+        # Set while the game waits for another player, for that player to be handed over by.
+        self._replaced: asyncio.Future[None] | None = None
+        self._replacements: list[Replacement] = []
+        self._listeners: list[Callable[[GameEvent], None]] = []
+        self.started = datetime.now(UTC)
+        """When the game began."""
+        self.updated = self.started
+        """When the game last changed: when it began, its last move or takeback, when a player
+        was replaced, or when it ended other than by a player failing."""
+
+    @classmethod
+    def restore(cls, white: Player, black: Player, record: SessionRecord) -> "GameSession":
+        """The session ``record`` was written from, with ``white`` and ``black`` in it.
+
+        A game that had ended stays ended: it is closed already, and is not to be played.
+        A request that was waiting for an answer is still waiting. A game that was paused is
+        not: whether its player can play is found out again when it is next asked to.
+
+        Raises:
+            ValueError: a move of the record is not legal where it was played.
+        """
+        session = cls(
+            white,
+            black,
+            move_delay=record.move_delay,
+            id=record.id,
+            fen=record.start_fen,
+        )
+        for played in record.moves:
+            move = chess.Move.from_uci(played.uci)
+            if not session._board.is_legal(move):
+                raise ValueError(f"{played.uci} is not a legal move in {session._board.fen()}")
+            session._board.push(move)
+            session._moves.append(played)
+        session._position = snapshot(session._board)
+        session._request = record.request
+        session._requests_made = record.requests_made
+        session._replacements = list(record.replacements)
+        session.started = record.started
+        session.updated = record.updated
+        if record.game_over is not None:
+            # Ended off the board, which the position alone does not say.
+            if session._position.game_over is None:
+                session._position = session._position.model_copy(
+                    update={"game_over": record.game_over, "legal_moves": {}}
+                )
+            session._started = True
+            session._closed = True
+        return session
+
+    @property
+    def record(self) -> SessionRecord:
+        """What the session would be made again from, as it stands now."""
+        return SessionRecord(
+            id=self.id,
+            start_fen=self._start_fen,
+            moves=list(self._moves),
+            move_delay=self._move_delay,
+            game_over=self._position.game_over,
+            request=self._request,
+            requests_made=self._requests_made,
+            replacements=list(self._replacements),
+            started=self.started,
+            updated=self.updated,
+        )
+
+    def listen(self, listener: Callable[[GameEvent], None]) -> None:
+        """Have ``listener`` called with every event as it happens, before any subscriber
+        hears of it, for as long as the session lasts.
+
+        Called in the middle of whatever changed the game, so it must not change the game
+        itself, and whatever it raises is the caller's: it is for keeping the game, which
+        catches its own failures.
+        """
+        self._listeners.append(listener)
 
     @property
     def players(self) -> tuple[Player, Player]:
@@ -233,7 +384,14 @@ class GameSession:
             moves=list(self._moves),
             position=self._position,
             request=self._request,
+            paused=self._paused,
+            replacements=list(self._replacements),
         )
+
+    @property
+    def paused(self) -> Paused | None:
+        """What the game is waiting for, while it waits for another player."""
+        return self._paused
 
     def submit_move(self, uci: str) -> None:
         """Play ``uci`` for the side to move, on behalf of a viewer.
@@ -299,6 +457,7 @@ class GameSession:
                 unchanged either way.
         """
         self._check_still_playing()
+        self._check_not_paused("take back")
         if not self._submitted_sides():
             raise ActionRejectedError("neither side is played by hand")
         if by is not None:
@@ -310,15 +469,19 @@ class GameSession:
             self._moves.pop()
         self._position = snapshot(self._board)
         self._request = None
+        # A player that took over is the one playing from the position the game is back in.
+        played = len(self._moves)
+        self._replacements = [
+            replaced.model_copy(update={"ply": min(replaced.ply, played)})
+            for replaced in self._replacements
+        ]
         self.updated = datetime.now(UTC)
         # The player being asked for a move was asked about a position that is gone. A
         # person may never answer it at all, being busy with the position now on the
         # board, so the question is dropped rather than waited on.
         self._takebacks += 1
         _drop_question(self._asking)
-        event = TakebackEvent(ply=len(self._moves), position=self._position)
-        for queue in self._subscribers:
-            queue.put_nowait(event)
+        self._broadcast(TakebackEvent(ply=len(self._moves), position=self._position))
 
     def ask_to_take_back(self, by: Color) -> None:
         """Take back ``by``'s last move, or ask the other side to agree to it.
@@ -401,7 +564,41 @@ class GameSession:
         if not isinstance(player, SubmittedMovePlayer):
             raise ActionRejectedError(f"{player.name} is not yours to {doing}")
 
+    def replace(self, player: Player) -> Player:
+        """Hand the side the game is paused for to ``player``, and carry on with it.
+
+        Returns the player it replaces, for whoever made it to let go of.
+
+        Raises:
+            ActionRejectedError: the game has ended, or is not waiting for another player.
+        """
+        self._check_still_playing()
+        paused, waiting = self._paused, self._replaced
+        # A game closed while it waited, as one expiring is, has stopped waiting.
+        if self._closed or paused is None or waiting is None or waiting.done():
+            raise ActionRejectedError("no player is waiting to be replaced")
+        side = _side(paused.side)
+        old = self._players[side]
+        self._players[side] = player
+        replacement = Replacement(
+            ply=len(self._moves), side=paused.side, old=_describe(old), new=_describe(player)
+        )
+        self._replacements.append(replacement)
+        self._paused = None
+        waiting.set_result(None)
+        self.updated = datetime.now(UTC)
+        self._broadcast(ReplacedEvent(replacement=replacement))
+        return old
+
+    def _check_not_paused(self, doing: str) -> None:
+        if self._paused is not None:
+            raise ActionRejectedError(
+                f"the game is waiting for another player to take over, so you cannot {doing}"
+            )
+
     def _broadcast(self, event: GameEvent) -> None:
+        for listener in self._listeners:
+            listener(event)
         for queue in self._subscribers:
             queue.put_nowait(event)
 
@@ -446,7 +643,12 @@ class GameSession:
         try:
             earliest = loop.time() + self._move_delay
             while not self._closed and self._position.game_over is None:
-                choice = await self._ask(self._players[self._board.turn], earliest)
+                try:
+                    choice = await self._ask(self._players[self._board.turn], earliest)
+                except PlayerUnavailableError as gone:
+                    await self._wait_for_another_player(gone)
+                    earliest = loop.time() + self._move_delay
+                    continue
                 if self._closed:
                     break
                 # A takeback while the player was thinking leaves nothing to play: the
@@ -460,6 +662,18 @@ class GameSession:
             raise
         finally:
             self.close()
+
+    async def _wait_for_another_player(self, gone: PlayerUnavailableError) -> None:
+        """Pause the game until :meth:`replace` hands the side on move to another player, or
+        the game is closed."""
+        color: Color = "white" if self._board.turn == chess.WHITE else "black"
+        self._paused = Paused(side=color, reason=str(gone))
+        self._replaced = asyncio.get_running_loop().create_future()
+        self._broadcast(PausedEvent(paused=self._paused))
+        try:
+            await self._replaced
+        finally:
+            self._replaced = None
 
     async def _ask(self, player: Player, earliest: float) -> PlayerMove | None:
         """The move ``player`` chooses, or None if a takeback left the question behind.
@@ -487,8 +701,12 @@ class GameSession:
             return None
         # A player that failed rather than answered is read before anything else: a
         # takeback does not mend whatever broke, and nothing else would ever look at
-        # the exception of a question that has been left behind.
+        # the exception of a question that has been left behind. A player that is gone is
+        # the exception: it is asked again when it is its move again, and fails again then,
+        # which pauses the game for its side rather than for whichever side is on move now.
         if (failed := asking.exception()) is not None:
+            if isinstance(failed, PlayerUnavailableError) and asked_after != self._takebacks:
+                return None
             raise failed
         # A takeback can land after the player has answered but before the answer gets
         # here, and that answer is about a position just as gone as a cancelled one.
@@ -515,6 +733,9 @@ class GameSession:
         if self._closed:
             return
         self._closed = True
+        # A game waiting for another player has nothing more to wait for.
+        if self._replaced is not None and not self._replaced.done():
+            self._replaced.set_result(None)
         for queue in self._subscribers:
             queue.put_nowait(None)
 
@@ -546,9 +767,13 @@ class GameSession:
             update={"game_over": game_over, "legal_moves": {}}
         )
         self._request = None
-        event = GameOverEvent(position=self._position)
-        for queue in self._subscribers:
-            queue.put_nowait(event)
+        self._paused = None
+        # A game that has just ended is kept its full time from now, for its result to be seen.
+        # Not one a player failed in, which is kept as still being played, from its last move:
+        # a player that fails again on every restart is no reason to keep it for ever.
+        if game_over.reason != "error":
+            self.updated = datetime.now(UTC)
+        self._broadcast(GameOverEvent(position=self._position))
         self.close()
 
     def _make_move(self, choice: PlayerMove) -> None:
@@ -563,9 +788,7 @@ class GameSession:
         # anybody would be agreeing to.
         self._request = None
         self.updated = datetime.now(UTC)
-        event = MoveEvent(ply=len(self._moves), move=record, position=self._position)
-        for queue in self._subscribers:
-            queue.put_nowait(event)
+        self._broadcast(MoveEvent(ply=len(self._moves), move=record, position=self._position))
 
 
 def _drop_question(asking: asyncio.Future[PlayerMove] | None) -> None:

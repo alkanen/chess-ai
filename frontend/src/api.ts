@@ -136,6 +136,25 @@ export interface PendingRequest {
   by: Color;
 }
 
+/** The game waits for a player to take over a side whose player cannot go on. */
+export interface Paused {
+  /** The side to move, whose player is gone. */
+  side: Color;
+  /** Why it cannot play, such as a checkpoint deleted since the game began with it. */
+  reason: string;
+}
+
+/** One side's player was replaced in the middle of the game, and by which. */
+export interface Replacement {
+  /** How many moves had been played when the new player took over. */
+  ply: number;
+  side: Color;
+  /** The player that could not go on. */
+  old: PlayerInfo;
+  /** The player that took its place. */
+  new: PlayerInfo;
+}
+
 /** Mirrors chess_ai.game_session.GameState. */
 export interface GameState {
   /** Tells this game apart from every other; it names the PGN file, and reaches nothing. */
@@ -151,6 +170,10 @@ export interface GameState {
   position: PositionSnapshot;
   /** What one side has asked the other and is waiting to hear about, if anything. */
   request: PendingRequest | null;
+  /** Set while the game waits for another player to take over a side that cannot go on. */
+  paused: Paused | null;
+  /** Every player replaced so far, in the order it happened. */
+  replacements: Replacement[];
 }
 
 /**
@@ -200,6 +223,8 @@ export type GameEvent =
   | { type: 'takeback'; ply: number; position: PositionSnapshot }
   | { type: 'request'; request: PendingRequest | null }
   | { type: 'game_over'; position: PositionSnapshot }
+  | { type: 'paused'; paused: Paused }
+  | { type: 'replaced'; replacement: Replacement }
   | { type: 'error'; message: string };
 
 /**
@@ -688,4 +713,20 @@ export async function startGame(request: NewGameRequest): Promise<NewGame> {
     throw new Error(await refusal(response));
   }
   return (await response.json()) as NewGame;
+}
+
+/**
+ * Hands the side a paused game is waiting on to another checkpoint, which plays on from where
+ * the game is. Any link but a watch link may. The game's channel says so to everyone following.
+ */
+export async function replacePlayer(link: string, player: ModelPlayerSpec): Promise<SeatView> {
+  const response = await fetch(apiUrl(gamePath(link, '/replace')), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(player),
+  });
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as SeatView;
 }

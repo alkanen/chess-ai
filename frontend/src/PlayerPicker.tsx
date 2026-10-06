@@ -186,6 +186,33 @@ export function PlayerPicker({ label, value, onChange, runs, stockfish }: Player
   );
 }
 
+interface ModelPickerProps {
+  /** "White" or "Black": the colour the model plays, and what its fields are labelled by. */
+  label: string;
+  value: PlayerChoice;
+  onChange: (choice: PlayerChoice) => void;
+  /** The runs there are to play, or null until they arrive. */
+  runs: RunSummary[] | null;
+}
+
+/**
+ * A checkpoint to play a side, chosen on its own: for where no other kind of player will do,
+ * such as taking over from a checkpoint that is gone.
+ */
+export function ModelPicker({ label, value, onChange, runs }: ModelPickerProps) {
+  const choice = resolved({ ...value, kind: 'model' }, runs);
+  const checkpoints = useCheckpoints(choice.run);
+  return (
+    <ModelFields
+      label={label}
+      value={choice}
+      onChange={onChange}
+      runs={runs}
+      checkpoints={checkpoints}
+    />
+  );
+}
+
 interface StockfishFieldsProps {
   label: string;
   value: PlayerChoice;

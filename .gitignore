@@ -7,6 +7,9 @@ chess-ai.toml
 # Games saved by the server, in the default games directory (./games, and only there)
 /games/
 
+# Games the server holds while they last, in the default directory (./ongoing-games, and only there)
+/ongoing-games/
+
 # Datasets built from PGN files, in the default data directory (./data, and only there)
 /data/
 

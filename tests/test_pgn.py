@@ -13,7 +13,7 @@ from game_helpers import (
 )
 from pgn_helpers import read_back, replayed
 
-from chess_ai.game_session import GameSession, GameState
+from chess_ai.game_session import GameSession, GameState, PlayerInfo, Replacement
 from chess_ai.pgn import game_pgn, pgn_filename, save_game
 from chess_ai.players import HumanPlayer, ModelDescription, StockfishDescription
 from chess_ai.position_view import GameOver, GameOverReason
@@ -301,3 +301,23 @@ async def test_tags_of_the_callers_own_are_added_and_take_the_place_of_its_defau
         "Bird's Opening",
     )
     assert headers["Result"] == "0-1", "and the rest are as they were"
+
+
+async def test_a_checkpoint_that_took_over_is_named_in_the_headers_and_noted_where_it_did():
+    first = ModelDescription(run="tiny", checkpoint=2)
+    finishing = ModelDescription(run="tiny", checkpoint=4)
+    game = await model_game(ModelDescription(run="mlp", checkpoint=9), finishing)
+    gone = PlayerInfo(name="tiny step 2", accepts_moves=False, model=first)
+    game.replacements = [
+        Replacement(ply=1, side="black", old=gone, new=game.black),
+        Replacement(ply=0, side="white", old=gone, new=game.white),
+    ]
+
+    record = read_back(game_pgn(game))
+
+    assert record.headers["Black"] == "tiny step 4"
+    assert record.headers["BlackCheckpoint"] == "4"
+    assert record.comment == "tiny step 2 replaced by mlp step 9"
+    first_move = record.next()
+    assert first_move is not None
+    assert first_move.comment == "tiny step 2 replaced by tiny step 4"

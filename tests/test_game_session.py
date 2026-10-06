@@ -9,6 +9,7 @@ import chess
 import pytest
 from game_helpers import (
     BrokenPlayer,
+    GoneModelPlayer,
     PlayerBroke,
     ScriptedModelPlayer,
     ScriptedPlayer,
@@ -19,12 +20,18 @@ from game_helpers import (
     settled,
 )
 
-from chess_ai.game_session import ActionRejectedError, GameSession, IllegalMoveError
+from chess_ai.game_session import (
+    ActionRejectedError,
+    GameSession,
+    IllegalMoveError,
+    SessionRecord,
+)
 from chess_ai.players import (
     CandidateMove,
     HumanPlayer,
     ModelDescription,
     MoveRejectedError,
+    PlayerUnavailableError,
     RandomPlayer,
     Thoughts,
     WinDrawLoss,
@@ -1286,3 +1293,267 @@ async def test_a_player_that_fails_ends_the_game_with_no_result_for_every_viewer
         "error",
     )
     assert [move.san for move in session.state.moves] == ["e4"]
+
+
+TINY = ModelDescription(run="tiny", checkpoint=2)
+OTHER = ModelDescription(run="tiny", checkpoint=4)
+
+
+async def test_a_game_written_down_is_made_again_as_it_was():
+    session = GameSession(HumanPlayer(), HumanPlayer(), move_delay=0.25, id="kept")
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4 e7e5")
+        session.ask_to_take_back("white")
+
+    again = GameSession.restore(HumanPlayer(), HumanPlayer(), session.record)
+
+    assert again.state == session.state
+    assert again.record == session.record
+    assert again.record.move_delay == 0.25
+    # The next request after a restart is a new one, not one an old answer could land on.
+    assert again.record.requests_made == 1
+
+
+async def test_a_game_made_again_plays_on_from_where_it_was():
+    session = GameSession(HumanPlayer(), RandomPlayer(1), id="kept")
+    async with playing(session) as events:
+        session.submit_move("e2e4")
+        await anext(events)
+        await anext(events)
+        await anext(events)
+    record = SessionRecord.model_validate_json(session.record.model_dump_json())
+
+    again = GameSession.restore(HumanPlayer(), RandomPlayer(2), record)
+    async with playing(again) as events:
+        assert (await anext(events)).type == "state"
+        again.submit_move("d2d4")
+        await anext(events)
+        await anext(events)
+
+    assert [move.uci for move in again.state.moves][:2] == [m.uci for m in session.state.moves]
+    assert len(again.state.moves) == 4
+    assert again.state.moves[2].uci == "d2d4"
+
+
+async def test_a_game_that_had_ended_off_the_board_is_made_again_ended():
+    session = GameSession(HumanPlayer(), RandomPlayer(1))
+    async with playing(session):
+        session.resign("white")
+
+    again = GameSession.restore(HumanPlayer(), RandomPlayer(1), session.record)
+
+    assert again.position.game_over == session.position.game_over
+    assert again.position.legal_moves == {}
+    with again.subscribe() as events:
+        assert [event.type for event in await collect(events)] == ["state"]
+    with pytest.raises(RuntimeError, match="already been played"):
+        await again.play()
+
+
+async def test_a_record_whose_moves_cannot_be_played_is_refused():
+    record = GameSession(HumanPlayer(), HumanPlayer()).record
+    record.moves.append(record.moves[0] if record.moves else _move("e2e5"))
+
+    with pytest.raises(ValueError, match="e2e5 is not a legal move"):
+        GameSession.restore(HumanPlayer(), HumanPlayer(), record)
+
+
+def _move(uci: str):
+    from chess_ai.game_session import MoveRecord
+
+    return MoveRecord(uci=uci, san="?")
+
+
+async def test_a_listener_hears_of_every_change_before_the_viewers_do():
+    session = GameSession(*scripted_players(FOOLS_MATE))
+    heard = []
+    session.listen(lambda event: heard.append((event.type, len(session.state.moves))))
+
+    with session.subscribe() as events:
+        await session.play()
+        received = await collect(events)
+
+    assert heard == [("move", ply) for ply in range(1, 5)]
+    assert len(received) == 5
+
+
+async def gone_game(**changes):
+    """A person playing White against a checkpoint that is gone by the time it has to move."""
+    gone = GoneModelPlayer(TINY)
+    session = GameSession(HumanPlayer(), gone, **changes)
+    return session, gone
+
+
+async def test_a_checkpoint_gone_by_its_move_pauses_the_game_rather_than_ending_it():
+    session, gone = await gone_game()
+    async with playing(session) as events:
+        await anext(events)
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+        paused = await anext(events)
+
+    assert paused.type == "paused"
+    assert paused.paused.side == "black"
+    assert "tiny step 2 has been deleted" in paused.paused.reason
+    assert session.state.paused == paused.paused
+    assert session.position.game_over is None
+    assert gone.asked == 1
+
+
+async def test_another_player_takes_over_the_paused_side_and_the_game_goes_on():
+    session, gone = await gone_game()
+    async with playing(session) as events:
+        await anext(events)
+        session.submit_move("e2e4")
+        await anext(events)
+        await anext(events)
+        replacing = ScriptedModelPlayer(["e7e5"], OTHER)
+
+        old = session.replace(replacing)
+        replaced = await anext(events)
+        move = await anext(events)
+
+    assert old is gone
+    assert replaced.type == "replaced"
+    assert replaced.replacement.ply == 1
+    assert replaced.replacement.side == "black"
+    assert replaced.replacement.old.model == TINY
+    assert replaced.replacement.new.model == OTHER
+    assert move.type == "move" and move.move.uci == "e7e5"
+    state = session.state
+    assert state.paused is None
+    assert state.black.model == OTHER
+    assert state.replacements == [replaced.replacement]
+
+
+async def test_a_game_that_is_not_paused_has_no_side_to_hand_over():
+    session = GameSession(HumanPlayer(), RandomPlayer(1))
+    async with playing(session):
+        with pytest.raises(ActionRejectedError, match="no player is waiting"):
+            session.replace(RandomPlayer(2))
+
+
+async def test_a_paused_game_takes_nothing_back_until_it_plays_on():
+    session, _ = await gone_game()
+    async with playing(session) as events:
+        await anext(events)
+        session.submit_move("e2e4")
+        await anext(events)
+        await anext(events)
+
+        with pytest.raises(ActionRejectedError, match="waiting for another player"):
+            session.ask_to_take_back("white")
+
+    assert len(session.state.moves) == 1
+
+
+@pytest.mark.parametrize("ending", ["resign", "abort"])
+async def test_a_paused_game_can_still_be_ended(ending):
+    session, _ = await gone_game()
+    async with playing(session) as events:
+        await anext(events)
+        session.submit_move("e2e4")
+        await anext(events)
+        await anext(events)
+        play = asyncio.ensure_future(asyncio.sleep(0))
+        if ending == "resign":
+            session.resign("white")
+        else:
+            session.ask_to_abort("white")
+        await play
+        over = await anext(events)
+
+    assert over.type == "game_over"
+    assert session.state.paused is None
+
+
+async def until(condition) -> None:
+    async with asyncio.timeout(2):
+        while not condition():
+            await asyncio.sleep(0)
+
+
+async def test_a_paused_game_that_is_closed_stops_being_played():
+    session, _ = await gone_game()
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await settled()
+        session.submit_move("e2e4")
+        await until(lambda: session.paused is not None)
+
+        session.close()
+        async with asyncio.timeout(1):
+            await game
+
+    assert [event.type for event in await collect(events)] == ["state", "move", "paused"]
+
+
+class GoneAfter(ScriptedModelPlayer):
+    """A checkpoint that plays its moves and is then gone."""
+
+    def __init__(self, moves, model):
+        super().__init__(moves, model)
+        self._left = len(moves)
+
+    async def choose_move(self, context):
+        if self._left == 0:
+            raise PlayerUnavailableError(f"{self.name} has been deleted")
+        self._left -= 1
+        return await super().choose_move(context)
+
+
+async def test_a_takeback_to_before_a_replacement_moves_it_back_with_the_game():
+    session = GameSession(HumanPlayer(), GoneAfter(["e7e5"], TINY))
+    async with playing(session):
+        session.submit_move("e2e4")
+        await until(lambda: len(session.state.moves) == 2)
+        session.submit_move("g1f3")
+        await until(lambda: session.paused is not None)
+        session.replace(ScriptedModelPlayer(["b8c6"], OTHER))
+        assert session.state.replacements[0].ply == 3
+        await until(lambda: len(session.state.moves) == 4)
+        session.take_back("white")
+
+    # Back to White's second move, which the replacement has not answered yet.
+    assert [move.uci for move in session.state.moves] == ["e2e4", "e7e5"]
+    assert session.state.replacements[0].ply == 2
+
+
+async def test_a_checkpoint_found_gone_as_its_move_is_taken_back_pauses_nobody():
+    """The side the game would pause for is the one on move, which after a takeback is not the
+    one whose checkpoint went missing. It is asked again when it is its move again."""
+    gone = BrokenPlayer(PlayerUnavailableError("tiny step 2 has been deleted"))
+    session = GameSession(HumanPlayer(), gone)
+
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await asyncio.sleep(0)
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+
+        # The checkpoint is found gone, and the takeback lands before the game has read it.
+        gone.fail()
+        await asyncio.sleep(0)
+        session.take_back()
+        await settled()
+
+        assert session.paused is None
+        session.submit_move("d2d4")
+        await settled()
+        gone.fail()
+        await until(lambda: session.paused is not None)
+        assert session.paused is not None and session.paused.side == "black"
+        session.close()
+        await game
+
+
+async def test_a_game_closed_while_paused_takes_no_other_player():
+    session, _ = await gone_game()
+    async with playing(session):
+        session.submit_move("e2e4")
+        await until(lambda: session.paused is not None)
+        session.close()
+
+        with pytest.raises(ActionRejectedError):
+            session.replace(RandomPlayer(1))

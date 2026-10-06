@@ -12,7 +12,7 @@ import re
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never
 
@@ -45,6 +45,8 @@ from chess_ai.game_session import (
     GameState,
     GameStateEvent,
     MoveEvent,
+    PausedEvent,
+    ReplacedEvent,
     RequestEvent,
     TakebackEvent,
 )
@@ -56,6 +58,7 @@ from chess_ai.players import (
     HumanPlayer,
     MoveRejectedError,
     Player,
+    PlayerUnavailableError,
     RandomPlayer,
     SelectionStrategy,
     close_players,
@@ -70,6 +73,7 @@ from chess_ai.stockfish import (
     DEFAULT_MOVE_TIME,
     MAX_MOVE_TIME,
     MIN_MOVE_TIME,
+    DeferredStockfishPlayer,
     StockfishError,
     StockfishInfo,
     describe_stockfish,
@@ -87,6 +91,15 @@ from chess_ai.training.run_store import (
     save_notes,
 )
 from chess_ai.web.engine_cache import CheckpointKey, EngineCache
+from chess_ai.web.game_store import (
+    GameStore,
+    HumanRecord,
+    ModelRecord,
+    PlayerRecord,
+    RandomRecord,
+    StockfishRecord,
+    StoredGame,
+)
 from chess_ai.web.games import (
     Access,
     GameLinks,
@@ -131,6 +144,10 @@ front of this server writes in its log for the same thing.
 
 IDLE_CHECKPOINT_POLL_SECONDS = 600.0
 """How often the loaded checkpoints are looked over for ones no game has played with lately."""
+
+EXPIRY_POLL_SECONDS = 600.0
+"""How often the games are looked over for ones nobody has moved in for too long. A game kept
+ten minutes past its week is no matter."""
 
 RUN_POLL_SECONDS = 1.0
 """How often a run being followed is looked at for new metrics and a new heartbeat.
@@ -302,7 +319,8 @@ class SeatView(BaseModel):
     watch: str
     """The game's watch link, to pass on to anyone who wants to follow it."""
     updated: datetime
-    """When the game last changed: when it began, or its last move or takeback."""
+    """When the game last changed: when it began, its last move or takeback, when a player was
+    replaced, or when it ended."""
 
 
 class NewGame(BaseModel):
@@ -312,7 +330,16 @@ class NewGame(BaseModel):
     links: GameLinks
 
 
-ViewerEvent = SeatView | MoveEvent | TakebackEvent | RequestEvent | GameOverEvent | ErrorEvent
+ViewerEvent = (
+    SeatView
+    | MoveEvent
+    | TakebackEvent
+    | RequestEvent
+    | GameOverEvent
+    | PausedEvent
+    | ReplacedEvent
+    | ErrorEvent
+)
 """What the game WebSocket sends: the game's events, plus this viewer's own errors."""
 
 
@@ -327,7 +354,13 @@ def create_app(
         """Keep a finished game, so that it can be looked at again or trained on."""
         logger.info("Saved the finished game to %s", save_game(game, config.paths.games))
 
-    games = GameRegistry(on_finished=save_finished_game, max_ongoing=config.games.max_ongoing)
+    store = GameStore(config.paths.ongoing_games)
+    games = GameRegistry(
+        on_finished=save_finished_game,
+        max_ongoing=config.games.max_ongoing,
+        store=store,
+        expire_after=timedelta(days=config.games.expire_after_days),
+    )
     engines = EngineCache(
         lambda key: _load_checkpoint(key, config),
         capacity=config.games.max_loaded_checkpoints,
@@ -341,11 +374,14 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        _restore_games(store, games, config, engines)
         unloading = asyncio.create_task(_unload_idle_checkpoints(engines))
+        expiring = asyncio.create_task(_expire_games(games))
         try:
             yield
         finally:
             unloading.cancel()
+            expiring.cancel()
             await games.close()
             engines.clear()
 
@@ -421,10 +457,12 @@ def create_app(
             games.check_room()
         except TooManyGamesError as full:
             raise HTTPException(status.HTTP_409_CONFLICT, str(full)) from full
-        white, black = await _players(request, config, engines)
+        (white, white_record), (black, black_record) = await _players(request, config, engines)
         try:
             session = GameSession(white, black, move_delay=request.move_delay, fen=request.fen)
-            links = games.start(session, settings=request, follows=follows)
+            links = games.start(
+                session, settings=request, follows=follows, players=(white_record, black_record)
+            )
         except GamesClosedError as closed:
             close_players(white, black)
             raise HTTPException(
@@ -444,7 +482,10 @@ def create_app(
             400: {"description": "A player cannot be made again, such as a run that is gone"},
             403: {"description": "The link only watches the game"},
             404: {"description": "No game has this link"},
-            409: {"description": "As many games are in progress as the server holds"},
+            409: {
+                "description": "As many games are in progress as the server holds, or the "
+                "game's settings were not kept"
+            },
             500: {"description": "As for starting a game"},
             503: {"description": "The server is shutting down and is starting no more games"},
         },
@@ -466,13 +507,55 @@ def create_app(
                 status.HTTP_403_FORBIDDEN, "a watch link cannot start a game from this one"
             )
         settings = seat.settings
-        assert isinstance(settings, NewGameRequest), "every game here is started from one"
+        if not isinstance(settings, NewGameRequest):
+            # Kept by an older server in a form this one cannot read.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "this game cannot be played again: what it was started with was not kept",
+            )
         # Under the lock, so that two people asking at once get one game, not one each.
         async with starting:
             joined = seat.next_game()
             if joined is not None:
                 return NewGame(game=joined.state, links=joined.own_links)
             return await start(settings, follows=seat)
+
+    @api.post(
+        "/games/{link}/replace",
+        responses={
+            400: {"description": "The checkpoint cannot be played, as for starting a game"},
+            403: {"description": "The link only watches the game"},
+            404: {"description": "No game has this link"},
+            409: {"description": "The game is not waiting for another player"},
+            500: {"description": "As for starting a game"},
+        },
+    )
+    async def replace_player(link: str, spec: ModelSpec) -> SeatView:
+        """Hand the side a paused game is waiting on to another checkpoint, and play on.
+
+        A game pauses when the checkpoint on move is gone: deleted, or replaced by other
+        weights, since the game began with it. Any link but a watch link may choose another,
+        which plays that side from the position the game is in. The game records the change,
+        and its PGN names the checkpoint that finished the game and says where it took over.
+        """
+        seat = _seat(link)
+        if seat.access == "watch":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "a watch link cannot choose the players of a game"
+            )
+        # Asked before the checkpoint is loaded, so that nothing is read for a game that does
+        # not need it; and again once it is, by `replace`, since the game may have moved on.
+        if seat.state.paused is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "the game is not waiting for another player"
+            )
+        player, record = await _player(spec, config, engines)
+        try:
+            seat.replace(player, record)
+        except ActionRejectedError as rejected:
+            close_players(player)
+            raise HTTPException(status.HTTP_409_CONFLICT, str(rejected)) from rejected
+        return _seat_view(seat)
 
     @api.get(
         "/stockfish",
@@ -781,9 +864,13 @@ def create_app(
     return app
 
 
+Made = tuple[Player, PlayerRecord]
+"""A player, and what it takes to make it again after a restart."""
+
+
 async def _players(
     request: NewGameRequest, config: Config, engines: EngineCache
-) -> tuple[Player, Player]:
+) -> tuple[Made, Made]:
     """Both sides of a new game, made from what was asked for.
 
     Whatever the first side holds is let go of again if the second cannot be made, so that a
@@ -802,17 +889,17 @@ async def _players(
     try:
         black = await _player(request.black, config, engines)
     except BaseException:
-        close_players(white)
+        close_players(white[0])
         raise
     return white, black
 
 
-async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Player:
+async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Made:
     match spec:
         case HumanSpec():
-            return HumanPlayer()
+            return HumanPlayer(), HumanRecord()
         case RandomSpec():
-            return RandomPlayer()
+            return RandomPlayer(), RandomRecord()
         case ModelSpec():
             # On a worker thread: a model player reads a checkpoint off the disk and builds a
             # network from it, which the game being played meanwhile, and every viewer watching
@@ -823,7 +910,7 @@ async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Play
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, str(missing)) from missing
         case StockfishSpec():
             try:
-                return await start_stockfish(
+                engine = await start_stockfish(
                     config.stockfish.path, elo=spec.elo, move_time=spec.move_time
                 )
             except StockfishError as unavailable:
@@ -831,6 +918,10 @@ async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Play
                 raise HTTPException(
                     status.HTTP_500_INTERNAL_SERVER_ERROR, str(unavailable)
                 ) from unavailable
+            record = StockfishRecord(
+                elo=spec.elo, move_time=spec.move_time, description=engine.stockfish
+            )
+            return engine, record
         case _:
             # The union is closed, so this is unreachable until somebody adds a kind of
             # player and not the case that makes it. Said here, where the omission is, rather
@@ -838,7 +929,7 @@ async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Play
             assert_never(spec)
 
 
-def _model_player(spec: ModelSpec, config: Config, engines: EngineCache) -> Player:
+def _model_player(spec: ModelSpec, config: Config, engines: EngineCache) -> Made:
     """A checkpoint, loaded and sat down at the board.
 
     The checkpoint is borrowed from ``engines``, which every game shares: a checkpoint playing
@@ -849,11 +940,20 @@ def _model_player(spec: ModelSpec, config: Config, engines: EngineCache) -> Play
     It is loaded here, if it is not loaded already, so that a checkpoint that cannot be played
     is refused when the game is asked for rather than on its first move.
     """
-    from chess_ai.inference import DeviceUnavailableError, InferenceError, ModelPlayer
+    from chess_ai.inference import DeviceUnavailableError, InferenceError
 
     run = open_run(config.paths.runs, spec.run)
     chosen = choose_checkpoint(run, spec.checkpoint)
     key = CheckpointKey(run.name, chosen.step, _fingerprint(run.checkpoint_path(chosen)))
+    record = ModelRecord(
+        run=key.run,
+        step=key.step,
+        fingerprint=key.fingerprint,
+        rating=spec.rating,
+        strategy=spec.strategy,
+        temperature=spec.temperature,
+        seed=spec.seed,
+    )
     try:
         engines.preload(key)
     except DeviceUnavailableError as misconfigured:
@@ -863,15 +963,97 @@ def _model_player(spec: ModelSpec, config: Config, engines: EngineCache) -> Play
         ) from misconfigured
     except InferenceError as unusable:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(unusable)) from unusable
+    return _model_player_from(record, engines), record
+
+
+def _model_player_from(record: ModelRecord, engines: EngineCache) -> Player:
+    """The checkpoint ``record`` names, sat down at the board without being loaded yet."""
+    from chess_ai.inference import ModelPlayer
+
     return ModelPlayer(
-        engines.engine(key),
-        run=run.name,
-        checkpoint=chosen.step,
-        rating=spec.rating,
-        strategy=spec.strategy,
-        temperature=spec.temperature,
-        seed=spec.seed,
+        engines.engine(CheckpointKey(record.run, record.step, record.fingerprint)),
+        run=record.run,
+        checkpoint=record.step,
+        rating=record.rating,
+        strategy=record.strategy,
+        temperature=record.temperature,
+        seed=record.seed,
     )
+
+
+def _revive(record: PlayerRecord, config: Config, engines: EngineCache) -> Player:
+    """The player ``record`` was written of, holding nothing until its game next needs it.
+
+    A checkpoint is loaded on its first move, and one that is gone by then pauses the game
+    rather than keeping it from being taken back at all; Stockfish is started on its first move.
+    """
+    match record:
+        case HumanRecord():
+            return HumanPlayer()
+        case RandomRecord():
+            return RandomPlayer()
+        case ModelRecord():
+            return _model_player_from(record, engines)
+        case StockfishRecord():
+            return DeferredStockfishPlayer(
+                config.stockfish.path,
+                elo=record.elo,
+                move_time=record.move_time,
+                description=record.description,
+            )
+        case _:
+            assert_never(record)
+
+
+def _restore_games(
+    store: GameStore, games: GameRegistry, config: Config, engines: EngineCache
+) -> None:
+    """Take back every game kept in ``store``, as the server starts, then let go of those that
+    have expired meanwhile."""
+    restored = 0
+    for stored in store.read_all():
+        try:
+            _restore_game(stored, games, config, engines)
+        except Exception:
+            # One game that cannot be taken back is no reason to lose the others, or for the
+            # server not to start. Its file is left where it is, for somebody to look at.
+            logger.exception("Could not take back game %s, so it is left out", stored.id)
+            continue
+        restored += 1
+    if restored:
+        logger.info("Took back %d games from %s", restored, store.directory)
+    games.expire()
+
+
+def _restore_game(
+    stored: StoredGame, games: GameRegistry, config: Config, engines: EngineCache
+) -> None:
+    settings = None
+    if stored.settings is not None:
+        try:
+            settings = NewGameRequest.model_validate(stored.settings)
+        except ValidationError:
+            # Only playing it again needs them, which is a small thing to lose beside the game.
+            logger.warning(
+                "Cannot read what game %s was started with, so it cannot be played again",
+                stored.id,
+                exc_info=True,
+            )
+    white = _revive(stored.white, config, engines)
+    try:
+        black = _revive(stored.black, config, engines)
+        games.restore(stored, white, black, settings)
+    except BaseException:
+        close_players(white)
+        raise
+
+
+class CheckpointGoneError(RunError, PlayerUnavailableError):
+    """A game's checkpoint is no longer there to be loaded, or has been replaced by another.
+
+    Both things at once: a run that is not as the game was asked to find it, which starting a
+    game refuses, and a player that cannot go on, which pauses a game in progress.
+    """
 
 
 def _load_checkpoint(key: CheckpointKey, config: Config) -> Any:
@@ -885,18 +1067,22 @@ def _load_checkpoint(key: CheckpointKey, config: Config) -> Any:
     random mover has no use for it, and starting up is a second or two quicker without it.
 
     Raises:
-        RunError: the run, or the checkpoint, is not there (any more), or has been replaced.
+        CheckpointGoneError: the run, or the checkpoint, is not there (any more), or has been
+            replaced.
         InferenceError: the checkpoint cannot be played with, or the device is not there.
     """
     from chess_ai.inference import load_engine
 
-    run = open_run(config.paths.runs, key.run)
-    path = run.checkpoint_path(choose_checkpoint(run, key.step))
-    _check_unchanged(path, key)
-    engine = load_engine(
-        path, device=config.inference.device, batch_size=config.inference.batch_size
-    )
-    _check_unchanged(path, key)
+    try:
+        run = open_run(config.paths.runs, key.run)
+        path = run.checkpoint_path(choose_checkpoint(run, key.step))
+        _check_unchanged(path, key)
+        engine = load_engine(
+            path, device=config.inference.device, batch_size=config.inference.batch_size
+        )
+        _check_unchanged(path, key)
+    except RunError as gone:
+        raise CheckpointGoneError(str(gone)) from gone
     return engine
 
 
@@ -931,6 +1117,13 @@ def _hand_back_device_memory() -> None:
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_initialized():
         torch.cuda.empty_cache()
+
+
+async def _expire_games(games: GameRegistry) -> None:
+    """Look over the games now and then, deleting those nobody has moved in for too long."""
+    while True:
+        await asyncio.sleep(EXPIRY_POLL_SECONDS)
+        games.expire()
 
 
 async def _unload_idle_checkpoints(engines: EngineCache) -> None:

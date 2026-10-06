@@ -47,6 +47,11 @@ data = "data"
 # directory is made when it is first needed.
 runs = "runs"
 
+# Where the games the server holds are kept while they last, one JSON file per
+# game, so that a restart carries on with them. A game is deleted from here once
+# it has expired (see [games] expire_after_days), or at once if it is aborted.
+ongoing_games = "ongoing-games"
+
 [inference]
 # Where to run a model player's network: "cpu", "cuda", or "auto" for a GPU if
 # there is one. The CPU by default, deliberately: the machine that plays is
@@ -79,3 +84,8 @@ max_loaded_checkpoints = 10
 # How many hours a loaded checkpoint that no game has played with is kept before
 # it is let go of, so that a game left for the day holds no memory meanwhile.
 checkpoint_idle_hours = 24
+
+# How many days a game is kept after its last move, finished or not, before it
+# is deleted along with its links. Every move, and the game ending, starts the
+# count again.
+expire_after_days = 7

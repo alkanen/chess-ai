@@ -56,6 +56,8 @@ function gameOf(
       moves: [],
       position,
       request: null,
+      paused: null,
+      replacements: [],
     },
     access,
     watch: 'the-watch-link',

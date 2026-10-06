@@ -42,6 +42,8 @@ function gameOf(white: Playing, black: Playing, moves = 0): GameState {
     moves: Array.from({ length: moves }, () => ({ uci: 'e2e4', san: 'e4', thoughts: null })),
     position: POSITION,
     request: null,
+    paused: null,
+    replacements: [],
   };
 }
 

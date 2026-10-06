@@ -1033,3 +1033,133 @@ def test_playing_again_after_the_new_game_has_ended_starts_another(chess_client)
     again = chess_client.post(f"/chess/api/games/{first['white']}/rematch").json()
 
     assert again["game"]["id"] != once["game"]["id"]
+
+
+def ongoing_games(tmp_path) -> list[Path]:
+    """The games the server keeps on disk, which is in the directory the tests run in."""
+    return sorted((tmp_path / "ongoing-games").glob("*.json"))
+
+
+def test_a_game_carries_on_from_where_it_was_after_the_server_restarts(tmp_path):
+    with serve("/chess", tmp_path) as client:
+        links = start_game(client)
+        with connect(client, links["white"]) as websocket:
+            receive(websocket)
+            ask(websocket, type="move", uci="e2e4")
+            played = receive_moves(websocket, 2)
+
+    with serve("/chess", tmp_path) as client:
+        seen = client.get(f"/chess/api/games/{links['white']}").json()
+        with connect(client, links["white"]) as websocket:
+            state = receive(websocket)
+            ask(websocket, type="move", uci="d2d4")
+            more = receive_moves(websocket, 2)
+
+    assert seen["access"] == "white"
+    assert [move["uci"] for move in seen["game"]["moves"]] == [e.move.uci for e in played]
+    assert state.type == "state" and len(state.game.moves) == 2
+    assert [event.ply for event in more] == [3, 4]
+    assert more[0].move.uci == "d2d4"
+
+
+def test_a_watch_link_still_only_watches_after_a_restart(tmp_path):
+    with serve("/chess", tmp_path) as client:
+        links = start_game(client)
+
+    with serve("/chess", tmp_path) as client, connect(client, links["watch"]) as websocket:
+        assert receive(websocket).access == "watch"
+        ask(websocket, type="resign")
+        refused = receive(websocket)
+
+    assert refused.type == "error"
+
+
+def test_a_game_that_had_ended_is_still_there_after_a_restart_and_saved_once(tmp_path):
+    with serve("/chess", tmp_path) as client:
+        links = start_game(client)
+        resign_through(client, links["white"])
+
+    with serve("/chess", tmp_path) as client:
+        seen = client.get(f"/chess/api/games/{links['watch']}")
+
+    assert seen.status_code == 200
+    assert seen.json()["game"]["position"]["game_over"]["reason"] == "resignation"
+    assert len(saved_games(tmp_path)) == 1
+
+
+def test_an_aborted_game_leaves_nothing_behind_on_disk(chess_client, tmp_path):
+    links = start_game(chess_client)
+    assert len(ongoing_games(tmp_path)) == 1
+
+    with connect(chess_client, links["white"]) as websocket:
+        receive(websocket)
+        ask(websocket, type="abort")
+        assert receive(websocket).type == "game_over"
+
+    assert ongoing_games(tmp_path) == []
+
+
+def test_a_game_past_its_expiry_is_gone_when_the_server_starts(tmp_path):
+    with serve("/chess", tmp_path) as client:
+        links = start_game(client)
+
+    # A millisecond's expiry, which the game is past by the time the server is back.
+    with serve("/chess", tmp_path, expire_after_days=1e-8) as client:
+        gone = client.get(f"/chess/api/games/{links['white']}")
+
+    assert gone.status_code == 404
+    assert ongoing_games(tmp_path) == []
+
+
+def test_restarted_games_count_towards_the_limit(tmp_path):
+    with serve("/chess", tmp_path) as client:
+        start_game(client)
+
+    with serve("/chess", tmp_path, max_ongoing=1) as client:
+        refused = client.post("/chess/api/games", json=HUMAN_GAME)
+
+    assert refused.status_code == 409
+
+
+def test_a_game_file_that_cannot_be_read_does_not_stop_the_server(tmp_path, caplog):
+    with serve("/chess", tmp_path) as client:
+        links = start_game(client)
+    (tmp_path / "ongoing-games" / "broken.json").write_text("{")
+
+    with serve("/chess", tmp_path) as client:
+        found = client.get(f"/chess/api/games/{links['white']}")
+
+    assert found.status_code == 200
+    assert "Cannot read the game" in caplog.text
+
+
+def test_the_ongoing_games_directory_is_the_one_the_config_names(tmp_path):
+    config = Config(
+        server=ServerConfig(path_prefix="/chess"),
+        paths=PathsConfig(games=tmp_path / "games", ongoing_games=tmp_path / "elsewhere"),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as client:
+        start_game(client)
+
+    assert len(list((tmp_path / "elsewhere").glob("*.json"))) == 1
+    assert ongoing_games(tmp_path) == []
+
+
+def test_a_game_whose_settings_no_longer_read_is_taken_back_without_play_again(tmp_path):
+    """A server updated since may not read every setting an older one wrote. The game is what
+    matters; only starting another like it needs the settings."""
+    with serve("/chess", tmp_path) as client:
+        links = start_game(client)
+        resign_through(client, links["white"])
+    [kept] = ongoing_games(tmp_path)
+    stored = json.loads(kept.read_text())
+    stored["settings"]["move_delay"] = "no longer a number"
+    kept.write_text(json.dumps(stored))
+
+    with serve("/chess", tmp_path) as client:
+        found = client.get(f"/chess/api/games/{links['white']}")
+        again = client.post(f"/chess/api/games/{links['white']}/rematch")
+
+    assert found.status_code == 200
+    assert again.status_code == 409
+    assert "cannot be played again" in again.json()["detail"]
