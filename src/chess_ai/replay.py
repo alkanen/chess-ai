@@ -31,6 +31,7 @@ the game they are; a game appended to an exported file without its tags is not.
 
 import io
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -321,23 +322,36 @@ def _summary(game: chess.pgn.Game, index: int) -> GameSummary:
 def _replay(game: chess.pgn.Game, summary: GameSummary) -> ReplayGame:
     """``game`` with the position it started in and the one every move leads to."""
     try:
-        board = game.board()
-        start_fen = board.fen()
-        start = snapshot(board, legal_moves=False)
-        moves = []
-        for move in game.mainline_moves():
-            # Named before it is played, since notation says what the position allowed.
-            san = board.san(move)
-            board.push(move)
-            moves.append(
-                ReplayMove(san=san, uci=move.uci(), position=snapshot(board, legal_moves=False))
-            )
+        return replayed(summary, game.board(), game.mainline_moves())
     except ValueError as unplayable:
         raise MalformedPgnError(
             f"game {summary.index + 1} cannot be read: {unplayable}"
         ) from unplayable
+
+
+def replayed(summary: GameSummary, board: chess.Board, moves: Iterable[chess.Move]) -> ReplayGame:
+    """The game ``summary`` describes, played out from ``board`` one move of ``moves`` at a time.
+
+    ``board`` is played on. Raises :exc:`ValueError` for a move ``board`` does not allow at that
+    point, which is a game that cannot be what its moves say. A null move is let through, since
+    no position allows one and PGN still writes them.
+    """
+    start_fen = board.fen()
+    start = snapshot(board, legal_moves=False)
+    played = []
+    for move in moves:
+        # A null move ("--", a side passing) is never legal, and is what analysis exports write
+        # for a line that skips a move; the parser plays it, so this does too.
+        if move and not board.is_legal(move):
+            raise ValueError(f"{move.uci()} is not a legal move in {board.fen()}")
+        # Named before it is played, since notation says what the position allowed.
+        san = board.san(move)
+        board.push(move)
+        played.append(
+            ReplayMove(san=san, uci=move.uci(), position=snapshot(board, legal_moves=False))
+        )
     return ReplayGame(
-        **summary.model_dump(), start_fen=start_fen, start_position=start, moves=moves
+        **summary.model_dump(), start_fen=start_fen, start_position=start, moves=played
     )
 
 

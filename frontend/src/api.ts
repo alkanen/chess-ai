@@ -278,6 +278,84 @@ export interface ReplayFile {
   selected: ReplayGame;
 }
 
+/** One PGN file a dataset was built from: mirrors chess_ai.dataset.manifest.SourceInfo. */
+export interface DatasetSource {
+  path: string;
+  bytes: number;
+  games_read: number;
+  games_kept: number;
+  /** What stopped the file being read whole, if anything did. */
+  error: string | null;
+  /** Whether what failed was the file rather than the PGN in it. */
+  went_away: boolean;
+}
+
+/** What a dataset is made of, counted as it was built: mirrors manifest.Statistics. */
+export interface DatasetStatistics {
+  /** Games by result, as PGN writes it. */
+  results: Record<string, number>;
+  /** Games by time-control class, in the order of the classes: "bullet" first. */
+  time_controls: Record<string, number>;
+  rating_sources: Record<string, number>;
+  /** Players by rating, keyed by the low end of a 100-wide bucket, in rating order. */
+  ratings: Record<string, number>;
+  /** Players whose rating the file did not give. */
+  ratings_unknown: number;
+}
+
+/** A dataset, described: mirrors chess_ai.dataset.manifest.Manifest. */
+export interface DatasetManifest {
+  format_version: number;
+  name: string;
+  /** When the build finished, as an ISO timestamp. */
+  created: string;
+  move_vocabulary_size: number;
+  validation_fraction: number;
+  rating_source: string;
+  sources: DatasetSource[];
+  /** Which games the build let through; empty when every game was kept. */
+  filters: Record<string, unknown>;
+  splits: Record<string, { games: number; positions: number }>;
+  /** Games left out, counted by why. */
+  skipped: Record<string, number>;
+  statistics: DatasetStatistics;
+}
+
+/** One dataset, with its manifest or why that cannot be read. */
+export interface DatasetSummary {
+  name: string;
+  manifest: DatasetManifest | null;
+  error: string | null;
+}
+
+/** One game of a dataset, as a page of its games lists it. */
+export interface DatasetGame {
+  /** Which game of its split this is, counting from zero; how it is opened. */
+  index: number;
+  plies: number;
+  /** Null where the file gave no rating. */
+  white_rating: number | null;
+  black_rating: number | null;
+  result: Result;
+  /** As PGN writes it ("2024.01.05"), with "??" for what the file did not say. */
+  date: string;
+  time_control: string;
+  rating_source: string;
+  /** The PGN file the game came from. */
+  source: string | null;
+  custom_start: boolean;
+}
+
+/** One page of a split's games. */
+export interface DatasetGames {
+  dataset: string;
+  split: string;
+  /** How many games the split holds. */
+  total: number;
+  offset: number;
+  games: DatasetGame[];
+}
+
 /** A game in the server's games directory, as the list of them describes it. */
 export interface SavedGame {
   /** The file's name, which is what opens it. */
@@ -729,4 +807,50 @@ export async function replacePlayer(link: string, player: ModelPlayerSpec): Prom
     throw new Error(await refusal(response));
   }
   return (await response.json()) as SeatView;
+}
+
+/** Every dataset on this server, by name. */
+export async function fetchDatasets(): Promise<DatasetSummary[]> {
+  return await fetched<DatasetSummary[]>(apiUrl('datasets'));
+}
+
+/** One dataset, by name. */
+export async function fetchDataset(name: string): Promise<DatasetSummary> {
+  return await fetched<DatasetSummary>(apiUrl(`datasets/${encodeURIComponent(name)}`));
+}
+
+/** A path under one split of one dataset. */
+function splitPath(dataset: string, split: string, rest: string): string {
+  return `datasets/${encodeURIComponent(dataset)}/${encodeURIComponent(split)}/${rest}`;
+}
+
+/** Up to `limit` games of one split of a dataset, from game `offset` on. */
+export async function fetchDatasetGames(
+  dataset: string,
+  split: string,
+  offset: number,
+  limit: number,
+): Promise<DatasetGames> {
+  const url = new URL(apiUrl(splitPath(dataset, split, 'games')));
+  url.searchParams.set('offset', String(offset));
+  url.searchParams.set('limit', String(limit));
+  return await fetched<DatasetGames>(url.href);
+}
+
+/** One game of a dataset, with the position before every move and after it. */
+export async function openDatasetGame(
+  dataset: string,
+  split: string,
+  index: number,
+): Promise<ReplayGame> {
+  return await fetched<ReplayGame>(apiUrl(splitPath(dataset, split, `games/${index}`)));
+}
+
+/** What a GET answers with, or why it was refused. */
+async function fetched<T>(url: string): Promise<T> {
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as T;
 }

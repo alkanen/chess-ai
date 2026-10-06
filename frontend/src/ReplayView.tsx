@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
 import {
+  openDatasetGame,
   openPgn,
   openSavedGame,
   PGN_MEDIA_TYPE,
@@ -8,6 +9,13 @@ import {
 } from './api';
 import { Board } from './board/Board';
 import type { Orientation } from './board/geometry';
+import {
+  datasetGameHash,
+  datasetGameInHash,
+  datasetHash,
+  pageOf,
+  type DatasetGameRef,
+} from './datasetPlaces';
 import { describeResult, GameStatus } from './GameStatus';
 import { MoveList } from './MoveList';
 import { ReplayControls } from './ReplayControls';
@@ -20,9 +28,29 @@ import './ReplayView.css';
  * Where the game on show came from.
  *
  * A file the viewer opened is kept here as its text, because the server keeps nothing:
- * moving to another game in the same file sends it up again.
+ * moving to another game in the same file sends it up again. A dataset game is one game,
+ * named by the address, and is opened from the dataset's page.
  */
-type Source = { kind: 'saved'; name: string } | { kind: 'file'; name: string; pgn: string };
+type Source =
+  | { kind: 'saved'; name: string }
+  | { kind: 'file'; name: string; pgn: string }
+  | { kind: 'dataset'; game: DatasetGameRef };
+
+/** Reads one game of a source, as a file of games with that one selected. */
+async function read(source: Source, game: number): Promise<ReplayFile> {
+  switch (source.kind) {
+    case 'saved':
+      return await openSavedGame(source.name, game);
+    case 'file':
+      return await openPgn(source.pgn, game);
+    case 'dataset': {
+      const { name, split, index } = source.game;
+      const selected = await openDatasetGame(name, split, index);
+      // A dataset game is opened on its own: there is nothing in the same file to move to.
+      return { games: [selected], selected };
+    }
+  }
+}
 
 /** What the arrow keys do, which is what the buttons under the board do. */
 const KEYS: Record<string, (at: number, plies: number) => number> = {
@@ -61,7 +89,12 @@ function said(part: string): boolean {
   return part !== '?' && part !== '????.??.??' && part !== '-' && part !== '';
 }
 
-export function ReplayView() {
+interface ReplayViewProps {
+  /** A dataset game the address names, to open as the view is shown; null for none. */
+  datasetGame?: DatasetGameRef | null;
+}
+
+export function ReplayView({ datasetGame = null }: ReplayViewProps) {
   const [source, setSource] = useState<Source | null>(null);
   const [file, setFile] = useState<ReplayFile | null>(null);
   /** How many moves of the game are on the board; 0 is the position it started from. */
@@ -94,6 +127,18 @@ export function ReplayView() {
     return () => window.removeEventListener('keydown', step);
   }, [file, plies]);
 
+  // The dataset game the address names, opened when the view is shown with one, and again
+  // when the address moves on to another. Keyed by the address, which says all there is to
+  // say about which game it is.
+  const datasetAddress = datasetGame === null ? null : datasetGameHash(datasetGame);
+  useEffect(() => {
+    const named = datasetAddress === null ? null : datasetGameInHash(datasetAddress);
+    if (named !== null) {
+      void openGame({ kind: 'dataset', game: named }, 0);
+    }
+    // Not on openGame, which is a new function every render: only the address says when to open.
+  }, [datasetAddress]);
+
   /**
    * Take the next request, and say afterwards whether it is still the one being waited
    * for: only what comes back for the last thing asked for is shown, however long
@@ -111,19 +156,21 @@ export function ReplayView() {
    * whichever one the server finished reading last.
    */
   async function openGame(opened: Source, game: number): Promise<void> {
+    if (opened.kind !== 'dataset' && datasetGameInHash(window.location.hash) !== null) {
+      // Otherwise a reload would bring back the dataset game rather than this one. Replaced
+      // rather than followed, so that Back still goes to the dataset the game was opened from.
+      window.history.replaceState(window.history.state, '', '#replay');
+    }
     const wanted = asking();
     setOpening(true);
     setError(null);
     try {
-      const read =
-        opened.kind === 'saved'
-          ? await openSavedGame(opened.name, game)
-          : await openPgn(opened.pgn, game);
+      const found = await read(opened, game);
       if (!wanted()) {
         return;
       }
       setSource(opened);
-      setFile(read);
+      setFile(found);
       setPly(0);
     } catch (e: unknown) {
       if (wanted()) {
@@ -208,7 +255,15 @@ export function ReplayView() {
           {opening && <p className="note">Opening…</p>}
           {game !== null && source !== null && (
             <>
-              <p className="opened">{source.name}</p>
+              <p className="opened">
+                {source.kind === 'dataset' ? (
+                  <a href={datasetHash(pageOf(source.game))}>
+                    {source.game.name}, {source.game.split} game {source.game.index + 1}
+                  </a>
+                ) : (
+                  source.name
+                )}
+              </p>
               {/* A file of one game has nothing to choose between. */}
               {file !== null && file.games.length > 1 && (
                 <label className="choose-game">

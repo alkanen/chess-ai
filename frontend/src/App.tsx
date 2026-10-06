@@ -1,5 +1,13 @@
 import { useEffect, useState } from 'react';
 import { CompareView } from './CompareView';
+import {
+  datasetGameInHash,
+  datasetInHash,
+  type DatasetGameRef,
+  type DatasetPage,
+} from './datasetPlaces';
+import { DatasetsView } from './DatasetsView';
+import { DatasetView } from './DatasetView';
 import { GameLobby } from './GameLobby';
 import { GameView } from './GameView';
 import { ReplayView } from './ReplayView';
@@ -12,13 +20,14 @@ const VIEWS = [
   { name: 'game', label: 'Game', hash: '' },
   { name: 'replay', label: 'Replay', hash: '#replay' },
   { name: 'runs', label: 'Runs', hash: '#runs' },
+  { name: 'datasets', label: 'Datasets', hash: '#datasets' },
 ] as const;
 
 type View = (typeof VIEWS)[number]['name'];
 
 /**
- * Where the address says the viewer is: a view, and for the game view perhaps one game, and
- * for the runs view perhaps one run.
+ * Where the address says the viewer is: a view, and for the game view perhaps one game, for
+ * the runs view perhaps one run, and for the datasets view perhaps one dataset.
  */
 interface Place {
   view: View;
@@ -28,6 +37,10 @@ interface Place {
   run: string | null;
   /** The runs compared side by side, under the runs view; null when none are. */
   compare: string[] | null;
+  /** The dataset on show, and which page of its games, under the datasets view. */
+  dataset?: DatasetPage | null;
+  /** The dataset game on show, under the replay view; null for a file or a saved game. */
+  datasetGame?: DatasetGameRef | null;
 }
 
 const GAME_PAGE = /^#(?:game|watch)\/(.+)$/;
@@ -47,6 +60,14 @@ function placeInAddress(): Place {
       run: null,
       compare: null,
     };
+  }
+  const dataset = datasetInHash(hash);
+  if (dataset !== null) {
+    return { view: 'datasets', link: null, run: null, compare: null, dataset };
+  }
+  const datasetGame = datasetGameInHash(hash);
+  if (datasetGame !== null) {
+    return { view: 'replay', link: null, run: null, compare: null, datasetGame };
   }
   const run = RUN_PAGE.exec(hash);
   if (run !== null) {
@@ -114,10 +135,14 @@ export function App() {
       </header>
       {view === 'game' && place.link === null && <GameLobby />}
       {view === 'game' && place.link !== null && <GameView key={place.link} link={place.link} />}
-      {view === 'replay' && <ReplayView />}
+      {view === 'replay' && <ReplayView datasetGame={place.datasetGame ?? null} />}
       {view === 'runs' && place.compare !== null && <CompareView names={place.compare} />}
       {view === 'runs' && place.compare === null && place.run === null && <RunsView />}
       {view === 'runs' && place.run !== null && <RunView key={place.run} name={place.run} />}
+      {view === 'datasets' && place.dataset == null && <DatasetsView />}
+      {view === 'datasets' && place.dataset != null && (
+        <DatasetView key={place.dataset.name} place={place.dataset} />
+      )}
     </main>
   );
 }

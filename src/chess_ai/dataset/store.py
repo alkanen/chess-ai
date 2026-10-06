@@ -548,6 +548,18 @@ class _StreamReader:
                 # or a build that ran out of disk leaves behind. numpy raises ValueError for it
                 # rather than OSError, and a traceback is no way to report a damaged dataset.
                 raise DatasetError(f"cannot read dataset shard {path}: {e}") from e
+            # Every shard but the last is full, and the last holds the rest of the count. A shard
+            # that holds anything else is not the one the manifest describes: a copy cut short at
+            # a record boundary, or a rebuild swapped in under a reader still holding the old
+            # manifest. Left to numpy, a short one either raises a bare IndexError or, worse,
+            # repeats the records it has into the places of the ones it has not.
+            expected = min(self._per_shard, self._count - number * self._per_shard)
+            if len(mapped) != expected:
+                raise DatasetError(
+                    f"cannot read dataset shard {path}: it holds {len(mapped)} records and "
+                    f"the manifest says {expected}; the dataset is damaged, or was rebuilt "
+                    "while being read"
+                )
             self._shards[number] = mapped
         return mapped
 
@@ -625,6 +637,10 @@ class SplitReader:
     def game(self, index: int) -> np.void:
         """Game ``index``, as a :data:`~chess_ai.dataset.records.GAME_DTYPE` record."""
         return self._games.record(index)
+
+    def game_records(self, start: int, count: int) -> np.ndarray:
+        """``count`` game records from game ``start`` on, which is one page of a list of games."""
+        return self._games.span(start, count)
 
     def game_positions(self, index: int) -> np.ndarray:
         """Every position of game ``index``, in the order it was played."""

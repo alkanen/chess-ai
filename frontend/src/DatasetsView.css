@@ -1,0 +1,210 @@
+.datasets-view {
+  /* The one hue the distributions are drawn in: the charts' first series. */
+  --bar: #2a78d6;
+}
+
+@media (prefers-color-scheme: dark) {
+  .datasets-view {
+    --bar: #4f93e3;
+  }
+}
+
+.datasets-view h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+}
+
+.dataset-view h2 {
+  margin-top: 0.5rem;
+}
+
+.datasets-view h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.datasets-view .note {
+  opacity: 0.7;
+}
+
+.datasets-view p[role='alert'],
+.datasets-view .warning,
+.datasets-view .unreadable {
+  font-weight: 600;
+  color: #c33;
+}
+
+.datasets-view a {
+  color: inherit;
+}
+
+/* A wide table scrolls inside its frame rather than pushing the page sideways. */
+.datasets-view .table-frame {
+  overflow-x: auto;
+  border: 1px solid rgb(128 128 128 / 30%);
+  border-radius: 6px;
+}
+
+.datasets-view .table-frame table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.datasets-view .table-frame th,
+.datasets-view .table-frame td {
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.datasets-view .table-frame thead th {
+  font-weight: 600;
+  border-bottom: 1px solid rgb(128 128 128 / 35%);
+}
+
+.datasets-view .table-frame tbody tr + tr {
+  border-top: 1px solid rgb(128 128 128 / 18%);
+}
+
+.datasets-view .table-frame tbody tr:hover {
+  background: rgb(128 128 128 / 10%);
+}
+
+.datasets-view .table-frame tbody th {
+  font-weight: 500;
+}
+
+/* A list of source files can be long: cut it short, the whole of it is in the tooltip. */
+.datasets-view td.sources {
+  max-width: 20rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.datasets-view td.unreadable {
+  white-space: normal;
+}
+
+.datasets-view .number {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.datasets-view .table-frame .number {
+  text-align: right;
+}
+
+.dataset-view .facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  margin: 0;
+}
+
+.dataset-view .facts dt {
+  opacity: 0.7;
+}
+
+.dataset-view .facts dd {
+  margin: 0;
+}
+
+.dataset-view ul.sources {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.dataset-view ul.sources .path {
+  overflow-wrap: anywhere;
+}
+
+.dataset-view ul.sources .warning {
+  margin: 0.15rem 0 0;
+}
+
+.distributions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 1rem 2.5rem;
+}
+
+.distributions .stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.distribution {
+  margin: 0;
+}
+
+.distribution figcaption {
+  margin-bottom: 0.25rem;
+  font-weight: 600;
+}
+
+.distribution .note {
+  margin: 0;
+}
+
+.distribution table {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+/* The caption already says what the table is; the header row is for screen readers. */
+.distribution thead {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.distribution th,
+.distribution td {
+  padding: 0.1rem 0.5rem 0.1rem 0;
+  text-align: left;
+  font-weight: normal;
+  white-space: nowrap;
+}
+
+.distribution td.number {
+  opacity: 0.8;
+}
+
+.distribution td.bar {
+  width: 14rem;
+  padding-right: 0;
+}
+
+.distribution td.bar span {
+  display: block;
+  /* A bar too short to see still says that something is there. */
+  min-width: 2px;
+  height: 0.8rem;
+  border-radius: 0 4px 4px 0;
+  background: var(--bar);
+}
+
+.dataset-games .pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.dataset-games .range {
+  font-variant-numeric: tabular-nums;
+}
+
+.dataset-view details summary {
+  cursor: pointer;
+}
+
+.dataset-view details ul.sources {
+  margin-top: 0.25rem;
+}
