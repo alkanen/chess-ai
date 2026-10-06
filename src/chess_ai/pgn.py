@@ -34,6 +34,7 @@ TERMINATIONS: dict[GameOverReason, str] = {
     "fifty_move_rule": "fifty-move rule",
     "resignation": "resignation",
     "abort": "abandoned",
+    "error": "unterminated",
 }
 """How the game ended, for the ``Termination`` header.
 

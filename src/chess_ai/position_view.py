@@ -21,7 +21,9 @@ GameOverReason = Literal[
     "fifty_move_rule",
     "resignation",
     "abort",
+    "error",
 ]
+""""error" is a game a player could not go on with, such as an engine that died: no result."""
 
 
 class Piece(BaseModel):

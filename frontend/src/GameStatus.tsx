@@ -2,8 +2,8 @@ import type { GameOver, GameOverReason, PositionSnapshot, Result } from './api';
 import { TurnIndicator } from './TurnIndicator';
 import './GameStatus.css';
 
-/** An abort is described on its own, so it is the one reason with nothing to say here. */
-const REASONS: Record<Exclude<GameOverReason, 'abort'>, string> = {
+/** The endings with no result are described on their own, so they have nothing to say here. */
+const REASONS: Record<Exclude<GameOverReason, 'abort' | 'error'>, string> = {
   checkmate: 'checkmate',
   stalemate: 'stalemate',
   insufficient_material: 'insufficient material',
@@ -24,7 +24,11 @@ export function describeResult(result: Result): string {
 }
 
 export function describeGameOver({ result, reason }: GameOver): string {
-  // An abort is the one ending that leaves no result, so there is nothing to score.
+  // An abort and a player that could not go on are the endings that leave no result, so
+  // there is nothing to score.
+  if (reason === 'error') {
+    return 'Game stopped: a player could not go on';
+  }
   if (result === '*' || reason === 'abort') {
     return 'Game aborted';
   }

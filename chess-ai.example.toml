@@ -64,3 +64,18 @@ batch_size = 32
 # looked up on PATH. A leading ~ is your home directory. Not needed unless a game
 # asks for Stockfish; see the README for installing it.
 path = "stockfish"
+
+[games]
+# How many games may be in progress at once. Every game is reached through its
+# own links, so several people can play at the same time; a new game beyond this
+# number is refused until one has ended.
+max_ongoing = 20
+
+# How many checkpoints the games may hold loaded at once, all games together.
+# Games playing the same checkpoint share one copy. Beyond this, the checkpoint
+# used longest ago is let go of and loaded again when a game next needs it.
+max_loaded_checkpoints = 10
+
+# How many hours a loaded checkpoint that no game has played with is kept before
+# it is let go of, so that a game left for the day holds no memory meanwhile.
+checkpoint_idle_hours = 24

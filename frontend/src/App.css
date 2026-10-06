@@ -92,3 +92,34 @@
   font-size: 0.85rem;
   opacity: 0.75;
 }
+
+/* What one of two people has asked the other, with the answers to give if it is yours. */
+.request {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid rgb(128 128 128 / 45%);
+  border-radius: 4px;
+  background: rgb(128 128 128 / 12%);
+}
+
+.request p {
+  flex: 1 0 100%;
+  margin: 0;
+}
+
+.request button {
+  flex: 1 1 auto;
+  padding: 0.4rem 0.75rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.side-panel .note,
+.no-such-game .note {
+  margin: 0;
+  opacity: 0.7;
+}

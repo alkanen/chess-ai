@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { GameState, PlayerInfo } from './api';
+import type { Access, GameState, PlayerInfo } from './api';
 import { GameControls } from './GameControls';
 import startPosition from './test/fixtures/start-position.json';
 
@@ -16,7 +16,8 @@ type Playing = keyof typeof PLAYERS;
 
 const POSITION = startPosition as GameState['position'];
 const GAME = 'a-game';
-const PGN_HREF = new URL(`/api/game/pgn?game=${GAME}`, window.location.href).href;
+const LINK = 'a-link';
+const PGN_HREF = new URL(`/api/games/${LINK}/pgn`, window.location.href).href;
 
 /** The PGN file the server hands over, named as the server names it. */
 function pgnResponse(): Response {
@@ -40,6 +41,19 @@ function gameOf(white: Playing, black: Playing, moves = 0): GameState {
     // Only how many there are decides what can be taken back, not what they were.
     moves: Array.from({ length: moves }, () => ({ uci: 'e2e4', san: 'e4', thoughts: null })),
     position: POSITION,
+    request: null,
+  };
+}
+
+/** The same game, ended. */
+function ended(game: GameState): GameState {
+  return {
+    ...game,
+    position: {
+      ...game.position,
+      legal_moves: {},
+      game_over: { result: '0-1', reason: 'resignation' },
+    },
   };
 }
 
@@ -47,12 +61,14 @@ function renderControls(overrides: Partial<Parameters<typeof GameControls>[0]> =
   const props = {
     orientation: 'white' as const,
     onFlip: vi.fn(),
-    pgnGame: GAME as string | null,
+    link: LINK,
     game: gameOf('human', 'random', 1),
+    access: 'white' as Access,
     disabled: false,
     onResign: vi.fn(),
     onAbort: vi.fn(),
     onTakeBack: vi.fn(),
+    onPlayAgain: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
   render(<GameControls {...props} />);
@@ -80,6 +96,8 @@ describe('GameControls', () => {
       return url;
     });
     URL.revokeObjectURL = vi.fn();
+    // Ending a game is asked about first; these tests say yes unless they say otherwise.
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.spyOn(HTMLElement.prototype, 'click').mockImplementation(function (this: HTMLElement) {
       const link = this as HTMLAnchorElement;
       const blob = blobs.get(link.href);
@@ -103,44 +121,61 @@ describe('GameControls', () => {
     expect(screen.getByRole('button', { name: 'Flip to White' })).toBeInTheDocument();
   });
 
-  it('resigns the one side the viewer plays', () => {
+  it('resigns the side the link plays, once that is confirmed', () => {
     const { onResign } = renderControls({ game: gameOf('human', 'random') });
 
     fireEvent.click(screen.getByRole('button', { name: 'Resign' }));
 
-    expect(onResign).toHaveBeenCalledExactlyOnceWith('white');
+    expect(window.confirm).toHaveBeenCalledOnce();
+    expect(onResign).toHaveBeenCalledOnce();
   });
 
-  it('resigns for Black when Black is the side the viewer plays', () => {
-    const { onResign } = renderControls({ game: gameOf('random', 'human') });
+  it('resigns nothing when the confirmation is turned down', () => {
+    vi.mocked(window.confirm).mockReturnValue(false);
+    const { onResign, onAbort } = renderControls();
 
     fireEvent.click(screen.getByRole('button', { name: 'Resign' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Abort' }));
 
-    expect(onResign).toHaveBeenCalledExactlyOnceWith('black');
+    expect(onResign).not.toHaveBeenCalled();
+    expect(onAbort).not.toHaveBeenCalled();
   });
 
-  it('asks which side resigns when the viewer plays both', () => {
-    const { onResign } = renderControls({ game: gameOf('human', 'human', 1) });
+  it('offers a watcher nothing to do to the game', () => {
+    renderControls({ access: 'watch' });
 
-    expect(buttons()).toEqual([
-      'Flip to Black',
-      'Take back',
-      'White resigns',
-      'Black resigns',
-      'Abort',
-    ]);
-
-    fireEvent.click(screen.getByRole('button', { name: 'Black resigns' }));
-
-    expect(onResign).toHaveBeenCalledExactlyOnceWith('black');
+    expect(buttons()).toEqual(['Flip to Black']);
+    expect(screen.getByRole('link', { name: 'Export PGN' })).toBeInTheDocument();
   });
 
-  it('offers no resignation in a game the viewer only watches, but still an abort', () => {
-    renderControls({ game: gameOf('random', 'random', 1) });
+  it('offers only an abort through the link to a game nobody plays by hand', () => {
+    renderControls({ game: gameOf('random', 'random', 1), access: 'control' });
 
-    // Nobody plays a game of two players that move for themselves, so nobody takes a
-    // move back in one either.
     expect(buttons()).toEqual(['Flip to Black', 'Abort']);
+  });
+
+  it('asks the other person for a takeback, and for an abort once both have moved', () => {
+    renderControls({ game: gameOf('human', 'human', 2) });
+
+    expect(buttons()).toEqual(['Flip to Black', 'Ask to take back', 'Resign', 'Ask to abort']);
+  });
+
+  it('aborts outright between two people until both have moved', () => {
+    renderControls({ game: gameOf('human', 'human', 1) });
+
+    expect(buttons()).toEqual(['Flip to Black', 'Ask to take back', 'Resign', 'Abort']);
+  });
+
+  it('asks nothing more while a request is waiting for an answer', () => {
+    const game = {
+      ...gameOf('human', 'human', 2),
+      request: { id: 1, kind: 'takeback', by: 'white' },
+    };
+    renderControls({ game: game as GameState });
+
+    expect(screen.getByRole('button', { name: 'Ask to take back' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Ask to abort' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Resign' })).toBeEnabled();
   });
 
   it('takes back the last move of a game the viewer plays', () => {
@@ -165,12 +200,6 @@ describe('GameControls', () => {
     expect(onAbort).toHaveBeenCalledOnce();
   });
 
-  it('offers only the flip when there is no game to end', () => {
-    renderControls({ game: null });
-
-    expect(buttons()).toEqual(['Flip to Black']);
-  });
-
   it('offers the game as a PGN file the browser saves', () => {
     renderControls();
 
@@ -182,16 +211,10 @@ describe('GameControls', () => {
   });
 
   it('offers the download of a game that has ended, which there is nothing left to end', () => {
-    renderControls({ game: null });
+    renderControls({ game: ended(gameOf('human', 'random', 1)) });
 
-    expect(buttons()).toEqual(['Flip to Black']);
+    expect(buttons()).toEqual(['Flip to Black', 'Play again']);
     expect(screen.getByRole('link', { name: 'Export PGN' })).toBeInTheDocument();
-  });
-
-  it('offers no download when no game has been started', () => {
-    renderControls({ game: null, pgnGame: null });
-
-    expect(screen.queryByRole('link')).not.toBeInTheDocument();
   });
 
   it('saves the game under the name the server gave it', async () => {
@@ -227,18 +250,16 @@ describe('GameControls', () => {
     }
   });
 
-  it('says why a game that has been replaced was not exported', async () => {
+  it('says why a game that is gone was not exported', async () => {
     // The one refusal a viewer can run into: they clicked before their browser heard
-    // that a new game had replaced the one they were looking at.
-    fetch.mockResolvedValue(
-      Response.json({ detail: 'that game has been replaced' }, { status: 409 }),
-    );
+    // that the game had been aborted.
+    fetch.mockResolvedValue(Response.json({ detail: 'there is no such game' }, { status: 404 }));
     renderControls();
 
     fireEvent.click(screen.getByRole('link', { name: 'Export PGN' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Could not export the game: that game has been replaced',
+      'Could not export the game: there is no such game',
     );
     expect(saved).toEqual([]);
   });
@@ -252,5 +273,68 @@ describe('GameControls', () => {
     expect(screen.getByRole('button', { name: 'Resign' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Abort' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Take back' })).toBeDisabled();
+  });
+
+  describe('playing again', () => {
+    it('is offered to a player once the game has ended', () => {
+      const { onPlayAgain } = renderControls({ game: ended(gameOf('human', 'random', 1)) });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Play again' }));
+
+      expect(onPlayAgain).toHaveBeenCalledOnce();
+    });
+
+    it('says that between two people it joins the game the other has started', () => {
+      renderControls({ game: ended(gameOf('human', 'human', 2)) });
+
+      expect(screen.getByText(/joins the new game if your opponent has started one/)).toBeVisible();
+    });
+
+    it('is offered to the control link of a game nobody played by hand', () => {
+      renderControls({ game: ended(gameOf('random', 'random', 1)), access: 'control' });
+
+      expect(screen.getByRole('button', { name: 'Play again' })).toBeInTheDocument();
+    });
+
+    it('is not offered while the game is being played', () => {
+      renderControls();
+
+      expect(screen.queryByRole('button', { name: 'Play again' })).not.toBeInTheDocument();
+    });
+
+    it('is not offered to a watcher', () => {
+      renderControls({ game: ended(gameOf('human', 'random', 1)), access: 'watch' });
+
+      expect(screen.queryByRole('button', { name: 'Play again' })).not.toBeInTheDocument();
+    });
+
+    it('is not offered after an abort, which kept nothing to play again from', () => {
+      const game = gameOf('human', 'random', 1);
+      renderControls({
+        game: {
+          ...game,
+          position: {
+            ...game.position,
+            legal_moves: {},
+            game_over: { result: '*', reason: 'abort' },
+          },
+        },
+      });
+
+      expect(screen.queryByRole('button', { name: 'Play again' })).not.toBeInTheDocument();
+    });
+
+    it('says why the game could not be started again', async () => {
+      renderControls({
+        game: ended(gameOf('human', 'random', 1)),
+        onPlayAgain: vi.fn().mockRejectedValue(new Error('20 games are already being played')),
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: 'Play again' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        'Could not start the game again: 20 games are already being played',
+      );
+    });
   });
 });

@@ -11,14 +11,21 @@ const GAME = {
   black: { name: 'Random mover', accepts_moves: false, model: null, stockfish: null },
   moves: [],
   position: startPosition,
+  request: null,
 } as unknown as GameState;
 
 /** A channel following a game, on an open connection. */
 function following() {
-  const channel = renderHook(() => useGameChannel());
+  const channel = renderHook(() => useGameChannel('a-link'));
   const socket = FakeWebSocket.latest;
   socket.open();
-  socket.deliver({ type: 'state', game: GAME });
+  socket.deliver({
+    type: 'state',
+    game: GAME,
+    access: 'white',
+    watch: 'a-watch-link',
+    updated: '2026-10-05T12:00:00Z',
+  });
   return { channel, socket };
 }
 
@@ -44,7 +51,7 @@ describe('useGameChannel', () => {
     act(() => channel.result.current.submitMove('e2e4'));
 
     expect(socket.sent.map((message) => JSON.parse(message))).toEqual([
-      { game: 'a-game', type: 'move', uci: 'e2e4' },
+      { type: 'move', uci: 'e2e4' },
     ]);
     expect(channel.result.current.movePending).toBe(true);
   });

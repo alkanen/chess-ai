@@ -109,9 +109,25 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 uv run chess-ai serve
 ```
 
-Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets, the API (`…/api/`, with interactive docs at `…/api/docs`) and the WebSocket that streams the game (`…/api/game/ws`) are all served under the prefix.
+Then open the URL it prints, for example `http://127.0.0.1:8000/chess/` with `path_prefix = "/chess"`. The page, its assets, the API (`…/api/`, with interactive docs at `…/api/docs`) and the WebSockets that stream the games (`…/api/games/<link>/ws`) are all served under the prefix.
 
-The server holds one game, which every open browser shows. Start a game from the page, choosing a human player, a random mover, a model or Stockfish for each colour, with a delay between moves so that a game between players that move instantly can be followed; starting another game replaces it for everyone.
+Start a game from the **Game** tab, choosing a human player, a random mover, a model or Stockfish for each colour, with a delay between moves so that a game between players that move instantly can be followed. Each game is a game of its own: several people can play at once, up to `[games] max_ongoing` games in progress (20 by default), and a new game beyond that is refused until one has ended.
+
+### Share a game with friends
+
+A game is reached only through its links, which the game page shows with a button to copy each:
+
+- a **play link** (`#game/<id>`) for each side a person plays, which moves that side, takes back, resigns and aborts. In a game between two people each gets their own, and can move only their own side; the browser that started the game goes to White's link and shows Black's, to send to whoever plays Black.
+- a **watch link** (`#watch/<id>`), which follows the game live and can do nothing to it.
+- a game nobody plays by hand, such as two models, has one link that can abort it instead of a play link.
+
+**The links are the only protection.** There are no accounts: each link is a random id nobody can guess, and whoever has it can do what it allows. Send play links only to the person who is to play that side, and serve the app to people you trust.
+
+Keep your play link: nothing else leads back to the game. The Game tab lists the games this browser has started or opened, so a link that was not bookmarked can still be found from the same browser.
+
+Between two people, a takeback is asked for and the other side agrees or declines; so is an abort, once both have moved. Against a model, Stockfish or the random mover, both happen at once. Resigning and aborting ask for confirmation first. A game that has ended stays to be looked at through its links, and an aborted game is deleted at once, links and all. Once a game has ended, **Play again** starts a new one with the same players and settings, with links of its own; a checkpoint chosen as latest or best is chosen afresh, so it may be a newer one. While that new game is being played, **Play again** on the old one joins it on your side instead of starting another, so two people who both click it end up playing each other again. A game a player could not go on with, such as a Stockfish that died or a checkpoint deleted or replaced while the game waited, ends as stopped, with no result.
+
+Games are held in memory for now, so restarting the server ends them all.
 
 ### Follow training
 
@@ -145,11 +161,11 @@ Both colours can be models, so two checkpoints of one run, or two runs, can be w
 
 Whether the rating does anything is a property of the training data rather than of the model player: a run whose games all came from one narrow band of ratings has never seen that feature move, and will have learned nothing from it. To see which it is for a checkpoint, play it against itself twice from the same position with **plays** set to its best move, changing nothing between the two games but the rating: a run that learned something from the feature plays a different game, and one that did not plays the same one move for move. Ask only for ratings inside the range the run trained on, which `chess-ai dataset stats <name>` reports for its dataset — a rating the run never saw takes the feature off the end of its training data, and whatever the model does then says nothing about what it learned.
 
-The network runs on the CPU unless `[inference] device` says otherwise, so a game can be played against a checkpoint while a run is training on the GPU. The PGN of a game a model played records the run, the checkpoint's step, the rating it was asked for and how it chose its moves, as `WhiteRun`, `WhiteCheckpoint`, `WhiteRating` and `WhiteSelection` (and the same for Black).
+The network runs on the CPU unless `[inference] device` says otherwise, so a game can be played against a checkpoint while a run is training on the GPU. Games playing the same checkpoint share one loaded copy; at most `[games] max_loaded_checkpoints` (10) are held at once, the one used longest ago making room for another, and one no game has played with for `checkpoint_idle_hours` (24) is let go of. Either is loaded again when a game next needs it. The PGN of a game a model played records the run, the checkpoint's step, the rating it was asked for and how it chose its moves, as `WhiteRun`, `WhiteCheckpoint`, `WhiteRating` and `WhiteSelection` (and the same for Black).
 
 On a human player's turn, hovering one of its pieces highlights that piece's legal destinations, drawing captures, castling and en passant apart from quiet moves. Move by clicking the piece and then the destination, or by dragging it there. The server is the only judge of the rules: it rejects anything illegal and the piece goes back where it was. A pawn reaching the last rank asks which piece to promote it to, and nothing is submitted until you pick one, by clicking it or with Enter or Space on the choice the picker opens on. Clicking elsewhere on the board, or pressing Escape, puts the pawn back.
 
-Every game that reaches a result is saved as PGN in the games directory, one file per game, named after the moment it ended: nothing has to be asked for, and the file replays in any other chess tool. A game that was aborted reached no result and is not kept. **Export PGN** downloads the game on show whenever you like, a game still being played included, with the moves played so far and the result `*` that PGN gives a game that has not ended.
+Every game that reaches a result is saved as PGN in the games directory, one file per game, named after the moment it ended: nothing has to be asked for, and the file replays in any other chess tool. A game that was aborted reached no result and is not kept. **Export PGN** downloads the game whenever you like, through any of its links, a game still being played included, with the moves played so far and the result `*` that PGN gives a game that has not ended.
 
 ### Play Stockfish
 
@@ -157,7 +173,7 @@ Choosing **Stockfish** for a colour plays the engine at the **Elo** you type, he
 
 Stockfish's documentation says the levels were calibrated at two minutes a game plus a second a move and anchored to the CCRL 40/4 engine rating list. A move time well under a second plays below the level, and neither is a Lichess or FIDE rating.
 
-Each Stockfish side is an engine process of its own, started with the game and stopped when the game ends, is replaced, or the server shuts down. A game that cannot find Stockfish is refused with a message saying where it looked. The PGN of a game Stockfish played records its strength as `WhiteElo` and its time a move as `WhiteMoveTime` (and the same for Black).
+Each Stockfish side is an engine process of its own, started with the game and stopped when the game ends or the server shuts down. A game that cannot find Stockfish is refused with a message saying where it looked. The PGN of a game Stockfish played records its strength as `WhiteElo` and its time a move as `WhiteMoveTime` (and the same for Black).
 
 ### Play a match
 
@@ -445,7 +461,7 @@ location /chess/ {
 
 If nginx runs on another machine, or on the Windows side of a WSL2 setup, set `host = "0.0.0.0"` so the server accepts connections from outside, and point `proxy_pass` at an address nginx can reach.
 
-If the page loads but keeps saying it lost the connection to the server, and the server logs `GET …/api/game/ws` answered `426 Upgrade Required`, the WebSocket requests are reaching it without the upgrade: nginx is not forwarding the headers above (an `HTTP/1.0` in the log line means `proxy_http_version 1.1` is missing). A port in `proxy_pass` that does not match the server's shows up in nginx instead, as a refused connection.
+If the page loads but keeps saying it lost the connection to the server, and the server logs `GET …/api/games/<link>/ws` answered `426 Upgrade Required`, the WebSocket requests are reaching it without the upgrade: nginx is not forwarding the headers above (an `HTTP/1.0` in the log line means `proxy_http_version 1.1` is missing). A port in `proxy_pass` that does not match the server's shows up in nginx instead, as a refused connection.
 
 The app has no authentication. It will have a read-only mode that disables starting and stopping jobs from the browser.
 

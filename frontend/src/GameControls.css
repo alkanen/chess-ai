@@ -25,6 +25,13 @@
 }
 
 /* Its own line under the controls, since a flex row is no place for a sentence. */
+.game-controls p.note {
+  flex: 1 0 100%;
+  margin: 0;
+  font-size: 0.9rem;
+  opacity: 0.7;
+}
+
 .game-controls p[role='alert'] {
   flex: 1 0 100%;
   margin: 0;
