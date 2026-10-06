@@ -98,3 +98,17 @@ export function formatAgo(timestamp: string | null | undefined, now: number = Da
   }
   return `${formatDuration((now - Date.parse(timestamp)) / 1000)} ago`;
 }
+
+const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+
+/** A size in the unit that makes it readable, as the command line writes one: "1.2 MB". */
+export function formatBytes(count: number): string {
+  let size = count;
+  for (const [place, unit] of BYTE_UNITS.entries()) {
+    if (size < 1024 || place === BYTE_UNITS.length - 1) {
+      return unit === 'B' ? `${size.toFixed(0)} B` : `${size.toFixed(1)} ${unit}`;
+    }
+    size /= 1024;
+  }
+  return `${count} B`;
+}

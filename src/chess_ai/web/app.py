@@ -10,8 +10,8 @@ import html
 import logging
 import re
 import sys
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never
@@ -37,6 +37,7 @@ from starlette.websockets import WebSocketClose, WebSocketState
 
 from chess_ai import replay
 from chess_ai.config import Config
+from chess_ai.dataset import DatasetError, ManifestError
 from chess_ai.game_session import (
     ActionRejectedError,
     GameEvent,
@@ -89,6 +90,17 @@ from chess_ai.training.run_store import (
     listed,
     open_run,
     save_notes,
+)
+from chess_ai.web.datasets import DEFAULT_PAGE as DEFAULT_DATASET_PAGE
+from chess_ai.web.datasets import MAX_PAGE as MAX_DATASET_PAGE
+from chess_ai.web.datasets import (
+    DatasetGames,
+    DatasetSummary,
+    NoSuchDatasetError,
+    dataset_game,
+    dataset_games,
+    describe_dataset,
+    describe_datasets,
 )
 from chess_ai.web.engine_cache import CheckpointKey, EngineCache
 from chess_ai.web.game_store import (
@@ -667,6 +679,52 @@ def create_app(
                 status.HTTP_500_INTERNAL_SERVER_ERROR, str(unwritable)
             ) from unwritable
 
+    # The dataset routes read files a build may be replacing at this moment, as the run routes
+    # do, and are plain `def` for the same reason. A dataset is opened per request and let go
+    # of at the end of it; see chess_ai.web.datasets.
+
+    @api.get("/datasets")
+    def datasets() -> list[DatasetSummary]:
+        """Every dataset here, by name, each with its manifest or why that cannot be read."""
+        return describe_datasets(config.paths.data)
+
+    @api.get("/datasets/{name}", responses={404: {"description": "No dataset of that name"}})
+    def dataset(name: str) -> DatasetSummary:
+        """One dataset's manifest: its sources, filters, counts and statistics."""
+        with _dataset_errors():
+            return describe_dataset(config.paths.data, name)
+
+    @api.get(
+        "/datasets/{name}/{split}/games",
+        responses={
+            404: {"description": "No dataset of that name, or no such split in it"},
+            500: {"description": "The dataset is there and cannot be read"},
+        },
+    )
+    def dataset_games_page(
+        name: str,
+        split: str,
+        offset: Annotated[int, Query(ge=0, description="The first game, counting from zero.")] = 0,
+        limit: Annotated[
+            int, Query(ge=1, le=MAX_DATASET_PAGE, description="How many games at most.")
+        ] = DEFAULT_DATASET_PAGE,
+    ) -> DatasetGames:
+        """One page of a split's games, in the order they were stored."""
+        with _dataset_errors():
+            return dataset_games(config.paths.data, name, split, offset, limit)
+
+    @api.get(
+        "/datasets/{name}/{split}/games/{index}",
+        responses={
+            404: {"description": "No such dataset, split or game"},
+            500: {"description": "The game's records cannot be read or played out"},
+        },
+    )
+    def dataset_game_replay(name: str, split: str, index: int) -> replay.ReplayGame:
+        """One game of a dataset, with the position before every move and after it."""
+        with _dataset_errors():
+            return dataset_game(config.paths.data, name, split, index)
+
     def _open_run(name: str) -> RunReader:
         try:
             return open_run(config.paths.runs, name)
@@ -1172,6 +1230,17 @@ async def _read_at_most(body: AsyncIterator[bytes], limit: int) -> bytes:
         # and logged with a traceback nobody can do anything about.
         raise HTTPException(CLIENT_GAVE_UP, "the upload was given up") from gone
     return bytes(read)
+
+
+@contextmanager
+def _dataset_errors() -> Iterator[None]:
+    """Answer a dataset that is not there with a 404, and one that cannot be read with a 500."""
+    try:
+        yield
+    except NoSuchDatasetError as missing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
+    except (DatasetError, ManifestError) as damaged:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(damaged)) from damaged
 
 
 def _replayed(pgn: str | bytes, selected: int) -> replay.ReplayFile:

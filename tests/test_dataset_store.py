@@ -207,6 +207,52 @@ def test_a_truncated_shard_is_reported_as_a_dataset_problem(tmp_path):
         open_dataset("test", data_dir=tmp_path)[TRAIN].position(0)
 
 
+def shortened(tmp_path, stream: str, dtype: np.dtype) -> Path:
+    """A built dataset whose last ``stream`` shard has lost a whole record, and its directory.
+
+    A whole number of records, so the file still maps: what a rebuild swapped in under a reader
+    holding the old manifest looks like, as well as a copy cut short at a record boundary.
+    """
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0, shards=TINY_SHARDS)
+    directory = dataset_path(tmp_path, "test") / TRAIN / stream
+    last = sorted(directory.glob("*.bin"))[-1]
+    last.write_bytes(last.read_bytes()[: -dtype.itemsize])
+    return directory
+
+
+@pytest.mark.parametrize(
+    ("stream", "dtype", "read"),
+    [
+        (GAMES, GAME_DTYPE, lambda split: split.game_records(0, split.games)),
+        (GAMES, GAME_DTYPE, lambda split: split.game(split.games - 1)),
+        (POSITIONS, POSITION_DTYPE, lambda split: split.game_positions(split.games - 1)),
+        (POSITIONS, POSITION_DTYPE, lambda split: split.positions([len(split) - 1])),
+        (MOVES, np.dtype("<u2"), lambda split: split.move_sequence(split.games - 1)),
+    ],
+)
+def test_a_shard_shorter_than_the_manifest_says_is_reported_not_read_around(
+    tmp_path, stream, dtype, read
+):
+    # numpy would otherwise either raise a bare IndexError or, worse, copy the records that are
+    # there into the slots of the ones that are not, and hand back a game that never was.
+    shortened(tmp_path, stream, dtype)
+    split = open_dataset("test", data_dir=tmp_path)[TRAIN]
+
+    with pytest.raises(DatasetError, match="the manifest says"):
+        read(split)
+
+
+def test_a_shard_longer_than_the_manifest_says_is_reported(tmp_path):
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0, shards=TINY_SHARDS)
+    directory = dataset_path(tmp_path, "test") / TRAIN / GAMES
+    last = sorted(directory.glob("*.bin"))[-1]
+    last.write_bytes(last.read_bytes() + bytes(GAME_DTYPE.itemsize))
+    split = open_dataset("test", data_dir=tmp_path)[TRAIN]
+
+    with pytest.raises(DatasetError, match="the manifest says"):
+        split.game(split.games - 1)
+
+
 def test_a_manifest_from_a_format_with_new_fields_says_to_rebuild(tmp_path):
     # A newer format is exactly the one carrying fields this code has never heard of, so the
     # version has to be read before the manifest is validated against this version's shape.

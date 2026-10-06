@@ -570,3 +570,10 @@ def test_frontend_fixture_matches_the_file_the_server_reads_back():
     fixture = json.loads((FRONTEND_FIXTURES / "replay-two-games.json").read_text(encoding="utf-8"))
 
     assert fixture == [read(TWO_GAMES, selected=n).model_dump(mode="json") for n in (0, 1)]
+
+
+def test_a_null_move_in_the_main_line_is_replayed_as_a_pass():
+    # ChessBase and many analysis exports write "--" for a side passing, and the parser plays it.
+    file = read("1. e4 -- 2. d4 *\n")
+
+    assert [move.san for move in file.selected.moves] == ["e4", "--", "d4"]
