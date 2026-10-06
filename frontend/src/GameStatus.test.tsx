@@ -48,4 +48,12 @@ describe('GameStatus', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Game aborted');
     expect(screen.getByRole('status')).not.toHaveTextContent('Draw');
   });
+
+  it('shows a game a player could not go on with as stopped, with no result', () => {
+    const stopped = position({ game_over: { result: '*', reason: 'error' } });
+
+    render(<GameStatus position={stopped} inGame />);
+
+    expect(screen.getByRole('status')).toHaveTextContent('Game stopped: a player could not go on');
+  });
 });

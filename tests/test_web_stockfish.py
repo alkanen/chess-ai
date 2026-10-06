@@ -17,7 +17,7 @@ from stockfish_helpers import fake_engine, needs_stockfish, running, started, wa
 from chess_ai.config import Config, PathsConfig, ServerConfig, StockfishConfig
 from chess_ai.web import create_app
 
-GAME = "/chess/api/game"
+GAME = "/chess/api/games"
 RANDOM = {"kind": "random"}
 HUMAN = {"kind": "human"}
 
@@ -50,9 +50,19 @@ def client(tmp_path, engine) -> Iterator[TestClient]:
 
 
 def start(client: TestClient, white: dict, black: dict, **changes) -> dict:
+    """Start a game, and return the game as it started."""
+    return start_with_links(client, white, black, **changes)[0]
+
+
+def start_with_links(client: TestClient, white: dict, black: dict, **changes) -> tuple[dict, dict]:
+    """Start a game, and return the game as it started and the links to it."""
     response = client.post(GAME, json={"white": white, "black": black, "move_delay": 0, **changes})
     assert response.status_code == 200, response.text
-    return response.json()
+    return response.json()["game"], response.json()["links"]
+
+
+def connect(client: TestClient, link: str):
+    return client.websocket_connect(f"{GAME}/{link}/ws")
 
 
 def test_stockfish_can_play_white_and_says_how_strong_it_plays(client, engine):
@@ -72,11 +82,11 @@ def test_stockfish_can_play_white_and_says_how_strong_it_plays(client, engine):
 
 
 def test_stockfish_can_play_black_and_moves_when_it_is_its_turn(client, engine):
-    game = start(client, HUMAN, stockfish())
+    _, links = start_with_links(client, HUMAN, stockfish())
 
-    with client.websocket_connect(f"{GAME}/ws") as websocket:
+    with connect(client, links["white"]) as websocket:
         assert websocket.receive_json()["type"] == "state"
-        websocket.send_json({"type": "move", "game": game["id"], "uci": "e2e4"})
+        websocket.send_json({"type": "move", "uci": "e2e4"})
         assert websocket.receive_json()["move"]["uci"] == "e2e4"
         reply = websocket.receive_json()
 
@@ -102,34 +112,40 @@ def test_two_stockfish_sides_get_an_engine_each_at_their_own_strength(client, en
 
 
 def test_a_game_that_ends_on_the_board_takes_its_engine_with_it(client, engine):
-    with client.websocket_connect(f"{GAME}/ws") as websocket:
-        assert websocket.receive_json()["type"] == "no_game"
-        start(client, stockfish(), RANDOM, fen=ONLY_MOVE_ENDS_IT)
-        assert websocket.receive_json()["type"] == "state"
-        ended = websocket.receive_json()
+    _, links = start_with_links(client, stockfish(), HUMAN, fen=ONLY_MOVE_ENDS_IT)
 
-    assert ended["position"]["game_over"]["reason"] == "insufficient_material"
+    with connect(client, links["watch"]) as websocket:
+        state = websocket.receive_json()
+        position = state["game"]["position"]
+        if position["game_over"] is None:
+            position = websocket.receive_json()["position"]
+
+    assert position["game_over"]["reason"] == "insufficient_material"
     wait_until_gone(*started(engine))
 
 
 def test_an_aborted_game_takes_its_engines_with_it(client, engine):
-    game = start(client, stockfish(move_time=30), stockfish())
+    _, links = start_with_links(client, stockfish(move_time=30), stockfish())
     pids = started(engine)
     assert all(running(pid) for pid in pids)
 
-    with client.websocket_connect(f"{GAME}/ws") as websocket:
+    with connect(client, links["control"]) as websocket:
         websocket.receive_json()
-        websocket.send_json({"type": "abort", "game": game["id"]})
+        websocket.send_json({"type": "abort"})
         assert websocket.receive_json()["type"] == "game_over"
 
     wait_until_gone(*pids)
 
 
-def test_a_game_replaced_by_another_takes_its_engine_with_it(client, engine):
-    start(client, stockfish(move_time=30), HUMAN)
+def test_a_resigned_game_takes_its_engine_with_it_and_leaves_the_others(client, engine):
+    _, links = start_with_links(client, HUMAN, stockfish(move_time=30))
     [first] = started(engine)
+    start(client, stockfish(move_time=30), HUMAN)
 
-    start(client, stockfish(), HUMAN)
+    with connect(client, links["white"]) as websocket:
+        websocket.receive_json()
+        websocket.send_json({"type": "resign"})
+        assert websocket.receive_json()["type"] == "game_over"
 
     wait_until_gone(first)
     assert running(started(engine)[1])
@@ -156,11 +172,11 @@ def test_a_missing_stockfish_is_the_servers_fault_and_says_how_to_fix_it(tmp_pat
 
 def test_a_refused_game_leaves_the_game_before_it_playing(tmp_path):
     with serve(tmp_path, tmp_path / "no-such-stockfish") as client:
-        before = start(client, HUMAN, RANDOM)
+        before, links = start_with_links(client, HUMAN, RANDOM)
 
         client.post(GAME, json={"white": stockfish(), "black": RANDOM})
 
-        with client.websocket_connect(f"{GAME}/ws") as websocket:
+        with connect(client, links["white"]) as websocket:
             assert websocket.receive_json()["game"]["id"] == before["id"]
 
 
@@ -218,14 +234,14 @@ def take_back_while_stockfish_thinks(client: TestClient) -> tuple[dict, dict]:
 
     Returns what the game says after the takeback, and Stockfish's reply to the second move.
     """
-    game = start(client, HUMAN, stockfish(move_time=1))
-    with client.websocket_connect(f"{GAME}/ws") as websocket:
+    _, links = start_with_links(client, HUMAN, stockfish(move_time=1))
+    with connect(client, links["white"]) as websocket:
         websocket.receive_json()
-        websocket.send_json({"type": "move", "game": game["id"], "uci": "e2e4"})
+        websocket.send_json({"type": "move", "uci": "e2e4"})
         assert websocket.receive_json()["move"]["uci"] == "e2e4"
-        websocket.send_json({"type": "takeback", "game": game["id"]})
+        websocket.send_json({"type": "takeback"})
         taken_back = websocket.receive_json()
-        websocket.send_json({"type": "move", "game": game["id"], "uci": "d2d4"})
+        websocket.send_json({"type": "move", "uci": "d2d4"})
         assert websocket.receive_json()["move"]["uci"] == "d2d4"
         return taken_back, websocket.receive_json()
 
@@ -254,14 +270,12 @@ def test_the_installed_stockfish_also_answers_the_move_on_the_board_after_a_take
 
 @needs_stockfish
 def test_the_installed_stockfish_plays_through_the_server(tmp_path):
-    with (
-        serve(tmp_path, "stockfish") as client,
-        client.websocket_connect(f"{GAME}/ws") as websocket,
-    ):
-        assert websocket.receive_json()["type"] == "no_game"
-        game = start(client, stockfish(), RANDOM)
-        assert websocket.receive_json()["type"] == "state"
-        moved = websocket.receive_json()
+    with serve(tmp_path, "stockfish") as client:
+        game, links = start_with_links(client, stockfish(), HUMAN)
+        with connect(client, links["watch"]) as websocket:
+            state = websocket.receive_json()
+            moves = state["game"]["moves"]
+            moved = moves[0] if moves else websocket.receive_json()["move"]
 
     assert game["white"]["stockfish"]["min_elo"] > 0
-    assert chess.Board().is_legal(chess.Move.from_uci(moved["move"]["uci"]))
+    assert chess.Board().is_legal(chess.Move.from_uci(moved["uci"]))

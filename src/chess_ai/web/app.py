@@ -9,8 +9,9 @@ import asyncio
 import html
 import logging
 import re
+import sys
 from collections.abc import AsyncIterator
-from contextlib import aclosing, asynccontextmanager
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never
@@ -31,12 +32,22 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
-from starlette.types import Message
-from starlette.websockets import WebSocketState
+from starlette.types import Message, Receive, Scope, Send
+from starlette.websockets import WebSocketClose, WebSocketState
 
 from chess_ai import replay
 from chess_ai.config import Config
-from chess_ai.game_session import ActionRejectedError, GameSession, GameState
+from chess_ai.game_session import (
+    ActionRejectedError,
+    GameEvent,
+    GameOverEvent,
+    GameSession,
+    GameState,
+    GameStateEvent,
+    MoveEvent,
+    RequestEvent,
+    TakebackEvent,
+)
 from chess_ai.pgn import MEDIA_TYPE as PGN_MEDIA_TYPE
 from chess_ai.pgn import game_pgn, pgn_filename, save_game
 from chess_ai.players import (
@@ -50,7 +61,6 @@ from chess_ai.players import (
     close_players,
 )
 from chess_ai.position_view import (
-    Color,
     InvalidFenError,
     PositionSnapshot,
     board_from_fen,
@@ -76,7 +86,16 @@ from chess_ai.training.run_store import (
     open_run,
     save_notes,
 )
-from chess_ai.web.game_channel import ChannelEvent, GameChannel, GameChannelClosedError
+from chess_ai.web.engine_cache import CheckpointKey, EngineCache
+from chess_ai.web.games import (
+    Access,
+    GameLinks,
+    GameRegistry,
+    GamesClosedError,
+    NoSuchGameError,
+    Seat,
+    TooManyGamesError,
+)
 from chess_ai.web.runs import (
     LatestMetricsCache,
     RunCheckpoints,
@@ -97,9 +116,9 @@ _HEAD_TAG = re.compile(r"<head(?:\s[^>]*)?>", re.IGNORECASE)
 NO_STORE = {"Cache-Control": "no-store"}
 """Kept by nobody, for a URL that means something else after every move.
 
-Every answer the PGN route gives carries this, not only the file: a 404 is one of the
-statuses a cache may keep of its own accord, and a stored "no game has been started"
-would go on being served long after a game had started.
+Every answer the game routes give carries this, not only the file: a 404 is one of the
+statuses a cache may keep of its own accord, and a stored "no such game" would go on being
+served for a link that has since been given a game.
 """
 
 CLIENT_GAVE_UP = 499
@@ -109,6 +128,9 @@ No number of HTTP's own says it: the request was neither refused nor served, and
 one asking is no longer there to read whichever was chosen. 499 is what the proxy in
 front of this server writes in its log for the same thing.
 """
+
+IDLE_CHECKPOINT_POLL_SECONDS = 600.0
+"""How often the loaded checkpoints are looked over for ones no game has played with lately."""
 
 RUN_POLL_SECONDS = 1.0
 """How often a run being followed is looked at for new metrics and a new heartbeat.
@@ -205,45 +227,53 @@ class NewGameRequest(BaseModel):
 
 
 class ViewerAction(BaseModel):
-    """Something a viewer asks of the game their browser is showing them.
+    """Something a viewer asks of the game their link reaches, on behalf of the link's side.
 
-    Every one of these names that game, because a new game can replace it in the moment
-    before the message arrives, and the server acts on the game the viewer meant.
+    Which game, and which side, is the link's to say: the WebSocket is opened for one link,
+    so nothing sent over it names either.
     """
 
     model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
-    game: str
-    """The ``id`` of the game this is meant for, as its state gave it."""
-
 
 class SubmitMove(ViewerAction):
-    """A viewer plays a move for the human side to move."""
+    """A move for the link's side, which has to be on move."""
 
     type: Literal["move"]
     uci: str
 
 
 class Resign(ViewerAction):
-    """A viewer resigns on behalf of one side, which must be a side they play."""
+    """The link's side resigns."""
 
     type: Literal["resign"]
-    color: Color
 
 
 class Abort(ViewerAction):
-    """A viewer ends the game with no result."""
+    """End the game with no result and delete it, or ask the other person to agree to that."""
 
     type: Literal["abort"]
 
 
 class TakeBack(ViewerAction):
-    """A viewer takes back the last move, or the last pair of moves."""
+    """Take back the side's last move, or ask the other person to agree to that."""
 
     type: Literal["takeback"]
 
 
-ViewerMessage = Annotated[SubmitMove | Resign | Abort | TakeBack, Field(discriminator="type")]
+class Answer(ViewerAction):
+    """Agree to, or decline, what the other person asked."""
+
+    type: Literal["answer"]
+    request: int
+    """The ``id`` of the request being answered, so that an answer meant for one request
+    cannot land on another asked after it."""
+    accept: bool
+
+
+ViewerMessage = Annotated[
+    SubmitMove | Resign | Abort | TakeBack | Answer, Field(discriminator="type")
+]
 """What a viewer may send over the game WebSocket."""
 
 _VIEWER_MESSAGE = TypeAdapter(ViewerMessage)
@@ -256,7 +286,33 @@ class ErrorEvent(BaseModel):
     message: str
 
 
-ViewerEvent = ChannelEvent | ErrorEvent
+class SeatView(BaseModel):
+    """A game as the link it was reached through sees it: the first thing the WebSocket sends.
+
+    ``access`` is what the link may do, which is all the browser has to go on in offering it.
+    """
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    type: Literal["state"] = "state"
+    game: GameState
+    access: Access
+    """"white" or "black" for a play link, "control" for the one link to a game nobody plays
+    by hand, which can abort it, and "watch" for a link that can only follow the game."""
+    watch: str
+    """The game's watch link, to pass on to anyone who wants to follow it."""
+    updated: datetime
+    """When the game last changed: when it began, or its last move or takeback."""
+
+
+class NewGame(BaseModel):
+    """A game that has just been started, and every link to it."""
+
+    game: GameState
+    links: GameLinks
+
+
+ViewerEvent = SeatView | MoveEvent | TakebackEvent | RequestEvent | GameOverEvent | ErrorEvent
 """What the game WebSocket sends: the game's events, plus this viewer's own errors."""
 
 
@@ -271,20 +327,27 @@ def create_app(
         """Keep a finished game, so that it can be looked at again or trained on."""
         logger.info("Saved the finished game to %s", save_game(game, config.paths.games))
 
-    game_channel = GameChannel(on_finished=save_finished_game)
-    # One game starts at a time. Making a model player reads a checkpoint off the disk, which
-    # the handler suspends for, and two starts that interleave there would finish in whichever
-    # order their players happened to be built: the game somebody asked for first could come
-    # back and replace the game that replaced it, and the viewer who started that second game
-    # would have been told it was theirs. Held for the whole of starting, so that the games
-    # start in the order they were asked for — and so that two checkpoints are never loaded
-    # at once on a machine that may also be training.
+    games = GameRegistry(on_finished=save_finished_game, max_ongoing=config.games.max_ongoing)
+    engines = EngineCache(
+        lambda key: _load_checkpoint(key, config),
+        capacity=config.games.max_loaded_checkpoints,
+        idle_after=config.games.checkpoint_idle_hours * 3600,
+        on_unload=_hand_back_device_memory,
+    )
+    # One game starts at a time. Making a model player can read a checkpoint off the disk,
+    # which the handler suspends for, and the limit on games in progress is counted before
+    # that: two starts interleaving there could both be let in under the limit.
     starting = asyncio.Lock()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        yield
-        await game_channel.close()
+        unloading = asyncio.create_task(_unload_idle_checkpoints(engines))
+        try:
+            yield
+        finally:
+            unloading.cancel()
+            await games.close()
+            engines.clear()
 
     app = FastAPI(
         title="chess-ai",
@@ -304,12 +367,13 @@ def create_app(
         return snapshot(chess.Board())
 
     @api.post(
-        "/game",
+        "/games",
         responses={
             400: {
                 "description": "The position cannot be played from, or a player cannot be "
                 "made: no such run, no such checkpoint, or a checkpoint that cannot be loaded"
             },
+            409: {"description": "As many games are in progress as the server holds"},
             500: {
                 "description": "A model was asked for and the inference device this server "
                 "is configured with is not there on this machine, or Stockfish was asked for "
@@ -318,18 +382,23 @@ def create_app(
             503: {"description": "The server is shutting down and is starting no more games"},
         },
     )
-    async def new_game(request: NewGameRequest) -> GameState:
-        """Start a new game, replacing the current one for every viewer.
+    async def new_game(request: NewGameRequest) -> NewGame:
+        """Start a new game, alongside any others, and return the links that reach it.
+
+        The game gets a watch link, a play link for each side a person plays, and, if nobody
+        plays either side, a control link that can abort it. The links are the only way to the
+        game: there is no list of games, and whoever holds a link can do what it allows.
 
         A game starts from the standard starting position unless a FEN says otherwise.
-        Anything that would stop the game being started is refused, and the current game
-        plays on: a FEN that cannot be played from, or a checkpoint that is not there. Not
-        every refusal is the asker's doing — a configured inference device that this machine
-        does not have, or a Stockfish that is not installed where the config says, is answered
-        as the server's own fault, and a server on its way down starts nothing at all.
+        Anything that would stop the game being started is refused: a FEN that cannot be
+        played from, a checkpoint that is not there, or as many games in progress as the server
+        holds. Not every refusal is the asker's doing — a configured inference device that this
+        machine does not have, or a Stockfish that is not installed where the config says, is
+        answered as the server's own fault, and a server on its way down starts nothing at all.
 
         Every Stockfish side is an engine process of its own, which is stopped when its game
-        ends, is replaced, or the server goes down, and at once if the game is refused.
+        ends or the server goes down, and at once if the game is refused. A checkpoint is
+        shared by every game playing it.
         """
         # The position is checked before the players are made, so that a mistyped FEN is
         # answered at once rather than after tens of megabytes of checkpoint have been read.
@@ -339,19 +408,71 @@ def create_app(
             except InvalidFenError as invalid:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, str(invalid)) from invalid
         async with starting:
-            white, black = await _players(request, config)
-            try:
-                session = GameSession(white, black, move_delay=request.move_delay, fen=request.fen)
-                game_channel.start(session)
-            except GameChannelClosedError as closed:
-                close_players(white, black)
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE, "the server is shutting down"
-                ) from closed
-            except BaseException:
-                close_players(white, black)
-                raise
-        return session.state
+            return await start(request)
+
+    async def start(request: NewGameRequest, follows: Seat | None = None) -> NewGame:
+        """Start the game ``request`` asks for, or say why it cannot be started.
+
+        Called holding ``starting``.
+        """
+        # Counted before the players are made as well as when the game starts, so that a
+        # full server does not start an engine or load a checkpoint only to refuse.
+        try:
+            games.check_room()
+        except TooManyGamesError as full:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(full)) from full
+        white, black = await _players(request, config, engines)
+        try:
+            session = GameSession(white, black, move_delay=request.move_delay, fen=request.fen)
+            links = games.start(session, settings=request, follows=follows)
+        except GamesClosedError as closed:
+            close_players(white, black)
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "the server is shutting down"
+            ) from closed
+        except TooManyGamesError as full:
+            close_players(white, black)
+            raise HTTPException(status.HTTP_409_CONFLICT, str(full)) from full
+        except BaseException:
+            close_players(white, black)
+            raise
+        return NewGame(game=session.state, links=links)
+
+    @api.post(
+        "/games/{link}/rematch",
+        responses={
+            400: {"description": "A player cannot be made again, such as a run that is gone"},
+            403: {"description": "The link only watches the game"},
+            404: {"description": "No game has this link"},
+            409: {"description": "As many games are in progress as the server holds"},
+            500: {"description": "As for starting a game"},
+            503: {"description": "The server is shutting down and is starting no more games"},
+        },
+    )
+    async def rematch(link: str) -> NewGame:
+        """Start a new game with the settings the game ``link`` reaches was started with.
+
+        The players are asked for as they were the first time: a checkpoint chosen as "latest"
+        or "best" is chosen again, and may be a newer one now. The new game has links of its
+        own. A watch link cannot start one: it is for following a game, not for playing.
+
+        Once one has been started from this game, asking again joins it for as long as it is
+        being played, rather than starting another: two people who both ask to play again want
+        one game between them. Joining hands over only the asker's own link and the watch link.
+        """
+        seat = _seat(link)
+        if seat.access == "watch":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "a watch link cannot start a game from this one"
+            )
+        settings = seat.settings
+        assert isinstance(settings, NewGameRequest), "every game here is started from one"
+        # Under the lock, so that two people asking at once get one game, not one each.
+        async with starting:
+            joined = seat.next_game()
+            if joined is not None:
+                return NewGame(game=joined.state, links=joined.own_links)
+            return await start(settings, follows=seat)
 
     @api.get(
         "/stockfish",
@@ -469,26 +590,33 @@ def create_app(
         except RunError as missing:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
 
+    def _seat(link: str) -> Seat:
+        try:
+            return games.seat(link)
+        except NoSuchGameError as missing:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, str(missing), headers=NO_STORE
+            ) from missing
+
+    @api.get("/games/{link}", responses={404: {"description": "No game has this link"}})
+    async def game(link: str, response: Response) -> SeatView:
+        """A game as ``link`` sees it: its state, and what the link may do in it.
+
+        Read on the event loop, as the PGN below is, because that is where moves are made.
+        """
+        response.headers.update(NO_STORE)
+        return _seat_view(_seat(link))
+
     @api.get(
-        "/game/pgn",
+        "/games/{link}/pgn",
         response_class=Response,
         responses={
             200: {"content": {PGN_MEDIA_TYPE: {}}, "description": "The game as a PGN file"},
-            404: {"description": "No game has been started yet"},
-            409: {"description": "The game asked for has been replaced by another"},
+            404: {"description": "No game has this link"},
         },
     )
-    async def game_pgn_file(
-        game: Annotated[
-            str | None,
-            Query(
-                description="The id of the game to download, as its state gives it. A game "
-                "that has been replaced since is refused rather than quietly swapped for "
-                "its replacement. Left out, whatever game is on show is served."
-            ),
-        ] = None,
-    ) -> Response:
-        """Download a game as PGN, whether it has finished or not.
+    async def game_pgn_file(link: str) -> Response:
+        """Download a game as PGN, whether it has finished or not, through any of its links.
 
         A game in progress is described as far as it has been played, with the result "*"
         that PGN gives a game that has not ended.
@@ -496,15 +624,7 @@ def create_app(
         # Read here on the event loop, which a plain `def` would not be: FastAPI runs
         # those in a worker thread, and a game read there while a move is being made can
         # come out claiming a checkmate that is not among its moves.
-        current = game_channel.current_game
-        if current is None:
-            raise HTTPException(
-                status.HTTP_404_NOT_FOUND, "no game has been started", headers=NO_STORE
-            )
-        if game is not None and game != current.id:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, "that game has been replaced", headers=NO_STORE
-            )
+        current = _seat(link).state
         # One moment dates the file and names it, so that the two cannot disagree.
         now = datetime.now()
         return Response(
@@ -576,16 +696,28 @@ def create_app(
         # file that is not UTF-8 is two passes over every byte of it.
         return await run_in_threadpool(_replayed, pgn, game)
 
-    @api.websocket("/game/ws")
-    async def follow_game(websocket: WebSocket) -> None:
-        """Send the current game's full state and every event after it, and act on replies."""
+    @api.websocket("/games/{link}/ws")
+    async def follow_game(websocket: WebSocket, link: str) -> None:
+        """Send the game's full state as ``link`` sees it and every event after it, and do what
+        the viewer asks, as far as the link allows.
+
+        A link that reaches no game is answered with an ``error`` event, and the connection is
+        closed. So is the connection to a game that stops: one that has ended has nothing more
+        to send, and one that was aborted is gone.
+        """
         await websocket.accept()
         connection = _Connection(websocket)
-        # Either side can end the connection: the viewer goes away, or the channel
-        # closes and has nothing left to send.
+        try:
+            seat = games.seat(link)
+        except NoSuchGameError as missing:
+            await connection.send(ErrorEvent(message=str(missing)))
+            await connection.close(status.WS_1008_POLICY_VIOLATION)
+            return
+        # Either side can end the connection: the viewer goes away, or the game stops and
+        # has nothing left to send.
         async with asyncio.TaskGroup() as tasks:
-            sending = tasks.create_task(_send_game_events(connection, game_channel))
-            receiving = tasks.create_task(_act_on_viewer_messages(connection, game_channel))
+            sending = tasks.create_task(_send_game_events(connection, seat))
+            receiving = tasks.create_task(_act_on_viewer_messages(connection, seat))
             await asyncio.wait({sending, receiving}, return_when=asyncio.FIRST_COMPLETED)
             sending.cancel()
             receiving.cancel()
@@ -618,7 +750,7 @@ def create_app(
 
     # A WebSocket route matches only an upgrade, so a plain request on its path would fall
     # through to a 404 that reads as the API missing from under the prefix.
-    for websocket_path in ("/game/ws", "/runs/{name}/ws"):
+    for websocket_path in ("/games/{link}/ws", "/runs/{name}/ws"):
         api.add_api_route(
             websocket_path, _upgrade_required, methods=["GET"], include_in_schema=False
         )
@@ -649,7 +781,9 @@ def create_app(
     return app
 
 
-async def _players(request: NewGameRequest, config: Config) -> tuple[Player, Player]:
+async def _players(
+    request: NewGameRequest, config: Config, engines: EngineCache
+) -> tuple[Player, Player]:
     """Both sides of a new game, made from what was asked for.
 
     Whatever the first side holds is let go of again if the second cannot be made, so that a
@@ -664,11 +798,6 @@ async def _players(request: NewGameRequest, config: Config) -> tuple[Player, Pla
             picked; :func:`_model_player` answers that as the server's own fault. A Stockfish
             that is not there, or is not Stockfish, is the same kind of fault.
     """
-    # One engine per checkpoint rather than per player: a checkpoint playing itself at two
-    # ratings, or its best move against its own sampling, is one set of weights and two ways
-    # of choosing from them. Everything a player was asked for — the rating, the strategy,
-    # its generator — lives in the player, so the engine has nothing of either side in it.
-    engines: dict[tuple[str, int], Any] = {}
     white = await _player(request.white, config, engines)
     try:
         black = await _player(request.black, config, engines)
@@ -678,7 +807,7 @@ async def _players(request: NewGameRequest, config: Config) -> tuple[Player, Pla
     return white, black
 
 
-async def _player(spec: AnyPlayer, config: Config, engines: dict[tuple[str, int], Any]) -> Player:
+async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Player:
     match spec:
         case HumanSpec():
             return HumanPlayer()
@@ -709,44 +838,115 @@ async def _player(spec: AnyPlayer, config: Config, engines: dict[tuple[str, int]
             assert_never(spec)
 
 
-def _model_player(spec: ModelSpec, config: Config, engines: dict[tuple[str, int], Any]) -> Player:
+def _model_player(spec: ModelSpec, config: Config, engines: EngineCache) -> Player:
     """A checkpoint, loaded and sat down at the board.
 
-    The inference package is imported here rather than at the top of this module, because it
-    is what brings in torch: a server that is replaying games and playing people against the
-    random mover has no use for it, and starting up is a second or two quicker without it.
+    The checkpoint is borrowed from ``engines``, which every game shares: a checkpoint playing
+    in several games, or playing itself at two ratings, is one set of weights and several ways
+    of choosing from them. Everything a player was asked for — the rating, the strategy, its
+    generator — lives in the player, so the engine has nothing of any game in it.
 
-    ``engines`` is what the two sides of one game share, keyed by the checkpoint they came
-    from; see :func:`_players`.
+    It is loaded here, if it is not loaded already, so that a checkpoint that cannot be played
+    is refused when the game is asked for rather than on its first move.
     """
-    from chess_ai.inference import DeviceUnavailableError, InferenceError, ModelPlayer, load_engine
+    from chess_ai.inference import DeviceUnavailableError, InferenceError, ModelPlayer
 
     run = open_run(config.paths.runs, spec.run)
     chosen = choose_checkpoint(run, spec.checkpoint)
-    engine = engines.get((run.name, chosen.step))
-    if engine is None:
-        try:
-            engine = load_engine(
-                run.checkpoint_path(chosen),
-                device=config.inference.device,
-                batch_size=config.inference.batch_size,
-            )
-        except DeviceUnavailableError as misconfigured:
-            # Nobody who clicked Start chose the device; the machine this server runs on did.
-            raise HTTPException(
-                status.HTTP_500_INTERNAL_SERVER_ERROR, str(misconfigured)
-            ) from misconfigured
-        except InferenceError as unusable:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(unusable)) from unusable
-        engines[(run.name, chosen.step)] = engine
+    key = CheckpointKey(run.name, chosen.step, _fingerprint(run.checkpoint_path(chosen)))
+    try:
+        engines.preload(key)
+    except DeviceUnavailableError as misconfigured:
+        # Nobody who clicked Start chose the device; the machine this server runs on did.
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, str(misconfigured)
+        ) from misconfigured
+    except InferenceError as unusable:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(unusable)) from unusable
     return ModelPlayer(
-        engine,
+        engines.engine(key),
         run=run.name,
         checkpoint=chosen.step,
         rating=spec.rating,
         strategy=spec.strategy,
         temperature=spec.temperature,
         seed=spec.seed,
+    )
+
+
+def _load_checkpoint(key: CheckpointKey, config: Config) -> Any:
+    """Read checkpoint ``key`` off the disk and build an engine that plays with it.
+
+    The file has to be the one ``key`` was taken from, before the read and after it: a game
+    that began with one set of weights is not to go on with another under the same name.
+
+    The inference package is imported here rather than at the top of this module, because it
+    is what brings in torch: a server that is replaying games and playing people against the
+    random mover has no use for it, and starting up is a second or two quicker without it.
+
+    Raises:
+        RunError: the run, or the checkpoint, is not there (any more), or has been replaced.
+        InferenceError: the checkpoint cannot be played with, or the device is not there.
+    """
+    from chess_ai.inference import load_engine
+
+    run = open_run(config.paths.runs, key.run)
+    path = run.checkpoint_path(choose_checkpoint(run, key.step))
+    _check_unchanged(path, key)
+    engine = load_engine(
+        path, device=config.inference.device, batch_size=config.inference.batch_size
+    )
+    _check_unchanged(path, key)
+    return engine
+
+
+def _fingerprint(path: Path) -> tuple[int, ...]:
+    """What tells this checkpoint file from another written in its place.
+
+    Raises:
+        RunError: the file is not there.
+    """
+    try:
+        found = path.stat()
+    except OSError as missing:
+        raise RunError(f"cannot read the checkpoint {path}: {missing.strerror}") from missing
+    return (found.st_ino, found.st_size, found.st_mtime_ns)
+
+
+def _check_unchanged(path: Path, key: CheckpointKey) -> None:
+    if _fingerprint(path) != key.fingerprint:
+        raise RunError(
+            f"{key.run} step {key.step} has been replaced since the game began with it, "
+            "so the game cannot go on with it"
+        )
+
+
+def _hand_back_device_memory() -> None:
+    """Give a GPU's memory back once a checkpoint on it has been let go of.
+
+    PyTorch keeps the memory of freed tensors for itself, to hand out again, and a training run
+    on the same card cannot have it until it is given back. Nothing to do if torch was never
+    imported, or never touched a GPU.
+    """
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
+async def _unload_idle_checkpoints(engines: EngineCache) -> None:
+    """Look over the loaded checkpoints now and then, letting go of those nobody plays."""
+    while True:
+        await asyncio.sleep(IDLE_CHECKPOINT_POLL_SECONDS)
+        await run_in_threadpool(engines.unload_idle)
+
+
+def _seat_view(seat: Seat, game: GameState | None = None) -> SeatView:
+    """``seat``'s game as its link sees it, with ``game`` as its state if that is given."""
+    return SeatView(
+        game=game if game is not None else seat.state,
+        access=seat.access,
+        watch=seat.watch,
+        updated=seat.updated,
     )
 
 
@@ -832,11 +1032,11 @@ class _Connection:
                 await self._websocket.close(code)
 
 
-async def _act_on_viewer_messages(connection: _Connection, game_channel: GameChannel) -> None:
+async def _act_on_viewer_messages(connection: _Connection, seat: Seat) -> None:
     """Do what the viewer asks of the game, until the viewer goes away.
 
-    Anything the game will not do is reported to the viewer who asked and to nobody
-    else, and the game goes on.
+    Anything the game will not do, or the link may not, is reported to the viewer who asked
+    and to nobody else, and the game goes on.
     """
     try:
         while (message := await connection.receive())["type"] != "websocket.disconnect":
@@ -846,34 +1046,48 @@ async def _act_on_viewer_messages(connection: _Connection, game_channel: GameCha
                 await connection.send(ErrorEvent(message="the server cannot read that message"))
                 continue
             try:
-                _act(game_channel, asked)
+                _act(seat, asked)
             except (ActionRejectedError, MoveRejectedError) as rejected:
                 await connection.send(ErrorEvent(message=str(rejected)))
     except WebSocketDisconnect:
         pass  # The viewer has already gone.
 
 
-def _act(game_channel: GameChannel, asked: ViewerMessage) -> None:
+def _act(seat: Seat, asked: ViewerMessage) -> None:
     match asked:
         case SubmitMove():
-            game_channel.submit_move(asked.game, asked.uci)
+            seat.submit_move(asked.uci)
         case Resign():
-            game_channel.resign(asked.game, asked.color)
+            seat.resign()
         case Abort():
-            game_channel.abort(asked.game)
+            seat.abort()
         case TakeBack():
-            game_channel.take_back(asked.game)
+            seat.take_back()
+        case Answer():
+            seat.answer(asked.request, accept=asked.accept)
 
 
-async def _send_game_events(connection: _Connection, game_channel: GameChannel) -> None:
-    """Send the game channel's events until it closes, then let the viewer go."""
+async def _send_game_events(connection: _Connection, seat: Seat) -> None:
+    """Send the game's events until it stops, then let the viewer go.
+
+    The game's own first event, its full state, goes out as the link sees it.
+    """
     try:
-        async with aclosing(game_channel.events()) as events:
+        with seat.subscribe() as events:
             async for event in events:
-                await connection.send(event)
-        await connection.close(status.WS_1001_GOING_AWAY)
+                await connection.send(_as_seen(event, seat))
+        # Done for good once the game is over, which the browser need not ask about again.
+        # Otherwise the server is going down, and the game will be there when it is back.
+        over = seat.state.position.game_over is not None
+        await connection.close(status.WS_1000_NORMAL_CLOSURE if over else status.WS_1001_GOING_AWAY)
     except WebSocketDisconnect:
         pass  # The viewer has already gone.
+
+
+def _as_seen(event: GameEvent, seat: Seat) -> ViewerEvent:
+    if isinstance(event, GameStateEvent):
+        return _seat_view(seat, event.game)
+    return event
 
 
 async def _send_run_events(connection: _Connection, stream: RunStream, every: float) -> None:
@@ -907,6 +1121,15 @@ async def _until_disconnected(connection: _Connection) -> None:
 
 class _FrontendFiles(StaticFiles):
     """The built frontend, whose directory may only appear after the server has started."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # A WebSocket to a path no route has, such as one a browser still running an older
+        # frontend reconnects to, ends up here. Static files are HTTP only, and would fail
+        # it with a server error; it is refused instead, as a route that is not there.
+        if scope["type"] == "websocket":
+            await WebSocketClose(status.WS_1008_POLICY_VIOLATION)(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
 
     async def check_config(self) -> None:
         # StaticFiles raises on a missing directory. Until the frontend is built,

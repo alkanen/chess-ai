@@ -12,7 +12,7 @@ export class FakeWebSocket {
 
   onopen: (() => void) | null = null;
   onmessage: ((message: { data: string }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((closing: { code: number }) => void) | null = null;
   closed = false;
   readyState: number = FakeWebSocket.CONNECTING;
 
@@ -57,12 +57,15 @@ export class FakeWebSocket {
     act(() => this.onmessage?.({ data: JSON.stringify(event) }));
   }
 
-  /** The connection drops. */
-  disconnect() {
+  /**
+   * The connection drops, or the server closes it with `code`: 1000 once the game has ended,
+   * 1008 for a link that reaches no game.
+   */
+  disconnect(code = 1006) {
     if (!this.closed) {
       this.closed = true;
       this.readyState = FakeWebSocket.CLOSED;
-      act(() => this.onclose?.());
+      act(() => this.onclose?.({ code }));
     }
   }
 }

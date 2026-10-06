@@ -105,7 +105,7 @@ describe('NewGameForm', () => {
     const posted = await start(fetch);
 
     const [url, init] = fetch.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(new URL('/chess/api/game', window.location.href).href);
+    expect(url).toBe(new URL('/chess/api/games', window.location.href).href);
     expect(init.method).toBe('POST');
     expect(posted).toEqual({ white: HUMAN, black: RANDOM, move_delay: 2, fen: null });
     expect(await screen.findByRole('button', { name: 'Start' })).toBeEnabled();

@@ -4,6 +4,7 @@ import {
   fetchStockfish,
   isArchived,
   startGame,
+  type NewGame,
   type RunSummary,
   type StockfishInfo,
 } from './api';
@@ -86,8 +87,13 @@ function useStockfish(wanted: boolean): [StockfishInfo | null, string | null] {
   return useAskedOnce(wanted, fetchStockfish);
 }
 
-/** Starts a new game on the server, replacing the current one for every viewer. */
-export function NewGameForm() {
+interface NewGameFormProps {
+  /** Told of the game once the server has started it, with every link to it. */
+  onStarted?: (started: NewGame) => void;
+}
+
+/** Starts a new game on the server, alongside any others. */
+export function NewGameForm({ onStarted }: NewGameFormProps) {
   const [white, setWhite] = useState<PlayerChoice>({ ...NO_MODEL, kind: 'human' });
   const [black, setBlack] = useState<PlayerChoice>({ ...NO_MODEL, kind: 'random' });
   const [moveDelay, setMoveDelay] = useState(DEFAULT_MOVE_DELAY);
@@ -116,13 +122,14 @@ export function NewGameForm() {
     setStarting(true);
     setError(null);
     try {
-      await startGame({
+      const started = await startGame({
         white: playerSpec(sides.white),
         black: playerSpec(sides.black),
         move_delay: moveDelay,
         // An empty box is not a position: that game starts where games start.
         fen: fen.trim() || null,
       });
+      onStarted?.(started);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

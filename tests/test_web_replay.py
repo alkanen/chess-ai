@@ -315,19 +315,19 @@ def test_no_name_opens_a_file_outside_the_games_directory(chess_client, games, t
 
 def test_a_game_played_here_is_listed_and_replayed_move_for_move(tmp_path, games):
     """The one journey that matters: play a game, then open it again in the viewer."""
-    with (
-        serve(tmp_path, games) as playing,
-        playing.websocket_connect("/chess/api/game/ws") as websocket,
-    ):
-        assert websocket.receive_json()["type"] == "no_game"
-        playing.post(
-            "/chess/api/game",
+    with serve(tmp_path, games) as playing:
+        started = playing.post(
+            "/chess/api/games",
             json={"white": {"kind": "random"}, "black": {"kind": "random"}, "move_delay": 0},
         )
-        # Played out to its result, which is the point at which a game is saved. A game
-        # that ends on the board ends with the move that ended it, and sends no more.
-        while websocket.receive_json().get("position", {}).get("game_over") is None:
-            pass
+        watch = started.json()["links"]["watch"]
+        with playing.websocket_connect(f"/chess/api/games/{watch}/ws") as websocket:
+            # Played out to its result, which is the point at which a game is saved. A game
+            # that ends on the board ends with the move that ended it, and sends no more.
+            event = websocket.receive_json()
+            position = event["game"]["position"]
+            while position["game_over"] is None:
+                position = websocket.receive_json()["position"]
 
     client = serve(tmp_path, games)
     [saved] = client.get("/chess/api/replay/saved").json()

@@ -1,41 +1,36 @@
-import { useState } from 'react';
-import type { GameState, PlayerInfo, PositionSnapshot } from './api';
+import { useEffect, useState } from 'react';
+import { type Access, type PlayerInfo, type PositionSnapshot, rematch } from './api';
 import { Board } from './board/Board';
 import type { Orientation } from './board/geometry';
 import { GameControls } from './GameControls';
+import { GameLinks } from './GameLinks';
 import { GameStatus } from './GameStatus';
 import { MoveList } from './MoveList';
-import { NewGameForm } from './NewGameForm';
+import { forgetGame, goToNewGame, rememberGame } from './myGames';
+import { RequestPanel } from './RequestPanel';
 import { useGameChannel } from './useGameChannel';
 import './App.css';
 
-/** Whether the side to move is played from this browser, so its moves can be made here. */
-function yourTurn(game: GameState | null, position: PositionSnapshot): boolean {
-  if (game === null || position.game_over !== null) {
-    return false;
-  }
-  return (position.turn === 'white' ? game.white : game.black).accepts_moves;
+/** Whether the side to move is the one this link plays, so its moves can be made here. */
+function yourTurn(access: Access | null, position: PositionSnapshot): boolean {
+  return position.game_over === null && access === position.turn;
 }
 
 /**
- * The side of the board a viewer belongs on: the one they play, if the game gives them
- * exactly one. Watching, or playing both sides, leaves them behind White as usual.
+ * The side of the board a viewer belongs on: the one their link plays. Watching leaves them
+ * behind White as usual.
  */
-function playersSide(game: GameState | null): Orientation {
-  if (game !== null && game.black.accepts_moves && !game.white.accepts_moves) {
-    return 'black';
-  }
-  return 'white';
+function playersSide(access: Access | null): Orientation {
+  return access === 'black' ? 'black' : 'white';
 }
 
 /**
  * Which side is at the bottom of the board, and the flip that turns it round.
  *
- * The board faces the side you are given to play, and stays wherever you last put it
- * until a game hands you the other colour.
+ * The board faces the side you are given to play, and stays wherever you last put it.
  */
-function useOrientation(game: GameState | null): [Orientation, () => void] {
-  const facing = playersSide(game);
+function useOrientation(access: Access | null): [Orientation, () => void] {
+  const facing = playersSide(access);
   const [orientation, setOrientation] = useState<Orientation>(facing);
   const [shown, setShown] = useState<Orientation>(facing);
   if (shown !== facing) {
@@ -95,55 +90,103 @@ function Player({ player }: { player: PlayerInfo }) {
   );
 }
 
-/** The game the server is playing: the board it is played on, and what is asked of it. */
-export function GameView() {
-  const { view, connected, error, movePending, submitMove, resign, abort, takeBack } =
-    useGameChannel();
-  const [orientation, flip] = useOrientation(view?.game ?? null);
+interface GameViewProps {
+  /** The link the game is reached through, which says what this viewer may do in it. */
+  link: string;
+}
 
-  // A game that has ended is still there to look at, but there is nothing left to end.
-  const unfinished = view?.position.game_over === null ? view.game : null;
+/** One game, as a link reaches it: the board it is played on, and what is asked of it. */
+export function GameView({ link }: GameViewProps) {
+  const {
+    view,
+    connected,
+    missing,
+    error,
+    movePending,
+    submitMove,
+    resign,
+    abort,
+    takeBack,
+    answer,
+  } = useGameChannel(link);
+  const access = view?.access ?? null;
+  const [orientation, flip] = useOrientation(access);
 
+  // Kept in this browser's list of games once the server has said what the link is, so that
+  // the game can be found again from the Game tab; and dropped once it is gone.
+  useEffect(() => {
+    if (access !== null) {
+      rememberGame({ link, access });
+    }
+  }, [link, access]);
+  useEffect(() => {
+    if (missing !== null) {
+      forgetGame(link);
+    }
+  }, [link, missing]);
+
+  if (missing !== null) {
+    return (
+      <div className="no-such-game">
+        <p role="alert">{missing}</p>
+        <p>
+          <a href="#">Start a new game</a>
+        </p>
+      </div>
+    );
+  }
   if (view === null) {
     return <p>Connecting to the server…</p>;
   }
+  const { game } = view;
+  const aborted = view.position.game_over?.reason === 'abort';
   return (
     <>
-      <GameStatus position={view.position} inGame={view.game !== null} />
+      <GameStatus position={view.position} inGame />
       <div className="game-view">
         <div className="board-frame">
           <Board
             snapshot={view.position}
             orientation={orientation}
-            interactive={connected && !movePending && yourTurn(view.game, view.position)}
+            interactive={connected && !movePending && yourTurn(access, view.position)}
             onMove={submitMove}
           />
         </div>
         <aside className="side-panel">
-          {!connected && <p role="alert">Lost the connection to the server. Reconnecting…</p>}
+          {!connected && view.position.game_over === null && (
+            <p role="alert">Lost the connection to the server. Reconnecting…</p>
+          )}
           {connected && error !== null && <p role="alert">{error}</p>}
-          {view.game !== null && (
-            <dl className="players">
-              <dt>White</dt>
-              <Player player={view.game.white} />
-              <dt>Black</dt>
-              <Player player={view.game.black} />
-            </dl>
+          {aborted && <p className="note">The game has been deleted, and nothing of it kept.</p>}
+          {access === 'watch' && <p className="note">You are watching this game.</p>}
+          <dl className="players">
+            <dt>White</dt>
+            <Player player={game.white} />
+            <dt>Black</dt>
+            <Player player={game.black} />
+          </dl>
+          {game.request !== null && view.position.game_over === null && (
+            <RequestPanel
+              request={game.request}
+              access={view.access}
+              disabled={!connected}
+              onAnswer={answer}
+            />
           )}
           <GameControls
             orientation={orientation}
             onFlip={flip}
-            pgnGame={view.game?.id ?? null}
-            game={unfinished}
+            link={link}
+            game={game}
+            access={view.access}
             disabled={!connected}
             onResign={resign}
             onAbort={abort}
             onTakeBack={takeBack}
+            onPlayAgain={async () => goToNewGame(await rematch(link), view.access)}
           />
-          {view.game !== null && (
-            <MoveList moves={view.game.moves} startFen={view.game.start_fen} />
-          )}
-          <NewGameForm />
+          <MoveList moves={game.moves} startFen={game.start_fen} />
+          {!aborted && <GameLinks link={link} access={view.access} watch={view.watch} />}
         </aside>
       </div>
     </>

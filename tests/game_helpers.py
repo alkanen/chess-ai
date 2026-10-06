@@ -134,6 +134,11 @@ def replay(events: Sequence[GameEvent]) -> GameState:
     assert first.type == "state"
     game = first.game.model_copy(deep=True)
     for index, event in enumerate(rest):
+        if event.type == "request":
+            game.request = event.request
+            continue
+        # Whatever happens next in the game is an answer to any request made before it.
+        game.request = None
         if event.type == "game_over":
             # Nothing happens in a game after it has been resigned or aborted.
             assert index == len(rest) - 1

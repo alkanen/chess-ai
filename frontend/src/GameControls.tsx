@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { type Color, fetchPgn, type GameState, type PgnFile, PGN_MEDIA_TYPE, pgnUrl } from './api';
+import { type Access, fetchPgn, type GameState, type PgnFile, PGN_MEDIA_TYPE, pgnUrl } from './api';
 import type { Orientation } from './board/geometry';
 import './GameControls.css';
 
@@ -20,56 +20,104 @@ function save({ name, text }: PgnFile): void {
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-/** The sides a viewer may resign: the ones whose moves this browser plays. */
-function resignable(game: GameState | null): Color[] {
-  if (game === null) {
-    return [];
-  }
-  const sides: Color[] = [];
-  if (game.white.accepts_moves) sides.push('white');
-  if (game.black.accepts_moves) sides.push('black');
-  return sides;
+/** Whether both sides are people, between whom a takeback or an abort is asked for. */
+export function betweenTwoPeople(game: GameState): boolean {
+  return game.white.accepts_moves && game.black.accepts_moves;
+}
+
+/** Whether aborting takes the other person's say: two people who have both moved. */
+function abortIsAsked(game: GameState): boolean {
+  return betweenTwoPeople(game) && game.moves.length >= 2;
 }
 
 interface GameControlsProps {
   /** Which side is at the bottom of the board. */
   orientation: Orientation;
   onFlip: () => void;
-  /** The id of the game to download as PGN, or null when there is no game to download. */
-  pgnGame: string | null;
-  /** The game that can still be ended, or null when there is none to act on. */
-  game: GameState | null;
+  /** The link the game is downloaded as PGN through. */
+  link: string;
+  /** The game, which says what there is left to do in it. */
+  game: GameState;
+  /** What this viewer's link may do in the game. */
+  access: Access;
   /** Whether the server is out of reach, so nothing can be asked of the game. */
   disabled: boolean;
-  onResign: (color: Color) => void;
+  onResign: () => void;
   onAbort: () => void;
   onTakeBack: () => void;
+  /** Starts a new game with this one's settings, once this one has ended. */
+  onPlayAgain: () => Promise<void>;
 }
 
 /**
  * Turning the board round and downloading the game, which are this browser's business
- * alone, and what changes the game itself, which is everyone's: a takeback, a
- * resignation and an abort all reach every viewer.
+ * alone, and what changes the game itself, which only a play link may: a takeback, a
+ * resignation and an abort. Between two people, a takeback and an abort once both have
+ * moved are asked of the other, who answers them.
+ *
+ * Resigning and aborting are asked about first, since a game may have taken days, and a
+ * click is all it takes to end it.
  */
 export function GameControls({
   orientation,
   onFlip,
-  pgnGame,
+  link,
   game,
+  access,
   disabled,
   onResign,
   onAbort,
   onTakeBack,
+  onPlayAgain,
 }: GameControlsProps) {
-  const sides = resignable(game);
   const [exportFailed, setExportFailed] = useState<string | null>(null);
+  const [againFailed, setAgainFailed] = useState<string | null>(null);
+  const [startingAgain, setStartingAgain] = useState(false);
+  const playing = game.position.game_over === null;
+  const side = access === 'white' || access === 'black' ? access : null;
+  // Nothing more can be asked while something is waiting for an answer.
+  const waiting = game.request !== null;
+  const asking = betweenTwoPeople(game);
 
-  async function exportPgn(id: string) {
+  async function exportPgn() {
     setExportFailed(null);
     try {
-      save(await fetchPgn(id));
+      save(await fetchPgn(link));
     } catch (e: unknown) {
       setExportFailed(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function playAgain() {
+    setAgainFailed(null);
+    setStartingAgain(true);
+    try {
+      await onPlayAgain();
+    } catch (e: unknown) {
+      setAgainFailed(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStartingAgain(false);
+    }
+  }
+
+  // Whoever played the game can start it again; a watcher cannot, and an aborted game is
+  // gone, settings and all.
+  const canPlayAgain =
+    !playing && access !== 'watch' && game.position.game_over?.reason !== 'abort';
+
+  function resign() {
+    if (window.confirm('Resign this game? It ends at once, as a loss for you.')) {
+      onResign();
+    }
+  }
+
+  function abort() {
+    const question = abortIsAsked(game)
+      ? 'Ask your opponent to abort this game? If they agree, it is deleted, and nothing ' +
+        'of it is kept.'
+      : 'Abort this game? It is deleted at once, and nothing of it is kept.';
+    if (window.confirm(question)) {
+      onAbort();
     }
   }
 
@@ -80,44 +128,55 @@ export function GameControls({
       </button>
       {/* Downloading is a request of its own: a game that has ended is as downloadable
           as one in progress, and a dropped connection leaves the link alone. */}
-      {pgnGame !== null && (
-        <a
-          className="download"
-          href={pgnUrl(pgnGame)}
-          download
-          onClick={(event) => {
-            // A real link, which "save link as" still follows, but a plain click is
-            // answered here: the server can refuse a game that has been replaced, and
-            // a navigation has nowhere to show that.
-            event.preventDefault();
-            void exportPgn(pgnGame);
-          }}
-        >
-          Export PGN
-        </a>
-      )}
-      {/* Only a game somebody is playing has a move to give back to them. */}
-      {sides.length > 0 && (
+      <a
+        className="download"
+        href={pgnUrl(link)}
+        download
+        onClick={(event) => {
+          // A real link, which "save link as" still follows, but a plain click is
+          // answered here: the server can refuse a game that is gone, and a navigation
+          // has nowhere to show that.
+          event.preventDefault();
+          void exportPgn();
+        }}
+      >
+        Export PGN
+      </a>
+      {playing && side !== null && (
         <button
           type="button"
-          disabled={disabled || game === null || game.moves.length === 0}
+          disabled={disabled || waiting || game.moves.length === 0}
           onClick={onTakeBack}
         >
-          Take back
+          {asking ? 'Ask to take back' : 'Take back'}
         </button>
       )}
-      {sides.map((color) => (
-        <button key={color} type="button" disabled={disabled} onClick={() => onResign(color)}>
-          {/* One side to resign needs no saying which; two do. */}
-          {sides.length === 1 ? 'Resign' : `${color === 'white' ? 'White' : 'Black'} resigns`}
+      {playing && side !== null && (
+        <button type="button" disabled={disabled} onClick={resign}>
+          Resign
         </button>
-      ))}
-      {game !== null && (
-        <button type="button" disabled={disabled} onClick={onAbort}>
-          Abort
+      )}
+      {playing && (side !== null || access === 'control') && (
+        <button
+          type="button"
+          disabled={disabled || (waiting && abortIsAsked(game))}
+          onClick={abort}
+        >
+          {abortIsAsked(game) ? 'Ask to abort' : 'Abort'}
         </button>
+      )}
+      {canPlayAgain && (
+        <button type="button" disabled={startingAgain} onClick={() => void playAgain()}>
+          Play again
+        </button>
+      )}
+      {canPlayAgain && asking && (
+        <p className="note">
+          Play again joins the new game if your opponent has started one already.
+        </p>
       )}
       {exportFailed !== null && <p role="alert">Could not export the game: {exportFailed}</p>}
+      {againFailed !== null && <p role="alert">Could not start the game again: {againFailed}</p>}
     </div>
   );
 }

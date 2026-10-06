@@ -160,3 +160,24 @@ def test_where_stockfish_is_can_be_set_in_the_environment(tmp_path, monkeypatch)
     config = load_config(environ={"CHESS_AI_STOCKFISH_PATH": "~/engines/stockfish"})
 
     assert config.stockfish.path == str(tmp_path / "engines" / "stockfish")
+
+
+def test_the_server_holds_twenty_games_and_ten_checkpoints_by_default():
+    games = load_config(environ={}).games
+
+    assert (games.max_ongoing, games.max_loaded_checkpoints) == (20, 10)
+    assert games.checkpoint_idle_hours == 24
+
+
+def test_how_many_games_the_server_holds_can_be_set(tmp_path):
+    path = write(tmp_path / "custom.toml", "[games]\nmax_ongoing = 5\n")
+
+    games = load_config(path, environ={"CHESS_AI_GAMES_MAX_LOADED_CHECKPOINTS": "2"}).games
+
+    assert (games.max_ongoing, games.max_loaded_checkpoints) == (5, 2)
+
+
+def test_the_example_config_is_the_defaults():
+    example = Path(__file__).parents[1] / "chess-ai.example.toml"
+
+    assert load_config(example, environ={}) == load_config(environ={})

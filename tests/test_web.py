@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from chess_ai.config import Config, ServerConfig
 from chess_ai.web import create_app
@@ -117,7 +118,7 @@ def test_api_docs_under_prefix(chess_client):
 
 
 @pytest.mark.parametrize("prefix", ["/chess", ""])
-@pytest.mark.parametrize("path", ["/api/game/ws", "/api/runs/some-run/ws"])
+@pytest.mark.parametrize("path", ["/api/games/some-game/ws", "/api/runs/some-run/ws"])
 def test_a_websocket_path_asked_without_the_upgrade_says_what_is_missing(static_dir, prefix, path):
     """What a proxy that drops the upgrade headers passes on: not a 404, which reads as a
     routing mistake under the prefix, but 426 and the headers to forward."""
@@ -131,13 +132,15 @@ def test_a_websocket_path_asked_without_the_upgrade_says_what_is_missing(static_
     assert "README" in detail
 
 
-@pytest.mark.parametrize("path", ["/api/game/ws", "/api/runs/some-run/ws"])
+@pytest.mark.parametrize("path", ["/api/games/some-game/ws", "/api/runs/some-run/ws"])
 def test_a_websocket_path_still_upgrades(chess_client, path):
     with chess_client.websocket_connect(f"/chess{path}") as websocket:
-        assert websocket.receive_json()["type"] in {"no_game", "error"}
+        assert websocket.receive_json()["type"] == "error"
 
 
-@pytest.mark.parametrize("path", ["/api/game/wss", "/api/nothing-here", "/api/game/ws/more"])
+@pytest.mark.parametrize(
+    "path", ["/api/games/some-game/wss", "/api/nothing-here", "/api/games/some-game/ws/more"]
+)
 def test_an_unknown_api_path_is_still_not_found(chess_client, path):
     assert chess_client.get(f"/chess{path}").status_code == 404
 
@@ -187,3 +190,18 @@ def test_built_frontend_uses_relative_urls():
 
     assert urls
     assert all(url.startswith("./") for url in urls), urls
+
+
+@pytest.mark.parametrize("path", ["/api/game/ws", "/api/nothing-here/ws", "/no-such-page"])
+def test_a_websocket_to_a_path_that_is_not_one_is_refused_rather_than_failing(chess_client, path):
+    """A browser still running an older frontend reconnects to WebSocket paths that are gone.
+
+    Those fall through to the static files, which only serve HTTP: refused, not a server error.
+    """
+    with (
+        pytest.raises(WebSocketDisconnect) as refused,
+        chess_client.websocket_connect(f"/chess{path}"),
+    ):
+        pass
+
+    assert refused.value.code == 1008

@@ -197,7 +197,10 @@ async def test_illegal_move_is_rejected_without_changing_state(illegal):
     board = chess.Board()
     board.push_uci("e2e4")
     board.push_uci("e7e5")
-    assert state.position == snapshot(board)
+    # The board stands where it was, and the game is over: nobody can go on with it.
+    assert state.position.fen == snapshot(board).fen
+    assert state.position.game_over is not None
+    assert state.position.game_over.reason == "error"
     assert replay(received) == state
 
 
@@ -1023,3 +1026,263 @@ async def test_a_repetition_counts_the_positions_the_opening_passed_through():
     assert game_over is not None
     assert game_over.reason == "threefold_repetition"
     assert len(session.state.moves) <= 8
+
+
+async def two_people_after(session: GameSession, events, moves: str) -> None:
+    """Play ``moves`` between two people, waiting for each to reach the subscriber."""
+    assert (await anext(events)).type == "state"
+    for uci in moves.split():
+        await settled()
+        session.submit_move(uci)
+        assert (await anext(events)).type == "move"
+    await settled()
+
+
+async def test_between_two_people_a_takeback_is_asked_for_and_waits_for_an_answer():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4")
+        session.ask_to_take_back("white")
+        asked = await anext(events)
+
+    assert asked.type == "request"
+    assert asked.request is not None
+    assert (asked.request.kind, asked.request.by) == ("takeback", "white")
+    assert session.state.request == asked.request
+    assert [move.san for move in session.state.moves] == ["e4"]
+
+
+async def test_an_accepted_takeback_undoes_the_askers_move():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4")
+        session.ask_to_take_back("white")
+        assert (await anext(events)).type == "request"
+
+        session.answer("black", 1, accept=True)
+        taken_back = await anext(events)
+        await settled()
+        session.submit_move("d2d4")
+        assert (await anext(events)).type == "move"
+
+    assert taken_back.type == "takeback"
+    assert taken_back.ply == 0
+    assert session.state.request is None
+    assert [move.san for move in session.state.moves] == ["d4"]
+
+
+async def test_an_accepted_takeback_after_the_reply_undoes_the_reply_too():
+    """The asker's own move is what they want back, and the reply to it goes with it."""
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4 e7e5 g1f3")
+        session.ask_to_take_back("black")
+        assert (await anext(events)).type == "request"
+
+        session.answer("white", 1, accept=True)
+        taken_back = await anext(events)
+
+    assert taken_back.type == "takeback"
+    assert taken_back.ply == 1
+    assert taken_back.position.turn == "black"
+
+
+async def test_a_declined_request_leaves_the_game_as_it_was():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4 e7e5")
+        session.ask_to_abort("white")
+        assert (await anext(events)).type == "request"
+
+        session.answer("black", 1, accept=False)
+        declined = await anext(events)
+
+    assert declined.type == "request"
+    assert declined.request is None
+    assert session.state.request is None
+    assert session.state.position.game_over is None
+    assert len(session.state.moves) == 2
+
+
+async def test_an_accepted_abort_ends_the_game_with_no_result():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4 e7e5")
+        session.ask_to_abort("black")
+        assert (await anext(events)).type == "request"
+
+        session.answer("white", 1, accept=True)
+        ended = await anext(events)
+
+    assert ended.type == "game_over"
+    assert ended.position.game_over is not None
+    assert ended.position.game_over.reason == "abort"
+
+
+@pytest.mark.parametrize("moves", ["", "e2e4"])
+async def test_two_people_can_abort_on_their_own_until_both_have_moved(moves):
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, moves)
+        session.ask_to_abort("black")
+        ended = await anext(events)
+
+    assert ended.type == "game_over"
+    assert ended.position.game_over is not None
+    assert ended.position.game_over.reason == "abort"
+
+
+async def test_a_move_clears_the_request_it_was_made_before():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4")
+        session.ask_to_take_back("white")
+        assert (await anext(events)).type == "request"
+
+        # Black answers by playing on instead.
+        session.submit_move("e7e5")
+        assert (await anext(events)).type == "move"
+
+        with pytest.raises(ActionRejectedError, match="nothing is waiting for your answer"):
+            session.answer("black", 1, accept=True)
+
+    assert session.state.request is None
+
+
+async def test_nobody_answers_their_own_request():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4")
+        session.ask_to_take_back("white")
+        assert (await anext(events)).type == "request"
+
+        with pytest.raises(ActionRejectedError, match="nothing is waiting for your answer"):
+            session.answer("white", 1, accept=True)
+
+
+async def test_a_second_request_waits_for_the_first_to_be_answered():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4 e7e5")
+        session.ask_to_take_back("white")
+        assert (await anext(events)).type == "request"
+
+        with pytest.raises(ActionRejectedError, match="already waiting"):
+            session.ask_to_abort("black")
+
+
+async def test_a_side_with_no_move_of_its_own_has_nothing_to_ask_back():
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4")
+
+        with pytest.raises(ActionRejectedError, match="no move to take back"):
+            session.ask_to_take_back("black")
+
+
+async def test_against_a_player_that_moves_for_itself_nothing_needs_asking():
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5", "b8c6"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert [(await anext(events)).type for _ in range(2)] == ["move", "move"]
+
+        session.ask_to_take_back("white")
+        taken_back = await anext(events)
+        await settled()
+        session.ask_to_abort("white")
+        ended = await anext(events)
+
+    assert (taken_back.type, taken_back.ply) == ("takeback", 0)
+    assert ended.type == "game_over"
+
+
+async def test_a_side_played_by_a_program_cannot_ask_anything():
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        with pytest.raises(ActionRejectedError, match="not yours to take back"):
+            session.ask_to_take_back("black")
+        with pytest.raises(ActionRejectedError, match="not yours to abort"):
+            session.ask_to_abort("black")
+
+
+async def test_a_game_nobody_plays_by_hand_is_aborted_by_whoever_holds_it():
+    session = GameSession(ScriptedPlayer([]), ScriptedPlayer([]))
+
+    session.ask_to_abort(None)
+
+    assert session.state.position.game_over is not None
+    assert session.state.position.game_over.reason == "abort"
+
+
+async def test_the_game_says_when_it_last_changed():
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]))
+    began = session.updated
+
+    async with playing(session) as events:
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+
+    assert session.updated > began
+
+
+async def test_an_answer_meant_for_an_earlier_request_does_not_answer_a_later_one():
+    """A click on Agree that arrives late must not agree to what was asked after it."""
+    session = GameSession(HumanPlayer(), HumanPlayer())
+
+    async with playing(session) as events:
+        await two_people_after(session, events, "e2e4 e7e5")
+        session.ask_to_take_back("black")
+        first = await anext(events)
+        session.answer("white", first.request.id, accept=False)
+        assert (await anext(events)).request is None
+        session.ask_to_abort("black")
+        second = await anext(events)
+
+        with pytest.raises(ActionRejectedError, match="nothing is waiting for your answer"):
+            session.answer("white", first.request.id, accept=True)
+
+    assert first.request.id != second.request.id
+    assert session.state.request == second.request
+    assert session.state.position.game_over is None
+
+
+async def test_a_player_that_fails_ends_the_game_with_no_result_for_every_viewer():
+    """A game nobody can go on with is over, rather than waiting for ever on a move."""
+    broken = BrokenPlayer()
+    session = GameSession(HumanPlayer(), broken)
+
+    with session.subscribe() as events:
+        game = asyncio.create_task(session.play())
+        await asyncio.sleep(0)
+        assert (await anext(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await anext(events)).type == "move"
+
+        broken.fail()
+        with pytest.raises(PlayerBroke):
+            async with asyncio.timeout(2):
+                await game
+        ended = await collect(events)
+
+    assert [event.type for event in ended] == ["game_over"]
+    assert ended[0].position.game_over is not None
+    assert (ended[0].position.game_over.result, ended[0].position.game_over.reason) == (
+        "*",
+        "error",
+    )
+    assert [move.san for move in session.state.moves] == ["e4"]

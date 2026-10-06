@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import {
   gameChannelUrl,
-  type Color,
+  type Access,
   type GameEvent,
   type GameState,
   type PositionSnapshot,
@@ -10,10 +10,13 @@ import {
 
 /** What the game view shows. */
 export interface GameView {
-  /** The current game, or null before any game has been started. */
-  game: GameState | null;
-  /** The position on the board: the game's, or the starting position without a game. */
+  game: GameState;
+  /** The position on the board, which is the game's. */
   position: PositionSnapshot;
+  /** What the link this game was reached through may do in it. */
+  access: Access;
+  /** The game's watch link. */
+  watch: string;
 }
 
 interface ChannelState {
@@ -27,18 +30,28 @@ export interface GameChannel extends ChannelState {
   /** Whether the current connection has delivered the game, so the view is live. */
   connected: boolean;
   /**
+   * Why the link reaches no game, once the server has said it does not: it never did, or
+   * the game was aborted. Nothing is followed after that.
+   */
+  missing: string | null;
+  /**
    * Whether a submitted move is still waiting for the server's answer. The wait is
    * bounded, so the board never stays shut for longer than {@link ANSWER_TIMEOUT_MS}.
    */
   movePending: boolean;
-  /** Plays a move, in UCI, for the side to move. The server has the final say. */
+  /** Plays a move, in UCI, for the link's side. The server has the final say. */
   submitMove: (uci: string) => void;
-  /** Resigns the game for one side, ending it for every viewer. */
-  resign: (color: Color) => void;
-  /** Ends the game with no result, for every viewer. */
+  /** Resigns the game for the link's side, ending it for every viewer. */
+  resign: () => void;
+  /** Aborts the game, or asks the other person to agree to it. */
   abort: () => void;
-  /** Takes back the last move, or the last pair of moves, for every viewer. */
+  /** Takes back the side's last move, or asks the other person to agree to it. */
   takeBack: () => void;
+  /**
+   * Agrees to, or declines, what the other person asked, naming the request: an answer that
+   * arrives late must not agree to something asked after it.
+   */
+  answer: (request: number, accept: boolean) => void;
 }
 
 const MAX_RETRY_DELAY_MS = 10_000;
@@ -52,6 +65,14 @@ const ANSWER_TIMEOUT_MS = 5_000;
 
 const NO_ANSWER = 'The server has not answered. Your move may not have arrived.';
 
+/**
+ * How the server closes a connection it has nothing more to send on: the game has ended, or
+ * (with an error before it) the link reaches no game. Either is final, and reconnecting would
+ * only be told the same again. Any other close, such as the server restarting, is reconnected.
+ */
+const DONE = 1000;
+const NO_SUCH_GAME = 1008;
+
 const DISCONNECTED: ChannelState = { view: null, error: null };
 
 /** How long to wait before reconnecting after the given number of failed attempts. */
@@ -61,41 +82,69 @@ function retryDelayMs(failures: number): number {
 
 function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
   switch (event.type) {
-    case 'no_game':
-      return { view: { game: null, position: event.position }, error: null };
     case 'state':
-      return { view: { game: event.game, position: event.game.position }, error: null };
+      return {
+        view: {
+          game: event.game,
+          position: event.game.position,
+          access: event.access,
+          watch: event.watch,
+        },
+        error: null,
+      };
     case 'move': {
-      if (state.view?.game == null) {
+      if (state.view === null) {
         return { ...state, error: null };
       }
       const game = {
         ...state.view.game,
         moves: [...state.view.game.moves, event.move],
         position: event.position,
+        // A request was about the position before the move.
+        request: null,
       };
-      return { view: { game, position: game.position }, error: null };
+      return {
+        view: { ...state.view, game, position: game.position },
+        error: null,
+      };
     }
     case 'takeback': {
       // The moves after the takeback never happened, and the position is the one the
       // game stood in before them.
-      if (state.view?.game == null) {
+      if (state.view === null) {
         return { ...state, error: null };
       }
       const game = {
         ...state.view.game,
         moves: state.view.game.moves.slice(0, event.ply),
         position: event.position,
+        request: null,
       };
-      return { view: { game, position: event.position }, error: null };
+      return {
+        view: { ...state.view, game, position: event.position },
+        error: null,
+      };
+    }
+    case 'request': {
+      if (state.view === null) {
+        return state;
+      }
+      const game = { ...state.view.game, request: event.request };
+      return { view: { ...state.view, game }, error: null };
     }
     case 'game_over': {
       if (state.view === null) {
         return { ...state, error: null };
       }
-      const game =
-        state.view.game === null ? null : { ...state.view.game, position: event.position };
-      return { view: { game, position: event.position }, error: null };
+      const game = {
+        ...state.view.game,
+        position: event.position,
+        request: null,
+      };
+      return {
+        view: { ...state.view, game, position: event.position },
+        error: null,
+      };
     }
     case 'error':
       return { ...state, error: event.message };
@@ -103,16 +152,14 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
 }
 
 /**
- * Follows the server's current game over a WebSocket, reconnecting when the connection
- * drops. The server sends the full state on every connection, so nothing is lost, and
- * it is the only judge of the moves submitted through it.
+ * Follows the game a link reaches over a WebSocket, reconnecting when the connection drops.
+ * The server sends the full state on every connection, so nothing is lost, and it is the
+ * only judge of what is asked through it.
  */
-export function useGameChannel(): GameChannel {
+export function useGameChannel(link: string): GameChannel {
   const [{ view, error }, dispatch] = useReducer(applyEvent, DISCONNECTED);
-  // Everything a viewer asks names the game they are looking at, so that a new game
-  // starting in the meantime takes none of it.
-  const game = view?.game?.id ?? null;
   const [connected, setConnected] = useState(false);
+  const [missing, setMissing] = useState<string | null>(null);
   const [movePending, setMovePending] = useState(false);
   const socket = useRef<WebSocket | null>(null);
   const answer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -127,27 +174,38 @@ export function useGameChannel(): GameChannel {
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let failures = 0;
     let stopped = false;
+    // What the server said last, which is why it is closing if it is.
+    let lastError: string | null = null;
 
     function connect() {
-      const opened = new WebSocket(gameChannelUrl());
+      const opened = new WebSocket(gameChannelUrl(link));
       socket.current = opened;
       opened.onmessage = (message: MessageEvent<string>) => {
-        // The server starts every connection with the game's state, so a message (rather
-        // than the socket opening) shows that a connection works.
-        failures = 0;
-        setConnected(true);
+        const event = JSON.parse(message.data) as GameEvent;
+        lastError = event.type === 'error' ? event.message : null;
+        // The server starts every connection with the game's state, so a state (rather
+        // than the socket opening, or an error) shows that a connection works.
+        if (event.type === 'state') {
+          failures = 0;
+          setConnected(true);
+        }
         // Whatever the server has to say, it has answered any move we submitted.
         stopWaiting();
-        dispatch(JSON.parse(message.data) as GameEvent);
+        dispatch(event);
       };
-      opened.onclose = () => {
+      opened.onclose = (closing?: CloseEvent) => {
         setConnected(false);
         // Nothing can arrive on this socket now, least of all an answer.
         stopWaiting();
-        if (!stopped) {
-          retryTimer = setTimeout(connect, retryDelayMs(failures));
-          failures += 1;
+        if (closing?.code === NO_SUCH_GAME) {
+          setMissing(lastError ?? 'There is no such game.');
+          return;
         }
+        if (closing?.code === DONE || stopped) {
+          return;
+        }
+        retryTimer = setTimeout(connect, retryDelayMs(failures));
+        failures += 1;
       };
     }
 
@@ -159,7 +217,7 @@ export function useGameChannel(): GameChannel {
       socket.current?.close();
       socket.current = null;
     };
-  }, [stopWaiting]);
+  }, [link, stopWaiting]);
 
   /** Sends a message, and says whether the connection was there to take it. */
   const send = useCallback((message: ViewerMessage): boolean => {
@@ -175,7 +233,7 @@ export function useGameChannel(): GameChannel {
 
   const submitMove = useCallback(
     (uci: string) => {
-      if (game === null || !send({ game, type: 'move', uci })) {
+      if (!send({ type: 'move', uci })) {
         return;
       }
       setMovePending(true);
@@ -185,32 +243,29 @@ export function useGameChannel(): GameChannel {
         dispatch({ type: 'error', message: NO_ANSWER });
       }, ANSWER_TIMEOUT_MS);
     },
-    [game, send, stopWaiting],
+    [send, stopWaiting],
   );
 
-  // Ending a game holds nothing up on the board, so neither waits for an answer.
-  const resign = useCallback(
-    (color: Color) => {
-      if (game !== null) {
-        send({ game, type: 'resign', color });
-      }
-    },
-    [game, send],
+  // None of these hold anything up on the board: each answers itself with what it changed,
+  // or with an error, and a move made meanwhile is the server's to sort out.
+  const resign = useCallback(() => void send({ type: 'resign' }), [send]);
+  const abort = useCallback(() => void send({ type: 'abort' }), [send]);
+  const takeBack = useCallback(() => void send({ type: 'takeback' }), [send]);
+  const answerRequest = useCallback(
+    (request: number, accept: boolean) => void send({ type: 'answer', request, accept }),
+    [send],
   );
 
-  const abort = useCallback(() => {
-    if (game !== null) {
-      send({ game, type: 'abort' });
-    }
-  }, [game, send]);
-
-  // A takeback answers itself with the position it goes back to, so like the endings it
-  // holds nothing up on the board while it is on its way.
-  const takeBack = useCallback(() => {
-    if (game !== null) {
-      send({ game, type: 'takeback' });
-    }
-  }, [game, send]);
-
-  return { view, error, connected, movePending, submitMove, resign, abort, takeBack };
+  return {
+    view,
+    error,
+    connected,
+    missing,
+    movePending,
+    submitMove,
+    resign,
+    abort,
+    takeBack,
+    answer: answerRequest,
+  };
 }

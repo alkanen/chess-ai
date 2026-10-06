@@ -9,7 +9,9 @@ export type GameOverReason =
   | 'threefold_repetition'
   | 'fifty_move_rule'
   | 'resignation'
-  | 'abort';
+  | 'abort'
+  /** A player could not go on, such as an engine that died: no result. */
+  | 'error';
 
 export interface Piece {
   color: Color;
@@ -125,9 +127,18 @@ export interface PlayerInfo {
   stockfish: StockfishDescription | null;
 }
 
+/** What one of two people at the board has asked the other, awaiting an answer. */
+export interface PendingRequest {
+  /** Which request this is, which an answer quotes. */
+  id: number;
+  kind: 'takeback' | 'abort';
+  /** The side that asked. */
+  by: Color;
+}
+
 /** Mirrors chess_ai.game_session.GameState. */
 export interface GameState {
-  /** Tells this game apart from the one that replaces it. */
+  /** Tells this game apart from every other; it names the PGN file, and reaches nothing. */
   id: string;
   /** The player with the white pieces. */
   white: PlayerInfo;
@@ -138,30 +149,69 @@ export interface GameState {
   /** Every move played so far. */
   moves: MoveRecord[];
   position: PositionSnapshot;
+  /** What one side has asked the other and is waiting to hear about, if anything. */
+  request: PendingRequest | null;
 }
 
 /**
- * What the game channel sends: the full state first, then every move. An error answers
- * something this viewer sent, and reaches nobody else.
+ * What a link may do in its game: play one side, abort a game nobody plays by hand
+ * ("control"), or only watch.
+ */
+export type Access = Color | 'control' | 'watch';
+
+/** The links to one game, as the person who started it is given them. */
+export interface GameLinks {
+  /** Follows the game and can do nothing to it. */
+  watch: string;
+  /** Plays White, in a game a person plays White in. */
+  white: string | null;
+  /** Plays Black, in a game a person plays Black in. */
+  black: string | null;
+  /** Aborts a game nobody plays by hand. */
+  control: string | null;
+}
+
+/** A game as the link it was reached through sees it: mirrors chess_ai.web.app.SeatView. */
+export interface SeatView {
+  type: 'state';
+  game: GameState;
+  access: Access;
+  /** The game's watch link, to pass on to anyone who wants to follow it. */
+  watch: string;
+  /** When the game last changed, as an ISO timestamp. */
+  updated: string;
+}
+
+/** A game that has just been started, and every link to it. */
+export interface NewGame {
+  game: GameState;
+  links: GameLinks;
+}
+
+/**
+ * What the game channel sends: the full state first, as the link sees it, then everything
+ * that happens. A move, a takeback or the end of the game also ends any request that was
+ * waiting for an answer. An error answers something this viewer sent, and reaches nobody
+ * else.
  */
 export type GameEvent =
-  | { type: 'no_game'; position: PositionSnapshot }
-  | { type: 'state'; game: GameState }
+  | SeatView
   | { type: 'move'; ply: number; move: MoveRecord; position: PositionSnapshot }
   | { type: 'takeback'; ply: number; position: PositionSnapshot }
+  | { type: 'request'; request: PendingRequest | null }
   | { type: 'game_over'; position: PositionSnapshot }
   | { type: 'error'; message: string };
 
 /**
- * What a viewer sends: a move for a side they play, or an end to the game. Each one
- * names the game it is meant for, since a new game can replace it before it arrives.
+ * What a viewer sends, on behalf of the side their link plays: the link says which game and
+ * which side, so nothing here does.
  */
-export type ViewerMessage = { game: string } & (
+export type ViewerMessage =
   | { type: 'move'; uci: string }
-  | { type: 'resign'; color: Color }
+  | { type: 'resign' }
   | { type: 'abort' }
   | { type: 'takeback' }
-);
+  | { type: 'answer'; request: number; accept: boolean };
 
 /** One move of a game being replayed, and the position it leads to. */
 export interface ReplayMove {
@@ -414,17 +464,17 @@ export function apiUrl(path: string): string {
   return new URL(`api/${path}`, document.baseURI).href;
 }
 
+/** The API path of the game a link reaches, with `rest` after it. */
+function gamePath(link: string, rest = ''): string {
+  return `games/${encodeURIComponent(link)}${rest}`;
+}
+
 /**
- * Where the game a viewer is looking at is downloaded as PGN, in progress or finished.
- *
- * The game is named, as in everything else a viewer sends, because a new game can replace
- * it in the moment before the click: the server then refuses the download rather than
- * handing over a game the viewer has never seen. The server names the file itself.
+ * Where a game is downloaded as PGN, in progress or finished, through any of its links.
+ * The server names the file itself.
  */
-export function pgnUrl(game: string): string {
-  const url = new URL(apiUrl('game/pgn'));
-  url.searchParams.set('game', game);
-  return url.href;
+export function pgnUrl(link: string): string {
+  return apiUrl(gamePath(link, '/pgn'));
 }
 
 /** What a PGN file is, to a browser that is being handed one or sent one. */
@@ -441,13 +491,12 @@ const PGN_FILENAME = /filename="([^"]*)"/;
 /**
  * The game's PGN, fetched rather than followed as a link.
  *
- * A link has nowhere to put a refusal, and this one can be refused: a game replaced in
- * the moment before the click is turned down rather than swapped for its replacement.
- * Left to the browser, that answer is either a download that fails out of sight or a
- * file full of the error, so it is read here and the viewer is told.
+ * A link has nowhere to put a refusal, and this one can be refused: a game aborted in the
+ * meantime is gone. Left to the browser, that answer is either a download that fails out
+ * of sight or a file full of the error, so it is read here and the viewer is told.
  */
-export async function fetchPgn(game: string): Promise<PgnFile> {
-  const response = await fetch(pgnUrl(game));
+export async function fetchPgn(link: string): Promise<PgnFile> {
+  const response = await fetch(pgnUrl(link));
   if (!response.ok) {
     throw new Error(await refusal(response));
   }
@@ -455,9 +504,9 @@ export async function fetchPgn(game: string): Promise<PgnFile> {
   return { name: named?.[1] || 'game.pgn', text: await response.text() };
 }
 
-/** The WebSocket URL of the game channel, under the path prefix like every API URL. */
-export function gameChannelUrl(): string {
-  const url = new URL(apiUrl('game/ws'));
+/** The WebSocket URL of the game a link reaches, under the path prefix like every API URL. */
+export function gameChannelUrl(link: string): string {
+  const url = new URL(apiUrl(gamePath(link, '/ws')));
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   return url.href;
 }
@@ -601,9 +650,36 @@ export function runChannelUrl(run: string): string {
   return url.href;
 }
 
-/** Starts a new game, replacing the current one for every viewer. */
-export async function startGame(request: NewGameRequest): Promise<GameState> {
-  const response = await fetch(apiUrl('game'), {
+/**
+ * A game as a link sees it, or null when the link reaches no game: it never did, or the game
+ * was aborted.
+ */
+export async function fetchGame(link: string): Promise<SeatView | null> {
+  const response = await fetch(apiUrl(gamePath(link)));
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as SeatView;
+}
+
+/**
+ * Starts a new game with the settings the game `link` reaches was started with, and returns
+ * the links that reach the new one. A watch link cannot.
+ */
+export async function rematch(link: string): Promise<NewGame> {
+  const response = await fetch(apiUrl(gamePath(link, '/rematch')), { method: 'POST' });
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as NewGame;
+}
+
+/** Starts a new game, alongside any others, and returns the links that reach it. */
+export async function startGame(request: NewGameRequest): Promise<NewGame> {
+  const response = await fetch(apiUrl('games'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(request),
@@ -611,5 +687,5 @@ export async function startGame(request: NewGameRequest): Promise<GameState> {
   if (!response.ok) {
     throw new Error(await refusal(response));
   }
-  return (await response.json()) as GameState;
+  return (await response.json()) as NewGame;
 }

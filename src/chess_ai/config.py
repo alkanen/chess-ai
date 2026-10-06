@@ -128,6 +128,22 @@ class StockfishConfig(BaseModel):
         return os.path.expanduser(value)
 
 
+class GamesConfig(BaseModel):
+    """How many games the server holds at once, and what it keeps loaded for them."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_ongoing: int = Field(default=20, ge=1)
+    """How many games may be in progress at once. A new game beyond that is refused; a game
+    that has ended, or been aborted, no longer counts."""
+    max_loaded_checkpoints: int = Field(default=10, ge=1)
+    """How many checkpoints the games may hold loaded at once, all games together. Games that
+    play the same checkpoint share it. Beyond this, the one used longest ago is let go of, and
+    loaded again when a game next needs it."""
+    checkpoint_idle_hours: float = Field(default=24.0, gt=0)
+    """How long a loaded checkpoint nobody has played with is kept before it is let go of."""
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -135,6 +151,7 @@ class Config(BaseModel):
     paths: PathsConfig = PathsConfig()
     inference: InferenceConfig = InferenceConfig()
     stockfish: StockfishConfig = StockfishConfig()
+    games: GamesConfig = GamesConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> Config:

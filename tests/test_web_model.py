@@ -5,6 +5,7 @@ the web server ever sees of a run anyway: a directory of files it only reads.
 """
 
 import asyncio
+import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal
@@ -16,7 +17,7 @@ from pgn_helpers import read_back
 from starlette.testclient import WebSocketTestSession
 from training_helpers import model_run
 
-from chess_ai.config import Config, InferenceConfig, PathsConfig, ServerConfig
+from chess_ai.config import Config, GamesConfig, InferenceConfig, PathsConfig, ServerConfig
 from chess_ai.inference import DEFAULT_BATCH_SIZE
 from chess_ai.training import run_store
 from chess_ai.web import app as app_module
@@ -52,8 +53,13 @@ def client(tmp_path, runs) -> Iterator[TestClient]:
 
 def start(client: TestClient, white: dict, black: dict, **changes):
     return client.post(
-        f"{PREFIX}/api/game", json={"white": white, "black": black, "move_delay": 0, **changes}
+        f"{PREFIX}/api/games", json={"white": white, "black": black, "move_delay": 0, **changes}
     )
+
+
+def watching(client: TestClient, started):
+    """Follow the game that was started, through its watch link."""
+    return client.websocket_connect(f"{PREFIX}/api/games/{started.json()['links']['watch']}/ws")
 
 
 def play_out(websocket: WebSocketTestSession) -> tuple[list[dict], dict]:
@@ -128,7 +134,7 @@ def test_a_game_against_a_checkpoint_says_which_one_is_playing(client):
     started = start(client, model(checkpoint="latest", rating=1600), {"kind": "human"})
 
     assert started.status_code == 200
-    white = started.json()["white"]
+    white = started.json()["game"]["white"]
     assert white["name"] == "tiny step 4"
     assert white["accepts_moves"] is False
     assert white["model"] == {
@@ -138,7 +144,7 @@ def test_a_game_against_a_checkpoint_says_which_one_is_playing(client):
         "strategy": "argmax",
         "temperature": None,
     }
-    assert started.json()["black"]["model"] is None
+    assert started.json()["game"]["black"]["model"] is None
 
 
 @pytest.mark.parametrize(
@@ -148,13 +154,13 @@ def test_a_game_against_a_checkpoint_says_which_one_is_playing(client):
 def test_which_checkpoint_of_the_run_plays(client, choice, step):
     started = start(client, model(checkpoint=choice), RANDOM)
 
-    assert started.json()["white"]["model"]["checkpoint"] == step
+    assert started.json()["game"]["white"]["model"]["checkpoint"] == step
 
 
 def test_a_sampling_model_records_the_temperature_it_plays_at(client):
     started = start(client, model(strategy="sample", temperature=1.5, seed=4), RANDOM)
 
-    model_played = started.json()["white"]["model"]
+    model_played = started.json()["game"]["white"]["model"]
     assert (model_played["strategy"], model_played["temperature"]) == ("sample", 1.5)
 
 
@@ -165,8 +171,9 @@ def test_a_run_that_is_not_here_is_refused_and_the_game_goes_on(client):
 
     assert refused.status_code == 400
     assert "other" in refused.json()["detail"]
-    # The game that was being played is still the one on show.
-    assert client.get(f"{PREFIX}/api/game/pgn?game={playing.json()['id']}").status_code == 200
+    # The game that was being played is still there.
+    watch = playing.json()["links"]["watch"]
+    assert client.get(f"{PREFIX}/api/games/{watch}/pgn").status_code == 200
 
 
 def test_a_checkpoint_the_run_never_saved_is_refused(client):
@@ -208,21 +215,19 @@ def test_a_checkpoint_that_cannot_be_read_is_refused_with_a_reason(client, runs)
     ],
 )
 def test_a_model_player_the_server_cannot_read_is_refused(client, change):
-    refused = client.post(f"{PREFIX}/api/game", json={"white": RANDOM, "black": RANDOM, **change})
+    refused = client.post(f"{PREFIX}/api/games", json={"white": RANDOM, "black": RANDOM, **change})
 
     assert refused.status_code == 422
 
 
 def test_a_game_between_two_checkpoints_is_watched_to_its_end(client):
-    with client.websocket_connect(f"{PREFIX}/api/game/ws") as websocket:
-        assert websocket.receive_json()["type"] == "no_game"
-        started = start(
-            client,
-            model(checkpoint="best", rating=1200),
-            model(checkpoint="latest", rating=2000, strategy="sample", seed=1),
-        )
-        assert started.status_code == 200
-
+    started = start(
+        client,
+        model(checkpoint="best", rating=1200),
+        model(checkpoint="latest", rating=2000, strategy="sample", seed=1),
+    )
+    assert started.status_code == 200
+    with watching(client, started) as websocket:
         moves, ended = play_out(websocket)
 
     assert ended["game_over"] is not None
@@ -236,9 +241,8 @@ def test_a_game_between_two_checkpoints_is_watched_to_its_end(client):
 
 
 def test_a_finished_game_is_saved_with_the_checkpoints_that_played_it(client, tmp_path):
-    with client.websocket_connect(f"{PREFIX}/api/game/ws") as websocket:
-        assert websocket.receive_json()["type"] == "no_game"
-        start(client, model(checkpoint="best", rating=1200), model(checkpoint="latest"))
+    started = start(client, model(checkpoint="best", rating=1200), model(checkpoint="latest"))
+    with watching(client, started) as websocket:
         play_out(websocket)
 
     saved = sorted((tmp_path / "games").glob("*.pgn"))
@@ -254,7 +258,7 @@ def test_a_finished_game_is_saved_with_the_checkpoints_that_played_it(client, tm
 def test_a_game_in_progress_against_a_checkpoint_downloads_with_its_headers(client):
     started = start(client, {"kind": "human"}, model(checkpoint=2, rating=1800))
 
-    pgn = client.get(f"{PREFIX}/api/game/pgn?game={started.json()['id']}")
+    pgn = client.get(f"{PREFIX}/api/games/{started.json()['links']['watch']}/pgn")
 
     headers = read_back(pgn.text).headers
     assert headers["Black"] == "tiny step 2"
@@ -310,8 +314,47 @@ def test_one_checkpoint_playing_itself_is_loaded_once(client, monkeypatch):
     assert started.status_code == 200
     assert len(loaded) == 1, "the same checkpoint was read twice"
     # Sharing the weights must not share what each side was asked for.
-    assert started.json()["white"]["model"]["rating"] == 1200
-    assert started.json()["black"]["model"]["rating"] == 2400
+    assert started.json()["game"]["white"]["model"]["rating"] == 1200
+    assert started.json()["game"]["black"]["model"]["rating"] == 2400
+
+
+def test_games_playing_the_same_checkpoint_share_one_load(client, monkeypatch):
+    """Several friends playing the same model hold it in memory once, not once each."""
+    import chess_ai.inference as inference
+
+    loaded = []
+    real = inference.load_engine
+    monkeypatch.setattr(
+        inference, "load_engine", lambda path, **kw: (loaded.append(path), real(path, **kw))[1]
+    )
+
+    first = start(client, {"kind": "human"}, model(checkpoint="latest", rating=1200))
+    second = start(client, model(checkpoint="latest", rating=1800), {"kind": "human"})
+
+    assert (first.status_code, second.status_code) == (200, 200)
+    assert len(loaded) == 1, "the same checkpoint was read for each game"
+
+
+def test_a_checkpoint_beyond_the_limit_takes_the_place_of_the_one_used_longest_ago(
+    tmp_path, runs, monkeypatch
+):
+    import chess_ai.inference as inference
+
+    loaded = []
+    real = inference.load_engine
+    monkeypatch.setattr(
+        inference, "load_engine", lambda path, **kw: (loaded.append(path.name), real(path, **kw))[1]
+    )
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+        games=GamesConfig(max_loaded_checkpoints=1),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as small:
+        for step in (2, 4, 2):
+            assert start(small, {"kind": "human"}, model(checkpoint=step)).status_code == 200
+
+    assert len(loaded) == 3, "with room for one, the first checkpoint had to be read again"
 
 
 def test_two_different_checkpoints_are_two_engines(client, monkeypatch):
@@ -364,3 +407,35 @@ def test_one_run_that_cannot_be_read_does_not_sink_the_list(client, runs, monkey
     assert found["other"]["checkpoints"] == 2
     # Nothing could be counted for the run being written, and the name is still offered.
     assert found["tiny"]["checkpoints"] == 0
+
+
+def test_a_checkpoint_replaced_while_a_game_waits_is_not_played_in_its_place(
+    tmp_path, runs, monkeypatch
+):
+    """A run restarted under the same name writes new weights at the same steps.
+
+    A game whose checkpoint was let go of in the meantime must not carry on with those as if
+    they were the ones it began with, which it would go on naming in its state and its PGN.
+    """
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+        games=GamesConfig(max_loaded_checkpoints=1),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as small:
+        first = start(small, {"kind": "human"}, model(checkpoint=2)).json()["links"]
+        # Another game's checkpoint takes the only place, so the first one is let go of.
+        assert start(small, {"kind": "human"}, model(checkpoint=4)).status_code == 200
+        # Restarted with --overwrite: the old run is cleared and new weights saved at the
+        # same steps.
+        shutil.rmtree(runs / "tiny")
+        model_run(runs, seed=99)
+
+        with small.websocket_connect(f"{PREFIX}/api/games/{first['white']}/ws") as websocket:
+            assert websocket.receive_json()["type"] == "state"
+            websocket.send_json({"type": "move", "uci": "e2e4"})
+            assert websocket.receive_json()["type"] == "move"
+            ended = websocket.receive_json()
+
+    assert ended["type"] == "game_over"
+    assert ended["position"]["game_over"]["reason"] == "error"
