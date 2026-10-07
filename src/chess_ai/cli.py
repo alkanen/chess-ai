@@ -280,6 +280,19 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
     stats.add_argument("name", help="the dataset to summarise")
     stats.set_defaults(handler=_dataset_stats)
 
+    download = actions.add_parser(
+        "download",
+        help="download Lichess monthly dumps of rated games",
+        description="Download Lichess's monthly dumps of rated standard games into the data "
+        "directory, compressed, as a build reads them. A download that stopped is carried on from "
+        "where it stopped, and every file is checked against the checksum Lichess publishes "
+        "before it is given its name.",
+    )
+    download.add_argument(
+        "months", nargs="+", type=_month, metavar="YYYY-MM", help="the months to download"
+    )
+    download.set_defaults(handler=_download_dumps)
+
 
 def _add_train_command(commands: argparse._SubParsersAction) -> None:
     """``chess-ai train``: one experiment config file, one run directory."""
@@ -1136,6 +1149,37 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
             err=True,
         )
         return 1
+    return 0
+
+
+def _month(text: str) -> str:
+    from chess_ai.dataset.download import parse_month
+
+    try:
+        return parse_month(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
+def _download_dumps(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.dataset.download import (
+        DownloadError,
+        DownloadPrinter,
+        download_months,
+        downloads_dir,
+    )
+
+    printer = DownloadPrinter()
+    try:
+        paths = download_months(
+            args.months, directory=downloads_dir(config.paths.data), progress=printer
+        )
+    except DownloadError as e:
+        raise _UserError(e) from e
+    finally:
+        printer.finish()
+    for path in paths:
+        _say(f"chess-ai: {path}")
     return 0
 
 

@@ -336,7 +336,28 @@ The manifest records the filters the build used, how many games each one left ou
 positions are stored but not trained on; `dataset stats` and the datasets page show them.
 Datasets built before there were filters are still read, as unfiltered.
 
-`.pgn.zst` Lichess dumps and a command that downloads them are next.
+#### Lichess dumps
+
+Lichess publishes every month of rated standard games as a zstd-compressed PGN file. `dataset
+download` fetches the months you name into `lichess/` under the data directory, kept compressed:
+
+```sh
+uv run chess-ai dataset download 2024-01 2024-02
+uv run chess-ai dataset build lichess-2024-q1 data/lichess/lichess_db_standard_rated_2024-0*.pgn.zst
+```
+
+A download in progress is a `.part` file. One that stops, or is stopped with ctrl-c, carries on
+from where it got to the next time the month is asked for. Each file is checked against the
+SHA-256 Lichess publishes before it gets its own name; one that does not match is deleted, to be
+downloaded again from the start. A month already there is not downloaded again.
+
+A build reads `.pgn.zst` files as they are, without decompressing them to disk, and picks them up
+from directories and globs alongside `.pgn` files. The dataset is the same, to the byte, as one
+built from the decompressed file. A compressed file cannot be cut where a plain one is, so the
+build's own process decompresses it and hands the text to the other processes in pieces; that is
+fast enough to keep them busy, and the progress is measured in compressed bytes. A file that is
+cut short or damaged keeps the games before the damage, and the manifest records the error
+against it.
 
 ### Train a model
 
