@@ -48,6 +48,14 @@ class Progress:
     What the rate and the time left are worked out from, so that minutes spent taking checksums
     are not counted as minutes spent reading. ``None`` means the phase is the whole build.
     """
+    games_before: int = 0
+    """Games the counts include that an interrupted build read before this one resumed it."""
+    bytes_before: int = 0
+    """Bytes the count includes that an interrupted build read before this one resumed it.
+
+    Both are left out of the rate and the time left, which are this process's: a build resumed
+    at 90% would otherwise claim the first 90% as read in the seconds since it started.
+    """
 
     @property
     def _phase_seconds(self) -> float:
@@ -56,7 +64,7 @@ class Progress:
     @property
     def games_per_second(self) -> float:
         seconds = self._phase_seconds
-        return self.games_read / seconds if seconds > 0 else 0.0
+        return (self.games_read - self.games_before) / seconds if seconds > 0 else 0.0
 
     @property
     def fraction(self) -> float:
@@ -69,14 +77,15 @@ class Progress:
     def seconds_remaining(self) -> float | None:
         """How much longer at this rate, or ``None`` when there is no way to tell yet."""
         seconds = self._phase_seconds
-        if self.done or self.bytes_total <= 0 or self.bytes_read <= 0 or seconds <= 0:
+        read = self.bytes_read - self.bytes_before
+        if self.done or self.bytes_total <= 0 or read <= 0 or seconds <= 0:
             return None
         if self.bytes_read >= self.bytes_total:
             # Past the total, which happens when a file grew after it was sized: the difference
             # below goes negative, and format_duration does not guard it either -- a build two
             # hours over its estimate printed "-9000s left". There is no estimate to give.
             return None
-        return seconds * (self.bytes_total - self.bytes_read) / self.bytes_read
+        return seconds * (self.bytes_total - self.bytes_read) / read
 
 
 class ProgressPrinter:

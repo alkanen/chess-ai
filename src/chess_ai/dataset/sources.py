@@ -541,6 +541,9 @@ class TextPiece:
 
     ``error`` is what stopped the decompression, carried by the last piece it produced: the games
     in ``text`` are read first, and the error is raised where the next game would have been.
+
+    ``start`` and ``stop`` are where ``text`` lies in the file's decompressed text, which is how a
+    resumed build finds its place again; see :func:`text_pieces`.
     """
 
     source: int
@@ -548,6 +551,8 @@ class TextPiece:
     text: bytes
     end: int
     error: Exception | None = None
+    start: int = 0
+    stop: int = 0
 
     @property
     def bytes(self) -> int:
@@ -589,6 +594,8 @@ def text_pieces(
     target_bytes: int,
     most_bytes: int,
     stop: Callable[[], bool] = lambda: False,
+    resume_at: int = 0,
+    on_passing: Callable[[], None] | None = None,
 ) -> Iterator[TextPiece | CompressedTail]:
     """``source``, a compressed file, decompressed and cut into pieces of whole games.
 
@@ -609,6 +616,14 @@ def text_pieces(
     A failure to read or decompress the file is not raised: it ends the cutting with a piece of
     whatever whole games were in hand and the error to raise after them. An :exc:`OSError`
     means the file went away; anything else, that its contents stopped making sense.
+
+    ``resume_at`` passes over the pieces that start before that offset into the text, which is
+    where a resumed build carries on from: one of the pieces' starts. The file is still cut from
+    its beginning, and not from there, because where a cut falls depends on how the text came out
+    of the decompressor before it -- and a cut that falls elsewhere can, in a file whose comments
+    hold whole games, read other games. Cut the same way, it is the same pieces after it.
+    ``on_passing`` is told of each piece passed over, which for a month is minutes of saying
+    nothing otherwise.
     """
     if target_bytes <= 0:
         raise ValueError(f"a piece has to be some bytes long, not {target_bytes}")
@@ -637,6 +652,8 @@ def text_pieces(
                         # found once the rest of it arrives.
                         searched = max(target_bytes, len(text) - len(SEPARATOR) + 1)
                         if len(text) > most_bytes:
+                            # A tail always starts at or past a resumed build's place: the place is
+                            # a piece's start, and nothing is cut after a tail.
                             yield CompressedTail(
                                 source=index,
                                 path=source.path,
@@ -655,7 +672,18 @@ def text_pieces(
                         ended = True
                 if cut == 0:
                     return
-                yield TextPiece(source=index, path=source.path, text=bytes(text[:cut]), end=read())
+                if taken < resume_at:
+                    if on_passing is not None:
+                        on_passing()
+                else:
+                    yield TextPiece(
+                        source=index,
+                        path=source.path,
+                        text=bytes(text[:cut]),
+                        end=read(),
+                        start=taken,
+                        stop=taken + cut,
+                    )
                 del text[:cut]
                 taken += cut
                 searched = 0
@@ -664,7 +692,15 @@ def text_pieces(
         # in is not, and is counted as unreadable by whoever reads the error.
         whole = _last_boundary(text)
         yield TextPiece(
-            source=index, path=source.path, text=bytes(text[:whole]), end=read(), error=e
+            source=index,
+            path=source.path,
+            # Only what comes after the place a resumed build carries on from. Whatever came
+            # before it was read by the build that stopped, and the error is still this file's.
+            text=bytes(text[max(0, resume_at - taken) : whole]),
+            end=read(),
+            error=e,
+            start=max(taken, resume_at),
+            stop=max(taken + whole, resume_at),
         )
 
 
@@ -723,10 +759,37 @@ def read_game(
     return chess.pgn.read_game(text, Visitor=lambda: _Screened(skip))
 
 
+class _Passing(chess.pgn.BaseVisitor[bool]):
+    """A visitor that skips a whole game, headers and all, and says only that there was one."""
+
+    def begin_game(self) -> chess.pgn.SkipType:
+        return chess.pgn.SKIP
+
+    def result(self) -> bool:
+        return True
+
+
+def pass_games(text: TextIO, games: int) -> int:
+    """Read past the next ``games`` games in ``text``, and say how many there were.
+
+    How a resumed build gets back to the game it stopped before, when it was reading a stretch of
+    a file in its own process and not a piece at a time. python-chess reads a game it skips to the
+    same line it reads one it parses to, the blank line after it: a build already skips the moves
+    of every game its filters leave out, and the games after those are the games they always were.
+    This skips the headers as well, which is as fast as python-chess finds the end of a game.
+    """
+    passed = 0
+    while passed < games and chess.pgn.read_game(text, Visitor=_Passing) is not None:
+        passed += 1
+    return passed
+
+
 def games_in_range(
     piece: ByteRange,
     on_read: Callable[[int], None] | None = None,
     skip: Callable[[chess.pgn.Headers], bool] | None = None,
+    passing: int = 0,
+    on_passing: Callable[[int], None] | None = None,
 ) -> Iterator[tuple[chess.pgn.Game, int]]:
     """Every game in ``piece``, with where the reading had got to, as a stream.
 
@@ -753,7 +816,9 @@ def games_in_range(
     :func:`~chess_ai.dataset.builder._check_worth_publishing`.
     """
     with piece.path.open("rb") as handle:
-        text, window = reading(handle, piece.start, piece.end, on_read)
+        text, window = reading(handle, piece.start, piece.end, on_passing)
+        pass_games(text, passing)
+        window.on_read = on_read
         while True:
             record = read_game(text, skip)
             if record is None:
@@ -765,6 +830,8 @@ def games_in_piece(
     piece: Piece,
     on_read: Callable[[int], None] | None = None,
     skip: Callable[[chess.pgn.Headers], bool] | None = None,
+    passing: int = 0,
+    on_passing: Callable[[int], None] | None = None,
 ) -> Iterator[tuple[chess.pgn.Game, int]]:
     """Every game in a piece of any kind, with where the reading had got to, as a stream.
 
@@ -772,11 +839,17 @@ def games_in_piece(
     file: the offsets are into the compressed file, which is what its size is counted in. A
     :class:`TextPiece` is in memory and reports its ``end`` throughout; ``on_read`` only matters
     to a :class:`CompressedTail`, which is a long read in the build's own process.
+
+    ``passing`` is how many games at the start of the piece to read past without yielding them,
+    which is where a resumed build that stopped part way through the piece carries on; see
+    :func:`pass_games`. They are behind the progress already, so ``on_read`` is not told of them;
+    ``on_passing`` is, in its place, as the reading goes.
     """
     if isinstance(piece, ByteRange):
-        yield from games_in_range(piece, on_read, skip)
+        yield from games_in_range(piece, on_read, skip, passing, on_passing)
     elif isinstance(piece, TextPiece):
         text = io.TextIOWrapper(io.BytesIO(piece.text), encoding=ENCODING, errors="replace")
+        pass_games(text, passing)
         while True:
             record = read_game(text, skip)
             if record is None:
@@ -785,17 +858,19 @@ def games_in_piece(
         if piece.error is not None:
             raise piece.error
     else:
-        yield from _games_in_tail(piece, on_read, skip)
+        yield from _games_in_tail(piece, on_read, skip, passing, on_passing)
 
 
 def _games_in_tail(
     piece: CompressedTail,
     on_read: Callable[[int], None] | None,
     skip: Callable[[chess.pgn.Headers], bool] | None,
+    passing: int = 0,
+    on_passing: Callable[[int], None] | None = None,
 ) -> Iterator[tuple[chess.pgn.Game, int]]:
     """Every game in a compressed file from ``piece.start`` of its text to its end."""
     with piece.path.open("rb") as handle:
-        window = _Window(handle, 0, None)
+        window = _Window(handle, 0, None, on_passing)
         stream = _Decompressing(window)
         passed = 0
         while passed < piece.start:
@@ -804,10 +879,11 @@ def _games_in_tail(
                 # The file is shorter than when it was cut: there is no rest of it to read.
                 return
             passed += len(data)
+        text = io.TextIOWrapper(io.BufferedReader(stream), encoding=ENCODING, errors="replace")
+        pass_games(text, passing)
         # Only from here: what was passed over is behind the progress already, and reporting it
         # again would send the line back to the start of the file and then forward.
         window.on_read = on_read
-        text = io.TextIOWrapper(io.BufferedReader(stream), encoding=ENCODING, errors="replace")
         while True:
             record = read_game(text, skip)
             if record is None:
@@ -887,9 +963,24 @@ class PgnReader:
         """
         return self._window.position if self._window is not None else 0
 
-    def games(self) -> Iterator[chess.pgn.Game]:
-        """Every record in the file, in order, until there are no more."""
+    def games(
+        self, passing: int = 0, on_passing: Callable[[int], None] | None = None
+    ) -> Iterator[chess.pgn.Game]:
+        """Every record in the file, in order, until there are no more.
+
+        ``passing`` is how many to read past first without yielding them, which is where a
+        resumed build carries on from. They are behind the progress already, so ``on_passing``
+        is told how far the reading has got while they are passed, in place of ``on_read``. See
+        :func:`pass_games`.
+        """
         assert self._file is not None, "read a PgnReader inside its with block"
+        if passing:
+            assert self._window is not None
+            on_read, self._window.on_read = self._window.on_read, on_passing
+            try:
+                pass_games(self._file, passing)
+            finally:
+                self._window.on_read = on_read
         while True:
             record = read_game(self._file, self._skip)
             if record is None:
