@@ -26,12 +26,13 @@ import sys
 import time
 import traceback
 from collections import Counter, deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures import process as _executor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from itertools import chain
 from pathlib import Path
 from typing import Final
 
@@ -70,13 +71,16 @@ from chess_ai.dataset.records import (
     TimeControl,
 )
 from chess_ai.dataset.sources import (
-    ByteRange,
+    CompressedTail,
     PgnReader,
+    Piece,
     Source,
+    TextPiece,
     game_ranges,
-    games_in_range,
+    games_in_piece,
     quiet_parser,
     resolve_sources,
+    text_pieces,
 )
 from chess_ai.dataset.store import (
     DEFAULT_SHARDS,
@@ -160,6 +164,10 @@ four times the PGN it came from. At the default of one worker per core on a 32-c
 that is 64 outstanding, or 2.1 GB if the writing ever fell that far behind -- and 4.2 GB at
 :data:`MAX_PIECE_BYTES`. A whole build of that month peaked at 1.0 GB, because the writing does
 not fall behind, but the ceiling is the number to reason with rather than the observed peak.
+
+A piece of a compressed file is its text rather than a pair of offsets, so each outstanding one
+also holds up to :data:`MAX_PIECE_BYTES` of PGN here until its worker is done with it: another
+0.5 GB at 64 pieces of :data:`CHUNK_BYTES`, on top of the records.
 """
 
 ProgressCallback = Callable[[Progress], None]
@@ -694,7 +702,7 @@ class _Tally:
 class _Job:
     """One piece of one PGN file to read, and everything reading it has to be told."""
 
-    piece: ByteRange
+    piece: Piece
     rating_source: RatingSource | None
     validation_fraction: float
     screen: Screen = Screen()
@@ -738,7 +746,8 @@ class _Read:
     reading one game at a time would have left them.
     """
 
-    piece: ByteRange
+    piece: Piece
+    """The piece read, less its text if it had any: that has been read, and is not sent back."""
     outcomes: np.ndarray
     splits: dict[str, _Records]
     unexpected: str | None = None
@@ -783,7 +792,7 @@ def _read_piece(job: _Job) -> _Read:
     # Applied here as well as in the parent: a worker started by spawn or forkserver rather than
     # fork inherits nothing, and a dump of millions of games has thousands of unreadable ones.
     with quiet_parser():
-        reading = games_in_range(job.piece, skip=lambda headers: skips_moves(headers, screen))
+        reading = games_in_piece(job.piece, skip=lambda headers: skips_moves(headers, screen))
         while True:
             try:
                 # The offset is for a caller reading a piece itself; a worker reports one figure
@@ -830,7 +839,11 @@ def _read_piece(job: _Job) -> _Read:
             targets.append(records.targets)
             not_targets.append(records.not_targets)
     return _Read(
-        piece=job.piece,
+        piece=(
+            replace(job.piece, text=b"", error=None)
+            if isinstance(job.piece, TextPiece)
+            else job.piece
+        ),
         outcomes=np.asarray(outcomes, dtype=np.uint8),
         splits={
             split: _Records(
@@ -852,7 +865,7 @@ def _read_piece(job: _Job) -> _Read:
 
 def _in_order(
     pool: ProcessPoolExecutor,
-    jobs: Sequence[_Job],
+    jobs: Iterable[_Job],
     *,
     in_flight: int,
     wanted: Callable[[_Job], bool] | None = None,
@@ -861,7 +874,11 @@ def _in_order(
 
     A job comes back as its :class:`_Read`, or as the job itself when its piece is larger than
     :data:`MAX_PIECE_BYTES` -- too large for a worker to hold the records of, and so for the
-    caller to read where nothing has to be held. See :meth:`_Build._read_here`.
+    caller to read where nothing has to be held. See :meth:`_Build._read_here`. The tail of a
+    compressed file that could not be cut is always such a piece.
+
+    ``jobs`` may be a generator, and for a compressed file it is one that decompresses the file
+    as it goes: it is only advanced as jobs are handed out, so it holds no more than this does.
 
     In order, because that is what makes a parallel build's dataset the same as a serial one's:
     the records reach the shards in the order the games appear in the files, so every offset and
@@ -882,7 +899,7 @@ def _in_order(
 
     def given_out(job: _Job) -> tuple[_Job, "Future[_Read] | None"]:
         """``job`` with the worker reading it, or with ``None`` if it is too large for one."""
-        if job.piece.bytes > MAX_PIECE_BYTES:
+        if isinstance(job.piece, CompressedTail) or job.piece.bytes > MAX_PIECE_BYTES:
             return job, None
         return job, pool.submit(_read_piece, job)
 
@@ -1023,13 +1040,20 @@ class _Build:
             before[index] = running
             running += source.bytes
         found = {index: _SourceTally() for index in range(len(sources))}
-        jobs: list[_Job] = []
+        jobs: list[Iterable[_Job]] = []
         # Before the cutting rather than after it, so there is a line on the screen from the
         # first moment. It says zeros until a piece comes back, which is what is true: the
         # bytes it counts are bytes games have been read from, and cutting has read none.
         self.report(scanning=True)
         for index, source in enumerate(sources):
             try:
+                if source.compressed:
+                    # Cut as it is read, since it cannot be cut any other way; see text_pieces.
+                    # Opened here all the same, so that a file that cannot be read at all is
+                    # counted as one, just as cutting a plain file counts it.
+                    _try_opening(source)
+                    jobs.append(self._text_jobs(source, index, found[index]))
+                    continue
                 pieces = game_ranges(source, index, CHUNK_BYTES, on_scan=self._scanning())
             except DatasetError as e:
                 # The file cannot be read at all, which is what PgnReader.open failing means in
@@ -1038,15 +1062,7 @@ class _Build:
                 found[index].went_away = True
                 LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
                 continue
-            jobs.extend(
-                _Job(
-                    piece=piece,
-                    rating_source=self.rating_source,
-                    validation_fraction=self.validation_fraction,
-                    screen=self.screen,
-                )
-                for piece in pieces
-            )
+            jobs.append([self._job(piece) for piece in pieces])
             # Cutting a well-formed file reads under a percent of it and is over in
             # milliseconds, but a file with no boundary in it is scanned to the end before it
             # yields its single piece -- 300 MB/s, so half a minute for a Lichess month and
@@ -1068,7 +1084,7 @@ class _Build:
         try:
             for outcome in _in_order(
                 pool,
-                jobs,
+                chain.from_iterable(jobs),
                 in_flight=workers * IN_FLIGHT_PER_WORKER,
                 wanted=lambda job: not found[job.piece.source].stopped and not self.full,
             ):
@@ -1126,6 +1142,30 @@ class _Build:
                 )
             )
         self._bytes_read = self._bytes_total
+
+    def _job(self, piece: Piece) -> _Job:
+        """What a worker is told to read ``piece``."""
+        return _Job(
+            piece=piece,
+            rating_source=self.rating_source,
+            validation_fraction=self.validation_fraction,
+            screen=self.screen,
+        )
+
+    def _text_jobs(self, source: Source, index: int, state: _SourceTally) -> Iterator[_Job]:
+        """The jobs of a compressed file, cut as its text is decompressed in this process.
+
+        Stops decompressing when the build is full or an earlier piece of the file gave up, as
+        ``wanted`` stops handing out the pieces of a plain file: neither has a use for the rest.
+        """
+        for piece in text_pieces(
+            source,
+            index,
+            CHUNK_BYTES,
+            MAX_PIECE_BYTES,
+            stop=lambda: state.stopped or self.full,
+        ):
+            yield self._job(piece)
 
     def _take(self, read: _Read, state: _SourceTally) -> None:
         """Write one worker's piece into the dataset, and take its counts into the build's.
@@ -1245,13 +1285,16 @@ class _Build:
             state.explained = True
             LOGGER.warning(
                 "chess-ai: %s has %s bytes with no game boundary in them, which is more than a "
-                "worker should hold at once, so that stretch is being read in this process, on "
-                "one core, with the others idle until it is done. Its games are most likely not "
-                "separated by a blank line.",
+                "worker should hold at once, so %s is being read in this process, on one core, "
+                "with the others idle until it is done. Its games are most likely not separated "
+                "by a blank line.",
                 job.piece.path,
                 f"{job.piece.bytes:,}",
+                # A compressed file cannot be cut again further on without holding its text up
+                # to the next boundary, which is the thing there is no room for.
+                "the rest of the file" if isinstance(job.piece, CompressedTail) else "that stretch",
             )
-        reading = games_in_range(
+        reading = games_in_piece(
             job.piece, on_read=self._reading(before, job.piece.end), skip=self._skip
         )
         while True:
@@ -1505,6 +1548,14 @@ class _Build:
                 ratings_unknown=self.tally.ratings_unknown,
             ),
         )
+
+
+def _try_opening(source: Source) -> None:
+    """Raise :exc:`DatasetError` if ``source`` cannot be opened, as cutting a plain file would."""
+    try:
+        source.path.open("rb").close()
+    except OSError as e:
+        raise DatasetError(f"cannot read {source.path}: {e.strerror}") from e
 
 
 def _described(error: Exception) -> str:

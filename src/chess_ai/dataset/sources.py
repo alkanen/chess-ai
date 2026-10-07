@@ -11,6 +11,12 @@ A file can also be cut into :class:`ByteRange` pieces of whole games, which is w
 build read one file in several processes at once. The cutting is a cheap scan for game
 boundaries rather than a parse, so it costs a few reads per piece and not a pass over the
 file.
+
+A Lichess dump comes compressed with zstd, as ``.pgn.zst``, and is read that way rather than
+decompressed to disk first: a recent month is about 30 GB compressed and seven times that as
+text. A compressed stream cannot be entered part way through, so such a file is not cut by
+offset; the process that reads it decompresses it and cuts the *text* instead, into
+:class:`TextPiece` pieces it hands over whole. See :func:`text_pieces`.
 """
 
 import glob
@@ -24,11 +30,15 @@ from types import TracebackType
 from typing import BinaryIO, Final, TextIO
 
 import chess.pgn
+import zstandard
 
 from chess_ai.dataset.store import DatasetError
 
 SUFFIX: Final = ".pgn"
-"""What a PGN file is called, and all that is picked up from a directory."""
+"""What a PGN file is called, and one of the two things picked up from a directory."""
+
+COMPRESSED_SUFFIX: Final = ".pgn.zst"
+"""What a zstd-compressed PGN file is called, which is how Lichess publishes its dumps."""
 
 ENCODING: Final = "utf-8-sig"
 """How a PGN file is read: UTF-8, past a byte-order mark some exporters write.
@@ -58,16 +68,27 @@ such a file is read at, four megabytes is about a report a second.
 
 @dataclass(frozen=True)
 class Source:
-    """One PGN file to read, and how large it is, which is what makes progress an estimate."""
+    """One PGN file to read, and how large it is, which is what makes progress an estimate.
+
+    For a compressed file the size is the compressed one, and so is every count of bytes read
+    from it: that is the number known before the file is read, and the only one a percentage
+    can be taken of.
+    """
 
     path: Path
     bytes: int
+
+    @property
+    def compressed(self) -> bool:
+        """Whether the file is zstd-compressed, which is decided by its name ending in ``.zst``."""
+        return self.path.name.lower().endswith(".zst")
 
 
 def resolve_sources(patterns: Sequence[str]) -> list[Source]:
     """The PGN files ``patterns`` name, in order, without repeats.
 
-    Each pattern is a file, a directory (its own ``*.pgn`` files, in name order), or a glob.
+    Each pattern is a file, a directory (its own ``*.pgn`` and ``*.pgn.zst`` files, in name
+    order), or a glob.
     A pattern matching nothing is an error: a mistyped path that quietly built an empty
     dataset would only be noticed by the run that trained on it.
     """
@@ -83,7 +104,41 @@ def resolve_sources(patterns: Sequence[str]) -> list[Source]:
                 continue
             seen.add(resolved)
             sources.append(Source(path=path, bytes=path.stat().st_size))
+    _refuse_both_copies(sources, seen)
     return sources
+
+
+def _refuse_both_copies(sources: Sequence[Source], seen: set[Path]) -> None:
+    """Refuse a dump named together with its own decompressed copy, which is its games twice.
+
+    ``zstd -d`` keeps the file it decompressed, so a dump looked at where it was downloaded
+    leaves ``x.pgn`` beside ``x.pgn.zst``, and a build of the directory would read the month
+    twice: every game in the same split both times, and nothing to say so.
+
+    Refused rather than one of them skipped, because neither is safe to pick for the person.
+    The ``.pgn`` is written in place while ``zstd`` runs, so it may be half a month; and it may
+    as well be a copy somebody edited on purpose. Naming the files, or moving one, says which.
+    """
+    pairs = [
+        (source.path, counterpart)
+        for source in sources
+        if source.compressed
+        # Looked for beside the link and beside its target, since a dump is often a link to
+        # another disk and either can hold the copy. Beside the target matters even when the
+        # build names that disk too: the dump there is dropped as a duplicate of the link if the
+        # link came first, which leaves the link the only source to find the copy from.
+        for counterpart in sorted(
+            {source.path.with_suffix("").resolve(), source.path.resolve().with_suffix("")}
+        )
+        if counterpart != source.path.resolve() and counterpart in seen
+    ]
+    if pairs:
+        raise DatasetError(
+            "these dumps are named together with their decompressed copies, which would read "
+            "their games twice: "
+            + "; ".join(f"{packed} and {plain}" for packed, plain in pairs)
+            + ". Name the files to read, or move one copy of each out of the way"
+        )
 
 
 def _matches(pattern: str) -> list[Path]:
@@ -99,7 +154,8 @@ def _matches(pattern: str) -> list[Path]:
 
 
 def _is_pgn(path: Path) -> bool:
-    return path.is_file() and path.suffix.lower() == SUFFIX
+    name = path.name.lower()
+    return path.is_file() and (name.endswith(SUFFIX) or name.endswith(COMPRESSED_SUFFIX))
 
 
 @dataclass(frozen=True)
@@ -349,7 +405,8 @@ class _Window(io.RawIOBase):
         self._start = start
         self._left = None if end is None else max(0, end - start)
         self._read = 0
-        self._on_read = on_read
+        self.on_read = on_read
+        """Told the position every :data:`READ_REPORT_BYTES`; may be set part way through."""
         self._since = 0
 
     @property
@@ -385,11 +442,11 @@ class _Window(io.RawIOBase):
         if self._left is not None:
             self._left -= got
         self._read += got
-        if self._on_read is not None and got:
+        if self.on_read is not None and got:
             self._since += got
             if self._since >= READ_REPORT_BYTES:
                 self._since = 0
-                self._on_read(self.position)
+                self.on_read(self.position)
         return got
 
 
@@ -398,11 +455,245 @@ def reading(
     start: int,
     end: int | None,
     on_read: Callable[[int], None] | None = None,
+    *,
+    compressed: bool = False,
 ) -> tuple[TextIO, _Window]:
-    """``handle`` from ``start`` to ``end`` as text, and the window counting underneath it."""
+    """``handle`` from ``start`` to ``end`` as text, and the window counting underneath it.
+
+    ``compressed`` decompresses what the window hands up, so the window goes on counting bytes
+    of the *file*: those are what a compressed source's size is measured in.
+    """
     window = _Window(handle, start, end, on_read)
-    text = io.TextIOWrapper(io.BufferedReader(window), encoding=ENCODING, errors="replace")
+    raw: io.RawIOBase = _Decompressing(window) if compressed else window
+    text = io.TextIOWrapper(io.BufferedReader(raw), encoding=ENCODING, errors="replace")
     return text, window
+
+
+DECOMPRESS_READ: Final = 128 << 10
+"""Compressed bytes fed to the decompressor at a time: about a megabyte of PGN out of it."""
+
+
+class _Decompressing(io.RawIOBase):
+    """A zstd-compressed file read through as the text it holds.
+
+    Written on a decompression object rather than taken from ``zstandard``'s own stream reader,
+    because that one ends quietly where the file does: a dump cut off part way through -- a
+    download that stopped, a copy onto a full disk -- reads as a shorter dump with nothing to
+    say it is one. Here a file that ends inside a frame raises :exc:`zstandard.ZstdError`, as a
+    corrupt one does, and a build counts it as a file whose contents stopped making sense.
+
+    Frames follow one another, as ``zstd`` writes them for concatenated input, and each is
+    decompressed in turn.
+    """
+
+    def __init__(self, raw: BinaryIO) -> None:
+        self._raw = raw
+        self._frame = zstandard.ZstdDecompressor().decompressobj()
+        self._in_frame = False
+        """Whether the current frame has been given any input, so that ending now cuts it."""
+        self._pending = memoryview(b"")
+        self._ended = False
+
+    @property
+    def name(self) -> str:
+        return self._raw.name
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        while not self._pending:
+            if self._ended:
+                return 0
+            data = self._raw.read(DECOMPRESS_READ)
+            if not data:
+                self._ended = True
+                if self._in_frame:
+                    raise zstandard.ZstdError("the file ends part way through a zstd frame")
+                return 0
+            self._pending = memoryview(self._decompressed(data))
+        size = min(len(buffer), len(self._pending))
+        buffer[:size] = self._pending[:size]
+        self._pending = self._pending[size:]
+        return size
+
+    def _decompressed(self, data: bytes) -> bytes:
+        """What ``data`` decompresses to, starting the next frame wherever one ends."""
+        out = []
+        while data:
+            out.append(self._frame.decompress(data))
+            self._in_frame = True
+            if not self._frame.eof:
+                break
+            data = self._frame.unused_data
+            self._frame = zstandard.ZstdDecompressor().decompressobj()
+            self._in_frame = False
+        return b"".join(out)
+
+
+@dataclass(frozen=True)
+class TextPiece:
+    """A run of whole games out of a compressed file, as the text itself.
+
+    What a compressed file is cut into in place of a :class:`ByteRange`, by the process that
+    decompresses it; see :func:`text_pieces`. ``end`` is how far into the *compressed* file the
+    decompression had got when the piece was cut, which is what a build counts its progress in.
+
+    ``error`` is what stopped the decompression, carried by the last piece it produced: the games
+    in ``text`` are read first, and the error is raised where the next game would have been.
+    """
+
+    source: int
+    path: Path
+    text: bytes
+    end: int
+    error: Exception | None = None
+
+    @property
+    def bytes(self) -> int:
+        """How much text this piece is, which is what a worker holds while it reads it."""
+        return len(self.text)
+
+
+@dataclass(frozen=True)
+class CompressedTail:
+    """The rest of a compressed file from a point no boundary could be found after.
+
+    The compressed counterpart of a :class:`ByteRange` too large for a worker: the text from
+    ``start`` -- an offset into the *decompressed* file -- has run past the largest piece without
+    a game boundary in it, so it cannot be cut, and is read in the build's own process to the end
+    of the file. Not to the next boundary: nothing here can say where that is without holding
+    the text up to it, which is what the piece size bounds. ``end`` is the file's size, which is
+    where the progress stands once it is read.
+
+    Carries no open file or decompressor, so it can wait in a queue for as long as it likes: it
+    is read by decompressing the file again from the beginning and passing over ``start`` bytes,
+    which costs a few seconds of a file shaped this way and saves holding one open meanwhile.
+    """
+
+    source: int
+    path: Path
+    start: int
+    end: int
+    bytes: int
+    """How much text had gone by without a boundary, which is what made this a tail."""
+
+
+type Piece = ByteRange | TextPiece | CompressedTail
+"""Anything a file is cut into for reading."""
+
+
+def text_pieces(
+    source: Source,
+    index: int,
+    target_bytes: int,
+    most_bytes: int,
+    stop: Callable[[], bool] = lambda: False,
+) -> Iterator[TextPiece | CompressedTail]:
+    """``source``, a compressed file, decompressed and cut into pieces of whole games.
+
+    The counterpart of :func:`game_ranges` for a file that cannot be entered part way through:
+    this reads it from the start, and each piece is the text itself, about ``target_bytes`` of
+    it, ending at the first game boundary past that. A boundary is what :func:`align_to_game`
+    takes one to be, so the same file read compressed or not is cut at the same kind of place,
+    and gives the same games.
+
+    A generator, so that the file is decompressed only as fast as the pieces are wanted: the
+    caller holds a bounded number of them, whatever the size of the file. ``stop`` is asked
+    before each piece and ends the reading when it says so -- for a build that has its games,
+    or a file an earlier piece of which gave up.
+
+    Text that runs past ``most_bytes`` without a boundary ends the cutting with a
+    :class:`CompressedTail` for the rest of the file, rather than growing a piece without limit.
+
+    A failure to read or decompress the file is not raised: it ends the cutting with a piece of
+    whatever whole games were in hand and the error to raise after them. An :exc:`OSError`
+    means the file went away; anything else, that its contents stopped making sense.
+    """
+    if target_bytes <= 0:
+        raise ValueError(f"a piece has to be some bytes long, not {target_bytes}")
+    text = bytearray()
+    # The text before `text`, which is where its first game starts in the decompressed file.
+    taken = 0
+    searched = 0
+    window: _Window | None = None
+
+    def read() -> int:
+        return 0 if window is None else min(window.position, source.bytes)
+
+    try:
+        with source.path.open("rb") as handle:
+            window = _Window(handle, 0, None)
+            stream = _Decompressing(window)
+            ended = False
+            while not stop():
+                cut = None
+                while cut is None:
+                    if len(text) >= target_bytes:
+                        cut = _boundary_after(text, max(target_bytes, searched))
+                        if cut is not None:
+                            break
+                        # Overlapping the end, so that a separator split across two reads is
+                        # found once the rest of it arrives.
+                        searched = max(target_bytes, len(text) - len(SEPARATOR) + 1)
+                        if len(text) > most_bytes:
+                            yield CompressedTail(
+                                source=index,
+                                path=source.path,
+                                start=taken,
+                                end=source.bytes,
+                                bytes=len(text),
+                            )
+                            return
+                    if ended:
+                        cut = len(text)
+                        break
+                    data = stream.read(DECOMPRESS_READ * 8)
+                    if data:
+                        text += data
+                    else:
+                        ended = True
+                if cut == 0:
+                    return
+                yield TextPiece(source=index, path=source.path, text=bytes(text[:cut]), end=read())
+                del text[:cut]
+                taken += cut
+                searched = 0
+    except (OSError, zstandard.ZstdError) as e:
+        # The games before the last boundary in hand are whole and are read; the one it stopped
+        # in is not, and is counted as unreadable by whoever reads the error.
+        whole = _last_boundary(text)
+        yield TextPiece(
+            source=index, path=source.path, text=bytes(text[:whole]), end=read(), error=e
+        )
+
+
+def _boundary_after(text: bytearray, offset: int) -> int | None:
+    """Where the first game boundary at or after ``offset`` in ``text`` starts, if there is one.
+
+    ``text`` starts at the start of a game, so a blank line in front of a candidate is always in
+    it to be recognised by; see :func:`_separated`.
+    """
+    searched = offset
+    while True:
+        found = text.find(SEPARATOR, searched)
+        if found < 0:
+            return None
+        if found > 0 and _separated(text, found):
+            return found
+        searched = found + 1
+
+
+def _last_boundary(text: bytearray) -> int:
+    """Where the last game in ``text`` starts, which is where the whole games in it end."""
+    searched = len(text)
+    while True:
+        found = text.rfind(SEPARATOR, 0, searched)
+        if found <= 0:
+            return 0
+        if _separated(text, found):
+            return found
+        searched = found
 
 
 class _Screened(chess.pgn.GameBuilder):
@@ -470,6 +761,60 @@ def games_in_range(
             yield record, window.position
 
 
+def games_in_piece(
+    piece: Piece,
+    on_read: Callable[[int], None] | None = None,
+    skip: Callable[[chess.pgn.Headers], bool] | None = None,
+) -> Iterator[tuple[chess.pgn.Game, int]]:
+    """Every game in a piece of any kind, with where the reading had got to, as a stream.
+
+    :func:`games_in_range` for a :class:`ByteRange`, and the same for the pieces of a compressed
+    file: the offsets are into the compressed file, which is what its size is counted in. A
+    :class:`TextPiece` is in memory and reports its ``end`` throughout; ``on_read`` only matters
+    to a :class:`CompressedTail`, which is a long read in the build's own process.
+    """
+    if isinstance(piece, ByteRange):
+        yield from games_in_range(piece, on_read, skip)
+    elif isinstance(piece, TextPiece):
+        text = io.TextIOWrapper(io.BytesIO(piece.text), encoding=ENCODING, errors="replace")
+        while True:
+            record = read_game(text, skip)
+            if record is None:
+                break
+            yield record, piece.end
+        if piece.error is not None:
+            raise piece.error
+    else:
+        yield from _games_in_tail(piece, on_read, skip)
+
+
+def _games_in_tail(
+    piece: CompressedTail,
+    on_read: Callable[[int], None] | None,
+    skip: Callable[[chess.pgn.Headers], bool] | None,
+) -> Iterator[tuple[chess.pgn.Game, int]]:
+    """Every game in a compressed file from ``piece.start`` of its text to its end."""
+    with piece.path.open("rb") as handle:
+        window = _Window(handle, 0, None)
+        stream = _Decompressing(window)
+        passed = 0
+        while passed < piece.start:
+            data = stream.read(min(DECOMPRESS_READ * 8, piece.start - passed))
+            if not data:
+                # The file is shorter than when it was cut: there is no rest of it to read.
+                return
+            passed += len(data)
+        # Only from here: what was passed over is behind the progress already, and reporting it
+        # again would send the line back to the start of the file and then forward.
+        window.on_read = on_read
+        text = io.TextIOWrapper(io.BufferedReader(stream), encoding=ENCODING, errors="replace")
+        while True:
+            record = read_game(text, skip)
+            if record is None:
+                return
+            yield record, window.position
+
+
 class PgnReader:
     """The games in one PGN file, one at a time, with the file's read position to hand.
 
@@ -504,7 +849,9 @@ class PgnReader:
         # Through a window, for the counting rather than for the bound: `None` reads to the
         # file's real end, as this has always done. It is what lets a read say it is alive while
         # the parser is inside a single call that swallows a whole file.
-        self._file, self._window = reading(self._handle, 0, None, self._on_read)
+        self._file, self._window = reading(
+            self._handle, 0, None, self._on_read, compressed=self.source.compressed
+        )
 
     def close(self) -> None:
         """Let go of the file, whether or not it was read to the end."""
