@@ -275,7 +275,6 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
         help="read a file even if another source has the same contents or is the same "
         "Lichess month",
     )
-    _interrupted_options(build, "build")
     build.set_defaults(handler=_build_dataset)
 
     append = actions.add_parser(
@@ -288,10 +287,7 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
     )
     append.add_argument("name", help="the dataset to append to")
     append.add_argument(
-        "sources",
-        nargs="*",
-        metavar="PGN",
-        help="PGN files, directories of them, or glob patterns; none with --resume",
+        "sources", nargs="+", metavar="PGN", help="PGN files, directories of them, or glob patterns"
     )
     append.add_argument(
         "--max-games",
@@ -305,7 +301,12 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
         help="append a file even if the dataset already has one with the same contents or of "
         "the same Lichess month",
     )
-    _interrupted_options(append, "append")
+    append.add_argument(
+        "--discard-interrupted",
+        action="store_true",
+        help="cut off the records an interrupted append left past the last version, and "
+        "append from there",
+    )
     append.add_argument(
         "--workers",
         type=int,
@@ -1133,76 +1134,10 @@ def _build_settings(args: argparse.Namespace):
     return sources, fraction, source, filters
 
 
-def _interrupted_options(parser: argparse.ArgumentParser, doing: str) -> None:
-    """The options that say what to do about an interrupted build or append."""
-    what = parser.add_mutually_exclusive_group()
-    what.add_argument(
-        "--resume",
-        action="store_true",
-        help=f"carry on an interrupted {doing} from its last checkpoint, with the sources and "
-        "settings it was started with",
-    )
-    what.add_argument(
-        "--discard-interrupted",
-        action="store_true",
-        help=f"throw away an interrupted {doing} of this dataset without asking, and start this "
-        "one" + (" from the last version" if doing == "append" else ""),
-    )
-
-
-def _confirm() -> Callable[[str], bool] | None:
-    """A question to put to the person running the command, if there is one at a terminal.
-
-    ``None`` anywhere else, so that a script or a cron job is refused and told which flag says
-    what it meant rather than left waiting on a question nobody will answer.
-    """
-    try:
-        if not (sys.stdin.isatty() and sys.stderr.isatty()):
-            return None
-    except (AttributeError, ValueError):
-        return None
-
-    def ask(question: str) -> bool:
-        print(f"{question} [y/N] ", end="", file=sys.stderr, flush=True)
-        try:
-            answer = sys.stdin.readline()
-        except (OSError, ValueError):
-            return False
-        return answer.strip().lower() in ("y", "yes")
-
-    return ask
-
-
 def _build_dataset(config: Config, args: argparse.Namespace) -> int:
-    from chess_ai.dataset import (
-        DEFAULT_VALIDATION_FRACTION,
-        DatasetError,
-        ProgressPrinter,
-        build_dataset,
-    )
+    from chess_ai.dataset import DatasetError, ProgressPrinter, build_dataset
 
-    if args.resume:
-        given = [
-            option
-            for option, value in (
-                ("PGN files", args.sources),
-                ("--definition", args.definition),
-                ("--validation-fraction", args.validation_fraction),
-                ("--rating-source", args.rating_source),
-                *((f"--{name.replace('_', '-')}", getattr(args, name)) for name in _FILTER_OPTIONS),
-            )
-            # Every one of these is None, or no files, unless it was given: a filter of 0 is
-            # given as much as one of 1500 is, and so is --no-unknown-rating-passes.
-            if value is not None and value != []
-        ]
-        if given:
-            raise _UserError(
-                "--resume carries on with the sources and settings the interrupted build was "
-                f"started with, so it takes no {', '.join(given)}"
-            )
-        sources, fraction, source, filters = [], DEFAULT_VALIDATION_FRACTION, None, None
-    else:
-        sources, fraction, source, filters = _build_settings(args)
+    sources, fraction, source, filters = _build_settings(args)
     printer = ProgressPrinter()
     try:
         manifest = build_dataset(
@@ -1216,9 +1151,6 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
             workers=args.workers,
             filters=filters,
             allow_repeat=args.allow_repeat,
-            resume=args.resume,
-            discard_interrupted=args.discard_interrupted,
-            confirm=_confirm(),
         )
     except DatasetError as e:
         raise _UserError(e) from e
@@ -1238,13 +1170,6 @@ def _append_dataset(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.dataset import DatasetError, ProgressPrinter
     from chess_ai.dataset.builder import append_dataset
 
-    if args.resume and (args.sources or args.max_games is not None or args.allow_repeat):
-        raise _UserError(
-            "--resume carries on with the sources and maximum the interrupted append was started "
-            "with, so it takes no PGN files, --max-games or --allow-repeat"
-        )
-    if not args.resume and not args.sources:
-        raise _UserError("name the PGN files to append, or --resume an interrupted append")
     printer = ProgressPrinter()
     try:
         manifest = append_dataset(
@@ -1256,8 +1181,6 @@ def _append_dataset(config: Config, args: argparse.Namespace) -> int:
             workers=args.workers,
             allow_repeat=args.allow_repeat,
             discard_interrupted=args.discard_interrupted,
-            resume=args.resume,
-            confirm=_confirm(),
         )
     except DatasetError as e:
         raise _UserError(e) from e

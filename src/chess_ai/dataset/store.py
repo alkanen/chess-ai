@@ -38,7 +38,7 @@ import errno
 import logging
 import os
 import re
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from types import TracebackType
@@ -384,17 +384,6 @@ class _StreamWriter:
             )
         self._file = file
 
-    def flush(self) -> None:
-        """Put what has been written so far on the disk, keeping the shard open to write more.
-
-        What a checkpoint is written after: the records it counts have to be there to be resumed
-        from. The directory is flushed as well, for the name of a shard started since the last.
-        """
-        if self._file is None:
-            return
-        sync_file(self._file)
-        sync_directory(self._directory)
-
     def close(self) -> None:
         """Finish the current shard, with what was written actually on the disk.
 
@@ -512,17 +501,6 @@ class SplitWriter:
         self._moves.append(moves)
         self._games.append(games)
 
-    def flush(self) -> None:
-        """Put every stream's records so far on the disk; see :meth:`_StreamWriter.flush`."""
-        for stream in (self._positions, self._games, self._moves, self._targets):
-            if stream is not None:
-                stream.flush()
-
-    @property
-    def counts(self) -> SplitCounts:
-        """How much this split holds now, in the form a manifest or a checkpoint says it."""
-        return SplitCounts(games=self.games, positions=self.positions, targets=self.targets)
-
     def close(self) -> None:
         """Close all three streams, whatever any one of them does on the way.
 
@@ -539,9 +517,8 @@ class SplitWriter:
 class DatasetWriter:
     """A dataset being built or appended to: both splits, and the manifest written when it is done.
 
-    ``counts`` is how much each split of the directory already holds, which this writes after: the
-    dataset being appended to, or what an interrupted build or append had written when it was
-    last checkpointed. Without them this is a new build, into a directory of its own.
+    ``base`` is the manifest of the dataset being appended to, whose directory this writes into
+    after the records it already has; without one this is a build, into a directory of its own.
     """
 
     def __init__(
@@ -550,11 +527,11 @@ class DatasetWriter:
         shards: Shards = DEFAULT_SHARDS,
         *,
         targets: bool = False,
-        counts: Mapping[str, SplitCounts] | None = None,
+        base: Manifest | None = None,
     ) -> None:
         self.directory = directory
         self.shards = shards
-        if counts is None:
+        if base is None:
             # Never a directory that is already there: one that is belongs to another build, and
             # writing into it publishes its shards inside this dataset. The builder checks first,
             # so this is the invariant said where it belongs rather than a condition anyone should
@@ -567,7 +544,7 @@ class DatasetWriter:
                 directory / split,
                 shards,
                 targets=targets,
-                counts=counts.get(split) if counts is not None else None,
+                counts=base.splits.get(split) if base is not None else None,
             )
             for split in SPLITS
         }
@@ -588,12 +565,6 @@ class DatasetWriter:
         # letting it raise would put a disk error in the place of the Ctrl-C that caused it.
         with suppress(Exception):
             self.close()
-
-    def flush(self) -> None:
-        """Put every record written so far on the disk, to checkpoint them."""
-        for writer in self.splits.values():
-            writer.flush()
-        sync_directory(self.directory)
 
     def close(self) -> None:
         """Close every split, whatever any one of them does; see :meth:`SplitWriter.close`."""
@@ -946,20 +917,18 @@ _STREAMS: Final = (
 """Every stream a split can have: its directory, its records, its shard size, and its count."""
 
 
-def _stream_ends(
-    directory: Path, shards: Shards, splits: Mapping[str, SplitCounts]
-) -> Iterator[tuple[Path, np.dtype, int, int]]:
-    """Every stream of the dataset in ``directory``, with where it ends after ``splits``.
+def _stream_ends(directory: Path, manifest: Manifest) -> Iterator[tuple[Path, np.dtype, int, int]]:
+    """Every stream of the dataset in ``directory``, with where it ends after ``manifest``.
 
-    Each comes with its record type, its shard size and how many records ``splits`` counts in
+    Each comes with its record type, its shard size and how many records ``manifest`` counts in
     it. A target stream is counted only when the dataset keeps one; otherwise none of it is the
     dataset's, and anything in it is past the end.
     """
     for split in SPLITS:
-        counts = splits.get(split, SplitCounts())
+        counts = manifest.splits.get(split, SplitCounts())
         for stream, dtype, per_shard, counted in _STREAMS:
             count = 0 if stream == TARGETS and counts.targets is None else getattr(counts, counted)
-            yield directory / split / stream, dtype, getattr(shards, per_shard), count
+            yield directory / split / stream, dtype, getattr(manifest.shards, per_shard), count
 
 
 def _shards_in(stream: Path) -> dict[int, Path]:
@@ -977,16 +946,6 @@ def _shards_in(stream: Path) -> dict[int, Path]:
 def records_past(directory: Path, manifest: Manifest) -> list[Path]:
     """The shards of the dataset in ``directory`` that hold more than ``manifest`` counts.
 
-    See :func:`records_past_counts`, which this is for a manifest's counts.
-    """
-    return records_past_counts(directory, manifest.shards, manifest.splits)
-
-
-def records_past_counts(
-    directory: Path, shards: Shards, splits: Mapping[str, SplitCounts]
-) -> list[Path]:
-    """The shards of the dataset in ``directory`` that hold more than ``splits`` counts.
-
     Which is what an append that was interrupted leaves: what it wrote is on the disk and its
     manifest is not, so nothing reads it. Only sizes are looked at, which is a few hundred
     ``stat`` calls for a large dataset.
@@ -996,7 +955,7 @@ def records_past_counts(
     and the next append starting that shard would find it taken.
     """
     past = []
-    for stream, dtype, per_shard, count in _stream_ends(directory, shards, splits):
+    for stream, dtype, per_shard, count in _stream_ends(directory, manifest):
         last, in_last = divmod(count, per_shard)
         for number, path in sorted(_shards_in(stream).items()):
             if number < last:
@@ -1006,43 +965,14 @@ def records_past_counts(
     return past
 
 
-def records_missing(
-    directory: Path, shards: Shards, splits: Mapping[str, SplitCounts]
-) -> list[Path]:
-    """The streams of the dataset in ``directory`` that hold fewer records than ``splits`` counts.
-
-    Which a checkpoint's counts never should: they are written after the records are flushed. One
-    that does is a dataset that was damaged or copied short since, and carrying on from it would
-    write records after a gap. Only sizes are looked at, as :func:`records_past_counts` does.
-    """
-    short = []
-    for stream, dtype, per_shard, count in _stream_ends(directory, shards, splits):
-        shards_in = _shards_in(stream)
-        for number in range(-(-count // per_shard)):
-            expected = min(per_shard, count - number * per_shard) * dtype.itemsize
-            path = shards_in.get(number)
-            if path is None or path.stat().st_size < expected:
-                short.append(stream)
-                break
-    return short
-
-
 def cut_back(directory: Path, manifest: Manifest) -> None:
     """Throw away every record of the dataset in ``directory`` that ``manifest`` does not count.
 
-    See :func:`cut_back_to`, which this is for a manifest's counts.
-    """
-    cut_back_to(directory, manifest.shards, manifest.splits)
-
-
-def cut_back_to(directory: Path, shards: Shards, splits: Mapping[str, SplitCounts]) -> None:
-    """Throw away every record of the dataset in ``directory`` that ``splits`` does not count.
-
     Shards past the end are removed and the last one counted is cut down to its records, so the
-    dataset is exactly what ``splits`` describes again, to the byte. Every change is flushed
+    dataset is exactly what ``manifest`` describes again, to the byte. Every change is flushed
     before this returns, so that an append which starts next never finds them back.
     """
-    for stream, dtype, per_shard, count in _stream_ends(directory, shards, splits):
+    for stream, dtype, per_shard, count in _stream_ends(directory, manifest):
         last, in_last = divmod(count, per_shard)
         for number, path in sorted(_shards_in(stream).items(), reverse=True):
             if number > last or (number == last and in_last == 0):

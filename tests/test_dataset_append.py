@@ -361,7 +361,7 @@ def test_the_next_append_refuses_to_start_over_an_interrupted_one(tmp_path, monk
     interrupted(tmp_path, monkeypatch, "unrated.pgn")
     left = shard_bytes(dataset_path(tmp_path, "test"))
 
-    with pytest.raises(DatasetError, match="interrupted append.*--resume.*--discard-interrupted"):
+    with pytest.raises(DatasetError, match="interrupted append left behind.*--discard-interrupted"):
         append(tmp_path, "custom-start.pgn")
     assert shard_bytes(dataset_path(tmp_path, "test")) == left, "and touches nothing"
 
