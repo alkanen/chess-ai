@@ -1,0 +1,475 @@
+"""Checkpoints and resuming: a build or append that stops part way is carried on, not redone."""
+
+import io
+import shutil
+from pathlib import Path
+
+import pytest
+from dataset_helpers import BACK_TO_BACK, TINY_SHARDS, build, comparable, fixture, shard_bytes
+from test_dataset_compressed import compressed, mixed_pgn, varied_pgn
+
+from chess_ai.dataset import (
+    DatasetError,
+    ProgressPrinter,
+    builder,
+    load_manifest,
+    open_dataset,
+    store,
+)
+from chess_ai.dataset.builder import append_dataset, build_dataset
+from chess_ai.dataset.checkpoint import CHECKPOINT_FILE, load_checkpoint
+from chess_ai.dataset.manifest import Filters, Manifest
+from chess_ai.dataset.store import dataset_path, records_past
+
+SETTINGS = {
+    "shards": TINY_SHARDS,
+    "validation_fraction": 0.3,
+    # A filter on positions, so that the target stream is written and cut back too.
+    "filters": Filters(min_rating=1600, unknown_rating_passes=True),
+}
+
+
+class Killed(BaseException):
+    """What kills a build in these tests: not an Exception, so nothing on the way catches it."""
+
+
+def stream_appends(monkeypatch) -> list[int]:
+    """Count the writes to every stream, which is where these tests kill a build."""
+    count = [0]
+    real = store._StreamWriter.append
+
+    def counting(self, records):
+        count[0] += 1
+        return real(self, records)
+
+    monkeypatch.setattr(store._StreamWriter, "append", counting)
+    return count
+
+
+def killing(monkeypatch, at: int) -> None:
+    """Kill the build at its ``at``-th write to a stream, before it is made.
+
+    A game is three or four writes, so this lands part way through a game's records as often as
+    between games, which is what cutting back to a checkpoint has to undo.
+    """
+    calls = [0]
+    real = store._StreamWriter.append
+
+    def append(self, records):
+        calls[0] += 1
+        if calls[0] == at:
+            raise Killed
+        return real(self, records)
+
+    monkeypatch.setattr(store._StreamWriter, "append", append)
+
+
+def checkpoint_every(monkeypatch, opportunities: int) -> None:
+    """Write a checkpoint at every ``opportunities``-th place one could be written.
+
+    Every place, rather than once a minute, so that a test of a few hundred games has many; and
+    not at all of them, so that a build is killed with records past its last checkpoint.
+    """
+    monkeypatch.setattr(builder, "CHECKPOINT_SECONDS", 0.0)
+    real = builder._Build.checkpoint
+    calls = [0]
+
+    def sometimes(self, *, force=False):
+        calls[0] += 1
+        if force or calls[0] % opportunities == 0:
+            real(self, force=True)
+
+    monkeypatch.setattr(builder._Build, "checkpoint", sometimes)
+
+
+def reading(patch, mode: str) -> None:
+    """Read the way ``mode`` says: one process, several, or several with stretches read here."""
+    if mode == "serial":
+        return
+    patch.setattr(builder, "PARALLEL_FROM_BYTES", 0)
+    patch.setattr(builder, "CHUNK_BYTES", 900)
+    if mode == "stretches":
+        # Pieces too large for a worker are read in the build's own process, a game at a time,
+        # and checkpointed by how many of their games are in.
+        patch.setattr(builder, "MAX_PIECE_BYTES", 1200)
+
+
+def sources(tmp_path: Path, kind: str, mode: str = "serial") -> list[str]:
+    """Files of mixed games, broken ones included, plain or compressed.
+
+    For ``mode`` "stretches", also one whose games are not separated by blank lines, which
+    cannot be cut and so is read in the build's own process.
+    """
+    files = [mixed_pgn(tmp_path / "mixed.pgn")]
+    if mode == "stretches":
+        flat = tmp_path / "flat.pgn"
+        flat.write_text(BACK_TO_BACK.replace("1500", "1700") * 40)
+        files.append(flat)
+    files.append(varied_pgn(tmp_path / "varied.pgn", games=30))
+    if kind == "zst":
+        return [str(compressed(path, frames=3)) for path in files]
+    return [str(path) for path in files]
+
+
+def workers(mode: str) -> int:
+    return 1 if mode == "serial" else 3
+
+
+def interrupted_then_resumed(run, resume, kills, monkeypatch, where, places: list) -> Manifest:
+    """Run ``run``, killed at each write in ``kills`` in turn and resumed after each.
+
+    ``where`` is the directory the checkpoint is in, and what each one said to carry on from is
+    put in ``places``: (source, offset, games passed).
+    """
+    for at in kills:
+        with monkeypatch.context() as patch:
+            killing(patch, at)
+            with pytest.raises(Killed):
+                run() if at == kills[0] else resume()
+        checkpoint = load_checkpoint(where())
+        assert checkpoint is not None
+        places.append((checkpoint.source, checkpoint.offset, checkpoint.passing))
+    return resume()
+
+
+@pytest.mark.parametrize("kind", ["plain", "zst"])
+@pytest.mark.parametrize("mode", ["serial", "parallel", "stretches"])
+def test_a_resumed_build_is_the_build_that_was_never_interrupted(tmp_path, monkeypatch, kind, mode):
+    named = sources(tmp_path, kind, mode)
+    with monkeypatch.context() as patch:
+        reading(patch, mode)
+        writes = stream_appends(patch)
+        expected = build(tmp_path / "whole", *named, workers=workers(mode), **SETTINGS)
+    total = writes[0]
+    assert total > 40, "enough writes to kill the build at several places"
+
+    places: list[tuple[int, int, int]] = []
+    for at in (1, 7, total // 3, total // 2 + 1, total * 2 // 3, total - 1):
+        data_dir = tmp_path / f"killed-{at}"
+        with monkeypatch.context() as patch:
+            reading(patch, mode)
+            checkpoint_every(patch, 3)
+            manifest = interrupted_then_resumed(
+                lambda data_dir=data_dir: build(
+                    data_dir, *named, workers=workers(mode), **SETTINGS
+                ),
+                lambda data_dir=data_dir: build_dataset(
+                    "test", [], data_dir=data_dir, resume=True, workers=workers(mode)
+                ),
+                # And the resumed build killed in turn, a little further on, where it has that far
+                # to go.
+                [at, 3] if at <= total // 2 + 1 else [at],
+                patch,
+                lambda data_dir=data_dir: builder.interrupted_builds(data_dir, "test")[0],
+                places,
+            )
+
+        assert shard_bytes(dataset_path(data_dir, "test")) == shard_bytes(
+            dataset_path(tmp_path / "whole", "test")
+        ), f"killed at write {at}"
+        assert comparable(manifest) == comparable(expected)
+        assert not (dataset_path(data_dir, "test") / CHECKPOINT_FILE).exists()
+        assert not builder.interrupted_builds(data_dir, "test")
+    # Carried on part way into a file, not from the start of one, and into a stretch read a game
+    # at a time where there are any: games passed rather than a piece's start.
+    assert any(offset or passing for _, offset, passing in places), places
+    if mode != "parallel":
+        assert any(passing for _, _, passing in places), places
+
+
+@pytest.mark.parametrize("kind", ["plain", "zst"])
+@pytest.mark.parametrize("mode", ["serial", "parallel"])
+def test_a_resumed_append_is_the_append_that_was_never_interrupted(
+    tmp_path, monkeypatch, kind, mode
+):
+    # Both files appended, one after the other: the filter leaves out every game of the second,
+    # and a version that kept nothing would not be one.
+    appended = sources(tmp_path, kind)
+    build(tmp_path / "whole", "lichess.pgn", **SETTINGS)
+    with monkeypatch.context() as patch:
+        reading(patch, mode)
+        writes = stream_appends(patch)
+        expected = append_dataset(
+            "test", appended, data_dir=tmp_path / "whole", workers=workers(mode)
+        )
+    total = writes[0]
+
+    places: list[tuple[int, int, int]] = []
+    for at in (1, total // 2, total - 1):
+        data_dir = tmp_path / f"killed-{at}"
+        build(data_dir, "lichess.pgn", **SETTINGS)
+        with monkeypatch.context() as patch:
+            reading(patch, mode)
+            checkpoint_every(patch, 2)
+            manifest = interrupted_then_resumed(
+                lambda data_dir=data_dir: append_dataset(
+                    "test", appended, data_dir=data_dir, workers=workers(mode)
+                ),
+                lambda data_dir=data_dir: append_dataset(
+                    "test", [], data_dir=data_dir, resume=True, workers=workers(mode)
+                ),
+                [at],
+                patch,
+                lambda data_dir=data_dir: dataset_path(data_dir, "test"),
+                places,
+            )
+
+        assert shard_bytes(dataset_path(data_dir, "test")) == shard_bytes(
+            dataset_path(tmp_path / "whole", "test")
+        ), f"killed at write {at}"
+        assert comparable(manifest) == comparable(expected)
+        assert not (dataset_path(data_dir, "test") / CHECKPOINT_FILE).exists()
+    assert any(offset or passing for _, offset, passing in places), places
+
+
+def interrupted_append(data_dir, monkeypatch, *names, at=5) -> None:
+    """Build "test" from lichess.pgn and kill an append of ``names`` at its ``at``-th write."""
+    build(data_dir, "lichess.pgn", **SETTINGS)
+    with monkeypatch.context() as patch:
+        checkpoint_every(patch, 2)
+        killing(patch, at)
+        with pytest.raises(Killed):
+            append_dataset("test", [fixture(name) for name in names], data_dir=data_dir)
+
+
+def test_an_interrupted_append_leaves_a_checkpoint_and_the_previous_version_readable(
+    tmp_path, monkeypatch
+):
+    interrupted_append(tmp_path, monkeypatch, "unrated.pgn", at=8)
+    directory = dataset_path(tmp_path, "test")
+    built = build(tmp_path / "clean", "lichess.pgn", **SETTINGS)
+
+    checkpoint = load_checkpoint(directory)
+    assert checkpoint is not None and checkpoint.version == 2
+    assert [Path(source.path).name for source in checkpoint.sources] == ["unrated.pgn"]
+    dataset = open_dataset("test", data_dir=tmp_path)
+    assert dataset.manifest.version == 1
+    assert dataset.manifest.games == built.games
+
+
+def test_an_append_of_other_sources_over_an_interrupted_one_is_refused_without_a_terminal(
+    tmp_path, monkeypatch
+):
+    interrupted_append(tmp_path, monkeypatch, "unrated.pgn")
+    left = shard_bytes(dataset_path(tmp_path, "test"))
+
+    with pytest.raises(DatasetError, match="--resume.*--discard-interrupted") as refused:
+        append_dataset("test", [fixture("custom-start.pgn")], data_dir=tmp_path)
+
+    assert "unrated.pgn" in str(refused.value), "it says which append is in the way"
+    assert shard_bytes(dataset_path(tmp_path, "test")) == left, "and touches nothing"
+    assert load_checkpoint(dataset_path(tmp_path, "test")) is not None
+
+
+def test_an_append_over_an_interrupted_one_aborts_when_told_to(tmp_path, monkeypatch):
+    interrupted_append(tmp_path, monkeypatch, "unrated.pgn")
+    left = shard_bytes(dataset_path(tmp_path, "test"))
+    asked = []
+
+    def no(question):
+        asked.append(question)
+        return False
+
+    with pytest.raises(DatasetError, match="left the interrupted append.*alone.*--resume"):
+        append_dataset("test", [fixture("custom-start.pgn")], data_dir=tmp_path, confirm=no)
+
+    assert len(asked) == 1 and "unrated.pgn" in asked[0] and "Discard" in asked[0]
+    assert shard_bytes(dataset_path(tmp_path, "test")) == left
+    # And it can still be carried on.
+    resumed = append_dataset("test", [], data_dir=tmp_path, resume=True)
+    assert resumed.version == 2 and resumed.versions[-1].sources[0].path == fixture("unrated.pgn")
+
+
+def test_discarding_an_interrupted_append_leaves_the_previous_version_byte_identical(
+    tmp_path, monkeypatch
+):
+    build(tmp_path / "clean", "lichess.pgn", **SETTINGS)
+    version_1 = shard_bytes(dataset_path(tmp_path / "clean", "test"))
+    expected = append_dataset("test", [fixture("custom-start.pgn")], data_dir=tmp_path / "clean")
+    interrupted_append(tmp_path / "data", monkeypatch, "unrated.pgn", at=6)
+    directory = dataset_path(tmp_path / "data", "test")
+    assert records_past(directory, load_manifest(directory)), "it had written past version 1"
+
+    with monkeypatch.context() as patch:
+        # Stopped right after the discarding, to look at what it left.
+        def stop(*args, **kwargs):
+            raise Killed
+
+        patch.setattr(builder._Build, "run", stop)
+        with pytest.raises(Killed):
+            append_dataset(
+                "test", [fixture("custom-start.pgn")], data_dir=tmp_path / "data", confirm=bool
+            )
+    assert shard_bytes(directory) == version_1
+    assert load_checkpoint(directory) is None
+
+    manifest = append_dataset("test", [fixture("custom-start.pgn")], data_dir=tmp_path / "data")
+    assert shard_bytes(directory) == shard_bytes(dataset_path(tmp_path / "clean", "test"))
+    assert comparable(manifest) == comparable(expected)
+
+
+def test_resuming_with_nothing_interrupted_says_so(tmp_path):
+    build(tmp_path, "lichess.pgn")
+
+    with pytest.raises(DatasetError, match="no interrupted append"):
+        append_dataset("test", [], data_dir=tmp_path, resume=True)
+    with pytest.raises(DatasetError, match="no interrupted build"):
+        build_dataset("other", [], data_dir=tmp_path, resume=True)
+
+
+def test_resuming_takes_no_sources(tmp_path, monkeypatch):
+    interrupted_append(tmp_path, monkeypatch, "unrated.pgn")
+
+    with pytest.raises(DatasetError, match="name none"):
+        append_dataset("test", [fixture("unrated.pgn")], data_dir=tmp_path, resume=True)
+    with pytest.raises(DatasetError, match="maximum"):
+        append_dataset("test", [], data_dir=tmp_path, resume=True, max_games=100)
+
+
+def test_a_source_that_changed_is_not_resumed_from_and_nothing_is_lost(tmp_path, monkeypatch):
+    source = tmp_path / "games.pgn"
+    shutil.copy(fixture("unrated.pgn"), source)
+    build(tmp_path / "data", "lichess.pgn", **SETTINGS)
+    with monkeypatch.context() as patch:
+        checkpoint_every(patch, 2)
+        killing(patch, 5)
+        with pytest.raises(Killed):
+            append_dataset("test", [str(source)], data_dir=tmp_path / "data")
+    directory = dataset_path(tmp_path / "data", "test")
+    left = shard_bytes(directory)
+    original = source.read_bytes()
+
+    source.write_bytes(original.replace(b"1-0", b"0-1"))  # The same size, other games.
+    with pytest.raises(DatasetError, match="contents have changed"):
+        append_dataset("test", [], data_dir=tmp_path / "data", resume=True)
+    source.write_bytes(original + b"\n")
+    with pytest.raises(DatasetError, match="was .* bytes and is"):
+        append_dataset("test", [], data_dir=tmp_path / "data", resume=True)
+
+    assert shard_bytes(directory) == left, "refused before anything was cut back"
+    source.write_bytes(original)
+    resumed = append_dataset("test", [], data_dir=tmp_path / "data", resume=True)
+    build(tmp_path / "clean", "lichess.pgn", **SETTINGS)
+    expected = append_dataset("test", [str(source)], data_dir=tmp_path / "clean")
+    assert comparable(resumed) == comparable(expected)
+
+
+def test_a_checkpoint_left_by_an_append_that_finished_is_cleared_away(tmp_path, monkeypatch):
+    # Killed between writing the manifest and removing the checkpoint: the append is done.
+    build(tmp_path, "lichess.pgn")
+    with monkeypatch.context() as patch:
+        patch.setattr(builder, "remove_checkpoint", lambda directory: None)
+        append_dataset("test", [fixture("unrated.pgn")], data_dir=tmp_path)
+    assert load_checkpoint(dataset_path(tmp_path, "test")) is not None
+
+    manifest = append_dataset("test", [fixture("custom-start.pgn")], data_dir=tmp_path)
+
+    assert manifest.version == 3
+    assert load_checkpoint(dataset_path(tmp_path, "test")) is None
+
+
+def test_an_append_killed_while_publishing_resumes(tmp_path, monkeypatch):
+    build(tmp_path, "lichess.pgn")
+    with monkeypatch.context() as patch:
+
+        def killed(self, directory):
+            raise Killed
+
+        patch.setattr(Manifest, "save", killed)
+        with pytest.raises(Killed):
+            append_dataset("test", [fixture("unrated.pgn")], data_dir=tmp_path)
+
+    assert append_dataset("test", [], data_dir=tmp_path, resume=True).games == 7
+
+
+def test_an_interrupted_build_asks_before_it_is_thrown_away(tmp_path, monkeypatch):
+    with monkeypatch.context() as patch:
+        checkpoint_every(patch, 2)
+        killing(patch, 6)
+        with pytest.raises(Killed):
+            build(tmp_path, "lichess.pgn", **SETTINGS)
+    (partial,) = builder.interrupted_builds(tmp_path, "test")
+    asked = []
+
+    with pytest.raises(DatasetError, match="left the interrupted build.*alone"):
+        build(tmp_path, "unrated.pgn", confirm=lambda question: asked.append(question) or False)
+    assert partial.is_dir() and "lichess.pgn" in asked[0]
+
+    manifest = build(tmp_path, "unrated.pgn", confirm=lambda question: True)
+
+    assert manifest.games == 3
+    assert not partial.exists()
+
+
+def test_two_interrupted_builds_are_not_guessed_between(tmp_path, monkeypatch):
+    with monkeypatch.context() as patch:
+        checkpoint_every(patch, 2)
+        killing(patch, 6)
+        with pytest.raises(Killed):
+            build(tmp_path, "lichess.pgn")
+    (partial,) = builder.interrupted_builds(tmp_path, "test")
+    shutil.copytree(partial, store.new_partial_path(tmp_path, "test"))
+
+    with pytest.raises(DatasetError, match="2 interrupted builds.*remove all but"):
+        build_dataset("test", [], data_dir=tmp_path, resume=True)
+
+
+def test_a_build_interrupted_before_its_first_checkpoint_leaves_nothing(tmp_path, monkeypatch):
+    # Killed while taking the checksums: nothing was read, so there is nothing to carry on.
+    def killed(path, on_read=None):
+        raise Killed
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builder, "sha256_of", killed)
+        with pytest.raises(Killed):
+            build(tmp_path, "lichess.pgn")
+
+    assert not builder.interrupted_builds(tmp_path, "test")
+    assert not store.abandoned_partials(tmp_path, "test")
+
+
+def test_a_resumed_build_reports_its_progress_from_where_it_was(tmp_path, monkeypatch):
+    # The line carries on from the checkpoint rather than starting from nothing and racing back,
+    # and the rate counts only the games read since it resumed.
+    named = sources(tmp_path, "plain")
+    with monkeypatch.context() as patch:
+        checkpoint_every(patch, 4)
+        killing(patch, 60)
+        with pytest.raises(Killed):
+            build(tmp_path, *named, workers=1, **SETTINGS)
+    (partial,) = builder.interrupted_builds(tmp_path, "test")
+    checkpoint = load_checkpoint(partial)
+    assert checkpoint is not None and checkpoint.bytes_read > 0
+    reports = []
+    out = io.StringIO()
+    printer = ProgressPrinter(out, interval=0.0, rewrite=False)
+
+    def both(progress):
+        reports.append(progress)
+        printer(progress)
+
+    build_dataset("test", [], data_dir=tmp_path, resume=True, workers=1, progress=both)
+
+    reading_reports = [report for report in reports if not report.hashing]
+    assert reading_reports[0].bytes_read == checkpoint.bytes_read
+    read = [report.bytes_read for report in reading_reports]
+    assert read == sorted(read), "never back to the start of the file it passes over"
+    assert all(report.games_before == checkpoint.counts.games_read for report in reports)
+    printed = out.getvalue().splitlines()
+    assert printed[-1].startswith("built"), printed
+
+
+def test_a_checkpoint_that_would_cut_into_an_earlier_version_is_refused(tmp_path, monkeypatch):
+    interrupted_append(tmp_path, monkeypatch, "unrated.pgn")
+    directory = dataset_path(tmp_path, "test")
+    checkpoint = load_checkpoint(directory)
+    assert checkpoint is not None
+    checkpoint.model_copy(update={"splits": {}}).save(directory)
+    version_1 = load_manifest(directory)
+    before = shard_bytes(directory)
+
+    with pytest.raises(DatasetError, match="fewer records than version 1"):
+        append_dataset("test", [], data_dir=tmp_path, resume=True)
+
+    assert shard_bytes(directory) == before
+    assert load_manifest(directory) == version_1

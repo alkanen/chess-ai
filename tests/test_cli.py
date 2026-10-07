@@ -1395,3 +1395,98 @@ def test_dataset_build_refuses_an_infinite_filter_in_a_definition(tmp_path, caps
         main(["dataset", "build", "games", fixture("lichess.pgn"), "--definition", "forever.toml"])
 
     assert "finite number" in capsys.readouterr().err
+
+
+def _interrupted_append(monkeypatch) -> None:
+    """Build "games" from lichess.pgn and kill an append of unrated.pgn part way."""
+    from chess_ai.dataset import store
+
+    assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+    real = store._StreamWriter.append
+    calls = [0]
+
+    def append(self, records):
+        calls[0] += 1
+        if calls[0] == 4:
+            raise KeyboardInterrupt
+        return real(self, records)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store._StreamWriter, "append", append)
+        with pytest.raises(KeyboardInterrupt):
+            main(["dataset", "append", "games", fixture("unrated.pgn")])
+
+
+def test_dataset_append_resume_carries_an_interrupted_append_on(tmp_path, monkeypatch, capsys):
+    _interrupted_append(monkeypatch)
+    capsys.readouterr()
+
+    assert main(["dataset", "append", "games", "--resume"]) == 0
+
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert manifest.version == 2 and manifest.games == 7
+    assert "version 2 added 3 games" in capsys.readouterr().out
+
+
+def test_dataset_append_resume_takes_no_sources(tmp_path, capsys):
+    assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "append", "games", fixture("unrated.pgn"), "--resume"])
+    assert exit_info.value.code == 2
+    assert "takes no PGN files" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["dataset", "append", "games"])
+    assert "--resume" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        main(["dataset", "append", "games", "--resume", "--discard-interrupted"])
+
+
+def test_dataset_build_resume_takes_no_settings(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "build", "games", "--resume", "--min-rating", "0"])
+
+    assert exit_info.value.code == 2
+    assert "takes no --min-rating" in capsys.readouterr().err
+
+
+class _Terminal(io.StringIO):
+    """A stream that says it is a terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_an_append_over_an_interrupted_one_asks_at_a_terminal(tmp_path, monkeypatch, capsys):
+    _interrupted_append(monkeypatch)
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stdin", _Terminal("n\n"))
+    monkeypatch.setattr(sys, "stderr", _Terminal())
+
+    with pytest.raises(SystemExit):
+        main(["dataset", "append", "games", fixture("custom-start.pgn")])
+    asked = sys.stderr.getvalue()
+    assert "unrated.pgn" in asked and "[y/N]" in asked
+    assert "left the interrupted append" in asked
+
+    monkeypatch.setattr(sys, "stdin", _Terminal("y\n"))
+    assert main(["dataset", "append", "games", fixture("custom-start.pgn")]) == 0
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert [Path(source.path).name for source in manifest.versions[-1].sources] == [
+        "custom-start.pgn"
+    ]
+
+
+def test_an_append_over_an_interrupted_one_is_refused_off_a_terminal(tmp_path, monkeypatch, capsys):
+    _interrupted_append(monkeypatch)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit):
+        main(["dataset", "append", "games", fixture("custom-start.pgn")])
+
+    err = capsys.readouterr().err
+    assert "--resume" in err and "--discard-interrupted" in err and "[y/N]" not in err
+    assert (
+        main(["dataset", "append", "games", fixture("custom-start.pgn"), "--discard-interrupted"])
+        == 0
+    )
