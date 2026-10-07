@@ -249,7 +249,7 @@ def _resumable(
             "start it again with 'chess-ai train --overwrite'"
         )
     payload = _load(reader.checkpoint_path(latest), doing=f"resume run {name!r}")
-    config = _config_of(payload, name)
+    config = _pinned_to_its_version(_config_of(payload, name), reader)
     run = _prepare(config, data_dir=data_dir)
     _same_dataset(run, reader)
     doing = f"resume run {name!r} from step {latest.step:,}"
@@ -298,6 +298,21 @@ def _config_of(payload: dict[str, Any], name: str) -> ExperimentConfig:
         ) from e
 
 
+def _pinned_to_its_version(config: ExperimentConfig, reader: RunReader) -> ExperimentConfig:
+    """``config`` with the dataset version the run recorded, where the config left it to the latest.
+
+    The latest is whatever has been appended since, and a resumed run carries on with the data it
+    was training on. A run from before datasets had versions recorded none and trained on version 1.
+    """
+    if config.dataset.version is not None:
+        return config
+    return config.model_copy(
+        update={
+            "dataset": config.dataset.model_copy(update={"version": reader.info.dataset.version})
+        }
+    )
+
+
 def _same_dataset(run: _Run, reader: RunReader) -> None:
     """Refuse to resume on a dataset other than the one the run was training on.
 
@@ -307,14 +322,15 @@ def _same_dataset(run: _Run, reader: RunReader) -> None:
     """
     recorded = reader.info.dataset
     manifest = run.dataset.manifest
-    there = (recorded.train_positions, recorded.created)
-    here = (_split_positions(manifest, TRAIN), manifest.created)
+    there = (recorded.version, recorded.train_positions, recorded.created)
+    here = (manifest.version, _split_positions(manifest, TRAIN), manifest.created)
     if there != here:
         raise TrainingError(
             f"dataset {manifest.name!r} is not the one run {reader.name!r} was training on "
-            f"({there[0]:,} train positions, built {there[1]}; now {here[0]:,}, built {here[1]}), "
-            "so a resumed run would not carry on where it was. Start a new run with "
-            "[initialize_from] to train its weights on this dataset instead"
+            f"(version {there[0]}: {there[1]:,} train positions, built {there[2]}; now version "
+            f"{here[0]}: {here[1]:,}, built {here[2]}), so a resumed run would not carry on "
+            "where it was. Start a new run with [initialize_from] to train its weights on this "
+            "dataset instead"
         )
 
 
@@ -354,13 +370,22 @@ def _initialize(run: _Run, *, runs_dir: Path) -> Lineage:
     payload = _load(reader.checkpoint_path(chosen), doing=doing)
     _check_compatible(run, payload, doing=doing)
     _load_weights(run, payload, doing=doing)
-    trained_on = (payload.get("config") or {}).get("dataset") or {}
     return Lineage(
         run=source.run,
         step=chosen.step,
         checkpoint=source.checkpoint,
-        dataset=trained_on.get("name") if isinstance(trained_on, dict) else None,
+        dataset=_trained_on_dataset(reader, payload),
     )
+
+
+def _trained_on_dataset(reader: RunReader, payload: dict[str, Any]) -> str | None:
+    """The dataset a run trained on, with its version when the run recorded one."""
+    try:
+        recorded = reader.info.dataset
+    except RunError:
+        trained_on = (payload.get("config") or {}).get("dataset") or {}
+        return trained_on.get("name") if isinstance(trained_on, dict) else None
+    return f"{recorded.name} v{recorded.version}"
 
 
 def _load(path: Path, *, doing: str) -> dict[str, Any]:
@@ -559,7 +584,9 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path) -> _Run:
     dtype = autocast_dtype(device, mixed_precision=config.training.mixed_precision)
 
     try:
-        dataset = open_dataset(config.dataset.name, data_dir=data_dir)
+        dataset = open_dataset(
+            config.dataset.name, data_dir=data_dir, version=config.dataset.version
+        )
     except (DatasetError, ManifestError) as e:
         raise TrainingError(_with_available(e, data_dir)) from e
     if dataset.manifest.move_vocabulary_size != VOCABULARY_SIZE:
@@ -590,6 +617,7 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path) -> _Run:
             batch_size=config.training.batch_size,
             batches=config.schedule.steps,
             seed=config.seed,
+            version=dataset.manifest.version,
         )
     except (DatasetError, ValueError) as e:
         raise TrainingError(e) from e
@@ -1109,6 +1137,7 @@ def _info(run: _Run, *, estimate: float | None, lineage: Lineage | None) -> RunI
         device=describe_device(run.device),
         dataset=DatasetReference(
             name=manifest.name,
+            version=manifest.version,
             directory=str(run.dataset.directory),
             format_version=manifest.format_version,
             created=manifest.created,
@@ -1151,7 +1180,13 @@ def _summary(
         f"chess-ai: run {config.name}, seed {config.seed}"
         + (f", resuming at step {first:,}" if start else ""),
         f"  device     {describe_device(run.device)}, {precision}",
-        f"  dataset    {manifest.name}: {manifest.games:,} games, {positions:,} train positions, "
+        f"  dataset    {manifest.name} v{manifest.version}"
+        + (
+            f" of {run.dataset.latest_version}"
+            if run.dataset.latest_version != manifest.version
+            else ""
+        )
+        + f": {manifest.games:,} games, {positions:,} train positions, "
         f"{_trained_on(manifest, VALIDATION):,} validation",
         f"  encoder    {run.spec.describe()}",
         f"  model      {config.model.architecture}, "

@@ -244,14 +244,39 @@ def test_a_shard_shorter_than_the_manifest_says_is_reported_not_read_around(
         read(split)
 
 
-def test_a_shard_longer_than_the_manifest_says_is_reported(tmp_path):
+def test_a_shard_longer_than_the_manifest_says_is_read_up_to_where_it_says(tmp_path):
+    # Which is what a dataset being appended to looks like from a reader of an earlier version,
+    # half a record past the end included.
     build(tmp_path, "lichess.pgn", validation_fraction=0.0, shards=TINY_SHARDS)
     directory = dataset_path(tmp_path, "test") / TRAIN / GAMES
+    split = open_dataset("test", data_dir=tmp_path)[TRAIN]
+    expected = split.game_records(0, split.games)
+    split.close()
     last = sorted(directory.glob("*.bin"))[-1]
-    last.write_bytes(last.read_bytes() + bytes(GAME_DTYPE.itemsize))
+    last.write_bytes(last.read_bytes() + bytes(GAME_DTYPE.itemsize + 3))
+
     split = open_dataset("test", data_dir=tmp_path)[TRAIN]
 
-    with pytest.raises(DatasetError, match="the manifest says"):
+    assert (split.game_records(0, split.games) == expected).all()
+
+
+def test_a_shard_longer_than_the_manifest_says_is_reported_once_the_dataset_was_rebuilt(tmp_path):
+    # A rebuild swapped in under a reader still holding the old manifest: the shard holds more
+    # than the reader expects, and the dataset on the disk is not the one it opened.
+    shards = Shards(positions_per_shard=7, games_per_shard=3, moves_per_shard=5)
+    build(tmp_path, "lichess.pgn", validation_fraction=0.0, shards=shards)
+    split = open_dataset("test", data_dir=tmp_path)[TRAIN]
+    assert split.games % shards.games_per_shard, "the last games shard is not full"
+    build(
+        tmp_path,
+        "lichess.pgn",
+        "unrated.pgn",
+        validation_fraction=0.0,
+        shards=shards,
+        overwrite=True,
+    )
+
+    with pytest.raises(DatasetError, match="was rebuilt while being read"):
         split.game(split.games - 1)
 
 

@@ -100,6 +100,21 @@ def test_one_dataset_is_described_by_its_name(client, data_dir):
     assert response.json()["manifest"] == manifest.model_dump(mode="json")
 
 
+def test_a_dataset_is_described_with_its_versions(client, data_dir):
+    from chess_ai.dataset.builder import append_dataset
+
+    build(data_dir, "lichess.pgn", validation_fraction=0.0)
+    manifest = append_dataset("test", [fixture("unrated.pgn")], data_dir=data_dir)
+
+    described = client.get(api("datasets/test")).json()["manifest"]
+
+    assert described == manifest.model_dump(mode="json")
+    assert [version["version"] for version in described["versions"]] == [1, 2]
+    assert [game["source"] for game in every_game(data_dir)] == [fixture("lichess.pgn")] * 4 + [
+        fixture("unrated.pgn")
+    ] * 3
+
+
 @pytest.mark.parametrize("name", ["missing", "..", ".test.1-abc.partial"])
 def test_a_dataset_that_is_not_there_is_not_found(client, data_dir, name):
     build(data_dir, "lichess.pgn")

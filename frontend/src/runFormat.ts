@@ -112,3 +112,8 @@ export function formatBytes(count: number): string {
   }
   return `${count} B`;
 }
+
+/** A dataset and the version of it a run trains on, as "lichess-2026 v3". */
+export function datasetLabel(name: string, version: number | null | undefined): string {
+  return version == null ? name : `${name} v${version}`;
+}

@@ -5,7 +5,14 @@ did this model learn from?" is a file that was written when the data was. The ma
 that file: the PGN files it came from, the filters that were applied, what was kept, what
 was skipped and why, when it was built, and the format and vocabulary it was built
 against. It is JSON rather than anything cleverer so that it can be read without this
-code, and it is written once, when the build finishes.
+code, and it is written when a build or an append finishes, never part-way through one.
+
+A dataset grows by appending, and each append is a :class:`Version`: what it read, what it
+kept, and the statistics of what it kept. A version is a prefix of the dataset -- version *n*
+is the first so many records of every stream, and appending only ever adds to the end -- so
+the manifest of an earlier version is the same file read up to that version; see
+:meth:`Manifest.at`. The totals at the top of the file are those of the latest version, worked
+out from the versions rather than kept beside them, so the two can never disagree.
 
 The statistics live here too, computed while the games streamed past. Recomputing them
 means reading the whole dataset again, which for tens of gigabytes is minutes of work to
@@ -62,6 +69,20 @@ class SourceInfo(BaseModel):
     A file that could not be opened, or that stopped making sense part-way through, leaves the
     dataset short of its games. The dataset is still usable, and this is what says it is not
     the dataset the sources asked for.
+    """
+    sha256: str | None = None
+    """The SHA-256 of the file's bytes, taken before it was read; ``None`` before datasets had
+    versions.
+
+    What recognises a source already in a dataset, whatever it is called now. For a Lichess dump
+    it is the checksum Lichess publishes, so a month streamed from Lichess and a downloaded copy
+    of it are known to be the same file.
+    """
+    month: str | None = None
+    """The Lichess month the file is a dump of, as ``YYYY-MM``, when its name says it is one.
+
+    A second way of recognising a source: a dump's decompressed copy has other bytes and the
+    same games.
     """
     went_away: bool = False
     """Whether what failed was the file rather than the PGN in it.
@@ -269,14 +290,64 @@ class Statistics(BaseModel):
     """Players whose rating the file did not give."""
 
 
+class Version(BaseModel):
+    """One build or append: what it read, and what it added to the end of the dataset.
+
+    Everything here is this version's own share, not the dataset's total up to it: the counts are
+    what it appended, and the statistics are of the games it kept. A version's records are the
+    ones after every earlier version's, so where version *n* ends is the sum of versions 1 to *n*.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: int = Field(ge=1)
+    created: datetime
+    max_games: int | None = Field(default=None, gt=0)
+    """The cap on the dataset's total games this version was added under."""
+    sources: list[SourceInfo] = Field(default_factory=list)
+    splits: dict[str, SplitCounts] = Field(default_factory=dict)
+    skipped: dict[str, int] = Field(default_factory=dict)
+    filtered: dict[str, int] = Field(default_factory=dict)
+    not_targets: dict[str, int] = Field(default_factory=dict)
+    reached_max_games: bool = False
+    statistics: Statistics = Statistics()
+
+    @property
+    def games(self) -> int:
+        return sum(counts.games for counts in self.splits.values())
+
+    @property
+    def positions(self) -> int:
+        return sum(counts.positions for counts in self.splits.values())
+
+
+_DERIVED: Final = (
+    "created",
+    "sources",
+    "splits",
+    "skipped",
+    "filtered",
+    "not_targets",
+    "reached_max_games",
+    "statistics",
+)
+"""The manifest's fields that are worked out from its versions, and only read from a manifest
+written before there were versions."""
+
+
 class Manifest(BaseModel):
-    """A dataset, described. See :func:`load_manifest` and :meth:`save`."""
+    """A dataset up to one of its versions, described. See :func:`load_manifest` and :meth:`save`.
+
+    The fields after ``shards`` are the totals of every version in ``versions``, so a manifest cut
+    back to an earlier version with :meth:`at` describes exactly what that version holds.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     format_version: int
     name: str
     created: datetime
+    """When the dataset was built, which is when its first version was."""
     move_vocabulary_size: int
     """The vocabulary the move indices are in, which a model has to agree with."""
     validation_fraction: float
@@ -294,8 +365,89 @@ class Manifest(BaseModel):
     not_targets: dict[str, int] = Field(default_factory=dict)
     """Positions stored but not trained on, counted by which filter left them out."""
     reached_max_games: bool = False
-    """Whether the build stopped at ``max_games`` rather than at the end of its sources."""
+    """Whether the latest version stopped at ``max_games`` rather than at the end of its sources."""
     statistics: Statistics = Statistics()
+    versions: list[Version] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _totals_of_the_versions(cls, data: Any) -> Any:
+        """Fill in the totals from the versions, or read a manifest from before versions as one.
+
+        A manifest written before datasets had versions is the description of one build, which is
+        what version 1 is. One written since has its totals worked out here rather than trusted,
+        so that cutting the list of versions short is all :meth:`at` has to do.
+        """
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        filters = data.get("filters", {})
+        if isinstance(filters, Filters):
+            filters = filters.model_dump(by_alias=True)
+        if not data.get("versions"):
+            if "created" not in data:
+                return data  # Not a manifest at all, which validating says better than this would.
+            data["versions"] = [
+                {
+                    "version": 1,
+                    "created": data["created"],
+                    "max_games": dict(filters).get("max_games"),
+                    **{field: data[field] for field in _DERIVED[1:] if field in data},
+                }
+            ]
+            return data
+        versions = [
+            version if isinstance(version, Version) else Version.model_validate(version)
+            for version in data["versions"]
+        ]
+        expected = list(range(1, len(versions) + 1))
+        if [version.version for version in versions] != expected:
+            raise ValueError(
+                f"the versions are numbered {[version.version for version in versions]}, "
+                f"not {expected}"
+            )
+        latest = versions[-1]
+        data["versions"] = versions
+        data["created"] = versions[0].created
+        data["sources"] = [source for version in versions for source in version.sources]
+        data["splits"] = _summed_splits(versions)
+        for field in ("skipped", "filtered", "not_targets"):
+            data[field] = _summed([getattr(version, field) for version in versions])
+        data["reached_max_games"] = latest.reached_max_games
+        data["statistics"] = _summed_statistics([version.statistics for version in versions])
+        # The cap is the one version that counts: each append may raise it.
+        filters = dict(filters)
+        filters.pop("max_games", None)
+        if latest.max_games is not None:
+            filters["max_games"] = latest.max_games
+        data["filters"] = filters
+        return data
+
+    @property
+    def version(self) -> int:
+        """Which version of the dataset this describes, counting from 1."""
+        return len(self.versions)
+
+    def at(self, version: int) -> "Manifest":
+        """The dataset as it was at ``version``: its first so many records, and their totals.
+
+        Raises :exc:`ManifestError` for a version the dataset does not have.
+        """
+        if not 1 <= version <= self.version:
+            raise ManifestError(
+                f"dataset {self.name!r} has no version {version}; it has versions 1 to "
+                f"{self.version}"
+                if self.version > 1
+                else f"dataset {self.name!r} has no version {version}; it has only version 1"
+            )
+        if version == self.version:
+            return self
+        return Manifest.model_validate(
+            {
+                **self.model_dump(exclude=set(_DERIVED) | {"versions"}),
+                "versions": self.versions[:version],
+            }
+        )
 
     @property
     def games(self) -> int:
@@ -375,3 +527,49 @@ def load_manifest(directory: Path) -> Manifest:
 def rating_bucket(rating: int) -> str:
     """The histogram bucket ``rating`` falls in, keyed by the bucket's low end."""
     return str(rating // RATING_BUCKET * RATING_BUCKET)
+
+
+def _summed(counts: list[dict[str, int]]) -> dict[str, int]:
+    """Counts by name added up, in the order the names first appear."""
+    total: dict[str, int] = {}
+    for each in counts:
+        for key, count in each.items():
+            total[key] = total.get(key, 0) + count
+    return total
+
+
+def _summed_splits(versions: list[Version]) -> dict[str, SplitCounts]:
+    """Where each split ends after ``versions``: the sum of what each of them appended.
+
+    A split's targets are counted only when some version counted them, which is all of them or
+    none: whether positions are filtered is the dataset's, and no append can change it.
+    """
+    splits: dict[str, SplitCounts] = {}
+    for version in versions:
+        for split, counts in version.splits.items():
+            before = splits.get(split, SplitCounts())
+            targets = (
+                None
+                if before.targets is None and counts.targets is None
+                else before.trained_on + counts.trained_on
+            )
+            splits[split] = SplitCounts(
+                games=before.games + counts.games,
+                positions=before.positions + counts.positions,
+                targets=targets,
+            )
+    return splits
+
+
+def _summed_statistics(statistics: list[Statistics]) -> Statistics:
+    """The statistics of several versions' games, as if they had been counted together."""
+    if len(statistics) == 1:
+        return statistics[0]
+    ratings = _summed([each.ratings for each in statistics])
+    return Statistics(
+        results=_summed([each.results for each in statistics]),
+        time_controls=_summed([each.time_controls for each in statistics]),
+        rating_sources=_summed([each.rating_sources for each in statistics]),
+        ratings=dict(sorted(ratings.items(), key=lambda item: int(item[0]))),
+        ratings_unknown=sum(each.ratings_unknown for each in statistics),
+    )

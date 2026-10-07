@@ -23,6 +23,12 @@ second; both are what memory mapping is for.
 ``targets`` is there only when the build filtered positions: it lists, in order, the positions
 of the split that are training targets. Without it every position is one.
 
+Appending to a dataset adds records to the end of every stream, so each version of a dataset is
+a prefix of it: a reader of an earlier version reads the first so many records and never looks
+past them, which is what lets it carry on while an append writes beyond. Records past the last
+version are what an interrupted append leaves; nothing reads them, and :func:`records_past` is
+what finds them.
+
 The two splits are separate directories rather than a flag on each record, which is what
 makes a leak impossible to write rather than merely tested for: nothing the trainer reads
 from a split's directory can have come from the other.
@@ -32,7 +38,7 @@ import errno
 import logging
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from types import TracebackType
@@ -48,7 +54,14 @@ except ImportError:  # pragma: no cover - POSIX only, and this project runs on L
     fcntl = None  # type: ignore[assignment]
 
 from chess_ai.dataset.files import sync_directory, sync_file
-from chess_ai.dataset.manifest import SPLITS, Shards, load_manifest
+from chess_ai.dataset.manifest import (
+    SPLITS,
+    Manifest,
+    ManifestError,
+    Shards,
+    SplitCounts,
+    load_manifest,
+)
 from chess_ai.dataset.records import (
     GAME_DTYPE,
     MOVE_DTYPE,
@@ -315,13 +328,17 @@ def shard_path(directory: Path, number: int) -> Path:
 
 
 class _StreamWriter:
-    """One stream of records, written out as numbered shards of ``per_shard`` records."""
+    """One stream of records, written out as numbered shards of ``per_shard`` records.
 
-    def __init__(self, directory: Path, dtype: np.dtype, per_shard: int) -> None:
+    ``count`` is how many records the stream already holds, which is where an append starts: the
+    last shard is carried on from its end if it is not full, and a new one started if it is.
+    """
+
+    def __init__(self, directory: Path, dtype: np.dtype, per_shard: int, count: int = 0) -> None:
         self._directory = directory
         self._dtype = dtype
         self._per_shard = per_shard
-        self._count = 0
+        self._count = count
         self._file: BinaryIO | None = None
 
     @property
@@ -337,6 +354,8 @@ class _StreamWriter:
             in_shard = self._count % self._per_shard
             if in_shard == 0:
                 self._next_shard()
+            elif self._file is None:
+                self._carry_on(in_shard)
             assert self._file is not None
             chunk = records[written : written + self._per_shard - in_shard]
             self._file.write(chunk.tobytes())
@@ -346,7 +365,24 @@ class _StreamWriter:
     def _next_shard(self) -> None:
         self.close()
         self._directory.mkdir(parents=True, exist_ok=True)
-        self._file = shard_path(self._directory, self._count // self._per_shard).open("wb")
+        # Never over a file that is there: one that is holds records past the end of the dataset,
+        # and an append refuses to start over those rather than writing on top of them.
+        self._file = shard_path(self._directory, self._count // self._per_shard).open("xb")
+
+    def _carry_on(self, in_shard: int) -> None:
+        """Open the last shard to append to it, after the ``in_shard`` records it holds."""
+        path = shard_path(self._directory, self._count // self._per_shard)
+        file = path.open("ab")
+        size = file.tell()
+        if size != in_shard * self._dtype.itemsize:
+            file.close()
+            # The caller checks for records past the end before appending anything, so this is
+            # the invariant said where it matters rather than something anyone should meet.
+            raise DatasetError(
+                f"cannot append to dataset shard {path}: it holds {size:,} bytes and the "
+                f"manifest says {in_shard * self._dtype.itemsize:,}"
+            )
+        self._file = file
 
     def close(self) -> None:
         """Finish the current shard, with what was written actually on the disk.
@@ -379,15 +415,30 @@ class SplitWriter:
     game index the positions belong to, and where in the split the game's plies start.
     """
 
-    def __init__(self, directory: Path, shards: Shards, *, targets: bool = False) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        shards: Shards,
+        *,
+        targets: bool = False,
+        counts: SplitCounts | None = None,
+    ) -> None:
+        """``counts`` is what the split already holds, for an append to carry on from."""
+        counts = counts if counts is not None else SplitCounts()
         self._directory = directory
         self._positions = _StreamWriter(
-            directory / POSITIONS, POSITION_DTYPE, shards.positions_per_shard
+            directory / POSITIONS, POSITION_DTYPE, shards.positions_per_shard, counts.positions
         )
-        self._games = _StreamWriter(directory / GAMES, GAME_DTYPE, shards.games_per_shard)
-        self._moves = _StreamWriter(directory / MOVES, MOVE_DTYPE, shards.moves_per_shard)
+        self._games = _StreamWriter(
+            directory / GAMES, GAME_DTYPE, shards.games_per_shard, counts.games
+        )
+        self._moves = _StreamWriter(
+            directory / MOVES, MOVE_DTYPE, shards.moves_per_shard, counts.positions
+        )
         self._targets = (
-            _StreamWriter(directory / TARGETS, TARGET_DTYPE, shards.targets_per_shard)
+            _StreamWriter(
+                directory / TARGETS, TARGET_DTYPE, shards.targets_per_shard, counts.trained_on
+            )
             if targets
             else None
         )
@@ -464,19 +515,38 @@ class SplitWriter:
 
 
 class DatasetWriter:
-    """A dataset being built: both splits, and the manifest written when it is done."""
+    """A dataset being built or appended to: both splits, and the manifest written when it is done.
+
+    ``base`` is the manifest of the dataset being appended to, whose directory this writes into
+    after the records it already has; without one this is a build, into a directory of its own.
+    """
 
     def __init__(
-        self, directory: Path, shards: Shards = DEFAULT_SHARDS, *, targets: bool = False
+        self,
+        directory: Path,
+        shards: Shards = DEFAULT_SHARDS,
+        *,
+        targets: bool = False,
+        base: Manifest | None = None,
     ) -> None:
         self.directory = directory
         self.shards = shards
-        # Never a directory that is already there: one that is belongs to another build, and
-        # writing into it publishes its shards inside this dataset. The builder checks first, so
-        # this is the invariant said where it belongs rather than a condition anyone should hit.
-        directory.mkdir(parents=True, exist_ok=False)
+        if base is None:
+            # Never a directory that is already there: one that is belongs to another build, and
+            # writing into it publishes its shards inside this dataset. The builder checks first,
+            # so this is the invariant said where it belongs rather than a condition anyone should
+            # hit.
+            directory.mkdir(parents=True, exist_ok=False)
+        elif not directory.is_dir():
+            raise DatasetError(f"no dataset to append to in {directory}")
         self.splits = {
-            split: SplitWriter(directory / split, shards, targets=targets) for split in SPLITS
+            split: SplitWriter(
+                directory / split,
+                shards,
+                targets=targets,
+                counts=base.splits.get(split) if base is not None else None,
+            )
+            for split in SPLITS
         }
 
     def __enter__(self) -> "DatasetWriter":
@@ -507,11 +577,21 @@ class DatasetWriter:
 class _StreamReader:
     """One stream of records, read out of its shards without loading them."""
 
-    def __init__(self, directory: Path, dtype: np.dtype, per_shard: int, count: int) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        dtype: np.dtype,
+        per_shard: int,
+        count: int,
+        still_ours: Callable[[], bool] | None = None,
+    ) -> None:
         self._directory = directory
         self._dtype = dtype
         self._per_shard = per_shard
         self._count = count
+        self._still_ours = still_ours
+        """Asked whether the dataset on the disk is still the one being read, when a shard holds
+        more than this reader expected; see :meth:`_shard`."""
         self._shards: dict[int, np.memmap] = {}
 
     def __len__(self) -> int:
@@ -573,27 +653,38 @@ class _StreamReader:
         mapped = self._shards.get(number)
         if mapped is None:
             path = shard_path(self._directory, number)
+            # Every shard but the last is full, and the last holds at least the rest of the count.
+            # It may hold more: what later versions appended, or what an append is writing right
+            # now, and neither is this reader's. Only the records it counts are mapped, so what
+            # lies past them -- a half-written record included -- is never looked at.
+            expected = min(self._per_shard, self._count - number * self._per_shard)
             try:
-                mapped = np.memmap(path, dtype=self._dtype, mode="r")
+                size = path.stat().st_size
             except OSError as e:
                 raise DatasetError(f"cannot read dataset shard {path}: {e.strerror}") from e
-            except ValueError as e:
-                # A file that is not a whole number of records, which is what a truncated copy
-                # or a build that ran out of disk leaves behind. numpy raises ValueError for it
-                # rather than OSError, and a traceback is no way to report a damaged dataset.
-                raise DatasetError(f"cannot read dataset shard {path}: {e}") from e
-            # Every shard but the last is full, and the last holds the rest of the count. A shard
-            # that holds anything else is not the one the manifest describes: a copy cut short at
-            # a record boundary, or a rebuild swapped in under a reader still holding the old
-            # manifest. Left to numpy, a short one either raises a bare IndexError or, worse,
-            # repeats the records it has into the places of the ones it has not.
-            expected = min(self._per_shard, self._count - number * self._per_shard)
-            if len(mapped) != expected:
+            held = size // self._dtype.itemsize
+            # A shard holding fewer is not the one the manifest describes: a copy cut short, a
+            # build that ran out of disk, or a rebuild swapped in under a reader still holding the
+            # old manifest. Left to numpy, a short one either raises a bare IndexError or, worse,
+            # repeats the records it has into the places of the ones it has not. One holding more
+            # is what appending looks like, and also what a rebuild can look like, which is told
+            # apart by asking whether the dataset on the disk is still this one.
+            if held < expected or (
+                held > expected and self._still_ours is not None and not self._still_ours()
+            ):
                 raise DatasetError(
-                    f"cannot read dataset shard {path}: it holds {len(mapped)} records and "
+                    f"cannot read dataset shard {path}: it holds {held} records and "
                     f"the manifest says {expected}; the dataset is damaged, or was rebuilt "
                     "while being read"
                 )
+            try:
+                mapped = np.memmap(path, dtype=self._dtype, mode="r", shape=(expected,))
+            except OSError as e:
+                raise DatasetError(f"cannot read dataset shard {path}: {e.strerror}") from e
+            except ValueError as e:
+                # The file shrank between being measured and being mapped. numpy raises
+                # ValueError for it rather than OSError, and a traceback is no way to report it.
+                raise DatasetError(f"cannot read dataset shard {path}: {e}") from e
             self._shards[number] = mapped
         return mapped
 
@@ -626,21 +717,30 @@ class SplitReader:
         counts_games: int,
         counts_positions: int,
         counts_targets: int | None = None,
+        still_ours: Callable[[], bool] | None = None,
     ):
         self._positions = _StreamReader(
-            directory / POSITIONS, POSITION_DTYPE, shards.positions_per_shard, counts_positions
+            directory / POSITIONS,
+            POSITION_DTYPE,
+            shards.positions_per_shard,
+            counts_positions,
+            still_ours,
         )
         self._games = _StreamReader(
-            directory / GAMES, GAME_DTYPE, shards.games_per_shard, counts_games
+            directory / GAMES, GAME_DTYPE, shards.games_per_shard, counts_games, still_ours
         )
         self._moves = _StreamReader(
-            directory / MOVES, MOVE_DTYPE, shards.moves_per_shard, counts_positions
+            directory / MOVES, MOVE_DTYPE, shards.moves_per_shard, counts_positions, still_ours
         )
         self._targets = (
             None
             if counts_targets is None
             else _StreamReader(
-                directory / TARGETS, TARGET_DTYPE, shards.targets_per_shard, counts_targets
+                directory / TARGETS,
+                TARGET_DTYPE,
+                shards.targets_per_shard,
+                counts_targets,
+                still_ours,
             )
         )
 
@@ -730,11 +830,19 @@ class SplitReader:
 
 
 class Dataset:
-    """A built dataset: its manifest, and its splits to read records from."""
+    """A built dataset at one of its versions: its manifest, and its splits to read records from.
 
-    def __init__(self, directory: Path) -> None:
+    ``version`` is the latest when it is not given. The manifest is the one of that version, so
+    everything read through this -- counts, statistics, records -- is what that version holds,
+    whatever has been appended since.
+    """
+
+    def __init__(self, directory: Path, version: int | None = None) -> None:
         self.directory = directory
-        self.manifest = load_manifest(directory)
+        latest = load_manifest(directory)
+        self.manifest = latest if version is None else latest.at(version)
+        self.latest_version = latest.version
+        """The newest version the dataset had when this was opened."""
         self._splits = {
             split: SplitReader(
                 directory / split,
@@ -742,9 +850,22 @@ class Dataset:
                 counts.games,
                 counts.positions,
                 counts.targets,
+                still_ours=self._still_ours,
             )
             for split, counts in self.manifest.splits.items()
         }
+
+    def _still_ours(self) -> bool:
+        """Whether the dataset in this directory is still this one, with this version in it.
+
+        A rebuild under the same name was created at another time, and one that has fewer
+        versions than this reads has lost the one being read.
+        """
+        try:
+            now = load_manifest(self.directory)
+        except ManifestError:
+            return False
+        return now.created == self.manifest.created and now.version >= self.manifest.version
 
     @property
     def splits(self) -> list[str]:
@@ -779,6 +900,86 @@ class Dataset:
             ) from None
 
 
-def open_dataset(name: str, *, data_dir: Path) -> Dataset:
-    """The dataset called ``name`` in ``data_dir``, ready to read records from."""
-    return Dataset(dataset_path(data_dir, name))
+def open_dataset(name: str, *, data_dir: Path, version: int | None = None) -> Dataset:
+    """The dataset called ``name`` in ``data_dir`` at ``version``, ready to read records from.
+
+    The latest version when ``version`` is not given.
+    """
+    return Dataset(dataset_path(data_dir, name), version)
+
+
+_STREAMS: Final = (
+    (POSITIONS, POSITION_DTYPE, "positions_per_shard", "positions"),
+    (GAMES, GAME_DTYPE, "games_per_shard", "games"),
+    (MOVES, MOVE_DTYPE, "moves_per_shard", "positions"),
+    (TARGETS, TARGET_DTYPE, "targets_per_shard", "trained_on"),
+)
+"""Every stream a split can have: its directory, its records, its shard size, and its count."""
+
+
+def _stream_ends(directory: Path, manifest: Manifest) -> Iterator[tuple[Path, np.dtype, int, int]]:
+    """Every stream of the dataset in ``directory``, with where it ends after ``manifest``.
+
+    Each comes with its record type, its shard size and how many records ``manifest`` counts in
+    it. A target stream is counted only when the dataset keeps one; otherwise none of it is the
+    dataset's, and anything in it is past the end.
+    """
+    for split in SPLITS:
+        counts = manifest.splits.get(split, SplitCounts())
+        for stream, dtype, per_shard, counted in _STREAMS:
+            count = 0 if stream == TARGETS and counts.targets is None else getattr(counts, counted)
+            yield directory / split / stream, dtype, getattr(manifest.shards, per_shard), count
+
+
+def _shards_in(stream: Path) -> dict[int, Path]:
+    """The shard files of the stream in ``stream``, by number."""
+    if not stream.is_dir():
+        return {}
+    named = re.compile(rf"(\d{{{SHARD_DIGITS}}}){re.escape(SHARD_SUFFIX)}")
+    return {
+        int(found[1]): entry
+        for entry in stream.iterdir()
+        if (found := named.fullmatch(entry.name)) is not None
+    }
+
+
+def records_past(directory: Path, manifest: Manifest) -> list[Path]:
+    """The shards of the dataset in ``directory`` that hold more than ``manifest`` counts.
+
+    Which is what an append that was interrupted leaves: what it wrote is on the disk and its
+    manifest is not, so nothing reads it. Only sizes are looked at, which is a few hundred
+    ``stat`` calls for a large dataset.
+
+    A shard past the last one counted is past the end however little it holds, an empty one
+    included: an append killed between starting a shard and writing to it leaves just the name,
+    and the next append starting that shard would find it taken.
+    """
+    past = []
+    for stream, dtype, per_shard, count in _stream_ends(directory, manifest):
+        last, in_last = divmod(count, per_shard)
+        for number, path in sorted(_shards_in(stream).items()):
+            if number < last:
+                continue
+            if number > last or in_last == 0 or path.stat().st_size > in_last * dtype.itemsize:
+                past.append(path)
+    return past
+
+
+def cut_back(directory: Path, manifest: Manifest) -> None:
+    """Throw away every record of the dataset in ``directory`` that ``manifest`` does not count.
+
+    Shards past the end are removed and the last one counted is cut down to its records, so the
+    dataset is exactly what ``manifest`` describes again, to the byte. Every change is flushed
+    before this returns, so that an append which starts next never finds them back.
+    """
+    for stream, dtype, per_shard, count in _stream_ends(directory, manifest):
+        last, in_last = divmod(count, per_shard)
+        for number, path in sorted(_shards_in(stream).items(), reverse=True):
+            if number > last or (number == last and in_last == 0):
+                path.unlink()
+            elif number == last and path.stat().st_size > in_last * dtype.itemsize:
+                with path.open("r+b") as file:
+                    file.truncate(in_last * dtype.itemsize)
+                    sync_file(file)
+        if stream.is_dir():
+            sync_directory(stream)

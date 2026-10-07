@@ -2,7 +2,13 @@ import { Fragment, useEffect, useState } from 'react';
 import { ARCHIVED_TAG, fetchRuns, isArchived, type RunSummary } from './api';
 import { MAX_SERIES } from './runCharts';
 import { RunStateBadge } from './RunState';
-import { formatAgo, formatCount, formatNumber, formatPercent } from './runFormat';
+import {
+  datasetLabel,
+  formatAgo,
+  formatCount,
+  formatNumber,
+  formatPercent,
+} from './runFormat';
 import { TagList } from './TagList';
 import './RunsView.css';
 
@@ -245,7 +251,9 @@ export function RunsView() {
                     <TagList tags={run.tags ?? []} picked={filter} onPick={setTag} />
                   </td>
                   <td>{run.architecture ?? '–'}</td>
-                  <td>{run.dataset ?? '–'}</td>
+                  <td>
+                    {run.dataset == null ? '–' : datasetLabel(run.dataset, run.dataset_version)}
+                  </td>
                   <td className="progress">{progress(run)}</td>
                   <td className="number">{formatNumber(metric(run.latest_train, 'loss'))}</td>
                   <td className="number">

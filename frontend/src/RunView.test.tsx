@@ -99,7 +99,8 @@ describe('RunView', () => {
     expect(screen.getByRole('heading', { name: 'mlp-big' })).toBeInTheDocument();
     expect(screen.getByText('running')).toBeInTheDocument();
     expect(screen.getByText('mlp, 12,345,678 parameters')).toBeInTheDocument();
-    expect(screen.getByText('lichess-2024, 950,000 training positions')).toBeInTheDocument();
+    // A run.json from before datasets had versions trained on the only one there was.
+    expect(screen.getByText('lichess-2024 v1, 950,000 training positions')).toBeInTheDocument();
     expect(screen.getByText('1,000 of 15,000, epoch 0.25')).toBeInTheDocument();
     expect(screen.getByText('345k positions/s')).toBeInTheDocument();
     expect(screen.getByText('1h 05m')).toBeInTheDocument();

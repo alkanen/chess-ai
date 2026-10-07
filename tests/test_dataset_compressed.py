@@ -11,6 +11,7 @@ from dataset_helpers import (
     SEPARATED,
     CountingPath,
     build,
+    comparable,
     fixture,
     flat_pgn,
     separated_pgn,
@@ -82,8 +83,8 @@ def parallel(patch, chunk: int = 300, most: int | None = None) -> None:
 
 def same_manifest(one, other) -> None:
     """Two manifests that say the same thing, apart from when, and which file it was."""
-    exclude = {"created": True, "sources": {"__all__": {"path", "bytes"}}}
-    assert one.model_dump(exclude=exclude) == other.model_dump(exclude=exclude)
+    fields = {"path", "bytes", "sha256"}
+    assert comparable(one, sources=fields) == comparable(other, sources=fields)
 
 
 def test_a_compressed_file_builds_the_same_dataset_as_the_file_it_was_made_from(tmp_path):
@@ -284,6 +285,9 @@ def test_a_build_that_is_full_stops_decompressing(tmp_path, monkeypatch):
     counter = CountingPath(packed)
     counter.install(monkeypatch)
     parallel(monkeypatch, chunk=2000)
+    # The checksum taken before reading is a pass over the whole file by design, and is not
+    # decompressing it; what is counted here is the reading.
+    monkeypatch.setattr(builder, "sha256_of", lambda path, on_read=None: "0" * 64)
 
     manifest = build(tmp_path / "data", str(packed), workers=2, filters=Filters(max_games=50))
 

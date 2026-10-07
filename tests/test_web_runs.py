@@ -130,6 +130,7 @@ def test_the_run_list_says_what_each_run_is_where_it_has_got_and_what_it_measure
     assert summary["name"] == "live"
     assert summary["architecture"] == "mlp"
     assert summary["dataset"] == "lichess-2024"
+    assert summary["dataset_version"] == 1
     assert summary["status"] == "running"
     assert summary["stale"] is False
     assert (summary["step"], summary["steps"], summary["epoch"]) == (100, 100, 0.5)

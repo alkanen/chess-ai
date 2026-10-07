@@ -17,7 +17,9 @@ thing people stage on a NAS mount. So the two are told apart:
 """
 
 import errno
+import hashlib
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import IO, Final
 
@@ -29,6 +31,9 @@ UNSUPPORTED: Final = frozenset(
     if code is not None
 )
 """What a filesystem answers when it does not implement flushing, rather than when it failed."""
+
+HASH_READ_BYTES: Final = 1 << 20
+"""How much of a file is read, and hashed, at a time."""
 
 
 def sync_file(file: IO) -> None:
@@ -64,3 +69,17 @@ def sync_directory(directory: Path) -> None:
         pass
     finally:
         os.close(fd)
+
+
+def sha256_of(path: Path, on_read: Callable[[int], None] | None = None) -> str:
+    """The SHA-256 of the file at ``path``, as hex, telling ``on_read`` the bytes as it goes.
+
+    Raises :exc:`OSError` for a file that cannot be read.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while data := handle.read(HASH_READ_BYTES):
+            digest.update(data)
+            if on_read is not None:
+                on_read(len(data))
+    return digest.hexdigest()

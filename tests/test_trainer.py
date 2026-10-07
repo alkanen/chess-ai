@@ -1378,6 +1378,69 @@ def test_a_run_whose_dataset_was_rebuilt_is_not_resumed(tmp_path, data_dir, monk
     assert open_run(tmp_path / "runs", "tiny").status.status == RunStatus.STOPPED
 
 
+def grown(data_dir) -> None:
+    """Append a version to the dataset "test": the lichess fixture's games a second time."""
+    from dataset_helpers import fixture
+
+    from chess_ai.dataset.builder import append_dataset
+
+    append_dataset("test", [fixture("lichess.pgn")], data_dir=data_dir, allow_repeat=True)
+
+
+def test_a_run_records_the_version_of_the_dataset_it_trained_on(tmp_path, data_dir):
+    first = open_dataset("test", data_dir=data_dir).manifest
+    grown(data_dir)
+
+    latest = run(tmp_path, data_dir, name="latest")
+    pinned = run(tmp_path, data_dir, name="pinned", dataset='name = "test"\nversion = 1')
+
+    assert latest.info.dataset.version == 2
+    assert latest.info.dataset.games == first.games + 4
+    assert pinned.info.dataset.version == 1
+    assert pinned.info.dataset.train_positions == first.splits["train"].positions
+    assert pinned.info.dataset.validation_positions == first.splits["validation"].positions
+
+
+def test_a_run_says_which_version_it_trains_on(tmp_path, data_dir):
+    grown(data_dir)
+
+    said = said_by(tmp_path, data_dir, dataset='name = "test"\nversion = 1')
+
+    assert any("dataset    test v1 of 2:" in line for line in said), said
+
+
+def test_a_run_on_a_version_the_dataset_does_not_have_is_refused(tmp_path, data_dir):
+    with pytest.raises(TrainingError, match="no version 2"):
+        run(tmp_path, data_dir, dataset='name = "test"\nversion = 2')
+
+
+def test_a_resumed_run_keeps_the_version_it_started_on(tmp_path, data_dir, monkeypatch):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    grown(data_dir)
+
+    reader = resumed(tmp_path, data_dir, "tiny")
+
+    assert reader.status.status == RunStatus.FINISHED
+    assert reader.info.dataset.version == 1
+
+
+def test_a_run_from_before_dataset_versions_resumes_on_version_1(tmp_path, data_dir, monkeypatch):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    path = tmp_path / "runs" / "tiny" / "run.json"
+    written = json.loads(path.read_text())
+    del written["dataset"]["version"]
+    path.write_text(json.dumps(written))
+    grown(data_dir)
+
+    assert resumed(tmp_path, data_dir, "tiny").status.status == RunStatus.FINISHED
+
+
 def test_a_run_from_before_biases_went_undecayed_resumes_with_everything_decayed(
     tmp_path, data_dir, monkeypatch
 ):
@@ -1440,7 +1503,7 @@ def test_a_new_run_starts_from_another_runs_weights(tmp_path, data_dir):
 
     lineage = trainer._initialize(prepared, runs_dir=tmp_path / "runs")
 
-    assert lineage.run == "pretrained" and lineage.step == 6 and lineage.dataset == "test"
+    assert lineage.run == "pretrained" and lineage.step == 6 and lineage.dataset == "test v1"
     for name, value in final_payload(source)["model_state"].items():
         assert torch.equal(value, prepared.model.state_dict()[name]), name
 
@@ -1460,9 +1523,9 @@ def test_a_fine_tuning_run_records_where_its_weights_came_from(tmp_path, data_di
         "run": "pretrained",
         "step": 3,
         "checkpoint": 3,
-        "dataset": "test",
+        "dataset": "test v1",
     }
-    assert "  weights    from run pretrained at step 3, trained on test" in said
+    assert "  weights    from run pretrained at step 3, trained on test v1" in said
     assert final_payload(tuned)["step"] == 6, "with a step count of its own"
     assert [line["loss"] for line in lines_of(tuned, "train")] != [
         line["loss"] for line in lines_of(from_seed, "train")

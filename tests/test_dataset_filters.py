@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from dataset_helpers import TINY_SHARDS, build, fixture, shard_bytes
+from dataset_helpers import TINY_SHARDS, build, comparable, fixture, shard_bytes
 from pydantic import Field
 
 from chess_ai.dataset import (
@@ -603,8 +603,7 @@ def test_reading_in_several_processes_gives_the_same_filtered_dataset(tmp_path, 
     assert shard_bytes(dataset_path(tmp_path / "parallel", "test")) == shard_bytes(
         dataset_path(tmp_path / "serial", "test")
     )
-    ignored = {"created", "sources"}
-    assert parallel.model_dump(exclude=ignored) == serial.model_dump(exclude=ignored)
+    assert comparable(parallel, sources=True) == comparable(serial, sources=True)
     assert [s.games_read for s in parallel.sources] == [s.games_read for s in serial.sources]
 
 

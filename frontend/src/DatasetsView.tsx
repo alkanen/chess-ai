@@ -169,10 +169,18 @@ function DatasetRow({ dataset }: { dataset: DatasetSummary }) {
     );
   }
   const skipped = Object.values(manifest.skipped).reduce((sum, count) => sum + count, 0);
+  const latest = manifest.versions.at(-1);
   return (
     <tr>
       <th scope="row">{link}</th>
-      <td>{formatBuilt(manifest.created)}</td>
+      <td>
+        {formatBuilt(manifest.created)}
+        {latest !== undefined && latest.version > 1 && (
+          <span className="note version">
+            v{latest.version} added {formatBuilt(latest.created)}
+          </span>
+        )}
+      </td>
       <td className="sources" title={manifest.sources.map((source) => source.path).join('\n')}>
         {manifest.sources.map((source) => fileName(source.path)).join(', ')}
         {sourceFailed(manifest) && <span className="warning"> (not all read)</span>}

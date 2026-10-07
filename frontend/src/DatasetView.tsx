@@ -6,6 +6,7 @@ import {
   type DatasetManifest,
   type DatasetSource,
   type DatasetSummary,
+  type DatasetVersion,
 } from './api';
 import { DatasetStatistics } from './DatasetStatistics';
 import {
@@ -49,6 +50,7 @@ export function DatasetView({ place }: { place: DatasetPage }) {
       {manifest !== null && (
         <>
           <DatasetFacts manifest={manifest} />
+          {manifest.versions.length > 1 && <DatasetVersions versions={manifest.versions} />}
           <DatasetStatistics manifest={manifest} />
           <DatasetGameList manifest={manifest} place={place} />
         </>
@@ -72,6 +74,11 @@ function DatasetFacts({ manifest }: { manifest: DatasetManifest }) {
       <dl className="facts">
         <dt>Built</dt>
         <dd>{formatBuilt(manifest.created)}</dd>
+        <dt>Version</dt>
+        <dd>
+          {manifest.versions.length}
+          {manifest.versions.length > 1 && ', the latest; runs can train on any of them'}
+        </dd>
         <dt>Games</dt>
         <dd>{splitCounts(manifest, 'games')}</dd>
         <dt>Positions</dt>
@@ -100,6 +107,62 @@ function DatasetFacts({ manifest }: { manifest: DatasetManifest }) {
       </dl>
       <DatasetSources sources={manifest.sources} />
     </>
+  );
+}
+
+/** What a version added: its own share, which the versions before it do not include. */
+function versionTotal(version: DatasetVersion, what: 'games' | 'positions'): number {
+  return Object.values(version.splits).reduce((sum, split) => sum + split[what], 0);
+}
+
+/**
+ * Every version of a dataset and what each one added to the end of it. A run that names a
+ * version trains on that version and every one before it.
+ */
+function DatasetVersions({ versions }: { versions: DatasetVersion[] }) {
+  return (
+    <section aria-labelledby="dataset-versions-heading">
+      <h3 id="dataset-versions-heading">Versions</h3>
+      <div className="table-frame">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Version</th>
+              <th scope="col">Added</th>
+              <th scope="col" className="number">
+                Games added
+              </th>
+              <th scope="col" className="number">
+                Positions added
+              </th>
+              <th scope="col">Sources</th>
+              <th scope="col">Maximum</th>
+            </tr>
+          </thead>
+          <tbody>
+            {versions.map((version) => (
+              <tr key={version.version}>
+                <th scope="row">v{version.version}</th>
+                <td>{formatBuilt(version.created)}</td>
+                <td className="number">{formatCount(versionTotal(version, 'games'))}</td>
+                <td className="number">{formatCount(versionTotal(version, 'positions'))}</td>
+                <td
+                  className="sources"
+                  title={version.sources.map((source) => source.path).join('\n')}
+                >
+                  {version.sources.map((source) => fileName(source.path)).join(', ')}
+                </td>
+                <td>
+                  {version.max_games === null
+                    ? 'none'
+                    : `${formatCount(version.max_games)} games${version.reached_max_games ? ', reached' : ''}`}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 

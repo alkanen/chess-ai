@@ -18,6 +18,7 @@ stops the run instead of quietly training at a default; see :mod:`chess_ai.regis
 
     [dataset]
     name = "carlsen"
+    version = 2          # optional; the latest when left out
 
     [encoder]
     name = "board-planes"
@@ -76,6 +77,12 @@ class DatasetSection(_Section):
     """Which dataset to train on. It is found by name in the configured data directory."""
 
     name: str
+    version: int | None = Field(default=None, ge=1)
+    """Which version of it, counting from 1; the latest when not set.
+
+    The run records the version it resolved to, so a run that trained on the latest is not moved
+    onto data an append added after it started; see ``chess-ai dataset append``.
+    """
 
 
 class EncoderSection(_OpenSection):

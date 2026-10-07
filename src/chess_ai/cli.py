@@ -269,7 +269,52 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
         action="store_true",
         help="replace a dataset of this name that is already there",
     )
+    build.add_argument(
+        "--allow-repeat",
+        action="store_true",
+        help="read a file even if another source has the same contents or is the same "
+        "Lichess month",
+    )
     build.set_defaults(handler=_build_dataset)
+
+    append = actions.add_parser(
+        "append",
+        help="add games from more PGN files to a dataset, as a new version",
+        description="Read more PGN files into a dataset through the filters it was built with, "
+        "and add the games they keep to the end of it as its next version. Runs on an earlier "
+        "version are unaffected, and a config can name any version with [dataset] version. A "
+        "file already in the dataset, by its contents or as a Lichess month, is refused.",
+    )
+    append.add_argument("name", help="the dataset to append to")
+    append.add_argument(
+        "sources", nargs="+", metavar="PGN", help="PGN files, directories of them, or glob patterns"
+    )
+    append.add_argument(
+        "--max-games",
+        type=int,
+        metavar="N",
+        help="raise the dataset's cap on its total games to N, for a dataset that has reached it",
+    )
+    append.add_argument(
+        "--allow-repeat",
+        action="store_true",
+        help="append a file even if the dataset already has one with the same contents or of "
+        "the same Lichess month",
+    )
+    append.add_argument(
+        "--discard-interrupted",
+        action="store_true",
+        help="cut off the records an interrupted append left past the last version, and "
+        "append from there",
+    )
+    append.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"processes parsing the PGN files at once (default here: {default_workers()})",
+    )
+    append.set_defaults(handler=_append_dataset)
 
     stats = actions.add_parser(
         "stats",
@@ -278,6 +323,12 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
         "ratings, results and time controls.",
     )
     stats.add_argument("name", help="the dataset to summarise")
+    stats.add_argument(
+        "--version",
+        type=int,
+        metavar="N",
+        help="summarise the dataset as it was at version N (default: the latest)",
+    )
     stats.set_defaults(handler=_dataset_stats)
 
     download = actions.add_parser(
@@ -1084,12 +1135,7 @@ def _build_settings(args: argparse.Namespace):
 
 
 def _build_dataset(config: Config, args: argparse.Namespace) -> int:
-    from chess_ai.dataset import (
-        DatasetError,
-        ProgressPrinter,
-        build_dataset,
-        dataset_path,
-    )
+    from chess_ai.dataset import DatasetError, ProgressPrinter, build_dataset
 
     sources, fraction, source, filters = _build_settings(args)
     printer = ProgressPrinter()
@@ -1104,6 +1150,7 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
             overwrite=args.overwrite,
             workers=args.workers,
             filters=filters,
+            allow_repeat=args.allow_repeat,
         )
     except DatasetError as e:
         raise _UserError(e) from e
@@ -1116,26 +1163,70 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
         # still open and the error would otherwise be written onto the end of it. build_dataset
         # ends it for everything it gets as far as starting; this covers what it does not.
         printer.finish()
-    lost = [source.path for source in manifest.sources if source.went_away]
+    return _report_built(config, manifest)
+
+
+def _append_dataset(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.dataset import DatasetError, ProgressPrinter
+    from chess_ai.dataset.builder import append_dataset
+
+    printer = ProgressPrinter()
+    try:
+        manifest = append_dataset(
+            args.name,
+            args.sources,
+            data_dir=config.paths.data,
+            max_games=args.max_games,
+            progress=printer,
+            workers=args.workers,
+            allow_repeat=args.allow_repeat,
+            discard_interrupted=args.discard_interrupted,
+        )
+    except DatasetError as e:
+        raise _UserError(e) from e
+    except OSError as e:
+        raise _UserError(f"could not append to dataset {args.name!r}: {e.strerror or e}") from e
+    finally:
+        printer.finish()
+    return _report_built(config, manifest)
+
+
+def _report_built(config: Config, manifest) -> int:
+    """Say what a build or an append made, and answer for sources it could not read whole.
+
+    For an append, what is said is the version it added, then where the dataset now stands.
+    """
+    from chess_ai.dataset import dataset_path
+
+    latest = manifest.versions[-1]
+    lost = [source.path for source in latest.sources if source.went_away]
     # Only the sources that were there throughout and whose contents gave up: a source that went
     # away took an unknown number of games with it, and saying "not read whole" of that on stdout
     # while the warning says the rest of it understates it in the line a log gets read for.
     unread = [
         source.path
-        for source in manifest.sources
+        for source in latest.sources
         if source.error is not None and not source.went_away
     ]
+    skipped = sum(latest.skipped.values())
+    filtered = sum(latest.filtered.values())
+    added = (
+        f"version {latest.version} added {latest.games:,} games, {latest.positions:,} positions "
+        f"({manifest.games:,} games, {manifest.positions:,} positions in all), "
+        if latest.version > 1
+        else f"{manifest.games:,} games, {manifest.positions:,} positions, "
+    )
     _say(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
-        f"{manifest.games:,} games, {manifest.positions:,} positions, "
+        + added
         + (
             f"{manifest.trained_on:,} of them trained on, "
             if manifest.trained_on != manifest.positions
             else ""
         )
-        + f"{manifest.games_skipped:,} skipped"
-        + (f", {manifest.games_filtered:,} filtered out" if manifest.games_filtered else "")
-        + (" (stopped at --max-games)" if manifest.reached_max_games else "")
+        + f"{skipped:,} skipped"
+        + (f", {filtered:,} filtered out" if filtered else "")
+        + (" (stopped at --max-games)" if latest.reached_max_games else "")
         # A source that could not be read leaves the dataset short of its games, which is not
         # something to leave to whoever thinks to run "dataset stats" afterwards.
         + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else "")
@@ -1187,7 +1278,7 @@ def _dataset_stats(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.dataset import DatasetError, ManifestError, open_dataset, summarize
 
     try:
-        dataset = open_dataset(args.name, data_dir=config.paths.data)
+        dataset = open_dataset(args.name, data_dir=config.paths.data, version=args.version)
     except (DatasetError, ManifestError) as e:
         raise _UserError(_with_available(e, config.paths.data)) from e
     _say(summarize(dataset.manifest).rstrip("\n"))

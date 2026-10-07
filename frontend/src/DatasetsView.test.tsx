@@ -48,6 +48,32 @@ const MANIFEST: DatasetManifest = {
     ratings: { '1400': 100, '1600': 140 },
     ratings_unknown: 6,
   },
+  versions: [
+    {
+      version: 1,
+      created: '2026-10-01T12:00:00Z',
+      max_games: null,
+      sources: [],
+      splits: { train: { games: 120, positions: 9000 }, validation: { games: 3, positions: 210 } },
+      reached_max_games: false,
+    },
+  ],
+};
+
+/** The same dataset after an append: version 2 added a month's games. */
+const APPENDED: DatasetManifest = {
+  ...MANIFEST,
+  versions: [
+    MANIFEST.versions[0],
+    {
+      version: 2,
+      created: '2026-11-02T12:00:00Z',
+      max_games: 500,
+      sources: [{ ...MANIFEST.sources[0], path: '/data/pgn/lichess_2024-02.pgn' }],
+      splits: { train: { games: 40, positions: 3000 }, validation: { games: 1, positions: 70 } },
+      reached_max_games: false,
+    },
+  ],
 };
 
 const DATASETS: DatasetSummary[] = [
@@ -156,6 +182,50 @@ describe('the datasets pages', () => {
       'href',
       '#datasets/lichess-2024',
     );
+  });
+
+  /** The server, with the dataset appended to once. */
+  function appended(url: string): Promise<Response> {
+    const path = new URL(url).pathname.replace('/chess/api/', '');
+    const summary = { name: 'lichess-2024', manifest: APPENDED, error: null };
+    if (path === 'datasets') {
+      return Promise.resolve(Response.json([summary]));
+    }
+    if (path === 'datasets/lichess-2024') {
+      return Promise.resolve(Response.json(summary));
+    }
+    return server(url);
+  }
+
+  it('says when a dataset that was appended to got its latest version', async () => {
+    fetch.mockImplementation(appended);
+    open('#datasets');
+
+    const row = (await screen.findByRole('link', { name: 'lichess-2024' })).closest('tr')!;
+    expect(within(row).getAllByRole('cell')[0].textContent).toMatch(/v2 added .*2026/);
+  });
+
+  it('lists the versions of a dataset and what each one added', async () => {
+    fetch.mockImplementation(appended);
+    open('#datasets/lichess-2024');
+
+    const heading = await screen.findByRole('heading', { name: 'Versions' });
+    const table = within(heading.closest('section')!).getByRole('table');
+    const rows = within(table)
+      .getAllByRole('row')
+      .slice(1)
+      .map((row) => within(row).getAllByRole('cell').map((cell) => cell.textContent));
+    expect(rows).toEqual([
+      [expect.stringMatching(/2026/), '123', '9,210', '', 'none'],
+      [expect.stringMatching(/2026/), '41', '3,070', 'lichess_2024-02.pgn', '500 games'],
+    ]);
+  });
+
+  it('shows no versions for a dataset that was never appended to', async () => {
+    open('#datasets/lichess-2024');
+
+    await screen.findByRole('heading', { name: 'Sources' });
+    expect(screen.queryByRole('heading', { name: 'Versions' })).toBeNull();
   });
 
   it('lists a dataset that cannot be read, with the reason', async () => {
