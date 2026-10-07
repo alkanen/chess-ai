@@ -27,8 +27,15 @@ from typing import Final
 import chess
 import numpy as np
 
-FORMAT_VERSION: Final = 1
-"""The version of the on-disk layout, recorded in the manifest and checked when reading."""
+FORMAT_VERSION: Final = 2
+"""The version of the on-disk layout, recorded in the manifest and checked when reading.
+
+2 added the filters, and the stream of training targets a split has when some of its positions
+are not one. A dataset of version 1 is read as what it is: unfiltered, every position a target.
+"""
+
+READABLE_FORMATS: Final = frozenset({1, FORMAT_VERSION})
+"""The versions this code reads, which is every one whose records it still understands."""
 
 
 class Result(IntEnum):
@@ -152,6 +159,12 @@ game's file, as an index into the manifest's sources.
 
 MOVE_DTYPE: Final = np.dtype("<u2")
 """A move index, which is all the move stream holds."""
+
+TARGET_DTYPE: Final = np.dtype("<u8")
+"""A position index in the same split, which is all the target stream holds.
+
+Eight bytes, because a split can outgrow four: a recent Lichess month is billions of positions.
+"""
 
 assert POSITION_DTYPE.itemsize == 52, "the PRD asks for roughly 50-100 bytes per position"
 

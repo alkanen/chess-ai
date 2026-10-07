@@ -39,13 +39,14 @@ import chess.pgn
 import numpy as np
 
 from chess_ai.dataset.files import sync_directory
+from chess_ai.dataset.filters import FilterReason, Screen
 from chess_ai.dataset.games import (
     RESULT_NAMES,
-    GameRecords,
     GameSkipped,
     SkipReason,
     game_records,
     rating_source_of,
+    skips_moves,
     split_of,
 )
 from chess_ai.dataset.manifest import (
@@ -252,6 +253,7 @@ def build_dataset(
     overwrite: bool = False,
     workers: int | None = None,
     now: datetime | None = None,
+    filters: Filters | None = None,
 ) -> Manifest:
     """Build the dataset ``name`` under ``data_dir`` from the PGN files ``patterns`` name.
 
@@ -268,6 +270,10 @@ def build_dataset(
     :func:`default_workers`. The files are cut into pieces of whole games and the pieces are read
     in parallel, which gives the same dataset as reading every game in this process, to the byte;
     ``1`` reads them here, and so does any build with less than :data:`PARALLEL_FROM_BYTES` to do.
+
+    ``filters`` says which games are kept and which of their positions are trained on; see
+    :class:`~chess_ai.dataset.manifest.Filters`. Without them every game is kept, less those no
+    build keeps: the broken ones and those ended for cheating.
 
     ``overwrite`` replaces the dataset only once the new one is finished, so the old one survives
     a build that fails — at the cost of both existing at once while it runs. That way round
@@ -320,6 +326,7 @@ def build_dataset(
                     rating_source=rating_source,
                     validation_fraction=validation_fraction,
                     progress=progress,
+                    filters=filters if filters is not None else Filters(),
                 )
             except OSError as e:
                 raise DatasetError(
@@ -404,16 +411,27 @@ def _check_worth_publishing(manifest: Manifest, directory: Path) -> None:
             "those sources, or leave them out to build from the rest on purpose"
         )
     if manifest.games == 0:
+        # The filters are the likelier culprit when they left out games, and the advice says so.
+        what = (
+            f"the filters left out all {manifest.games_filtered:,} games they were shown"
+            if manifest.games_filtered
+            else "the source(s) are what you meant"
+        )
         if in_place:
             raise DatasetError(
                 f"this build of dataset {manifest.name!r} kept no games, and the dataset already "
-                f"in {directory} has {_games_in(directory)}. It has been left alone; check the "
-                "sources are what you meant before replacing it with nothing"
+                f"in {directory} has {_games_in(directory)}. It has been left alone; check "
+                + ("whether " if manifest.games_filtered else "")
+                + f"{what} before replacing it with nothing"
             )
         raise DatasetError(
             f"this build of dataset {manifest.name!r} kept no games, so there is no dataset to "
-            f"publish; check the source(s) are what you meant: "
-            f"{', '.join(str(source.path) for source in manifest.sources)}"
+            + (
+                f"publish: {what}"
+                if manifest.games_filtered
+                else f"publish; check {what}: "
+                f"{', '.join(str(source.path) for source in manifest.sources)}"
+            )
         )
 
 
@@ -567,9 +585,25 @@ def _report_set_aside(data_dir: Path, name: str) -> None:
         )
 
 
+OUTCOMES: Final[tuple[str, ...]] = (
+    TRAIN,
+    VALIDATION,
+    *(reason for reason in SkipReason),
+    *(reason for reason in FilterReason),
+)
+"""What can become of one game that was read, numbered by place: kept in a split, or left out
+for one reason or another. A worker hands back one of these per game, in the order it read them;
+see :class:`_Read`."""
+
+_OUTCOME: Final = {outcome: code for code, outcome in enumerate(OUTCOMES)}
+
+KEPT: Final = 2
+"""Outcomes below this are games kept, in :data:`TRAIN` and then :data:`VALIDATION`."""
+
+
 @dataclass
 class _Tally:
-    """How many games a build read, and what was in the ones it kept.
+    """How many games a build read, what became of them, and what was in the ones it kept.
 
     Separate from the build because a parallel build counts in each worker and adds the counts
     up here: this is both a build's running total and one piece of a file's contribution to
@@ -583,6 +617,9 @@ class _Tally:
     ratings: Counter[str] = field(default_factory=Counter)
     ratings_unknown: int = 0
     skipped: Counter[SkipReason] = field(default_factory=Counter)
+    filtered: Counter[FilterReason] = field(default_factory=Counter)
+    not_targets: Counter[FilterReason] = field(default_factory=Counter)
+    """Positions of kept games that are not trained on, by which filter left them out."""
     unexpected: str | None = None
     """The first failure nothing expected, written out, for the build to say once.
 
@@ -591,21 +628,45 @@ class _Tally:
     traceback anyway.
     """
 
-    def count(self, records: GameRecords) -> None:
-        """Take one kept game into the statistics."""
-        game = records.game[0]
-        self.results[Result(int(game["result"]))] += 1
-        self.time_controls[TimeControl(int(game["time_control"]))] += 1
-        self.rating_sources[RatingSource(int(game["rating_source"]))] += 1
-        flags = int(game["flags"])
-        for rating, unknown in (
-            (int(game["white_rating"]), GameFlags.WHITE_RATING_UNKNOWN),
-            (int(game["black_rating"]), GameFlags.BLACK_RATING_UNKNOWN),
+    def count(self, games: np.ndarray, not_targets: np.ndarray) -> None:
+        """Take kept games into the statistics: their records, and per game how many of their
+        positions the mover's rating and the clock left out of training.
+
+        Counted over arrays rather than a game at a time, because the parent counts every game
+        a worker read, in one go per piece, after deciding how many of them the build keeps.
+        """
+        if not len(games):
+            return
+        for counter, column, kind in (
+            (self.results, "result", Result),
+            (self.time_controls, "time_control", TimeControl),
+            (self.rating_sources, "rating_source", RatingSource),
         ):
-            if flags & unknown:
-                self.ratings_unknown += 1
-            else:
-                self.ratings[rating_bucket(rating)] += 1
+            for value, count in enumerate(np.bincount(games[column])):
+                if count:
+                    counter[kind(value)] += int(count)
+        flags = games["flags"]
+        for column, unknown in (
+            ("white_rating", GameFlags.WHITE_RATING_UNKNOWN),
+            ("black_rating", GameFlags.BLACK_RATING_UNKNOWN),
+        ):
+            missing = (flags & unknown) != 0
+            self.ratings_unknown += int(np.count_nonzero(missing))
+            buckets, counts = np.unique(games[column][~missing], return_counts=True)
+            for rating, count in zip(buckets.tolist(), counts.tolist(), strict=True):
+                self.ratings[rating_bucket(rating)] += count
+        rating, clock = np.asarray(not_targets, dtype=np.int64).reshape(-1, 2).sum(axis=0)
+        if rating:
+            self.not_targets[FilterReason.RATING] += int(rating)
+        if clock:
+            self.not_targets[FilterReason.CLOCK] += int(clock)
+
+    def left_out(self, reason: SkipReason | FilterReason, count: int = 1) -> None:
+        """Count games left out for ``reason``, which says whether they were broken or filtered."""
+        if isinstance(reason, SkipReason):
+            self.skipped[reason] += count
+        else:
+            self.filtered[reason] += count
 
     def note(self, error: BaseException) -> None:
         """Keep the first failure nothing expected, to be said out loud once."""
@@ -623,6 +684,8 @@ class _Tally:
         self.ratings += other.ratings
         self.ratings_unknown += other.ratings_unknown
         self.skipped += other.skipped
+        self.filtered += other.filtered
+        self.not_targets += other.not_targets
         if self.unexpected is None:
             self.unexpected = other.unexpected
 
@@ -634,6 +697,7 @@ class _Job:
     piece: ByteRange
     rating_source: RatingSource | None
     validation_fraction: float
+    screen: Screen = Screen()
 
 
 @dataclass
@@ -645,22 +709,42 @@ class _Records:
     moves: np.ndarray
     ply_counts: np.ndarray
     """How many plies each game has, which is what the writer turns into offsets."""
+    targets: np.ndarray
+    """Which positions are training targets, one boolean each."""
+    not_targets: np.ndarray
+    """Per game, how many positions the rating and the clock left out of training: (games, 2)."""
+
+    def first(self, games: int) -> "_Records":
+        """The first ``games`` games of these, which is where a build that is full stops."""
+        plies = int(self.ply_counts[:games].sum())
+        return _Records(
+            games=self.games[:games],
+            positions=self.positions[:plies],
+            moves=self.moves[:plies],
+            ply_counts=self.ply_counts[:games],
+            targets=self.targets[:plies],
+            not_targets=self.not_targets[:games],
+        )
 
 
 @dataclass
 class _Read:
-    """What reading one piece produced: its records, its counts, and how it ended."""
+    """What reading one piece produced: its records, what became of each game, and how it ended.
+
+    ``outcomes`` is one :data:`OUTCOMES` code per game read, in the order they were read, rather
+    than counts. That is what lets the parent stop at exactly the game that fills a build with a
+    maximum: the games of the piece past it were read by the worker and are not this build's, so
+    they are neither written nor counted, and the dataset and its manifest come out as a build
+    reading one game at a time would have left them.
+    """
 
     piece: ByteRange
-    tally: _Tally
+    outcomes: np.ndarray
     splits: dict[str, _Records]
+    unexpected: str | None = None
     error: str | None = None
     went_away: bool = False
     """Whether the file went away, rather than its contents having stopped making sense."""
-
-    @property
-    def kept(self) -> int:
-        return sum(len(records.games) for records in self.splits.values())
 
 
 @dataclass
@@ -691,13 +775,15 @@ def _read_piece(job: _Job) -> _Read:
     back what it had; the caller decides what that means for the file it came from.
     """
     tally = _Tally()
-    bins: dict[str, tuple[list, list, list, list]] = {split: ([], [], [], []) for split in SPLITS}
+    bins: dict[str, tuple[list, ...]] = {split: ([], [], [], [], [], []) for split in SPLITS}
+    outcomes: list[int] = []
     error: str | None = None
     went_away = False
+    screen = job.screen
     # Applied here as well as in the parent: a worker started by spawn or forkserver rather than
     # fork inherits nothing, and a dump of millions of games has thousands of unreadable ones.
     with quiet_parser():
-        reading = games_in_range(job.piece)
+        reading = games_in_range(job.piece, skip=lambda headers: skips_moves(headers, screen))
         while True:
             try:
                 # The offset is for a caller reading a piece itself; a worker reports one figure
@@ -709,15 +795,15 @@ def _read_piece(job: _Job) -> _Read:
                 # As in _read_games: the piece stopped mid-game. What was read is kept and the
                 # rest is not, and whether the file went away or the chess in it stopped making
                 # sense is the difference between an unknown number of games missing and none.
+                # Not an outcome: the game it stopped in was never read, and is counted as
+                # unreadable by whoever takes this piece, if the build still wants it.
                 tally.note(e)
-                tally.skipped[SkipReason.UNREADABLE] += 1
                 # The reason only. How many games the *file* had read by then is not known
-                # here -- `tally` counts this piece -- and it is what the manifest wants, so
-                # the sentence is composed in _take where the file's running total is.
+                # here -- this counts the piece -- and it is what the manifest wants, so the
+                # sentence is composed in _take where the file's running total is.
                 error = _described(e)
                 went_away = isinstance(e, OSError)
                 break
-            tally.games_read += 1
             try:
                 records = game_records(
                     record,
@@ -725,34 +811,40 @@ def _read_piece(job: _Job) -> _Read:
                     rating_source=(
                         rating_source_of(record) if job.rating_source is None else job.rating_source
                     ),
+                    screen=screen,
                 )
             except GameSkipped as skipped:
-                tally.skipped[skipped.reason] += 1
+                outcomes.append(_OUTCOME[skipped.reason])
                 continue
             except Exception as e:
                 tally.note(e)
-                tally.skipped[SkipReason.UNREADABLE] += 1
+                outcomes.append(_OUTCOME[SkipReason.UNREADABLE])
                 continue
             split = VALIDATION if split_of(records.identity, job.validation_fraction) else TRAIN
-            games, positions, moves, counts = bins[split]
+            outcomes.append(_OUTCOME[split])
+            games, positions, moves, counts, targets, not_targets = bins[split]
             games.append(records.game)
             positions.append(records.positions)
             moves.append(records.moves)
             counts.append(len(records.positions))
-            tally.count(records)
+            targets.append(records.targets)
+            not_targets.append(records.not_targets)
     return _Read(
         piece=job.piece,
-        tally=tally,
+        outcomes=np.asarray(outcomes, dtype=np.uint8),
         splits={
             split: _Records(
                 games=np.concatenate(games),
                 positions=np.concatenate(positions),
                 moves=np.concatenate(moves),
                 ply_counts=np.asarray(counts, dtype=np.int64),
+                targets=np.concatenate(targets),
+                not_targets=np.asarray(not_targets, dtype=np.int64),
             )
-            for split, (games, positions, moves, counts) in bins.items()
+            for split, (games, positions, moves, counts, targets, not_targets) in bins.items()
             if games
         },
+        unexpected=tally.unexpected,
         error=error,
         went_away=went_away,
     )
@@ -850,8 +942,11 @@ class _Build:
         rating_source: RatingSource | None,
         validation_fraction: float,
         progress: ProgressCallback | None,
+        filters: Filters,
     ) -> None:
-        self.writer = DatasetWriter(directory, shards)
+        self.filters = filters
+        self.screen = filters.screen()
+        self.writer = DatasetWriter(directory, shards, targets=self.screen.per_position)
         self.shards = shards
         self.rating_source = rating_source
         self.validation_fraction = validation_fraction
@@ -864,6 +959,16 @@ class _Build:
         self.sources: list[SourceInfo] = []
         self.tally = _Tally()
         self._said_unexpected = False
+        self.full = False
+        """Whether the build has kept its ``max_games`` and reads no further."""
+
+    @property
+    def kept(self) -> int:
+        """How many games the build has kept so far, in both splits."""
+        return sum(split.games for split in self.writer.splits.values())
+
+    def _skip(self, headers: chess.pgn.Headers) -> bool:
+        return skips_moves(headers, self.screen)
 
     def read_sources(self, sources: Sequence[Source], *, workers: int) -> None:
         """Read every source into the dataset, in this process or in ``workers`` of them.
@@ -879,6 +984,14 @@ class _Build:
         # cadence, and a source that gives no games never reaches it at all.
         self.report()
         for index, source in enumerate(sources):
+            if self.full:
+                # Never opened, and not missing anything: the build had what it was asked for.
+                self.sources.append(
+                    SourceInfo(
+                        path=str(source.path), bytes=source.bytes, games_read=0, games_kept=0
+                    )
+                )
+                continue
             self.read_source(source, index)
 
     def _read_in_parallel(self, sources: Sequence[Source], *, workers: int) -> None:
@@ -930,6 +1043,7 @@ class _Build:
                     piece=piece,
                     rating_source=self.rating_source,
                     validation_fraction=self.validation_fraction,
+                    screen=self.screen,
                 )
                 for piece in pieces
             )
@@ -956,7 +1070,7 @@ class _Build:
                 pool,
                 jobs,
                 in_flight=workers * IN_FLIGHT_PER_WORKER,
-                wanted=lambda job: not found[job.piece.source].stopped,
+                wanted=lambda job: not found[job.piece.source].stopped and not self.full,
             ):
                 index = outcome.piece.source
                 state = found[index]
@@ -969,13 +1083,18 @@ class _Build:
                 # The progress below then jumps to the end of the file rather than to this
                 # piece's end, because the rest of it is not going to be read: left counting
                 # pieces, the fraction would stall for whatever share of the build this file was.
-                if not state.stopped:
+                # And a build that is full drops what was still in flight when it filled up, the
+                # same way: `wanted` stops anything more being handed out.
+                if not state.stopped and not self.full:
                     if isinstance(outcome, _Job):
                         self._read_here(outcome, state, before=before[index])
                     else:
                         self._take(outcome, state)
-                self._bytes_read = before[index] + (
-                    sources[index].bytes if state.stopped else outcome.piece.end
+                self._bytes_read = (
+                    self._bytes_total
+                    if self.full
+                    else before[index]
+                    + (sources[index].bytes if state.stopped else outcome.piece.end)
                 )
                 self.report()
         except BrokenProcessPool as e:
@@ -1009,20 +1128,49 @@ class _Build:
         self._bytes_read = self._bytes_total
 
     def _take(self, read: _Read, state: _SourceTally) -> None:
-        """Write one worker's piece into the dataset, and take its counts into the build's."""
-        state.read += read.tally.games_read
-        state.kept += read.kept
-        self.tally.add(read.tally)
+        """Write one worker's piece into the dataset, and take its counts into the build's.
+
+        Only as much of it as the build still has room for: a build with a maximum stops at the
+        game that fills it, and what the worker read past that is neither written nor counted.
+        """
+        outcomes = read.outcomes
+        error = read.error
+        max_games = self.filters.max_games
+        if max_games is not None:
+            kept_at = np.flatnonzero(outcomes < KEPT)
+            room = max_games - self.kept
+            if len(kept_at) >= room:
+                outcomes = outcomes[: kept_at[room - 1] + 1]
+                # Whatever stopped the worker came after the last game this build wanted.
+                error = None
+                self.full = True
+        codes = np.bincount(outcomes, minlength=len(OUTCOMES))
+        state.read += len(outcomes)
+        state.kept += int(codes[_OUTCOME[TRAIN]] + codes[_OUTCOME[VALIDATION]])
+        self.tally.games_read += len(outcomes)
+        for code, count in enumerate(codes.tolist()):
+            if code >= KEPT and count:
+                self.tally.left_out(OUTCOMES[code], count)
+        if self.tally.unexpected is None:
+            self.tally.unexpected = read.unexpected
         self._say_unexpected()
         for split, records in read.splits.items():
+            records = records.first(int(codes[_OUTCOME[split]]))
             self.writer.splits[split].add_games(
-                records.games, records.positions, records.moves, records.ply_counts
+                records.games,
+                records.positions,
+                records.moves,
+                records.ply_counts,
+                records.targets,
             )
-        if read.error is not None:
+            self.tally.count(records.games, records.not_targets)
+        if error is not None:
+            # The game the piece stopped in, which the worker could not count as read.
+            self.tally.skipped[SkipReason.UNREADABLE] += 1
             # Counted after the increment above, so this is the file's total and reads the same
             # as the sentences _read_games and _read_here build from theirs. A worker's own
             # count would say "after 7 games" of a file that had read six million.
-            state.error = f"stopped reading after {state.read} games: {read.error}"
+            state.error = f"stopped reading after {state.read} games: {error}"
             state.went_away = read.went_away
             state.stopped = True
 
@@ -1103,8 +1251,12 @@ class _Build:
                 job.piece.path,
                 f"{job.piece.bytes:,}",
             )
-        reading = games_in_range(job.piece, on_read=self._reading(before, job.piece.end))
+        reading = games_in_range(
+            job.piece, on_read=self._reading(before, job.piece.end), skip=self._skip
+        )
         while True:
+            if self.full:
+                return
             try:
                 record, position = next(reading)
             except StopIteration:
@@ -1137,7 +1289,9 @@ class _Build:
         kept = 0
         error: str | None = None
         went_away = False
-        reader = PgnReader(source, on_read=self._reading(self._bytes_before, source.bytes))
+        reader = PgnReader(
+            source, on_read=self._reading(self._bytes_before, source.bytes), skip=self._skip
+        )
         try:
             # The open is guarded on its own, and nothing else is: a DatasetError out of the
             # reading below would be a write failure recorded as a bad file, which is the shape
@@ -1186,6 +1340,8 @@ class _Build:
         kept = 0
         games = reader.games()
         while True:
+            if self.full:
+                return read, kept, None, False
             try:
                 record = next(games)
             except StopIteration:
@@ -1220,9 +1376,10 @@ class _Build:
                 rating_source=(
                     rating_source_of(record) if self.rating_source is None else self.rating_source
                 ),
+                screen=self.screen,
             )
         except GameSkipped as skipped:
-            self.tally.skipped[skipped.reason] += 1
+            self.tally.left_out(skipped.reason)
             return 0
         except Exception as e:
             # Not a shape of broken game anyone has seen yet. One game is not worth abandoning
@@ -1231,8 +1388,12 @@ class _Build:
             self.tally.skipped[SkipReason.UNREADABLE] += 1
             return 0
         split = VALIDATION if split_of(records.identity, self.validation_fraction) else TRAIN
-        self.writer.splits[split].add_game(records.game, records.positions, records.moves)
-        self.tally.count(records)
+        self.writer.splits[split].add_game(
+            records.game, records.positions, records.moves, records.targets
+        )
+        self.tally.count(records.game, np.array([records.not_targets]))
+        if self.filters.max_games is not None and self.kept >= self.filters.max_games:
+            self.full = True
         return 1
 
     def _note_failure(self, error: BaseException) -> None:
@@ -1306,12 +1467,13 @@ class _Build:
                 else self.rating_source.name.lower()
             ),
             sources=self.sources,
-            filters=Filters(),
+            filters=self.filters,
             shards=self.shards,
             splits={
                 split: SplitCounts(
                     games=self.writer.splits[split].games,
                     positions=self.writer.splits[split].positions,
+                    targets=self.writer.splits[split].targets,
                 )
                 for split in SPLITS
             },
@@ -1320,6 +1482,17 @@ class _Build:
                 for reason in SkipReason
                 if self.tally.skipped[reason]
             },
+            filtered={
+                reason.value: self.tally.filtered[reason]
+                for reason in FilterReason
+                if self.tally.filtered[reason]
+            },
+            not_targets={
+                reason.value: self.tally.not_targets[reason]
+                for reason in FilterReason
+                if self.tally.not_targets[reason]
+            },
+            reached_max_games=self.full,
             statistics=Statistics(
                 results={
                     text: self.tally.results[result]

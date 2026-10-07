@@ -259,7 +259,7 @@ uv run chess-ai dataset stats my-games
 ```
 dataset my-games
   built      2024-05-17 09:30:00 UTC
-  format     version 1, move vocabulary 1968
+  format     version 2, move vocabulary 1968
   games      9,631 (train 9,436, validation 195)
   positions  742,905 (train 727,884, validation 15,021)
 ...
@@ -269,8 +269,74 @@ results
   1/2-1/2    518   5.4%  ███
 ```
 
-`.pgn.zst` Lichess dumps, a command that downloads them, and filters on rating, time control,
-termination and date are next.
+#### Filters
+
+A build keeps every game by default. Filters narrow it down, for fine-tuning on stronger
+players or slower games:
+
+```sh
+uv run chess-ai dataset build masters-classical ~/lichess/2024-*.pgn \
+    --min-rating 2200 --time-controls rapid,classical --exclude-terminations abandoned
+```
+
+| Option | Keeps |
+|---|---|
+| `--min-rating`, `--max-rating` | positions whose player to move is rated within the limits; either may be left out |
+| `--unknown-rating-passes` | players without a rating as well, when a limit is set (by default they fail it) |
+| `--min-clock SECONDS` | positions whose player to move had at least this long left, from the `[%clk]` comments |
+| `--time-controls` | games of these classes: `bullet`, `blitz`, `rapid`, `classical`, `correspondence`, `unknown` |
+| `--exclude-terminations` | games that did not end like this: `normal`, `time_forfeit`, `abandoned`, `unterminated`, `unknown` |
+| `--from`, `--until` | games played in the range, each `YYYY`, `YYYY-MM` or `YYYY-MM-DD` and inclusive |
+| `--sample FRACTION` | that fraction of the games that pass, chosen by a hash of each game |
+| `--max-games N` | the first N games that pass, in the order the files give them; reading stops there |
+
+The rating and the clock filters are about the *player to move*, so they decide which positions
+are trained on rather than which games are kept. A game between a 2300 and an 1800 built with
+`--min-rating 2000` is stored whole, since the history an encoder reads and the moves a
+sequence model reads are the whole game, but only the 2300's positions are trained on and
+validated against. A game none of whose positions is left to train on is not kept. A position
+with no clock comment passes `--min-clock`; before a side's first move, the clock is the time
+control's starting time.
+
+The other filters are about the whole game and are read off its headers, so a game they leave
+out is never parsed: a build that keeps a few percent of a dump is much faster than one that
+keeps it all. A game with no date fails a date range, and one dated only to the month has to
+fall inside it for the whole month. A sample is a hash of the game, independent of the
+validation split: the same game is in or out of every sample of that size, and a 5% sample is
+part of a 10% one. `--sample` and `--max-games` can be combined, filters first, then the
+sample, then the maximum.
+
+Games that a site ended for a rules infraction, which is mostly cheating, are left out of every
+dataset whatever the filters say, and counted as skipped.
+
+The same settings can be kept in a TOML file and given with `--definition`; options on the
+command line override it, and sources on the command line replace its sources. Sources in the
+file are relative to the file. The name stays on the command line, so one file can build both a
+full dataset and a quick `--max-games 10000` one.
+
+```toml
+# datasets/masters-classical.toml
+sources = ["../lichess/lichess_db_standard_rated_2024-0[1-6].pgn"]
+validation_fraction = 0.02
+
+[filters]
+min_rating = 2200
+time_controls = ["rapid", "classical"]
+exclude_terminations = ["abandoned"]
+from = "2024-01"
+until = "2024-06"
+min_clock = 30
+```
+
+```sh
+uv run chess-ai dataset build masters-classical --definition datasets/masters-classical.toml
+```
+
+The manifest records the filters the build used, how many games each one left out, and how many
+positions are stored but not trained on; `dataset stats` and the datasets page show them.
+Datasets built before there were filters are still read, as unfiltered.
+
+`.pgn.zst` Lichess dumps and a command that downloads them are next.
 
 ### Train a model
 

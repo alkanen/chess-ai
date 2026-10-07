@@ -303,6 +303,28 @@ export interface DatasetStatistics {
   ratings_unknown: number;
 }
 
+/** Mirrors chess_ai.dataset.manifest.Filters; a filter that is not set is left out. */
+export interface DatasetFilters {
+  min_rating?: number;
+  max_rating?: number;
+  unknown_rating_passes?: boolean;
+  time_controls?: string[];
+  exclude_terminations?: string[];
+  from?: string;
+  until?: string;
+  min_clock?: number;
+  sample?: number;
+  max_games?: number;
+}
+
+/** How much of a dataset one split holds: mirrors chess_ai.dataset.manifest.SplitCounts. */
+export interface DatasetSplitCounts {
+  games: number;
+  positions: number;
+  /** How many positions are trained on; absent or null when every one of them is. */
+  targets?: number | null;
+}
+
 /** A dataset, described: mirrors chess_ai.dataset.manifest.Manifest. */
 export interface DatasetManifest {
   format_version: number;
@@ -314,10 +336,16 @@ export interface DatasetManifest {
   rating_source: string;
   sources: DatasetSource[];
   /** Which games the build let through; empty when every game was kept. */
-  filters: Record<string, unknown>;
-  splits: Record<string, { games: number; positions: number }>;
+  filters: DatasetFilters;
+  splits: Record<string, DatasetSplitCounts>;
   /** Games left out, counted by why. */
   skipped: Record<string, number>;
+  /** Games the filters left out, counted by which filter. */
+  filtered: Record<string, number>;
+  /** Positions stored but not trained on, counted by which filter left them out. */
+  not_targets: Record<string, number>;
+  /** Whether the build stopped at its maximum number of games. */
+  reached_max_games: boolean;
   statistics: DatasetStatistics;
 }
 
@@ -515,7 +543,13 @@ export interface RunInfo {
   seed: number;
   code_version: string;
   device: string;
-  dataset: { name: string; positions: number; train_positions: number };
+  dataset: {
+    name: string;
+    positions: number;
+    train_positions: number;
+    /** How many train positions are trained on, when the dataset filtered positions. */
+    train_targets?: number | null;
+  };
   model: { architecture: string; options: Record<string, unknown>; parameter_count: number };
   steps: number;
   batch_size: number;

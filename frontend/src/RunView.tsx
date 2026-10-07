@@ -133,7 +133,7 @@ export function RunView({ name }: RunViewProps) {
             <dd>
               {info === null
                 ? '–'
-                : `${info.dataset.name}, ${formatCount(info.dataset.train_positions)} training positions`}
+                : `${info.dataset.name}, ${formatCount(info.dataset.train_targets ?? info.dataset.train_positions)} training positions`}
             </dd>
             <dt>Step</dt>
             <dd>

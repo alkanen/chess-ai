@@ -16,6 +16,7 @@ from pathlib import Path
 
 import chess
 import chess.pgn
+import numpy as np
 import pytest
 from dataset_helpers import (
     FIXTURES,
@@ -344,7 +345,7 @@ def test_the_manifest_records_what_the_dataset_was_built_from(tmp_path):
 
     assert manifest.name == "test"
     assert manifest.created == when
-    assert manifest.format_version == 1
+    assert manifest.format_version == 2
     assert manifest.move_vocabulary_size == VOCABULARY_SIZE
     assert manifest.validation_fraction == DEFAULT_VALIDATION_FRACTION
     assert manifest.filters.model_dump() == {}
@@ -1616,11 +1617,12 @@ def test_a_worker_records_a_failure_nothing_expected_with_its_traceback():
         patch.setattr(builder, "game_records", explode)
         read = builder._read_piece(job)
 
-    assert read.kept == 2, "the games it could still read"
-    assert read.tally.skipped[SkipReason.UNREADABLE] == 2
-    assert read.tally.unexpected is not None
-    assert "something nothing expected" in read.tally.unexpected
-    assert "Traceback" in read.tally.unexpected, "so a broken build is recognisable as one"
+    outcomes = [builder.OUTCOMES[code] for code in read.outcomes]
+    assert sum(outcome in SPLITS for outcome in outcomes) == 2, "the games it could still read"
+    assert outcomes.count(SkipReason.UNREADABLE) == 2
+    assert read.unexpected is not None
+    assert "something nothing expected" in read.unexpected
+    assert "Traceback" in read.unexpected, "so a broken build is recognisable as one"
 
 
 def test_a_failure_nothing_expected_is_said_once_for_the_whole_build(tmp_path, caplog):
@@ -1630,8 +1632,11 @@ def test_a_failure_nothing_expected_is_said_once_for_the_whole_build(tmp_path, c
 
     def carrying_failures(pool, jobs, *, in_flight, **rest):
         for read in real_in_order(pool, jobs, in_flight=in_flight, **rest):
-            read.tally.note(RuntimeError("something nothing expected"))
-            read.tally.skipped[SkipReason.UNREADABLE] += 1
+            noted = builder._Tally()
+            noted.note(RuntimeError("something nothing expected"))
+            read.unexpected = noted.unexpected
+            unreadable = builder.OUTCOMES.index(SkipReason.UNREADABLE)
+            read.outcomes = np.append(read.outcomes, np.uint8(unreadable))
             yield read
 
     with pytest.MonkeyPatch.context() as patch:
@@ -2144,7 +2149,7 @@ def test_a_source_that_gives_up_stops_being_handed_to_workers():
     # file, for nothing.
     empty = builder._Read(
         piece=ByteRange(source=0, path=Path("x.pgn"), start=0, end=1),
-        tally=builder._Tally(),
+        outcomes=np.empty(0, dtype=np.uint8),
         splits={},
     )
     submitted: list[builder._Job] = []
