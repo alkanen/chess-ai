@@ -405,8 +405,37 @@ def reading(
     return text, window
 
 
+class _Screened(chess.pgn.GameBuilder):
+    """A game builder that does not parse the moves of a game its headers have already decided.
+
+    The moves are what parsing a game costs, and a build filtered down to a few percent of a dump
+    would otherwise parse every one of them only to throw the game away. python-chess reads a game
+    it is told to skip as fast as it can find the end of it; what comes back has the headers and
+    no moves, and :func:`~chess_ai.dataset.games.game_records` reaches the same verdict on it from
+    the headers before it looks for any.
+    """
+
+    def __init__(self, skip: Callable[[chess.pgn.Headers], bool]) -> None:
+        super().__init__()
+        self._skip = skip
+
+    def end_headers(self) -> chess.pgn.SkipType | None:
+        return chess.pgn.SKIP if self._skip(self.game.headers) else None
+
+
+def read_game(
+    text: TextIO, skip: Callable[[chess.pgn.Headers], bool] | None = None
+) -> chess.pgn.Game | None:
+    """The next game in ``text``, without its moves where ``skip`` says so of its headers."""
+    if skip is None:
+        return chess.pgn.read_game(text)
+    return chess.pgn.read_game(text, Visitor=lambda: _Screened(skip))
+
+
 def games_in_range(
-    piece: ByteRange, on_read: Callable[[int], None] | None = None
+    piece: ByteRange,
+    on_read: Callable[[int], None] | None = None,
+    skip: Callable[[chess.pgn.Headers], bool] | None = None,
 ) -> Iterator[tuple[chess.pgn.Game, int]]:
     """Every game in ``piece``, with where the reading had got to, as a stream.
 
@@ -435,7 +464,7 @@ def games_in_range(
     with piece.path.open("rb") as handle:
         text, window = reading(handle, piece.start, piece.end, on_read)
         while True:
-            record = chess.pgn.read_game(text)
+            record = read_game(text, skip)
             if record is None:
                 return
             yield record, window.position
@@ -448,9 +477,15 @@ class PgnReader:
     ``errors``; deciding what to do about that belongs to the caller, which counts it.
     """
 
-    def __init__(self, source: Source, on_read: Callable[[int], None] | None = None) -> None:
+    def __init__(
+        self,
+        source: Source,
+        on_read: Callable[[int], None] | None = None,
+        skip: Callable[[chess.pgn.Headers], bool] | None = None,
+    ) -> None:
         self.source = source
         self._on_read = on_read
+        self._skip = skip
         self._handle: BinaryIO | None = None
         self._file: TextIO | None = None
         self._window: _Window | None = None
@@ -509,7 +544,7 @@ class PgnReader:
         """Every record in the file, in order, until there are no more."""
         assert self._file is not None, "read a PgnReader inside its with block"
         while True:
-            record = chess.pgn.read_game(self._file)
+            record = read_game(self._file, self._skip)
             if record is None:
                 return
             yield record

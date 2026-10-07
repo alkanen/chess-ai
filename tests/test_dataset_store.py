@@ -163,7 +163,9 @@ def test_a_dataset_that_is_not_there_says_so(tmp_path):
 def test_a_dataset_of_another_format_version_is_refused(tmp_path):
     built(tmp_path)
     manifest = dataset_path(tmp_path, "test") / "manifest.json"
-    manifest.write_text(manifest.read_text().replace('"format_version": 1', '"format_version": 99'))
+    manifest.write_text(
+        manifest.read_text().replace(f'"format_version": {FORMAT_VERSION}', '"format_version": 99')
+    )
 
     with pytest.raises(ManifestError, match="format version 99"):
         open_dataset("test", data_dir=tmp_path)

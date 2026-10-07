@@ -126,9 +126,10 @@ def format_progress(progress: Progress) -> str:
         f"{progress.positions:,} positions",
         f"{progress.games_per_second:,.0f} games/s",
     ]
-    skipped = progress.games_read - progress.games_kept
-    if skipped:
-        parts.append(f"{skipped:,} skipped")
+    # Broken and filtered alike: the line is about how much of what was read is being kept.
+    left_out = progress.games_read - progress.games_kept
+    if left_out:
+        parts.append(f"{left_out:,} left out")
     if progress.done:
         return f"built {', '.join(parts)} in {format_duration(progress.seconds)}"
     if progress.scanning:

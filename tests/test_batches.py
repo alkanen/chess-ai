@@ -16,6 +16,7 @@ from signal_helpers import SignalledWhileStarting
 from training_helpers import dataset
 
 from chess_ai.dataset import Result, open_dataset
+from chess_ai.dataset.manifest import Filters
 from chess_ai.encoders import create_encoder
 from chess_ai.move_codec import MIRRORED_INDEX, VOCABULARY_SIZE
 from chess_ai.training.batches import PositionBatches, batch_loader, iterate
@@ -438,3 +439,17 @@ def test_another_ctrl_c_while_stragglers_are_killed_waits_until_they_are(directo
         done.set()
         other.join()
         signal.signal(signal.SIGINT, previous)
+
+
+def test_an_epoch_of_a_filtered_dataset_visits_its_training_targets_and_nothing_else(tmp_path):
+    dataset(tmp_path / "data", filters=Filters(min_rating=1700))
+    with open_dataset("test", data_dir=tmp_path / "data") as built:
+        reader = built["train"]
+        assert 0 < reader.targets < len(reader), "some positions are stored and not trained on"
+        targets = reader.positions(reader.target_positions(np.arange(reader.targets)))
+        source = batches(built.directory, batch_size=1, batches=reader.targets)
+
+        visited = sorted(int(source[index].move[0]) for index in range(reader.targets))
+
+    assert source.positions == len(targets)
+    assert visited == sorted(int(move) for move in targets["move"])

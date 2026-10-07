@@ -568,7 +568,10 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path) -> _Run:
             f"{dataset.manifest.move_vocabulary_size} moves and this code has "
             f"{VOCABULARY_SIZE}; its move indices mean something else, so rebuild it"
         )
-    if not dataset.manifest.splits.get(TRAIN, None) or not dataset.manifest.splits[TRAIN].positions:
+    if (
+        not dataset.manifest.splits.get(TRAIN, None)
+        or not dataset.manifest.splits[TRAIN].trained_on
+    ):
         raise TrainingError(f"dataset {config.dataset.name!r} has nothing in its train split")
 
     # Seeded before the model is built, because building it is what draws the initial weights.
@@ -1028,7 +1031,7 @@ class _Beat:
 def _validation_split(run: _Run, *, say: Callable[[str], None]):
     """The validation split to measure on, or ``None`` with a word about why there is none."""
     counts = run.dataset.manifest.splits.get(VALIDATION)
-    if counts is None or not counts.positions:
+    if counts is None or not counts.trained_on:
         say(
             "chess-ai: warning: this dataset has no validation positions, so no validation "
             "metrics will be logged; rebuild it with a larger --validation-fraction"
@@ -1113,6 +1116,7 @@ def _info(run: _Run, *, estimate: float | None, lineage: Lineage | None) -> RunI
             positions=manifest.positions,
             train_positions=_split_positions(manifest, TRAIN),
             validation_positions=_split_positions(manifest, VALIDATION),
+            train_targets=manifest.splits[TRAIN].targets if TRAIN in manifest.splits else None,
         ),
         encoder=run.spec,
         model=ModelReference(
@@ -1148,7 +1152,7 @@ def _summary(
         + (f", resuming at step {first:,}" if start else ""),
         f"  device     {describe_device(run.device)}, {precision}",
         f"  dataset    {manifest.name}: {manifest.games:,} games, {positions:,} train positions, "
-        f"{_split_positions(manifest, VALIDATION):,} validation",
+        f"{_trained_on(manifest, VALIDATION):,} validation",
         f"  encoder    {run.spec.describe()}",
         f"  model      {config.model.architecture}, "
         f"{run.model.parameter_count:,} parameters{_options(config.model.options)}",
@@ -1288,6 +1292,12 @@ def _options(options: dict[str, Any]) -> str:
 def _split_positions(manifest, split: str) -> int:
     counts = manifest.splits.get(split)
     return counts.positions if counts else 0
+
+
+def _trained_on(manifest, split: str) -> int:
+    """How many of ``split``'s positions are training targets; see ``SplitCounts.trained_on``."""
+    counts = manifest.splits.get(split)
+    return counts.trained_on if counts else 0
 
 
 def _duration(seconds: float) -> str:

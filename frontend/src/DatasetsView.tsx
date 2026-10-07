@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
-import { fetchDatasets, type DatasetManifest, type DatasetSummary } from './api';
+import {
+  fetchDatasets,
+  type DatasetFilters,
+  type DatasetManifest,
+  type DatasetSummary,
+} from './api';
 import { datasetHash, DEFAULT_SPLIT } from './datasetPlaces';
 import { formatCount } from './runFormat';
 import './DatasetsView.css';
@@ -22,15 +27,60 @@ export function totalOf(manifest: DatasetManifest, what: 'games' | 'positions'):
   return Object.values(manifest.splits).reduce((sum, split) => sum + split[what], 0);
 }
 
-/** The filters a dataset was built with, in a few words. */
-export function describeFilters(filters: DatasetManifest['filters']): string {
-  const entries = Object.entries(filters);
-  if (entries.length === 0) {
-    return 'none';
+/**
+ * The filters a dataset was built with, a phrase per filter; mirrors describe_filters in
+ * chess_ai.dataset.summary, which says the same on the command line.
+ */
+export function filterPhrases(filters: DatasetFilters): string[] {
+  const phrases: string[] = [];
+  const { min_rating: min, max_rating: max } = filters;
+  if (min !== undefined || max !== undefined) {
+    const band =
+      max === undefined
+        ? `at least ${min}`
+        : min === undefined
+          ? `at most ${max}`
+          : `${min} to ${max}`;
+    const unknown = filters.unknown_rating_passes ? 'passes' : 'does not';
+    phrases.push(`player to move rated ${band}; an unknown rating ${unknown}`);
   }
-  return entries
-    .map(([name, value]) => `${name.replaceAll('_', ' ')} ${JSON.stringify(value)}`)
-    .join(', ');
+  if (filters.min_clock !== undefined) {
+    phrases.push(`player to move with at least ${filters.min_clock}s on the clock`);
+  }
+  if (filters.time_controls !== undefined) {
+    phrases.push(`time controls ${filters.time_controls.join(', ')}`);
+  }
+  if (filters.exclude_terminations !== undefined && filters.exclude_terminations.length > 0) {
+    const names = filters.exclude_terminations.map((name) => name.replaceAll('_', ' '));
+    phrases.push(`not ended by ${names.join(', ')}`);
+  }
+  if (filters.from !== undefined || filters.until !== undefined) {
+    const from = filters.from !== undefined ? ` from ${filters.from}` : '';
+    const until = filters.until !== undefined ? ` until ${filters.until}` : '';
+    phrases.push(`played${from}${until}`);
+  }
+  if (filters.sample !== undefined) {
+    phrases.push(`a ${filters.sample} sample, by a hash of each game`);
+  }
+  if (filters.max_games !== undefined) {
+    phrases.push(`at most ${formatCount(filters.max_games)} games`);
+  }
+  return phrases;
+}
+
+/** The filters a dataset was built with, in a few words. */
+export function describeFilters(filters: DatasetFilters): string {
+  const phrases = filterPhrases(filters);
+  return phrases.length === 0 ? 'none' : phrases.join('; ');
+}
+
+/** How many of a dataset's positions are trained on, or null when every one of them is. */
+export function trainedOn(manifest: DatasetManifest): number | null {
+  const splits = Object.values(manifest.splits);
+  if (splits.every((split) => split.targets == null)) {
+    return null;
+  }
+  return splits.reduce((sum, split) => sum + (split.targets ?? split.positions), 0);
 }
 
 /** Whether a source was not read whole, which leaves the dataset short of its games. */

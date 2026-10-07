@@ -9,7 +9,7 @@ set from one with a single peak, and no column of numbers says so at a glance.
 
 from typing import Final
 
-from chess_ai.dataset.manifest import RATING_BUCKET, SPLITS, Manifest
+from chess_ai.dataset.manifest import RATING_BUCKET, SPLITS, Filters, Manifest
 
 BAR_WIDTH: Final = 28
 """How wide the longest bar of a distribution is drawn."""
@@ -32,8 +32,13 @@ def summarize(manifest: Manifest) -> str:
         f"  positions  {_counts(manifest, 'positions')}",
         f"  held back  {manifest.validation_fraction:.1%} of games, by a hash of each game",
     ]
-    if not manifest.filters.model_dump():
-        lines.append("  filters    none: every game in every source")
+    if any(counts.targets is not None for counts in manifest.splits.values()):
+        lines.append(f"  trained on {_counts(manifest, 'trained_on')} positions")
+    filters = describe_filters(manifest.filters)
+    lines.append(f"  filters    {filters[0]}")
+    lines += [f"             {line}" for line in filters[1:]]
+    if manifest.reached_max_games:
+        lines.append(f"  stopped    at the maximum of {manifest.filters.max_games:,} games")
     lines += ["", "sources"]
     for source in manifest.sources:
         lines.append(
@@ -59,6 +64,19 @@ def summarize(manifest: Manifest) -> str:
         lines += _bars(
             {reason.replace("_", " "): count for reason, count in manifest.skipped.items()}
         )
+    if manifest.filtered:
+        lines += ["", f"games the filters left out  {manifest.games_filtered:,}"]
+        lines += _bars(
+            {reason.replace("_", " "): count for reason, count in manifest.filtered.items()}
+        )
+    if manifest.not_targets:
+        lines += [
+            "",
+            f"positions stored but not trained on  {sum(manifest.not_targets.values()):,}",
+        ]
+        lines += _bars(
+            {f"mover's {reason}": count for reason, count in manifest.not_targets.items()}
+        )
     lines += ["", "results"] + _bars(statistics.results)
     lines += ["", "time controls"] + _bars(statistics.time_controls)
     lines += ["", "rating sources"] + _bars(statistics.rating_sources)
@@ -71,6 +89,39 @@ def summarize(manifest: Manifest) -> str:
         ratings["unknown"] = statistics.ratings_unknown
     lines += _bars(ratings) if ratings else ["  no ratings"]
     return "\n".join(lines) + "\n"
+
+
+def describe_filters(filters: Filters) -> list[str]:
+    """What ``filters`` let through, a line per filter, or a line saying there were none."""
+    lines = []
+    if filters.min_rating is not None or filters.max_rating is not None:
+        if filters.max_rating is None:
+            band = f"at least {filters.min_rating}"
+        elif filters.min_rating is None:
+            band = f"at most {filters.max_rating}"
+        else:
+            band = f"{filters.min_rating} to {filters.max_rating}"
+        unknown = "passes" if filters.unknown_rating_passes else "does not"
+        lines.append(f"player to move rated {band}; an unknown rating {unknown}")
+    if filters.min_clock is not None:
+        lines.append(f"player to move with at least {filters.min_clock:g}s on the clock")
+    if filters.time_controls is not None:
+        lines.append(f"time controls {', '.join(filters.time_controls)}")
+    if filters.exclude_terminations:
+        names = ", ".join(name.replace("_", " ") for name in filters.exclude_terminations)
+        lines.append(f"not ended by {names}")
+    if filters.from_date is not None or filters.until is not None:
+        if filters.until is None:
+            lines.append(f"played from {filters.from_date}")
+        elif filters.from_date is None:
+            lines.append(f"played until {filters.until}")
+        else:
+            lines.append(f"played from {filters.from_date} until {filters.until}")
+    if filters.sample is not None:
+        lines.append(f"a {filters.sample:.4g} sample, by a hash of each game")
+    if filters.max_games is not None:
+        lines.append(f"at most {filters.max_games:,} games")
+    return lines or ["none: every game in every source"]
 
 
 def _counts(manifest: Manifest, what: str) -> str:

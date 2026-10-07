@@ -1242,3 +1242,97 @@ def test_two_sides_naming_one_checkpoint_play_the_same_one_while_the_run_saves(
     assert status == 0
     (game,) = match_games(tmp_path)
     assert (game.headers["WhiteCheckpoint"], game.headers["BlackCheckpoint"]) == ("4", "4")
+
+
+def test_dataset_build_takes_filters_as_options(tmp_path, capsys):
+    arguments = [fixture("lichess.pgn"), "--min-rating", "2000", "--time-controls", "bullet,blitz"]
+    assert main(["dataset", "build", "games", *arguments]) == 0
+
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert manifest.filters.min_rating == 2000
+    assert manifest.filters.time_controls == ["bullet", "blitz"]
+    assert manifest.games_filtered > 0
+    assert "filtered out" in capsys.readouterr().out
+
+
+def test_dataset_build_reads_a_definition_file_and_lets_options_override_it(tmp_path):
+    definitions = tmp_path / "definitions"
+    definitions.mkdir()
+    (definitions / "strong.toml").write_text(
+        f'sources = ["{os.path.relpath(fixture("lichess.pgn"), definitions)}"]\n'
+        "validation_fraction = 0.5\n"
+        'rating_source = "lichess"\n'
+        "\n"
+        "[filters]\n"
+        "min_rating = 2400\n"
+        'from = "2024-01"\n'
+        "max_games = 10\n"
+    )
+
+    arguments = ["--definition", str(definitions / "strong.toml"), "--min-rating", "1500"]
+    assert main(["dataset", "build", "games", *arguments]) == 0
+
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert manifest.validation_fraction == 0.5
+    assert manifest.rating_source == "lichess"
+    assert manifest.filters.min_rating == 1500, "the option over the file"
+    assert manifest.filters.from_date == "2024-01"
+    assert manifest.filters.max_games == 10
+    assert [source.path for source in manifest.sources] == [
+        str(definitions / os.path.relpath(fixture("lichess.pgn"), definitions))
+    ], "relative to the file, not to where the build was started"
+
+
+def test_dataset_build_sources_on_the_command_line_replace_the_definitions(tmp_path):
+    (tmp_path / "games.toml").write_text('sources = ["nothing-here.pgn"]\n')
+
+    assert (
+        main(["dataset", "build", "games", fixture("lichess.pgn"), "--definition", "games.toml"])
+        == 0
+    )
+
+
+def test_dataset_build_refuses_filters_that_make_no_sense(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(
+            [
+                "dataset",
+                "build",
+                "games",
+                fixture("lichess.pgn"),
+                "--min-rating",
+                "2000",
+                "--max-rating",
+                "1000",
+            ]
+        )
+
+    assert exit_info.value.code != 0
+    assert "the minimum rating 2000 is above the maximum 1000" in capsys.readouterr().err
+
+
+def test_dataset_build_needs_something_to_build_from(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "build", "games"])
+
+    assert exit_info.value.code != 0
+    assert "nothing to build from" in capsys.readouterr().err
+
+
+def test_dataset_build_refuses_a_definition_that_is_not_one(tmp_path, capsys):
+    (tmp_path / "bad.toml").write_text("[filters]\nmin_elo = 2000\n")
+
+    with pytest.raises(SystemExit):
+        main(["dataset", "build", "games", "--definition", "bad.toml"])
+
+    assert "invalid dataset definition" in capsys.readouterr().err
+
+
+def test_dataset_build_refuses_an_infinite_filter_in_a_definition(tmp_path, capsys):
+    # TOML has a literal inf; JSON would write it into the manifest as null, which is no filter.
+    (tmp_path / "forever.toml").write_text("[filters]\nmin_clock = inf\n")
+
+    with pytest.raises(SystemExit):
+        main(["dataset", "build", "games", fixture("lichess.pgn"), "--definition", "forever.toml"])
+
+    assert "finite number" in capsys.readouterr().err

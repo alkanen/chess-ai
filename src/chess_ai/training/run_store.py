@@ -139,6 +139,9 @@ class DatasetReference(BaseModel):
     positions: int
     train_positions: int
     validation_positions: int
+    train_targets: int | None = None
+    """How many train positions are trained on, when the dataset filtered positions; otherwise
+    every one of them is."""
 
 
 class ModelReference(BaseModel):

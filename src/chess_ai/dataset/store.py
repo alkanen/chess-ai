@@ -17,7 +17,11 @@ second; both are what memory mapping is for.
     <dataset>/train/positions/00000.bin
     <dataset>/train/games/00000.bin
     <dataset>/train/moves/00000.bin
+    <dataset>/train/targets/00000.bin
     <dataset>/validation/...
+
+``targets`` is there only when the build filtered positions: it lists, in order, the positions
+of the split that are training targets. Without it every position is one.
 
 The two splits are separate directories rather than a flag on each record, which is what
 makes a leak impossible to write rather than merely tested for: nothing the trainer reads
@@ -49,6 +53,7 @@ from chess_ai.dataset.records import (
     GAME_DTYPE,
     MOVE_DTYPE,
     POSITION_DTYPE,
+    TARGET_DTYPE,
     unpack_board,
 )
 
@@ -60,6 +65,7 @@ DATASETS_DIR: Final = "datasets"
 POSITIONS: Final = "positions"
 GAMES: Final = "games"
 MOVES: Final = "moves"
+TARGETS: Final = "targets"
 
 PARTIAL_SUFFIX: Final = ".partial"
 """What a dataset being built is called until it is finished; see :func:`new_partial_path`."""
@@ -373,13 +379,18 @@ class SplitWriter:
     game index the positions belong to, and where in the split the game's plies start.
     """
 
-    def __init__(self, directory: Path, shards: Shards) -> None:
+    def __init__(self, directory: Path, shards: Shards, *, targets: bool = False) -> None:
         self._directory = directory
         self._positions = _StreamWriter(
             directory / POSITIONS, POSITION_DTYPE, shards.positions_per_shard
         )
         self._games = _StreamWriter(directory / GAMES, GAME_DTYPE, shards.games_per_shard)
         self._moves = _StreamWriter(directory / MOVES, MOVE_DTYPE, shards.moves_per_shard)
+        self._targets = (
+            _StreamWriter(directory / TARGETS, TARGET_DTYPE, shards.targets_per_shard)
+            if targets
+            else None
+        )
 
     @property
     def games(self) -> int:
@@ -389,10 +400,21 @@ class SplitWriter:
     def positions(self) -> int:
         return self._positions.count
 
-    def add_game(self, game: np.ndarray, positions: np.ndarray, moves: np.ndarray) -> None:
+    @property
+    def targets(self) -> int | None:
+        """How many positions are training targets, or ``None`` if this split does not say."""
+        return None if self._targets is None else self._targets.count
+
+    def add_game(
+        self,
+        game: np.ndarray,
+        positions: np.ndarray,
+        moves: np.ndarray,
+        targets: np.ndarray | None = None,
+    ) -> None:
         """Append one whole game: its record, its positions, and the moves played in them."""
         assert len(game) == 1, "a game is one record"
-        self.add_games(game, positions, moves, np.array([len(positions)], dtype=np.int64))
+        self.add_games(game, positions, moves, np.array([len(positions)], dtype=np.int64), targets)
 
     def add_games(
         self,
@@ -400,6 +422,7 @@ class SplitWriter:
         positions: np.ndarray,
         moves: np.ndarray,
         ply_counts: np.ndarray,
+        targets: np.ndarray | None = None,
     ) -> None:
         """Append several whole games at once, ``ply_counts`` saying how long each one is.
 
@@ -409,6 +432,9 @@ class SplitWriter:
 
         This is the only place the two things only a growing file knows are decided, so a caller
         can hand over what it worked out for itself -- the chess -- and never where it went.
+
+        ``targets`` is one boolean per position, saying which are trained on, and is written only
+        by a split that keeps a target stream; ``None`` means every position is one.
         """
         assert len(games) == len(ply_counts), "a count for every game"
         assert len(positions) == len(moves), "every position has the move played in it"
@@ -417,6 +443,9 @@ class SplitWriter:
         games["ply_offset"] = self._positions.count + (np.cumsum(ply_counts) - ply_counts)
         games["ply_count"] = ply_counts
         positions["game"] = self._games.count + np.repeat(np.arange(len(games)), ply_counts)
+        if self._targets is not None:
+            chosen = np.flatnonzero(targets) if targets is not None else np.arange(len(positions))
+            self._targets.append((self._positions.count + chosen).astype(TARGET_DTYPE))
         self._positions.append(positions)
         self._moves.append(moves)
         self._games.append(games)
@@ -428,22 +457,27 @@ class SplitWriter:
         must not leave the other two with their files open and unflushed.
         """
         with ExitStack() as stack:
-            for stream in (self._positions, self._games, self._moves):
-                stack.callback(stream.close)
+            for stream in (self._positions, self._games, self._moves, self._targets):
+                if stream is not None:
+                    stack.callback(stream.close)
         sync_directory(self._directory)
 
 
 class DatasetWriter:
     """A dataset being built: both splits, and the manifest written when it is done."""
 
-    def __init__(self, directory: Path, shards: Shards = DEFAULT_SHARDS) -> None:
+    def __init__(
+        self, directory: Path, shards: Shards = DEFAULT_SHARDS, *, targets: bool = False
+    ) -> None:
         self.directory = directory
         self.shards = shards
         # Never a directory that is already there: one that is belongs to another build, and
         # writing into it publishes its shards inside this dataset. The builder checks first, so
         # this is the invariant said where it belongs rather than a condition anyone should hit.
         directory.mkdir(parents=True, exist_ok=False)
-        self.splits = {split: SplitWriter(directory / split, shards) for split in SPLITS}
+        self.splits = {
+            split: SplitWriter(directory / split, shards, targets=targets) for split in SPLITS
+        }
 
     def __enter__(self) -> "DatasetWriter":
         return self
@@ -585,7 +619,14 @@ class SplitReader:
     that are its own, so either can be followed to the other.
     """
 
-    def __init__(self, directory: Path, shards: Shards, counts_games: int, counts_positions: int):
+    def __init__(
+        self,
+        directory: Path,
+        shards: Shards,
+        counts_games: int,
+        counts_positions: int,
+        counts_targets: int | None = None,
+    ):
         self._positions = _StreamReader(
             directory / POSITIONS, POSITION_DTYPE, shards.positions_per_shard, counts_positions
         )
@@ -595,9 +636,34 @@ class SplitReader:
         self._moves = _StreamReader(
             directory / MOVES, MOVE_DTYPE, shards.moves_per_shard, counts_positions
         )
+        self._targets = (
+            None
+            if counts_targets is None
+            else _StreamReader(
+                directory / TARGETS, TARGET_DTYPE, shards.targets_per_shard, counts_targets
+            )
+        )
 
     def __len__(self) -> int:
         return len(self._positions)
+
+    @property
+    def targets(self) -> int:
+        """How many positions are training targets: all of them, unless the build filtered some."""
+        return len(self._positions) if self._targets is None else len(self._targets)
+
+    def target_positions(self, ordinals: np.ndarray | list[int]) -> np.ndarray:
+        """The position indices of training targets ``ordinals``, counting targets from 0.
+
+        What training and validation draw from: the n-th target is the n-th position when every
+        position is one, and the n-th entry of the target stream when the build filtered some.
+        """
+        wanted = np.asarray(ordinals, dtype=np.int64).reshape(-1)
+        if self._targets is None:
+            if len(wanted) and (wanted.min() < 0 or wanted.max() >= len(self._positions)):
+                raise IndexError(f"target index out of range: {len(self._positions)} targets")
+            return wanted
+        return self._targets.gather(wanted).astype(np.int64)
 
     @property
     def games(self) -> int:
@@ -658,8 +724,9 @@ class SplitReader:
 
     def close(self) -> None:
         """Let go of the shards this split has mapped; see :meth:`_StreamReader.close`."""
-        for stream in (self._positions, self._games, self._moves):
-            stream.close()
+        for stream in (self._positions, self._games, self._moves, self._targets):
+            if stream is not None:
+                stream.close()
 
 
 class Dataset:
@@ -674,6 +741,7 @@ class Dataset:
                 self.manifest.shards,
                 counts.games,
                 counts.positions,
+                counts.targets,
             )
             for split, counts in self.manifest.splits.items()
         }

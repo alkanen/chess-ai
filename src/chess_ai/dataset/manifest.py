@@ -16,11 +16,21 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from chess_ai.dataset.files import sync_directory, sync_file
+from chess_ai.dataset.filters import Screen, Termination, date_bounds
+from chess_ai.dataset.records import TimeControl
 
 MANIFEST_FILE: Final = "manifest.json"
 
@@ -76,13 +86,131 @@ class SourceInfo(BaseModel):
 
 
 class Filters(BaseModel):
-    """Which games a build let through.
+    """Which games a build let through, and which of their positions it trains on.
 
-    Empty so far: every game in every source is kept. The filters themselves are a slice
-    of their own, and this is where they will be recorded.
+    Every field is optional and means no filtering of its kind when it is not set, so an empty
+    one is a dataset of every game in every source -- less the games no filter can let through,
+    which are skipped whatever this says: the broken ones, and those ended for cheating. Fields
+    that are not set are left out of the manifest, so that an empty one reads as ``{}``.
+
+    These belong to the dataset rather than to a build, which is what lets its name mean one
+    definition of data: anything filtered differently is a different dataset.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        validate_by_name=True,
+        validate_by_alias=True,
+        # Written as "from", which is what a definition file calls it, in every dump.
+        serialize_by_alias=True,
+        # JSON writes an infinity as null, which would read back as no filter at all.
+        allow_inf_nan=False,
+    )
+
+    min_rating: int | None = Field(default=None, ge=0)
+    """The lowest rating of the player to move whose positions are trained on."""
+    max_rating: int | None = Field(default=None, ge=0)
+    """The highest rating of the player to move whose positions are trained on."""
+    unknown_rating_passes: bool = False
+    """Whether a player without a rating passes the rating limits. Only means anything with one."""
+    time_controls: list[str] | None = None
+    """The time-control classes kept, "unknown" among them if wanted; every class if not set."""
+    exclude_terminations: list[str] = Field(default_factory=list)
+    """The ways a game ended that leave it out; see :class:`~.filters.Termination`."""
+    from_date: str | None = Field(default=None, alias="from")
+    """The first day kept, as YYYY, YYYY-MM or YYYY-MM-DD; a year or month from its first day."""
+    until: str | None = None
+    """The last day kept, the same way; a year or month ends on its last day."""
+    min_clock: float | None = Field(default=None, ge=0)
+    """Seconds the player to move must have left for their position to be trained on."""
+    sample: float | None = Field(default=None, gt=0, le=1)
+    """The fraction of the games passing the filters that is kept, chosen by a hash of each."""
+    max_games: int | None = Field(default=None, gt=0)
+    """The most games kept: the first so many, in the order the sources give them."""
+
+    @field_validator("time_controls")
+    @classmethod
+    def _known_time_controls(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        names = [member.name.lower() for member in TimeControl]
+        unknown = [name for name in value if name not in names]
+        if unknown:
+            raise ValueError(f"no such time control {unknown[0]!r}; choose from {', '.join(names)}")
+        if not value:
+            raise ValueError("an empty list of time controls would keep no games at all")
+        return [name for name in names if name in value]
+
+    @field_validator("exclude_terminations")
+    @classmethod
+    def _known_terminations(cls, value: list[str]) -> list[str]:
+        names = [member.value for member in Termination]
+        unknown = [name for name in value if name not in names]
+        if unknown:
+            raise ValueError(f"no such termination {unknown[0]!r}; choose from {', '.join(names)}")
+        if Termination.RULES_INFRACTION in value:
+            raise ValueError(
+                "games ended for a rules infraction are always left out, so there is no need to "
+                "exclude them"
+            )
+        return [name for name in names if name in value]
+
+    @field_validator("from_date", "until")
+    @classmethod
+    def _a_date(cls, value: str | None) -> str | None:
+        if value is not None:
+            date_bounds(value)
+        return value
+
+    @model_validator(mode="after")
+    def _in_order(self) -> "Filters":
+        if (
+            self.min_rating is not None
+            and self.max_rating is not None
+            and self.min_rating > self.max_rating
+        ):
+            raise ValueError(
+                f"the minimum rating {self.min_rating} is above the maximum {self.max_rating}"
+            )
+        if (
+            self.from_date is not None
+            and self.until is not None
+            and date_bounds(self.from_date)[0] > date_bounds(self.until)[1]
+        ):
+            raise ValueError(f"the range from {self.from_date} until {self.until} is empty")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _only_what_is_set(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # Against each field's own default, so that what counts as "not set" is said once, where
+        # the field is. Every limit defaults to None, which a limit of 0 ("rated players only")
+        # is not equal to. Pydantic decides the keys: the field's name, or its alias.
+        defaults = {}
+        for name, info in type(self).model_fields.items():
+            default = info.get_default(call_default_factory=True)
+            defaults[name] = defaults[info.serialization_alias or name] = default
+        return {key: value for key, value in handler(self).items() if value != defaults[key]}
+
+    def screen(self) -> Screen:
+        """These filters in the form the reading checks them in."""
+        return Screen(
+            min_rating=self.min_rating,
+            max_rating=self.max_rating,
+            unknown_rating_passes=self.unknown_rating_passes,
+            time_controls=(
+                None
+                if self.time_controls is None
+                else frozenset(TimeControl[name.upper()] for name in self.time_controls)
+            ),
+            excluded_terminations=frozenset(
+                Termination(name) for name in self.exclude_terminations
+            ),
+            first_day=None if self.from_date is None else date_bounds(self.from_date)[0],
+            last_day=None if self.until is None else date_bounds(self.until)[1],
+            min_clock=self.min_clock,
+            sample=self.sample,
+        )
 
 
 class Shards(BaseModel):
@@ -97,6 +225,8 @@ class Shards(BaseModel):
     positions_per_shard: int = Field(gt=0)
     games_per_shard: int = Field(gt=0)
     moves_per_shard: int = Field(gt=0)
+    targets_per_shard: int = Field(default=8_000_000, gt=0)
+    """Defaulted, because a dataset built before there were targets says nothing about them."""
 
 
 class SplitCounts(BaseModel):
@@ -106,6 +236,17 @@ class SplitCounts(BaseModel):
 
     games: int = 0
     positions: int = 0
+    targets: int | None = None
+    """How many of the positions are training targets, or ``None`` when every one of them is.
+
+    Set when the build had a filter on positions, and then the split has a stream of their
+    indices; see :class:`~chess_ai.dataset.filters.Screen`.
+    """
+
+    @property
+    def trained_on(self) -> int:
+        """How many positions training draws from, which is what an epoch is."""
+        return self.positions if self.targets is None else self.targets
 
 
 class Statistics(BaseModel):
@@ -147,6 +288,13 @@ class Manifest(BaseModel):
     splits: dict[str, SplitCounts] = Field(default_factory=dict)
     skipped: dict[str, int] = Field(default_factory=dict)
     """Games left out, counted by why; see :class:`~chess_ai.dataset.builder.SkipReason`."""
+    filtered: dict[str, int] = Field(default_factory=dict)
+    """Games the filters left out, counted by which; see
+    :class:`~chess_ai.dataset.filters.FilterReason`."""
+    not_targets: dict[str, int] = Field(default_factory=dict)
+    """Positions stored but not trained on, counted by which filter left them out."""
+    reached_max_games: bool = False
+    """Whether the build stopped at ``max_games`` rather than at the end of its sources."""
     statistics: Statistics = Statistics()
 
     @property
@@ -160,6 +308,15 @@ class Manifest(BaseModel):
     @property
     def games_skipped(self) -> int:
         return sum(self.skipped.values())
+
+    @property
+    def games_filtered(self) -> int:
+        return sum(self.filtered.values())
+
+    @property
+    def trained_on(self) -> int:
+        """How many positions of both splits are training targets."""
+        return sum(counts.trained_on for counts in self.splits.values())
 
     def save(self, directory: Path) -> Path:
         """Write the manifest into ``directory``, replacing any manifest already there.
@@ -187,7 +344,7 @@ def load_manifest(directory: Path) -> Manifest:
     of the format this code does not know, which is a clearer answer than records read as
     the wrong shape.
     """
-    from chess_ai.dataset.records import FORMAT_VERSION
+    from chess_ai.dataset.records import FORMAT_VERSION, READABLE_FORMATS
 
     path = directory / MANIFEST_FILE
     try:
@@ -204,7 +361,7 @@ def load_manifest(directory: Path) -> Manifest:
     # fields this version has never heard of, and "extra inputs are not permitted" is not the
     # answer to "why can this not be read?".
     version = data.get("format_version")
-    if version != FORMAT_VERSION:
+    if version not in READABLE_FORMATS:
         raise ManifestError(
             f"{path} is dataset format version {version!r}, and this is version "
             f"{FORMAT_VERSION}; rebuild the dataset"

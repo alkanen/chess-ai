@@ -19,7 +19,7 @@ def test_a_summary_says_what_the_dataset_holds(tmp_path):
     assert f"positions  {manifest.positions:,}" in summary
     assert f"train {manifest.splits['train'].games:,}" in summary
     assert f"validation {manifest.splits['validation'].games:,}" in summary
-    assert "version 1, move vocabulary 1968" in summary
+    assert "version 2, move vocabulary 1968" in summary
     assert "filters    none" in summary
 
 
@@ -79,7 +79,7 @@ def test_progress_works_out_throughput_and_what_is_left():
     assert "990 games" in line
     assert "80,000 positions" in line
     assert "100 games/s" in line
-    assert "10 skipped" in line
+    assert "10 left out" in line
     assert "30s left" in line
 
 

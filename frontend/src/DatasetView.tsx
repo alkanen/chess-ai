@@ -14,7 +14,7 @@ import {
   PAGE_SIZE,
   type DatasetPage,
 } from './datasetPlaces';
-import { describeFilters, fileName, formatBuilt, totalOf } from './DatasetsView';
+import { describeFilters, fileName, formatBuilt, totalOf, trainedOn } from './DatasetsView';
 import { describeResult } from './GameStatus';
 import { formatBytes, formatCount, formatPercent } from './runFormat';
 import './DatasetsView.css';
@@ -66,6 +66,7 @@ function splitCounts(manifest: DatasetManifest, what: 'games' | 'positions'): st
 }
 
 function DatasetFacts({ manifest }: { manifest: DatasetManifest }) {
+  const trained = trainedOn(manifest);
   return (
     <>
       <dl className="facts">
@@ -75,10 +76,21 @@ function DatasetFacts({ manifest }: { manifest: DatasetManifest }) {
         <dd>{splitCounts(manifest, 'games')}</dd>
         <dt>Positions</dt>
         <dd>{splitCounts(manifest, 'positions')}</dd>
+        {trained !== null && (
+          <>
+            <dt>Trained on</dt>
+            <dd>
+              {formatCount(trained)} positions; the rest are there for the games around them
+            </dd>
+          </>
+        )}
         <dt>Held back</dt>
         <dd>{formatPercent(manifest.validation_fraction)} of games, for validation</dd>
         <dt>Filters</dt>
-        <dd>{describeFilters(manifest.filters)}</dd>
+        <dd>
+          {describeFilters(manifest.filters)}
+          {manifest.reached_max_games && '; stopped at the maximum'}
+        </dd>
         <dt>Ratings</dt>
         <dd>{manifest.rating_source}</dd>
         <dt>Format</dt>

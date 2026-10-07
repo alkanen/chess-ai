@@ -95,7 +95,9 @@ class PositionBatches(TorchDataset):
         self.batch_size = batch_size
         self._batches = batches
         self._seed = seed
-        self.positions = Dataset(directory).manifest.splits[split].positions
+        # The positions training draws from, which are the split's training targets: every
+        # position, unless the dataset was built with a filter on positions.
+        self.positions = Dataset(directory).manifest.splits[split].trained_on
         if not self.positions:
             raise ValueError(f"the {split!r} split of {directory} has no positions")
         # A short last batch is dropped only when there is a full one to keep: a split smaller
@@ -115,9 +117,10 @@ class PositionBatches(TorchDataset):
     def __getitem__(self, index: int) -> Batch:
         epoch, within = divmod(index, self.batches_per_epoch)
         start = within * self.batch_size
-        order = self._order(epoch)[start : start + self.batch_size]
+        reader = self._split_reader()
+        order = reader.target_positions(self._order(epoch)[start : start + self.batch_size])
         encoder = self._position_encoder()
-        frames = self._split_reader().position_history(order, encoder.history)
+        frames = reader.position_history(order, encoder.history)
         records = frames[:, 0]
         bundle = encoder.encode(frames)
         return Batch(

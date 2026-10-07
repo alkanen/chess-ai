@@ -4,6 +4,7 @@ import type { DatasetGame, DatasetManifest, DatasetSummary } from './api';
 import { App } from './App';
 import { datasetGameInHash, datasetHash, datasetInHash, PAGE_SIZE } from './datasetPlaces';
 import { ratingBars, resultBars, unknownLast } from './DatasetStatistics';
+import { filterPhrases } from './DatasetsView';
 import { foolsMateFile } from './test/replayFile';
 
 // uPlot draws on a canvas, which jsdom does not have; see RunView.test.tsx for the charts.
@@ -37,6 +38,9 @@ const MANIFEST: DatasetManifest = {
   filters: {},
   splits: { train: { games: 120, positions: 9000 }, validation: { games: 3, positions: 210 } },
   skipped: { no_result: 10, unsupported_variant: 2 },
+  filtered: {},
+  not_targets: {},
+  reached_max_games: false,
   statistics: {
     results: { '1-0': 60, '0-1': 50, '1/2-1/2': 13 },
     time_controls: { bullet: 20, blitz: 80, rapid: 23 },
@@ -99,6 +103,23 @@ function server(url: string): Promise<Response> {
   }
   return Promise.resolve(Response.json({ detail: `no ${path}` }, { status: 404 }));
 }
+
+describe('filterPhrases', () => {
+  it('says a limit of 0, which is a filter like any other', () => {
+    // A minimum rating of 0 means "rated players only", and 0 is falsy.
+    expect(filterPhrases({ min_rating: 0, min_clock: 0 })).toEqual([
+      'player to move rated at least 0; an unknown rating does not',
+      'player to move with at least 0s on the clock',
+    ]);
+    expect(filterPhrases({ max_rating: 0 })).toEqual([
+      'player to move rated at most 0; an unknown rating does not',
+    ]);
+  });
+
+  it('says nothing for no filters', () => {
+    expect(filterPhrases({})).toEqual([]);
+  });
+});
 
 describe('the datasets pages', () => {
   let fetch: ReturnType<typeof vi.fn>;
@@ -185,6 +206,45 @@ describe('the datasets pages', () => {
     expect(summary.closest('details')).not.toHaveAttribute('open');
     const failed = screen.getAllByText('Not read whole: ValueError: not PGN');
     expect(failed.filter((shown) => shown.closest('details') === null)).toHaveLength(1);
+  });
+
+  it('shows what a filtered dataset let through and what it trains on', async () => {
+    const manifest = {
+      ...MANIFEST,
+      filters: { min_rating: 2000, time_controls: ['rapid', 'classical'], max_games: 5000 },
+      splits: {
+        train: { games: 120, positions: 9000, targets: 6000 },
+        validation: { games: 3, positions: 210, targets: 140 },
+      },
+      filtered: { rating: 40, time_control: 7 },
+      not_targets: { rating: 3000, clock: 70 },
+      reached_max_games: true,
+    };
+    fetch.mockImplementation((url: string) =>
+      new URL(url).pathname === '/chess/api/datasets/lichess-2024'
+        ? Promise.resolve(Response.json({ name: 'lichess-2024', manifest, error: null }))
+        : server(url),
+    );
+    open('#datasets/lichess-2024');
+
+    expect(
+      await screen.findByText(
+        'player to move rated at least 2000; an unknown rating does not; ' +
+          'time controls rapid, classical; at most 5,000 games; stopped at the maximum',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/^6,140 positions; the rest are there/)).toBeInTheDocument();
+    const table = (name: string) => within(screen.getByRole('table', { name }));
+    expect(table('Filtered out').getByText('time control')).toBeInTheDocument();
+    expect(table('Not trained on').getByText("mover's clock")).toBeInTheDocument();
+  });
+
+  it('says nothing of training targets for a dataset that trains on every position', async () => {
+    open('#datasets/lichess-2024');
+
+    await screen.findByRole('table', { name: 'Rating' });
+    expect(screen.queryByText('Trained on')).not.toBeInTheDocument();
+    expect(screen.queryByRole('table', { name: 'Filtered out' })).not.toBeInTheDocument();
   });
 
   it('pages through a split of the games, keeping the page in the address', async () => {

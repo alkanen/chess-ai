@@ -145,8 +145,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
     """``chess-ai dataset ...``: making datasets out of PGN files, and looking at them."""
-    from chess_ai.dataset import DEFAULT_VALIDATION_FRACTION, RatingSource
+    from chess_ai.dataset import DEFAULT_VALIDATION_FRACTION, RatingSource, TimeControl
     from chess_ai.dataset.builder import default_workers, most_workers
+    from chess_ai.dataset.filters import Termination
 
     dataset = commands.add_parser("dataset", help="build and inspect training datasets")
     actions = dataset.add_subparsers(title="dataset commands", required=True, metavar="COMMAND")
@@ -155,19 +156,29 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
         "build",
         help="build a dataset from PGN files",
         description="Build a named dataset in the data directory from PGN files, directories "
-        "of PGN files, or globs. Games that cannot be read are skipped and counted.",
+        "of PGN files, or globs, keeping the games the filters let through. Games that cannot be "
+        "read, and games ended for a rules infraction (mostly cheating), are always left out; "
+        "everything left out is counted. The filters can also come from a definition file, "
+        "which the options here override.",
     )
     build.add_argument("name", help="what to call the dataset")
     build.add_argument(
         "sources",
-        nargs="+",
+        nargs="*",
         metavar="PGN",
-        help="PGN files, directories of them, or glob patterns",
+        help="PGN files, directories of them, or glob patterns; these replace the definition "
+        "file's sources",
+    )
+    build.add_argument(
+        "--definition",
+        type=Path,
+        metavar="FILE",
+        help="a TOML file of sources, filters and options to build from",
     )
     build.add_argument(
         "--validation-fraction",
         type=float,
-        default=DEFAULT_VALIDATION_FRACTION,
+        default=None,
         metavar="FRACTION",
         help="share of games held back for validation, chosen by a hash of each game "
         f"(default: {DEFAULT_VALIDATION_FRACTION})",
@@ -175,8 +186,72 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
     build.add_argument(
         "--rating-source",
         choices=[AUTO, *(source.name.lower() for source in RatingSource)],
-        default=AUTO,
+        default=None,
         help="rating pool to record for every game (default: auto, from each game's headers)",
+    )
+    filters = build.add_argument_group(
+        "filters",
+        "Which games are kept and which of their positions are trained on. None are set by "
+        "default. The rating and clock filters are about the player to move: a game is kept if "
+        "either player passes, and the other player's positions are stored but not trained on.",
+    )
+    filters.add_argument(
+        "--min-rating", type=int, metavar="RATING", help="lowest rating of the player to move"
+    )
+    filters.add_argument(
+        "--max-rating", type=int, metavar="RATING", help="highest rating of the player to move"
+    )
+    filters.add_argument(
+        "--unknown-rating-passes",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="whether a player without a rating passes the rating limits (default: no)",
+    )
+    filters.add_argument(
+        "--time-controls",
+        type=_names,
+        metavar="LIST",
+        help="comma-separated time-control classes to keep: "
+        + ", ".join(member.name.lower() for member in TimeControl),
+    )
+    filters.add_argument(
+        "--exclude-terminations",
+        type=_names,
+        metavar="LIST",
+        help="comma-separated ways of ending that leave a game out: "
+        + ", ".join(
+            member.value for member in Termination if member is not Termination.RULES_INFRACTION
+        ),
+    )
+    filters.add_argument(
+        "--from",
+        dest="from_date",
+        metavar="DATE",
+        help="first day kept: YYYY, YYYY-MM or YYYY-MM-DD; undated games are then left out",
+    )
+    filters.add_argument(
+        "--until",
+        metavar="DATE",
+        help="last day kept, the same way; a year or a month runs to its end",
+    )
+    filters.add_argument(
+        "--min-clock",
+        type=float,
+        metavar="SECONDS",
+        help="time the player to move must have left for the position to be trained on, from "
+        "the file's [%%clk] comments; positions without one pass",
+    )
+    filters.add_argument(
+        "--sample",
+        type=float,
+        metavar="FRACTION",
+        help="keep this fraction of the games that pass, chosen by a hash of each game",
+    )
+    filters.add_argument(
+        "--max-games",
+        type=int,
+        metavar="N",
+        help="stop once this many games are kept, the first in the order the sources give them",
     )
     build.add_argument(
         "--workers",
@@ -930,27 +1005,92 @@ def _serve(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+_FILTER_OPTIONS = (
+    "min_rating",
+    "max_rating",
+    "unknown_rating_passes",
+    "time_controls",
+    "exclude_terminations",
+    "from_date",
+    "until",
+    "min_clock",
+    "sample",
+    "max_games",
+)
+"""The ``dataset build`` options that are filters, by the name they have in both places."""
+
+
+def _names(text: str) -> list[str]:
+    """A comma-separated list of names, as an option takes one."""
+    return [name.strip().lower() for name in text.split(",") if name.strip()]
+
+
+def _build_settings(args: argparse.Namespace):
+    """What ``dataset build`` was asked for: the definition file's, with the options over it.
+
+    Returns the sources, the validation fraction, the rating source and the filters.
+    """
+    from pydantic import ValidationError
+
+    from chess_ai.dataset import DEFAULT_VALIDATION_FRACTION, DatasetError, RatingSource
+    from chess_ai.dataset.definition import DatasetDefinition, load_definition
+    from chess_ai.dataset.manifest import Filters
+
+    try:
+        definition = (
+            load_definition(args.definition) if args.definition is not None else DatasetDefinition()
+        )
+    except DatasetError as e:
+        raise _UserError(e) from e
+    sources = args.sources or definition.sources
+    if not sources:
+        raise _UserError(
+            "nothing to build from: name PGN files, or a --definition file that has sources"
+        )
+    fraction = args.validation_fraction
+    if fraction is None:
+        fraction = definition.validation_fraction
+    if fraction is None:
+        fraction = DEFAULT_VALIDATION_FRACTION
+    rating_source = args.rating_source or definition.rating_source or AUTO
+    if rating_source != AUTO and rating_source.upper() not in RatingSource.__members__:
+        raise _UserError(f"no such rating source {rating_source!r}")
+    given = {
+        name: getattr(args, name) for name in _FILTER_OPTIONS if getattr(args, name) is not None
+    }
+    try:
+        # By field name, which is what the options are called: "from" is only the file's alias.
+        filters = Filters.model_validate(
+            {name: getattr(definition.filters, name) for name in Filters.model_fields} | given
+        )
+    except ValidationError as e:
+        messages = "; ".join(error["msg"].removeprefix("Value error, ") for error in e.errors())
+        raise _UserError(f"invalid filters: {messages}") from e
+    source = None if rating_source == AUTO else RatingSource[rating_source.upper()]
+    return sources, fraction, source, filters
+
+
 def _build_dataset(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.dataset import (
         DatasetError,
         ProgressPrinter,
-        RatingSource,
         build_dataset,
         dataset_path,
     )
 
-    source = None if args.rating_source == AUTO else RatingSource[args.rating_source.upper()]
+    sources, fraction, source, filters = _build_settings(args)
     printer = ProgressPrinter()
     try:
         manifest = build_dataset(
             args.name,
-            args.sources,
+            sources,
             data_dir=config.paths.data,
-            validation_fraction=args.validation_fraction,
+            validation_fraction=fraction,
             rating_source=source,
             progress=printer,
             overwrite=args.overwrite,
             workers=args.workers,
+            filters=filters,
         )
     except DatasetError as e:
         raise _UserError(e) from e
@@ -975,7 +1115,14 @@ def _build_dataset(config: Config, args: argparse.Namespace) -> int:
     _say(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
         f"{manifest.games:,} games, {manifest.positions:,} positions, "
-        f"{manifest.games_skipped:,} skipped"
+        + (
+            f"{manifest.trained_on:,} of them trained on, "
+            if manifest.trained_on != manifest.positions
+            else ""
+        )
+        + f"{manifest.games_skipped:,} skipped"
+        + (f", {manifest.games_filtered:,} filtered out" if manifest.games_filtered else "")
+        + (" (stopped at --max-games)" if manifest.reached_max_games else "")
         # A source that could not be read leaves the dataset short of its games, which is not
         # something to leave to whoever thinks to run "dataset stats" afterwards.
         + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else "")

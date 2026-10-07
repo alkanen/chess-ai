@@ -11,6 +11,7 @@ import torch
 from training_helpers import dataset
 
 from chess_ai.dataset import Result, open_dataset
+from chess_ai.dataset.manifest import Filters
 from chess_ai.dataset.records import unpack_board
 from chess_ai.encoders import create_encoder
 from chess_ai.models import VALUE_CLASSES, ChessModel, ModelOutput
@@ -250,3 +251,16 @@ def test_validation_gives_the_encoder_the_history_it_asks_for(split):
     assert [int(split.position(index)["ply"]) for index in range(8)] == list(range(8))
     assert spatial[0, 12:].sum() == 0
     assert np.array_equal(spatial[1:, 12:].numpy(), plain[:-1])
+
+
+def test_a_filtered_split_is_measured_on_its_training_targets(tmp_path):
+    dataset(tmp_path / "data", filters=Filters(min_rating=1700))
+    with open_dataset("test", data_dir=tmp_path / "data") as built:
+        split = built["validation"]
+        assert 0 < split.targets < len(split), "some positions are stored and not trained on"
+        moves = split.positions(split.target_positions(np.arange(split.targets)))["move"]
+
+        metrics = measure(split, lambda n: [int(moves[n])], positions=10_000)
+
+    assert metrics["positions"] == split.targets
+    assert metrics["top1"] == 1.0, "every position measured was a target, in order"

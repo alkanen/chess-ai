@@ -21,6 +21,13 @@ import chess
 import chess.pgn
 import numpy as np
 
+from chess_ai.dataset.filters import (
+    FilterReason,
+    Screen,
+    Termination,
+    sampled,
+    termination_of,
+)
 from chess_ai.dataset.records import (
     GAME_DTYPE,
     MOVE_DTYPE,
@@ -84,14 +91,21 @@ class SkipReason(StrEnum):
     """Not standard chess; only standard chess is in scope."""
     TOO_LONG = "too_long"
     """More plies than a record can count, which means the file is not a game."""
+    RULES_INFRACTION = "rules_infraction"
+    """Ended by the site for a breach of its rules, which is mostly cheating: moves an engine
+    chose, under a human's rating. Left out of every dataset, whatever its filters say."""
     UNREADABLE = "unreadable"
     """Anything else the parser or this code could not make sense of."""
 
 
 class GameSkipped(Exception):
-    """One game is being left out. Carries the :class:`SkipReason` the build counts it under."""
+    """One game is being left out. Carries the reason the build counts it under.
 
-    def __init__(self, reason: SkipReason) -> None:
+    A :class:`SkipReason` for a game that is not usable chess, and a
+    :class:`~chess_ai.dataset.filters.FilterReason` for one the filters did not let through.
+    """
+
+    def __init__(self, reason: SkipReason | FilterReason) -> None:
         super().__init__(reason.value)
         self.reason = reason
 
@@ -101,29 +115,81 @@ class GameRecords:
     """One game as a dataset stores it: the game, its positions, and the moves played.
 
     ``identity`` is what the game is, as text, and is all the split hash looks at; see
-    :func:`split_of`.
+    :func:`split_of`. ``targets`` says which positions are trained on, one boolean each, and
+    ``not_targets`` how many are not, for the mover's rating and for the clock.
     """
 
     game: np.ndarray
     positions: np.ndarray
     moves: np.ndarray
     identity: str
+    targets: np.ndarray
+    not_targets: tuple[int, int] = (0, 0)
+
+
+NO_SCREEN: Final = Screen()
+"""The filters of a build that has none."""
+
+
+def header_verdict(
+    headers: chess.pgn.Headers, screen: Screen = NO_SCREEN
+) -> SkipReason | FilterReason | None:
+    """Why a game is left out on its headers alone, or ``None`` if they do not say it is.
+
+    Everything here is decided before a single move is parsed, which is what lets the reading
+    skip the moves of a game the answer is already known for; see :func:`skips_moves`.
+    """
+    if headers.get("Variant", "").strip().lower() not in STANDARD_VARIANTS:
+        return SkipReason.UNSUPPORTED_VARIANT
+    if headers.get("Result", "*") not in _RESULTS:
+        return SkipReason.NO_RESULT
+    termination = termination_of(headers.get("Termination"))
+    if termination is Termination.RULES_INFRACTION:
+        return SkipReason.RULES_INFRACTION
+    if not screen.per_game:
+        # Not worth reading the rest of the headers for, once per game of a dump.
+        return None
+    return screen.game_reason(
+        termination=termination,
+        time_control=time_control_class(headers.get("TimeControl")),
+        date=_date(headers),
+        white=_rating(headers.get("WhiteElo")),
+        black=_rating(headers.get("BlackElo")),
+    )
+
+
+def skips_moves(headers: chess.pgn.Headers, screen: Screen) -> bool:
+    """Whether the moves of a game with these headers need not be parsed at all.
+
+    Only for what this project added -- the filters, and leaving out games ended for cheating.
+    Games skipped for not being chess keep being parsed as they always were, so that a build
+    without filters reads exactly what it read before there were any.
+    """
+    verdict = header_verdict(headers, screen)
+    return isinstance(verdict, FilterReason) or verdict is SkipReason.RULES_INFRACTION
 
 
 def game_records(
-    record: chess.pgn.Game, *, source: int, rating_source: RatingSource
+    record: chess.pgn.Game,
+    *,
+    source: int,
+    rating_source: RatingSource,
+    screen: Screen = NO_SCREEN,
 ) -> GameRecords:
     """``record`` as dataset records, or raise :exc:`GameSkipped` saying why it cannot be.
 
     ``source`` is the index of the file the game came from. ``rating_source`` is the pool to
-    record for it, which the caller has either been told or read off the headers.
+    record for it, which the caller has either been told or read off the headers. ``screen`` is
+    the build's filters.
+
+    What the headers say is decided first, so a game is counted under the same reason whether or
+    not its moves were parsed; see :func:`skips_moves`.
     """
     headers = record.headers
-    if headers.get("Variant", "").strip().lower() not in STANDARD_VARIANTS:
-        raise GameSkipped(SkipReason.UNSUPPORTED_VARIANT)
-    result = _RESULTS.get(headers.get("Result", "*"))
-    if result is None:
-        raise GameSkipped(SkipReason.NO_RESULT)
+    verdict = header_verdict(headers, screen)
+    if verdict is not None:
+        raise GameSkipped(verdict)
+    result = _RESULTS[headers["Result"]]
     try:
         board = record.board()
     except ValueError as e:
@@ -149,6 +215,7 @@ def game_records(
     # per field per ply, and a dump has hundreds of millions of plies.
     fields = []
     indices = []
+    movers = []
     for ply, move in enumerate(moves):
         try:
             index = move_index(move)
@@ -157,6 +224,7 @@ def game_records(
             # did not generate: a drop, or a null move written as one.
             raise GameSkipped(SkipReason.ILLEGAL_MOVE) from e
         white_to_move = board.turn == chess.WHITE
+        movers.append(white_to_move)
         indices.append(index)
         fields.append(
             position_record(
@@ -197,13 +265,59 @@ def game_records(
         ],
         dtype=GAME_DTYPE,
     )
+    targets, rating_left_out, clock_left_out = screen.targets(
+        movers,
+        _clocks(record, len(moves), _starting_time(headers.get("TimeControl")))
+        if screen.min_clock is not None
+        else None,
+        white_passes=screen.rating_passes(white_rating, white_known),
+        black_passes=screen.rating_passes(black_rating, black_known),
+    )
+    if not targets.any():
+        # The headers let it through, so one of the players passes the rating. Either that
+        # player never moved, or every time they did they were short of time.
+        raise GameSkipped(FilterReason.CLOCK if clock_left_out else FilterReason.RATING)
     identity = [_identity_header(headers, name) for name in ("Site", "Date", "White", "Black")]
+    identity_text = "|".join([*identity, *(move.uci() for move in moves)])
+    if screen.sample is not None and not sampled(identity_text, screen.sample):
+        raise GameSkipped(FilterReason.SAMPLE)
     return GameRecords(
         game=game,
         positions=positions,
         moves=np.array(indices, dtype=MOVE_DTYPE),
-        identity="|".join([*identity, *(move.uci() for move in moves)]),
+        identity=identity_text,
+        targets=targets,
+        not_targets=(rating_left_out, clock_left_out),
     )
+
+
+def _clocks(record: chess.pgn.Game, plies: int, start: float | None) -> list[float | None]:
+    """How many seconds the player to move had left in each position, where the file says.
+
+    A ``[%clk]`` comment is the time left *after* the move it follows, so what the mover had
+    when they chose a move is what their previous move left them: two plies back. Before their
+    first move each side had ``start``, the time control's starting time. Where neither says --
+    a game whose file records no clocks, or does not say its time control -- the position gets
+    ``None``: one the file says nothing about is not one known to be rushed.
+    """
+    after = [node.clock() for node in record.mainline()]
+    return [after[ply - 2] if ply >= 2 else start for ply in range(plies)]
+
+
+def _starting_time(header: str | None) -> float | None:
+    """The seconds a ``TimeControl`` header gives each player at the start, if it says.
+
+    Read the way :func:`time_control_class` reads it: the first period's time. A sandclock, a game
+    without a clock, or a header that is not one says nothing.
+    """
+    text = (header or "").strip()
+    base = text.split(":")[0].partition("+")[0]
+    if base.startswith("*"):
+        return None
+    try:
+        return float(base.rpartition("/")[2])
+    except ValueError:
+        return None
 
 
 def split_of(identity: str, validation_fraction: float) -> bool:

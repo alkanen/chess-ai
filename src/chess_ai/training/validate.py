@@ -42,13 +42,15 @@ def validate(
     value_loss_weight: float,
     autocast_dtype: torch.dtype | None = None,
 ) -> dict[str, float]:
-    """Measure ``model`` on the first ``positions`` positions of ``split``.
+    """Measure ``model`` on the first ``positions`` training targets of ``split``.
 
     The front of the split rather than a sample of it, because the split is already a random
     selection — the dataset assigns whole games to it by a hash of the game — and taking the same
-    prefix every time makes two validations of the same model give the same answer.
+    prefix every time makes two validations of the same model give the same answer. Its training
+    targets rather than every position, so that it measures the moves the model is being taught:
+    in a dataset filtered on the mover's rating, the weaker players' moves are not those.
     """
-    total = min(positions, len(split))
+    total = min(positions, split.targets)
     if not total:
         raise ValueError("cannot validate on an empty split")
     was_training = model.training
@@ -58,7 +60,8 @@ def validate(
     try:
         for start in range(0, total, batch_size):
             frames = split.position_history(
-                np.arange(start, min(start + batch_size, total)), encoder.history
+                split.target_positions(np.arange(start, min(start + batch_size, total))),
+                encoder.history,
             )
             records = frames[:, 0]
             played, policy, value = _forward(

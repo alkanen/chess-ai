@@ -135,6 +135,26 @@ export function DatasetStatistics({ manifest }: { manifest: DatasetManifest }) {
               count,
             ])}
           />
+          {Object.keys(manifest.filtered).length > 0 && (
+            <Distribution
+              title="Filtered out"
+              of="games"
+              bars={Object.entries(manifest.filtered).map(([reason, count]): Bar => [
+                words(reason),
+                count,
+              ])}
+            />
+          )}
+          {Object.keys(manifest.not_targets).length > 0 && (
+            <Distribution
+              title="Not trained on"
+              of="positions"
+              bars={Object.entries(manifest.not_targets).map(([reason, count]): Bar => [
+                `mover's ${words(reason)}`,
+                count,
+              ])}
+            />
+          )}
         </div>
       </div>
     </section>
