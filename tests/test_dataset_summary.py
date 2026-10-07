@@ -228,8 +228,12 @@ def test_a_summary_tells_the_three_ways_a_source_falls_short_apart(tmp_path):
     gave_up_later = SourceInfo(
         path="broken.pgn", bytes=1, games_read=5, games_kept=5, error="stopped after 5 games"
     )
+    sources = [left_nothing, went_away_later, gave_up_later]
     described = manifest.model_copy(
-        update={"sources": [left_nothing, went_away_later, gave_up_later]}
+        update={
+            "sources": sources,
+            "versions": [manifest.versions[0].model_copy(update={"sources": sources})],
+        }
     )
 
     summary = summarize(described)
@@ -262,3 +266,21 @@ def test_closing_a_line_on_a_stream_that_has_gone_is_not_an_error():
     printer(_at(1.0))
 
     printer.finish()  # Must not raise.
+
+
+def test_the_rate_and_the_time_left_are_the_readings_own():
+    # Ten seconds of reading after a thousand of checksums: half the bytes in ten seconds is ten
+    # more to go, not a thousand.
+    progress = Progress(
+        games_read=500,
+        games_kept=500,
+        positions=0,
+        bytes_read=50,
+        bytes_total=100,
+        seconds=1010.0,
+        done=False,
+        reading_seconds=10.0,
+    )
+
+    assert progress.seconds_remaining == 10.0
+    assert progress.games_per_second == 50.0

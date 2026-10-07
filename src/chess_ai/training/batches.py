@@ -87,8 +87,11 @@ class PositionBatches(TorchDataset):
         batch_size: int,
         batches: int,
         seed: int = 0,
+        version: int | None = None,
     ) -> None:
+        """``version`` is the dataset's version to read, the latest when not given."""
         self._directory = directory
+        self._version = version
         self._split = split
         self._encoder_name = encoder
         self._encoder_options = dict(encoder_options or {})
@@ -97,7 +100,7 @@ class PositionBatches(TorchDataset):
         self._seed = seed
         # The positions training draws from, which are the split's training targets: every
         # position, unless the dataset was built with a filter on positions.
-        self.positions = Dataset(directory).manifest.splits[split].trained_on
+        self.positions = Dataset(directory, version).manifest.splits[split].trained_on
         if not self.positions:
             raise ValueError(f"the {split!r} split of {directory} has no positions")
         # A short last batch is dropped only when there is a full one to keep: a split smaller
@@ -167,7 +170,7 @@ class PositionBatches(TorchDataset):
     def _split_reader(self) -> SplitReader:
         """This process's own reader, opened the first time it asks for one."""
         if self._reader is None or self._opened_by != os.getpid():
-            self._dataset = Dataset(self._directory)
+            self._dataset = Dataset(self._directory, self._version)
             self._reader = self._dataset[self._split]
             self._opened_by = os.getpid()
         return self._reader

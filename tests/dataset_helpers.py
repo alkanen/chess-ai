@@ -34,6 +34,22 @@ def build(data_dir: Path, *sources: str, name: str = "test", **options) -> Manif
     return build_dataset(name, named or [str(FIXTURES)], data_dir=data_dir, **options)
 
 
+def comparable(manifest: Manifest, *, sources: set[str] | bool = False) -> dict:
+    """``manifest`` without when it was made, for comparing two builds of the same games.
+
+    ``sources`` leaves out those fields of every source, or the sources altogether when ``True``:
+    two copies of one file at other paths are the same games under another name and size.
+    """
+    without: dict = {"created": True}
+    if sources is True:
+        without["sources"] = True
+    elif sources:
+        without["sources"] = {"__all__": set(sources)}
+    return manifest.model_dump(
+        exclude={**without, "versions": {"__all__": without}},
+    )
+
+
 def move_sequences(split) -> list[tuple[int, ...]]:
     """Every game in ``split`` as the moves it is made of, which is what tells games apart."""
     return [tuple(split.move_sequence(game).tolist()) for game in range(split.games)]

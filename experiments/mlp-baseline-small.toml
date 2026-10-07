@@ -25,6 +25,10 @@ seed = 1234                                # default: 0
 # Its train split is trained on and its validation split is measured on; the dataset
 # decided which games went where, so no positions from one game are in both.
 name = "carlsen"
+# Which version of it, counting from 1; see `chess-ai dataset append`. Left out, the run
+# trains on the latest; either way it records the version it resolved to, and a resumed run
+# keeps that one.
+# version = 2                              # default: the latest
 
 [encoder]
 # What the network is shown. "board-planes" gives a plane per piece type and colour

@@ -288,6 +288,10 @@ export interface DatasetSource {
   error: string | null;
   /** Whether what failed was the file rather than the PGN in it. */
   went_away: boolean;
+  /** The SHA-256 of the file's bytes; absent before datasets had versions. */
+  sha256?: string | null;
+  /** The Lichess month the file is a dump of, as YYYY-MM, when its name says so. */
+  month?: string | null;
 }
 
 /** What a dataset is made of, counted as it was built: mirrors manifest.Statistics. */
@@ -325,7 +329,22 @@ export interface DatasetSplitCounts {
   targets?: number | null;
 }
 
-/** A dataset, described: mirrors chess_ai.dataset.manifest.Manifest. */
+/**
+ * One build or append, and what it added to the end of the dataset: mirrors
+ * chess_ai.dataset.manifest.Version. Its counts are its own share, not the dataset's total.
+ */
+export interface DatasetVersion {
+  version: number;
+  /** When it was added, as an ISO timestamp. */
+  created: string;
+  /** The cap on the dataset's total games it was added under. */
+  max_games: number | null;
+  sources: DatasetSource[];
+  splits: Record<string, DatasetSplitCounts>;
+  reached_max_games: boolean;
+}
+
+/** A dataset at its latest version, described: mirrors chess_ai.dataset.manifest.Manifest. */
 export interface DatasetManifest {
   format_version: number;
   name: string;
@@ -344,9 +363,11 @@ export interface DatasetManifest {
   filtered: Record<string, number>;
   /** Positions stored but not trained on, counted by which filter left them out. */
   not_targets: Record<string, number>;
-  /** Whether the build stopped at its maximum number of games. */
+  /** Whether the latest version stopped at its maximum number of games. */
   reached_max_games: boolean;
   statistics: DatasetStatistics;
+  /** Every version, oldest first; the totals above are the latest's. */
+  versions: DatasetVersion[];
 }
 
 /** One dataset, with its manifest or why that cannot be read. */
@@ -489,6 +510,8 @@ export interface RunSummary {
   architecture: string | null;
   /** The name of the dataset the run trains on. */
   dataset?: string | null;
+  /** Which version of the dataset it trains on. */
+  dataset_version?: number | null;
   /** When the run started, as an ISO timestamp. */
   created: string | null;
   status: RunStatus | null;
@@ -545,6 +568,8 @@ export interface RunInfo {
   device: string;
   dataset: {
     name: string;
+    /** The version of the dataset the run trains on; absent in a run.json from before. */
+    version?: number;
     positions: number;
     train_positions: number;
     /** How many train positions are trained on, when the dataset filtered positions. */

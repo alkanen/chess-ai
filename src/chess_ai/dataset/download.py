@@ -10,7 +10,6 @@ The files are kept compressed, because a build reads them that way; see
 :mod:`chess_ai.dataset.sources`.
 """
 
-import hashlib
 import http.client
 import logging
 import os
@@ -25,7 +24,7 @@ from datetime import date
 from pathlib import Path
 from typing import BinaryIO, Final, TextIO
 
-from chess_ai.dataset.files import sync_directory, sync_file
+from chess_ai.dataset.files import sha256_of, sync_directory, sync_file
 from chess_ai.dataset.progress import INTERVAL, format_duration
 from chess_ai.dataset.store import HELD_BY_ANOTHER, DatasetError
 
@@ -47,7 +46,7 @@ PART_SUFFIX: Final = ".part"
 """What a download is called until it is whole and checked."""
 
 READ_BYTES: Final = 1 << 20
-"""How much is read from the connection, and hashed, at a time."""
+"""How much is read from the connection at a time."""
 
 TIMEOUT: Final = 60.0
 """Seconds a connection may go without sending anything before the download gives up on it.
@@ -83,6 +82,24 @@ def parse_month(text: str) -> str:
 def dump_name(month: str) -> str:
     """What Lichess calls the dump of ``month``."""
     return f"lichess_db_standard_rated_{month}.pgn.zst"
+
+
+_DUMP = re.compile(r"lichess_db_standard_rated_(\d{4}-\d{2})\.pgn(?:\.zst)?", re.IGNORECASE)
+
+
+def dump_month(name: str) -> str | None:
+    """The month a file called ``name`` is the Lichess dump of, or ``None`` if it is not one.
+
+    Compressed or not: a dump decompressed with ``zstd -d`` keeps its name less the ``.zst``,
+    and its games are the same month's.
+    """
+    found = _DUMP.fullmatch(name)
+    if found is None:
+        return None
+    try:
+        return parse_month(found[1])
+    except ValueError:
+        return None
 
 
 def downloads_dir(data_dir: Path) -> Path:
@@ -234,14 +251,10 @@ def _continues(response, have: int) -> bool:
 
 
 def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
     try:
-        with path.open("rb") as handle:
-            while data := handle.read(READ_BYTES):
-                digest.update(data)
+        return sha256_of(path)
     except OSError as e:
         raise DownloadError(f"cannot read {path} to check it: {e.strerror}") from e
-    return digest.hexdigest()
 
 
 @contextmanager

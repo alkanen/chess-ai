@@ -27,7 +27,7 @@ class Progress:
     bytes_total: int
     """The sources' total size, which is known before a byte is read."""
     seconds: float
-    """How long the build has been running."""
+    """How long the build has been running, which only ever goes up: a printer throttles on it."""
     done: bool
     """Whether this is the final report of the build."""
     scanning: bool = False
@@ -37,10 +37,26 @@ class Progress:
     of the cutting and also of the moment before a serial read begins -- and that path does no
     cutting at all, so it was told it was looking for boundaries it never looks for.
     """
+    hashing: bool = False
+    """Whether the build is still taking the checksums of its sources, before reading any games.
+
+    The bytes then count how far through the checksums it is, which is a pass over every source.
+    """
+    reading_seconds: float | None = None
+    """How long the current phase has been running, when it started after the build did.
+
+    What the rate and the time left are worked out from, so that minutes spent taking checksums
+    are not counted as minutes spent reading. ``None`` means the phase is the whole build.
+    """
+
+    @property
+    def _phase_seconds(self) -> float:
+        return self.seconds if self.reading_seconds is None else self.reading_seconds
 
     @property
     def games_per_second(self) -> float:
-        return self.games_read / self.seconds if self.seconds > 0 else 0.0
+        seconds = self._phase_seconds
+        return self.games_read / seconds if seconds > 0 else 0.0
 
     @property
     def fraction(self) -> float:
@@ -52,14 +68,15 @@ class Progress:
     @property
     def seconds_remaining(self) -> float | None:
         """How much longer at this rate, or ``None`` when there is no way to tell yet."""
-        if self.done or self.bytes_total <= 0 or self.bytes_read <= 0 or self.seconds <= 0:
+        seconds = self._phase_seconds
+        if self.done or self.bytes_total <= 0 or self.bytes_read <= 0 or seconds <= 0:
             return None
         if self.bytes_read >= self.bytes_total:
             # Past the total, which happens when a file grew after it was sized: the difference
             # below goes negative, and format_duration does not guard it either -- a build two
             # hours over its estimate printed "-9000s left". There is no estimate to give.
             return None
-        return self.seconds * (self.bytes_total - self.bytes_read) / self.bytes_read
+        return seconds * (self.bytes_total - self.bytes_read) / self.bytes_read
 
 
 class ProgressPrinter:
@@ -132,6 +149,9 @@ def format_progress(progress: Progress) -> str:
         parts.append(f"{left_out:,} left out")
     if progress.done:
         return f"built {', '.join(parts)} in {format_duration(progress.seconds)}"
+    if progress.hashing:
+        # Nothing has been read yet but the bytes being checksummed, so they are all there is.
+        return f"checking the sources, {progress.fraction:.0%}, {format_duration(progress.seconds)}"
     if progress.scanning:
         # Only where the build says so. Inferring it from "nothing read yet" also caught the
         # moment before a serial read, which does no scanning -- see Progress.scanning.

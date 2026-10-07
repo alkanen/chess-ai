@@ -23,6 +23,7 @@ from dataset_helpers import (
     GOOD_GAMES,
     CountingPath,
     build,
+    comparable,
     fixture,
     flat_pgn,
     move_sequences,
@@ -1511,7 +1512,7 @@ def test_reading_in_several_processes_gives_the_same_dataset_to_the_byte(tmp_pat
         together = build(parallel, workers=4)
 
     assert shard_bytes(dataset_path(parallel, "test")) == shard_bytes(dataset_path(serial, "test"))
-    assert together.model_dump(exclude={"created"}) == alone.model_dump(exclude={"created"}), (
+    assert comparable(together) == comparable(alone), (
         "and the manifest says the same thing about them, statistics and skip counts and all"
     )
 
@@ -1838,7 +1839,7 @@ def test_a_piece_read_here_gives_the_same_dataset_as_a_worker_would(tmp_path):
     assert shard_bytes(dataset_path(tmp_path / "many", "test")) == shard_bytes(
         dataset_path(tmp_path / "one", "test")
     )
-    assert fallen_back.model_dump(exclude={"created"}) == alone.model_dump(exclude={"created"})
+    assert comparable(fallen_back) == comparable(alone)
 
 
 def test_progress_moves_while_a_piece_is_read_here(tmp_path):
@@ -2329,12 +2330,14 @@ def test_every_report_while_the_files_are_being_cut_says_so(tmp_path):
             validation_fraction=0.0,
             workers=2,
             progress=reports.append,
+            allow_repeat=True,
         )
 
-    cutting = [r for r in reports if not r.bytes_read and not r.done]
+    reading = [r for r in reports if not r.hashing]
+    cutting = [r for r in reading if not r.bytes_read and not r.done]
     assert len(cutting) >= 4, f"only {len(cutting)} report(s) while cutting three files"
     assert all(r.scanning for r in cutting), [r.scanning for r in cutting]
-    assert not any(r.scanning for r in reports if r.bytes_read), "and none once reading starts"
+    assert not any(r.scanning for r in reading if r.bytes_read), "and none once reading starts"
 
 
 def test_a_file_that_grew_does_not_count_into_the_next_files_share(tmp_path):
@@ -2362,11 +2365,14 @@ def test_a_file_that_grew_does_not_count_into_the_next_files_share(tmp_path):
             validation_fraction=0.0,
             workers=1,
             progress=reports.append,
+            # The two files are the same games, which is beside the point here.
+            allow_repeat=True,
         )
 
     assert manifest.games == 4000, "the serial path still reads to the real end"
-    read = [r.bytes_read for r in reports if not r.done]
+    reading = [r for r in reports if not r.hashing]
+    read = [r.bytes_read for r in reading if not r.done]
     assert read == sorted(read), "it never goes backwards"
     # Short of its last game, because the reports after that one are of the next file's bytes.
-    first = [r.bytes_read for r in reports if r.games_read < 2000 and not r.done]
+    first = [r.bytes_read for r in reading if r.games_read < 2000 and not r.done]
     assert max(first) <= recorded, f"{max(first)} reported of a file recorded as {recorded}"

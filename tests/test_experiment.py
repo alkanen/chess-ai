@@ -229,9 +229,12 @@ SECTION = re.compile(r"^\[(?P<name>[a-z_]+)\]")
 COMMENTED_SECTION = re.compile(r"^# \[(?P<name>[a-z_]+)\]")
 """An optional section, shown commented out: a config documents it without asking for it."""
 
-NO_DEFAULT = {"name", "dataset.name", "initialize_from.run"}
+COMMENTED_SETTING = re.compile(r"^# [a-z_0-9]+ = ")
+"""An option whose default cannot be written in TOML, shown commented out with an example."""
+
+NO_DEFAULT = {"name", "dataset.name", "dataset.version", "initialize_from.run"}
 """Settings with nothing to compare against: the run's name follows the file, the dataset has to
-be named, and so does a run to initialize from."""
+be named, the latest version of it has no number, and a run to initialize from has to be named."""
 
 
 def shipped() -> list[Path]:
@@ -273,7 +276,7 @@ def written(path: Path) -> dict[str, dict[str, str]]:
             commented = line.startswith("#")
             found.setdefault(section, {})
             continue
-        if commented:
+        if commented or COMMENTED_SETTING.match(line):
             line = line.removeprefix("# ")
         if setting := SETTING.match(line):
             note = DEFAULT_NOTE.match(line)

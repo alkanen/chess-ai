@@ -84,7 +84,10 @@ describe('RunsView', () => {
   });
 
   it('lists every run with its state, what it is, and its latest metrics', async () => {
-    const fetch = serving([summary(), summary({ name: 'old', status: 'finished', step: 15_000 })]);
+    const fetch = serving([
+      summary({ dataset_version: 2 }),
+      summary({ name: 'old', status: 'finished', step: 15_000 }),
+    ]);
 
     render(<RunsView />);
 
@@ -93,7 +96,7 @@ describe('RunsView', () => {
     const running = row('mlp-big');
     expect(running.getByText('running')).toBeInTheDocument();
     expect(running.getByText('mlp')).toBeInTheDocument();
-    expect(running.getByText('lichess-2024')).toBeInTheDocument();
+    expect(running.getByText('lichess-2024 v2')).toBeInTheDocument();
     expect(running.getByText('7,500 / 15,000 (50%)')).toBeInTheDocument();
     expect(running.getByText('2.512')).toBeInTheDocument();
     expect(running.getByText('45.9%')).toBeInTheDocument();

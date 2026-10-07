@@ -359,6 +359,31 @@ fast enough to keep them busy, and the progress is measured in compressed bytes.
 cut short or damaged keeps the games before the damage, and the manifest records the error
 against it.
 
+#### Appending to a dataset
+
+A dataset can grow, for example by the next Lichess month, without being rebuilt:
+
+```sh
+uv run chess-ai dataset append lichess-2024-q1 data/lichess/lichess_db_standard_rated_2024-04.pgn.zst
+```
+
+Each append is a new **version** of the dataset. The new games go through the filters the
+dataset was built with (they belong to the dataset, not to an append), and are added after the
+games already there, so version *n* is always the first so many games and positions of version
+*n + 1*. `--max-games` raises the dataset's cap on its total games, for a dataset that has
+reached it. Appending gives the same dataset, to the byte, as building from all the files at once.
+
+A file already in the dataset is refused: recognised by the SHA-256 of its bytes, taken before
+reading starts (a pass over the file, tens of seconds for a Lichess month), or by being the same
+Lichess month, which catches a `.pgn` appended after its own `.pgn.zst`. `--allow-repeat` appends
+it anyway. A build refuses the same file named twice under two names in the same way.
+
+An append holds the dataset's lock, and runs reading the dataset are not disturbed by it. The
+manifest is written last, so an append that is killed leaves records past the last version that
+nothing reads; the next append refuses to start over them until it is told
+`--discard-interrupted`, which cuts them off. `dataset stats` lists the versions, and
+`dataset stats NAME --version N` describes an earlier one.
+
 ### Train a model
 
 A run is started from one experiment config file, which says everything it depends on: the
@@ -370,6 +395,10 @@ filled in:
 ```sh
 uv run chess-ai train experiments/mlp-baseline.toml
 ```
+
+A run trains on the latest version of its dataset unless `[dataset] version` names one. The run
+records the version it resolved to, the runs list and run page show it as `NAME vN`, and a resumed
+run carries on with that version whatever has been appended since.
 
 It uses the GPU when there is one, in bfloat16, and the CPU when there is not. Before it starts
 it says what it is about to do, including how many parameters the model has and how fast a real

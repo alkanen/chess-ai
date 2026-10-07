@@ -64,6 +64,8 @@ class RunSummary(BaseModel):
     architecture: str | None = None
     dataset: str | None = None
     """The name of the dataset the run trains on."""
+    dataset_version: int | None = None
+    """Which version of the dataset it trains on."""
     created: datetime | None = None
     status: RunStatus | None = None
     """What the run's last heartbeat said, which for a run that is not running may be stale."""
@@ -129,6 +131,7 @@ def _describes(info: RunInfo) -> dict[str, Any]:
     return {
         "architecture": info.model.architecture,
         "dataset": info.dataset.name,
+        "dataset_version": info.dataset.version,
         "created": info.created,
         "steps": info.steps,
     }

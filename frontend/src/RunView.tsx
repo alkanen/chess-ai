@@ -4,6 +4,7 @@ import { MetricChart } from './MetricChart';
 import { CHARTS, chartData, logs, xAxis } from './runCharts';
 import { RunStateBadge } from './RunState';
 import {
+  datasetLabel,
   formatAgo,
   formatCount,
   formatDuration,
@@ -133,7 +134,7 @@ export function RunView({ name }: RunViewProps) {
             <dd>
               {info === null
                 ? '–'
-                : `${info.dataset.name}, ${formatCount(info.dataset.train_targets ?? info.dataset.train_positions)} training positions`}
+                : `${datasetLabel(info.dataset.name, info.dataset.version ?? 1)}, ${formatCount(info.dataset.train_targets ?? info.dataset.train_positions)} training positions`}
             </dd>
             <dt>Step</dt>
             <dd>

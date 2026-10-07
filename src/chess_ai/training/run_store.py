@@ -132,6 +132,9 @@ class DatasetReference(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str
+    version: int = 1
+    """The version of the dataset the run trained on; runs from before datasets had versions
+    trained on the only one there was."""
     directory: str
     format_version: int
     created: datetime | None = None

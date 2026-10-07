@@ -9,7 +9,7 @@ set from one with a single peak, and no column of numbers says so at a glance.
 
 from typing import Final
 
-from chess_ai.dataset.manifest import RATING_BUCKET, SPLITS, Filters, Manifest
+from chess_ai.dataset.manifest import RATING_BUCKET, SPLITS, Filters, Manifest, SourceInfo
 
 BAR_WIDTH: Final = 28
 """How wide the longest bar of a distribution is drawn."""
@@ -23,7 +23,7 @@ def summarize(manifest: Manifest) -> str:
     """``manifest`` as a page of text: what the dataset is, and what is in it."""
     statistics = manifest.statistics
     lines = [
-        f"dataset {manifest.name}",
+        f"dataset {manifest.name}, version {manifest.version}",
         f"  built      {manifest.created:%Y-%m-%d %H:%M:%S %Z}",
         f"  format     version {manifest.format_version}, "
         f"move vocabulary {manifest.move_vocabulary_size}",
@@ -39,26 +39,12 @@ def summarize(manifest: Manifest) -> str:
     lines += [f"             {line}" for line in filters[1:]]
     if manifest.reached_max_games:
         lines.append(f"  stopped    at the maximum of {manifest.filters.max_games:,} games")
+    if manifest.version > 1:
+        lines += ["", "versions"] + describe_versions(manifest)
     lines += ["", "sources"]
-    for source in manifest.sources:
-        lines.append(
-            f"  {source.path}  {format_bytes(source.bytes)}, "
-            f"{source.games_read:,} games read, {source.games_kept:,} kept"
-        )
-        if source.error is not None:
-            # A source the build could not read whole leaves the dataset short of its games,
-            # which is the first thing to know about a dataset that looks smaller than it should.
-            # Three things worth telling apart: a file that went before it said anything, a
-            # file that went away with an unknown number of its games still in it, and a file
-            # that was there throughout and whose chess stopped making sense, which is all it
-            # had to give.
-            if source.left_nothing:
-                what = "NOTHING READ FROM IT"
-            elif source.went_away:
-                what = "WENT AWAY PART-WAY THROUGH"
-            else:
-                what = "NOT READ WHOLE"
-            lines.append(f"    {what}: {source.error}")
+    for number, version in enumerate(manifest.versions, start=1):
+        for source in version.sources:
+            lines += _source_lines(source, number if manifest.version > 1 else None)
     lines += ["", f"skipped games  {manifest.games_skipped:,}"]
     if manifest.skipped:
         lines += _bars(
@@ -89,6 +75,48 @@ def summarize(manifest: Manifest) -> str:
         ratings["unknown"] = statistics.ratings_unknown
     lines += _bars(ratings) if ratings else ["  no ratings"]
     return "\n".join(lines) + "\n"
+
+
+def describe_versions(manifest: Manifest) -> list[str]:
+    """A line per version: when it was added, what it added, and the cap it was added under."""
+    width = len(str(manifest.version))
+    lines = []
+    for version in manifest.versions:
+        cap = (
+            f", at most {version.max_games:,} games"
+            + (" (reached)" if version.reached_max_games else "")
+            if version.max_games is not None
+            else ""
+        )
+        lines.append(
+            f"  v{version.version:<{width}}  {version.created:%Y-%m-%d %H:%M}  "
+            f"+{version.games:,} games, +{version.positions:,} positions from "
+            f"{len(version.sources)} source(s){cap}"
+        )
+    return lines
+
+
+def _source_lines(source: SourceInfo, version: int | None) -> list[str]:
+    """What a source gave, and why not more if it could not be read whole."""
+    lines = [
+        f"  {f'v{version}  ' if version is not None else ''}{source.path}  "
+        f"{format_bytes(source.bytes)}, "
+        f"{source.games_read:,} games read, {source.games_kept:,} kept"
+    ]
+    if source.error is not None:
+        # A source the build could not read whole leaves the dataset short of its games, which is
+        # the first thing to know about a dataset that looks smaller than it should. Three things
+        # worth telling apart: a file that went before it said anything, a file that went away
+        # with an unknown number of its games still in it, and a file that was there throughout
+        # and whose chess stopped making sense, which is all it had to give.
+        if source.left_nothing:
+            what = "NOTHING READ FROM IT"
+        elif source.went_away:
+            what = "WENT AWAY PART-WAY THROUGH"
+        else:
+            what = "NOT READ WHOLE"
+        lines.append(f"    {what}: {source.error}")
+    return lines
 
 
 def describe_filters(filters: Filters) -> list[str]:

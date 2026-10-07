@@ -172,6 +172,65 @@ def test_dataset_stats_summarises_a_built_dataset(tmp_path, capsys):
     assert "lichess.pgn" in out
 
 
+def test_dataset_append_adds_a_version(tmp_path, capsys):
+    assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+    capsys.readouterr()
+
+    assert main(["dataset", "append", "games", fixture("unrated.pgn")]) == 0
+
+    manifest = load_manifest(tmp_path / "data" / "datasets" / "games")
+    assert manifest.version == 2
+    assert manifest.games == 7
+    out = capsys.readouterr().out
+    assert "version 2 added 3 games" in out
+    assert "7 games" in out
+
+
+def test_dataset_append_refuses_a_file_already_in_the_dataset(tmp_path, capsys):
+    assert main(["dataset", "build", "games", fixture("lichess.pgn")]) == 0
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "append", "games", fixture("lichess.pgn")])
+
+    assert exit_info.value.code == 2
+    assert "--allow-repeat" in capsys.readouterr().err
+    assert main(["dataset", "append", "games", fixture("lichess.pgn"), "--allow-repeat"]) == 0
+    assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 8
+
+
+def test_dataset_append_can_raise_the_maximum(tmp_path):
+    assert main(["dataset", "build", "games", fixture("lichess.pgn"), "--max-games", "2"]) == 0
+
+    assert main(["dataset", "append", "games", fixture("unrated.pgn"), "--max-games", "4"]) == 0
+
+    assert load_manifest(tmp_path / "data" / "datasets" / "games").games == 4
+
+
+def test_dataset_append_to_a_dataset_that_is_not_there_says_to_build_it(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["dataset", "append", "games", fixture("lichess.pgn")])
+
+    assert exit_info.value.code == 2
+    assert "dataset build" in capsys.readouterr().err
+
+
+def test_dataset_stats_shows_the_versions_and_can_show_an_earlier_one(tmp_path, capsys):
+    main(["dataset", "build", "games", fixture("lichess.pgn")])
+    main(["dataset", "append", "games", fixture("unrated.pgn")])
+    capsys.readouterr()
+
+    assert main(["dataset", "stats", "games"]) == 0
+    latest = capsys.readouterr().out
+    assert main(["dataset", "stats", "games", "--version", "1"]) == 0
+    first = capsys.readouterr().out
+
+    assert "dataset games, version 2" in latest
+    assert "+3 games" in latest and "+4 games" in latest
+    assert "unrated.pgn" in latest
+    assert "dataset games, version 1" in first
+    assert "unrated.pgn" not in first
+
+
 def test_dataset_stats_of_a_dataset_that_is_not_there_says_what_is(tmp_path, capsys):
     main(["dataset", "build", "games", fixture("lichess.pgn")])
     capsys.readouterr()

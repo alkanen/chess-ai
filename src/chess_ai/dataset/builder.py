@@ -17,6 +17,12 @@ build abandoned four hours in, and the manifest says afterwards how many were lo
 
 The manifest is written last, which makes it the mark of a finished build: a build that died
 partway leaves records nothing will read, because there is no manifest pointing at them.
+
+A build is an append to an empty dataset. :func:`append_dataset` reads more sources into a dataset
+that is already there, through the filters it was built with, and adds what they kept to the end
+of it as a new version; :func:`build_dataset` does the same into a directory of its own and moves
+it into place when it is done. One path, so that a dataset appended to month by month holds the
+same records as one built from all the months at once.
 """
 
 import logging
@@ -39,7 +45,8 @@ from typing import Final
 import chess.pgn
 import numpy as np
 
-from chess_ai.dataset.files import sync_directory
+from chess_ai.dataset.download import dump_month
+from chess_ai.dataset.files import sha256_of, sync_directory
 from chess_ai.dataset.filters import FilterReason, Screen
 from chess_ai.dataset.games import (
     RESULT_NAMES,
@@ -56,10 +63,13 @@ from chess_ai.dataset.manifest import (
     VALIDATION,
     Filters,
     Manifest,
+    ManifestError,
     Shards,
     SourceInfo,
     SplitCounts,
     Statistics,
+    Version,
+    load_manifest,
     rating_bucket,
 )
 from chess_ai.dataset.progress import Progress
@@ -86,12 +96,15 @@ from chess_ai.dataset.store import (
     DEFAULT_SHARDS,
     DatasetError,
     DatasetWriter,
+    SplitWriter,
     abandoned_partials,
+    cut_back,
     dataset_lock,
     dataset_path,
     discarded_datasets,
     discarded_path,
     new_partial_path,
+    records_past,
     replaced_datasets,
     replaced_path,
     valid_name,
@@ -169,6 +182,9 @@ A piece of a compressed file is its text rather than a pair of offsets, so each 
 also holds up to :data:`MAX_PIECE_BYTES` of PGN here until its worker is done with it: another
 0.5 GB at 64 pieces of :data:`CHUNK_BYTES`, on top of the records.
 """
+
+HASH_REPORT_BYTES: Final = 64 << 20
+"""Bytes checksummed between progress reports while the sources are being fingerprinted."""
 
 ProgressCallback = Callable[[Progress], None]
 
@@ -262,6 +278,7 @@ def build_dataset(
     workers: int | None = None,
     now: datetime | None = None,
     filters: Filters | None = None,
+    allow_repeat: bool = False,
 ) -> Manifest:
     """Build the dataset ``name`` under ``data_dir`` from the PGN files ``patterns`` name.
 
@@ -292,18 +309,16 @@ def build_dataset(
     could open none of them, that could not open all of them and would be replacing a dataset
     already there, or that kept no games at all, is refused and publishes nothing. See
     :func:`_check_worth_publishing`.
+
+    The same file named twice under different names, or a Lichess month named both compressed
+    and not, is refused unless ``allow_repeat`` says it is meant; see :func:`_check_repeats`.
+
+    The dataset this makes is version 1 of it; :func:`append_dataset` adds the next.
     """
     valid_name(name)
     if not 0.0 <= validation_fraction <= 1.0:
         raise DatasetError(f"validation fraction {validation_fraction} is not between 0 and 1")
-    if workers is not None and workers < 1:
-        raise DatasetError(f"a build needs at least one worker to read with, not {workers}")
-    if workers is not None and workers > (ceiling := most_workers()):
-        raise DatasetError(
-            f"{workers} workers is more than this machine has any use for; the most it will "
-            f"start is {ceiling}. Each one holds pieces of a PGN file while it reads them, so "
-            "the memory a build takes grows with this number"
-        )
+    _check_workers(workers)
     sources = resolve_sources(patterns)
     directory = dataset_path(data_dir, name)
     # Held for the whole build, so that a second build of this dataset says so now rather than
@@ -341,15 +356,13 @@ def build_dataset(
                     f"cannot make the working directory {partial} for dataset {name!r}: "
                     f"{e.strerror}"
                 ) from e
-            with build.writer, quiet_parser():
-                build.read_sources(
-                    sources, workers=default_workers() if workers is None else workers
-                )
-                manifest = build.manifest(
-                    name=name,
-                    created=now if now is not None else datetime.now(UTC),
-                )
-            _check_worth_publishing(manifest, directory)
+            manifest = build.run(
+                name=name,
+                workers=workers,
+                now=now,
+                allow_repeat=allow_repeat,
+            )
+            _check_worth_publishing(manifest, directory, replacing=directory.exists())
             manifest.save(partial)
             _publish(partial, directory, name=name, overwrite=overwrite)
             # After everything that can still fail: closing the shards flushes them, and
@@ -377,8 +390,196 @@ def build_dataset(
     return manifest
 
 
-def _check_worth_publishing(manifest: Manifest, directory: Path) -> None:
-    """Refuse to publish a build that read less than it was asked to, where that would lose.
+def append_dataset(
+    name: str,
+    patterns: Sequence[str],
+    *,
+    data_dir: Path,
+    max_games: int | None = None,
+    progress: ProgressCallback | None = None,
+    workers: int | None = None,
+    now: datetime | None = None,
+    allow_repeat: bool = False,
+    discard_interrupted: bool = False,
+) -> Manifest:
+    """Read the PGN files ``patterns`` name into dataset ``name``, as its next version.
+
+    The sources are read through the filters, validation fraction and rating source the dataset
+    was built with -- a dataset's name means one definition of data -- and what they keep is
+    added after the records already there. ``max_games`` raises the dataset's cap on its total
+    games, for a dataset that has reached it; it cannot lower it.
+
+    A source the dataset already holds is refused, found by the SHA-256 of its bytes or by being
+    the same Lichess month, unless ``allow_repeat`` says it is meant; see :func:`_check_repeats`.
+
+    The manifest is written last, as a build's is, so a run reading an earlier version carries on
+    undisturbed while this runs, and an append that dies leaves records past the last version that
+    nothing reads. Those are left where they are rather than cleaned up behind anyone's back, and
+    the next append refuses to start over them unless ``discard_interrupted`` says to cut them off.
+
+    Raises :exc:`~chess_ai.dataset.store.DatasetError` for anything that stops the append from
+    starting, and for an append that kept no games.
+    """
+    valid_name(name)
+    _check_workers(workers)
+    sources = resolve_sources(patterns)
+    directory = dataset_path(data_dir, name)
+    with dataset_lock(data_dir, name):
+        if not directory.is_dir():
+            raise DatasetError(
+                f"there is no dataset {name!r} in {directory} to append to; "
+                "build it with 'chess-ai dataset build' first"
+            )
+        try:
+            base = load_manifest(directory)
+        except ManifestError as e:
+            raise DatasetError(f"cannot append to dataset {name!r}: {e}") from e
+        _check_appendable(base)
+        past = records_past(directory, base)
+        if past:
+            if not discard_interrupted:
+                raise DatasetError(
+                    f"dataset {name!r} has records past its version {base.version} that an "
+                    f"interrupted append left behind, in {len(past)} shard(s) such as {past[0]}. "
+                    "Nothing reads them. Resuming that append is not supported yet; append with "
+                    "--discard-interrupted to cut them off and start this one from version "
+                    f"{base.version}"
+                )
+            LOGGER.warning(
+                "chess-ai: discarding the records an interrupted append left past version %d "
+                "of dataset %r",
+                base.version,
+                name,
+            )
+            cut_back(directory, base)
+        filters = base.filters.model_copy(
+            update={"max_games": _cap(base, max_games)},
+        )
+        build = _Build(
+            directory=directory,
+            shards=base.shards,
+            sources=sources,
+            rating_source=(
+                None
+                if base.rating_source == AUTO_RATING_SOURCE
+                else RatingSource[base.rating_source.upper()]
+            ),
+            validation_fraction=base.validation_fraction,
+            progress=progress,
+            filters=filters,
+            base=base,
+        )
+        try:
+            manifest = build.run(name=name, workers=workers, now=now, allow_repeat=allow_repeat)
+            _check_worth_publishing(manifest, directory, replacing=False)
+            manifest.save(directory)
+            build.report(done=True)
+        finally:
+            _end_progress_line(progress)
+    return manifest
+
+
+def _check_workers(workers: int | None) -> None:
+    """Refuse a number of worker processes that cannot be, or that reads as a typo."""
+    if workers is not None and workers < 1:
+        raise DatasetError(f"a build needs at least one worker to read with, not {workers}")
+    if workers is not None and workers > (ceiling := most_workers()):
+        raise DatasetError(
+            f"{workers} workers is more than this machine has any use for; the most it will "
+            f"start is {ceiling}. Each one holds pieces of a PGN file while it reads them, so "
+            "the memory a build takes grows with this number"
+        )
+
+
+def _check_appendable(base: Manifest) -> None:
+    """Refuse to append to a dataset whose records this code would write differently."""
+    if base.format_version != FORMAT_VERSION:
+        raise DatasetError(
+            f"dataset {base.name!r} is format version {base.format_version}, and this code "
+            f"appends version {FORMAT_VERSION}; rebuild it to append to it"
+        )
+    if base.move_vocabulary_size != VOCABULARY_SIZE:
+        raise DatasetError(
+            f"dataset {base.name!r} was built against a move vocabulary of "
+            f"{base.move_vocabulary_size} moves and this code has {VOCABULARY_SIZE}; "
+            "rebuild it to append to it"
+        )
+
+
+def _cap(base: Manifest, max_games: int | None) -> int | None:
+    """The cap on the dataset's total games an append works to: the dataset's, or a raised one.
+
+    Refuses one that leaves no room, since an append that can keep nothing would read every source
+    to the end to find that out.
+    """
+    if max_games is not None:
+        if max_games <= base.games:
+            raise DatasetError(
+                f"dataset {base.name!r} already has {base.games:,} games, so a maximum of "
+                f"{max_games:,} leaves no room to append any; the maximum is on the dataset's "
+                "total, so give one above that"
+            )
+        return max_games
+    cap = base.filters.max_games
+    if cap is not None and base.games >= cap:
+        raise DatasetError(
+            f"dataset {base.name!r} is at its maximum of {cap:,} games; append with a larger "
+            "--max-games to add more"
+        )
+    return cap
+
+
+def _check_repeats(
+    name: str, known: Sequence[tuple[int, SourceInfo]], new: Sequence[SourceInfo]
+) -> None:
+    """Refuse sources whose games are already in the dataset, or named twice in this append.
+
+    A source is the same as another if it has the same bytes, by SHA-256, or if both are dumps of
+    the same Lichess month -- which is what catches a dump appended after its own decompressed
+    copy, whose bytes differ and whose games do not. ``known`` is the dataset's sources with the
+    version each came in.
+
+    A source recorded before datasets had versions has no checksum. It is recognised by its month
+    when its name has one, and otherwise by hashing it where it was, if it is still there and the
+    same size as the new one: identical bytes are at least the same number of them.
+    """
+    repeats: list[str] = []
+    seen: list[tuple[str, SourceInfo]] = [
+        (f"version {version}", source) for version, source in known
+    ]
+    for source in new:
+        for where, other in seen:
+            why = _same_source(source, other)
+            if why is not None:
+                repeats.append(f"{source.path} has {why} as {other.path}, in {where}")
+                break
+        seen.append(("this append" if known else "this build", source))
+    if repeats:
+        raise DatasetError(
+            f"these sources are already in dataset {name!r}, and their games would be in it "
+            f"twice: {'; '.join(repeats)}. Leave them out, or say --allow-repeat if that is meant"
+        )
+
+
+def _same_source(source: SourceInfo, other: SourceInfo) -> str | None:
+    """How ``source`` is the same file as ``other``, or ``None`` if it is not."""
+    if source.sha256 is not None and source.sha256 == other.sha256:
+        return "the same contents"
+    month = other.month if other.month is not None else dump_month(Path(other.path).name)
+    if source.month is not None and source.month == month:
+        return f"the same Lichess month, {month},"
+    if other.sha256 is None and source.sha256 is not None and other.bytes == source.bytes:
+        try:
+            if sha256_of(Path(other.path)) == source.sha256:
+                return "the same contents"
+        except OSError:
+            pass
+    return None
+
+
+def _check_worth_publishing(manifest: Manifest, directory: Path, *, replacing: bool) -> None:
+    """Refuse to publish a build or append that read less than it was asked to, where that would
+    lose.
 
     The sources are sized when a build starts and read as it reaches them, hours later, so a mount
     that drops or a sync job that rotates a directory of dumps can leave a build with nothing in
@@ -386,59 +587,81 @@ def _check_worth_publishing(manifest: Manifest, directory: Path) -> None:
 
     - if *every* source went away before saying anything, the build has no idea what it is
       missing, and that is what it is told rather than that it kept nothing, which it also did
-    - if *some* source went away and a dataset is already there, that source took an unknown
-      number of its games with it, the dataset in place was built from more than this one could
-      be, and a nightly ``--overwrite`` must not trade it for this. The remedy is to fix the
-      source or stop naming it, not a flag that says to carry on anyway
+    - if *some* source went away and the build is ``replacing`` a dataset already there, that
+      source took an unknown number of its games with it, the dataset in place was built from
+      more than this one could be, and a nightly ``--overwrite`` must not trade it for this. The
+      remedy is to fix the source or stop naming it, not a flag that says to carry on anyway
     - if *no games at all* were kept, it does not matter why, and it does not matter whether a
       dataset of this name is already there. A dataset of nothing is not a replacement for a
       dataset of something, and it is not a first dataset either: published with a manifest and
-      an exit status of zero, it is one the next stage opens and trains on. This is also the one
+      an exit status of zero, it is one the next stage opens and trains on. Nor is it a version:
+      a run asked to train on the latest would be told it was new data. This is also the one
       that catches a source truncated between being sized and being read, which fails in no way
       at all — no error, no games, nothing to complain of
 
     A source that was there throughout and whose *contents* stopped making sense is none of
     these, wherever in the file that happened: those games do not exist to be missed. See
     :attr:`~chess_ai.dataset.manifest.SourceInfo.went_away`.
+
+    Only the latest version is judged, which is what this build or append read.
     """
-    silent = [source for source in manifest.sources if source.left_nothing]
-    lost = [source for source in manifest.sources if source.went_away]
-    in_place = directory.exists()
-    if silent and len(silent) == len(manifest.sources):
+    latest = manifest.versions[-1]
+    appending = latest.version > 1
+    doing = (
+        f"this append to dataset {manifest.name!r}"
+        if appending
+        else f"this build of dataset {manifest.name!r}"
+    )
+    silent = [source for source in latest.sources if source.left_nothing]
+    lost = [source for source in latest.sources if source.went_away]
+    if silent and len(silent) == len(latest.sources):
         raise DatasetError(
-            f"none of the {len(silent)} source(s) of dataset {manifest.name!r} could be read, "
-            f"so there is nothing to build from: "
-            f"{', '.join(str(source.path) for source in silent)}"
+            f"none of the {len(silent)} source(s) "
+            + ("appended to" if appending else "of")
+            + f" dataset {manifest.name!r} could be read, so there is nothing to "
+            + ("append" if appending else "build from")
+            + f": {', '.join(str(source.path) for source in silent)}"
         )
-    if lost and in_place:
+    if lost and replacing:
         raise DatasetError(
-            f"{len(lost)} of the {len(manifest.sources)} source(s) of dataset "
+            f"{len(lost)} of the {len(latest.sources)} source(s) of dataset "
             f"{manifest.name!r} could not be read whole, and the dataset already in {directory} "
             f"was built from more than this one could be: "
             f"{', '.join(str(source.path) for source in lost)}. It has been left alone; fix "
             "those sources, or leave them out to build from the rest on purpose"
         )
-    if manifest.games == 0:
+    if latest.games == 0:
         # The filters are the likelier culprit when they left out games, and the advice says so.
+        filtered = sum(latest.filtered.values())
         what = (
-            f"the filters left out all {manifest.games_filtered:,} games they were shown"
-            if manifest.games_filtered
+            f"the filters left out all {filtered:,} games they were shown"
+            if filtered
             else "the source(s) are what you meant"
         )
-        if in_place:
+        if appending:
             raise DatasetError(
-                f"this build of dataset {manifest.name!r} kept no games, and the dataset already "
+                f"{doing} kept no games, so there is no version {latest.version} to add; check "
+                + ("whether " if filtered else "")
+                + (
+                    what
+                    if filtered
+                    else f"{what}: {', '.join(str(source.path) for source in latest.sources)}"
+                )
+            )
+        if replacing:
+            raise DatasetError(
+                f"{doing} kept no games, and the dataset already "
                 f"in {directory} has {_games_in(directory)}. It has been left alone; check "
-                + ("whether " if manifest.games_filtered else "")
+                + ("whether " if filtered else "")
                 + f"{what} before replacing it with nothing"
             )
         raise DatasetError(
-            f"this build of dataset {manifest.name!r} kept no games, so there is no dataset to "
+            f"{doing} kept no games, so there is no dataset to "
             + (
                 f"publish: {what}"
-                if manifest.games_filtered
+                if filtered
                 else f"publish; check {what}: "
-                f"{', '.join(str(source.path) for source in manifest.sources)}"
+                f"{', '.join(str(source.path) for source in latest.sources)}"
             )
         )
 
@@ -706,6 +929,9 @@ class _Job:
     rating_source: RatingSource | None
     validation_fraction: float
     screen: Screen = Screen()
+    source_offset: int = 0
+    """How many sources the dataset had before this build's, which its games' source indices
+    count on from."""
 
 
 @dataclass
@@ -816,7 +1042,7 @@ def _read_piece(job: _Job) -> _Read:
             try:
                 records = game_records(
                     record,
-                    source=job.piece.source,
+                    source=job.piece.source + job.source_offset,
                     rating_source=(
                         rating_source_of(record) if job.rating_source is None else job.rating_source
                     ),
@@ -960,15 +1186,30 @@ class _Build:
         validation_fraction: float,
         progress: ProgressCallback | None,
         filters: Filters,
+        base: Manifest | None = None,
     ) -> None:
+        """``base`` is the dataset being appended to, or ``None`` for a build of a new one."""
         self.filters = filters
         self.screen = filters.screen()
-        self.writer = DatasetWriter(directory, shards, targets=self.screen.per_position)
+        self.base = base
+        self.writer = DatasetWriter(directory, shards, targets=self.screen.per_position, base=base)
+        self._source_offset = len(base.sources) if base is not None else 0
+        self._games_before = base.games if base is not None else 0
+        self._positions_before = base.positions if base is not None else 0
+        self._sources = list(sources)
+        self._fingerprints: list[tuple[str | None, str | None]] = [
+            (None, dump_month(source.path.name)) for source in sources
+        ]
+        """Each source's SHA-256 and Lichess month; see :meth:`fingerprint`."""
         self.shards = shards
         self.rating_source = rating_source
         self.validation_fraction = validation_fraction
         self._progress = progress
-        self._started = time.monotonic()
+        self._began = time.monotonic()
+        """When the build started, which every report's ``seconds`` counts from."""
+        self._started = self._began
+        """When the current phase started: the checksums, then the reading. A rate and a time
+        left are worked out from this, so the checksums do not count as time spent reading."""
         self._bytes_total = sum(source.bytes for source in sources)
         self._bytes_before = 0
         """Bytes of the sources already finished, which the current file's count adds to."""
@@ -981,8 +1222,101 @@ class _Build:
 
     @property
     def kept(self) -> int:
-        """How many games the build has kept so far, in both splits."""
+        """How many games the dataset has so far, in both splits: what it had, and what this kept.
+
+        The dataset's total, because that is what ``max_games`` caps.
+        """
         return sum(split.games for split in self.writer.splits.values())
+
+    def run(
+        self, *, name: str, workers: int | None, now: datetime | None, allow_repeat: bool
+    ) -> Manifest:
+        """Check the sources, read them into the dataset, and say what the dataset now is.
+
+        The manifest that comes back is the dataset with this build's version on the end. Writing
+        it is the caller's, since only the caller knows where it goes.
+        """
+        self.fingerprint()
+        if not allow_repeat:
+            # Only sources something was read from. One a build never opened, because it was full
+            # before getting there, or one that went away before giving a game, has none of its
+            # games in the dataset, and appending it is how they get there. One that was read and
+            # whose games the filters left out does count: they would be left out again.
+            known = [
+                (version.version, source)
+                for version in (self.base.versions if self.base is not None else [])
+                for source in version.sources
+                if source.games_read > 0
+            ]
+            _check_repeats(
+                name,
+                known,
+                [
+                    self._source_info(index, source, read=0, kept=0)
+                    for index, source in enumerate(self._sources)
+                ],
+            )
+        with self.writer, quiet_parser():
+            self.read_sources(
+                self._sources, workers=default_workers() if workers is None else workers
+            )
+            return self.manifest(name=name, created=now if now is not None else datetime.now(UTC))
+
+    def fingerprint(self) -> None:
+        """Take the SHA-256 of every source, which is what recognises one appended before.
+
+        Taken before a game is read, so that a source already in the dataset is refused at the
+        start rather than hours into reading it. A pass over every byte, at the speed of the disk:
+        tens of seconds for a Lichess month. A file that cannot be read has none, and is counted
+        as unreadable when the reading gets to it, as it always was.
+        """
+        if not self._sources:
+            return
+        hashed = 0
+        reported = 0
+
+        def on_read(count: int) -> None:
+            nonlocal hashed, reported
+            hashed += count
+            if hashed - reported >= HASH_REPORT_BYTES:
+                reported = hashed
+                self._bytes_read = hashed
+                self.report(hashing=True)
+
+        self.report(hashing=True)
+        for index, source in enumerate(self._sources):
+            before = hashed
+            try:
+                digest = sha256_of(source.path, on_read)
+            except OSError:
+                digest = None
+            hashed = before + source.bytes
+            self._fingerprints[index] = (digest, self._fingerprints[index][1])
+        self._bytes_read = 0
+        self._started = time.monotonic()
+
+    def _source_info(
+        self,
+        index: int,
+        source: Source,
+        *,
+        read: int,
+        kept: int,
+        error: str | None = None,
+        went_away: bool = False,
+    ) -> SourceInfo:
+        """What the manifest says about source ``index`` of this build."""
+        sha256, month = self._fingerprints[index]
+        return SourceInfo(
+            path=str(source.path),
+            bytes=source.bytes,
+            games_read=read,
+            games_kept=kept,
+            error=error,
+            sha256=sha256,
+            month=month,
+            went_away=went_away,
+        )
 
     def _skip(self, headers: chess.pgn.Headers) -> bool:
         return skips_moves(headers, self.screen)
@@ -1003,11 +1337,7 @@ class _Build:
         for index, source in enumerate(sources):
             if self.full:
                 # Never opened, and not missing anything: the build had what it was asked for.
-                self.sources.append(
-                    SourceInfo(
-                        path=str(source.path), bytes=source.bytes, games_read=0, games_kept=0
-                    )
-                )
+                self.sources.append(self._source_info(index, source, read=0, kept=0))
                 continue
             self.read_source(source, index)
 
@@ -1132,11 +1462,11 @@ class _Build:
         for index, source in enumerate(sources):
             state = found[index]
             self.sources.append(
-                SourceInfo(
-                    path=str(source.path),
-                    bytes=source.bytes,
-                    games_read=state.read,
-                    games_kept=state.kept,
+                self._source_info(
+                    index,
+                    source,
+                    read=state.read,
+                    kept=state.kept,
                     error=state.error,
                     went_away=state.went_away,
                 )
@@ -1150,6 +1480,7 @@ class _Build:
             rating_source=self.rating_source,
             validation_fraction=self.validation_fraction,
             screen=self.screen,
+            source_offset=self._source_offset,
         )
 
     def _text_jobs(self, source: Source, index: int, state: _SourceTally) -> Iterator[_Job]:
@@ -1360,14 +1691,7 @@ class _Build:
         # a 20 GB file that is not PGN is the whole read with a blank terminal.
         self.report()
         self.sources.append(
-            SourceInfo(
-                path=str(source.path),
-                bytes=source.bytes,
-                games_read=read,
-                games_kept=kept,
-                error=error,
-                went_away=went_away,
-            )
+            self._source_info(index, source, read=read, kept=kept, error=error, went_away=went_away)
         )
 
     def _read_games(self, reader: PgnReader, index: int) -> tuple[int, int, str | None, bool]:
@@ -1415,7 +1739,7 @@ class _Build:
         try:
             records = game_records(
                 record,
-                source=index,
+                source=index + self._source_offset,
                 rating_source=(
                     rating_source_of(record) if self.rating_source is None else self.rating_source
                 ),
@@ -1466,7 +1790,7 @@ class _Build:
             self.tally.unexpected,
         )
 
-    def report(self, *, done: bool = False, scanning: bool = False) -> None:
+    def report(self, *, done: bool = False, scanning: bool = False, hashing: bool = False) -> None:
         """Tell the progress callback, if there is one, where the build has got to.
 
         A report that cannot be made is not a build that cannot be finished. The callback writes
@@ -1476,17 +1800,24 @@ class _Build:
         """
         if self._progress is None:
             return
+        now = time.monotonic()
         try:
             self._progress(
                 Progress(
                     games_read=self.tally.games_read,
-                    games_kept=sum(split.games for split in self.writer.splits.values()),
-                    positions=sum(split.positions for split in self.writer.splits.values()),
+                    # This build's, not the dataset's: what is being reported is the reading.
+                    games_kept=self.kept - self._games_before,
+                    positions=sum(split.positions for split in self.writer.splits.values())
+                    - self._positions_before,
                     bytes_read=self._bytes_total if done else self._bytes_read,
                     bytes_total=self._bytes_total,
-                    seconds=time.monotonic() - self._started,
+                    # Always the whole build's, which a printer throttles on and so must never go
+                    # back; the phase's own time is beside it, for the rate and the time left.
+                    seconds=now - self._began,
+                    reading_seconds=now - self._started if self._started != self._began else None,
                     done=done,
                     scanning=scanning,
+                    hashing=hashing,
                 )
             )
         except Exception as e:
@@ -1497,28 +1828,15 @@ class _Build:
             )
 
     def manifest(self, *, name: str, created: datetime) -> Manifest:
-        """Everything the build now knows about the dataset it has written."""
-        return Manifest(
-            format_version=FORMAT_VERSION,
-            name=name,
+        """Everything now known about the dataset: what it was, and this build's version of it."""
+        base_splits = self.base.splits if self.base is not None else {}
+        version = Version(
+            version=self.base.version + 1 if self.base is not None else 1,
             created=created,
-            move_vocabulary_size=VOCABULARY_SIZE,
-            validation_fraction=self.validation_fraction,
-            rating_source=(
-                AUTO_RATING_SOURCE
-                if self.rating_source is None
-                else self.rating_source.name.lower()
-            ),
+            max_games=self.filters.max_games,
             sources=self.sources,
-            filters=self.filters,
-            shards=self.shards,
             splits={
-                split: SplitCounts(
-                    games=self.writer.splits[split].games,
-                    positions=self.writer.splits[split].positions,
-                    targets=self.writer.splits[split].targets,
-                )
-                for split in SPLITS
+                split: _added(self.writer.splits[split], base_splits.get(split)) for split in SPLITS
             },
             skipped={
                 reason.value: self.tally.skipped[reason]
@@ -1548,6 +1866,32 @@ class _Build:
                 ratings_unknown=self.tally.ratings_unknown,
             ),
         )
+        return Manifest(
+            format_version=FORMAT_VERSION,
+            name=name,
+            created=created if self.base is None else self.base.created,
+            move_vocabulary_size=VOCABULARY_SIZE,
+            validation_fraction=self.validation_fraction,
+            rating_source=(
+                AUTO_RATING_SOURCE
+                if self.rating_source is None
+                else self.rating_source.name.lower()
+            ),
+            filters=self.filters,
+            shards=self.shards,
+            versions=[*(self.base.versions if self.base is not None else []), version],
+        )
+
+
+def _added(writer: SplitWriter, before: SplitCounts | None) -> SplitCounts:
+    """What ``writer`` has added to a split that held ``before``."""
+    before = before if before is not None else SplitCounts()
+    targets = writer.targets
+    return SplitCounts(
+        games=writer.games - before.games,
+        positions=writer.positions - before.positions,
+        targets=None if targets is None else targets - before.trained_on,
+    )
 
 
 def _try_opening(source: Source) -> None:
