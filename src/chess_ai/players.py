@@ -47,6 +47,9 @@ class GameContext:
 class CandidateMove(BaseModel):
     uci: str
     probability: float
+    san: str | None = None
+    """The move as it is written, in the position it was considered in; ``None`` in thoughts
+    kept from before candidates carried it."""
 
 
 class WinDrawLoss(BaseModel):

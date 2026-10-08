@@ -100,8 +100,10 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
         ...state.view.game,
         moves: [...state.view.game.moves, event.move],
         position: event.position,
-        // A request was about the position before the move.
+        // A request was about the position before the move, and what the player was
+        // considering is the move itself.
         request: null,
+        considering: null,
       };
       return {
         view: { ...state.view, game, position: game.position },
@@ -119,6 +121,7 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
         moves: state.view.game.moves.slice(0, event.ply),
         position: event.position,
         request: null,
+        considering: null,
         // A player that took over plays on from the position the game is back in.
         replacements: state.view.game.replacements.map((replaced) => ({
           ...replaced,
@@ -146,6 +149,7 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
         position: event.position,
         request: null,
         paused: null,
+        considering: null,
       };
       return {
         view: { ...state.view, game, position: event.position },
@@ -171,6 +175,15 @@ function applyEvent(state: ChannelState, event: GameEvent): ChannelState {
         replacements: [...state.view.game.replacements, replacement],
       };
       return { view: { ...state.view, game }, error: null };
+    }
+    case 'considering': {
+      // Only about the position the game stands in. One that arrives after the game has moved
+      // on is about a position that is gone.
+      if (state.view === null || event.considering.ply !== state.view.game.moves.length) {
+        return state;
+      }
+      const game = { ...state.view.game, considering: event.considering };
+      return { view: { ...state.view, game }, error: state.error };
     }
     case 'error':
       return { ...state, error: event.message };

@@ -14,6 +14,7 @@ const GAME = {
   request: null,
   paused: null,
   replacements: [],
+  considering: null,
 } as unknown as GameState;
 
 /** A channel following a game, on an open connection. */
@@ -146,5 +147,45 @@ describe('useGameChannel', () => {
     socket.deliver({ type: 'takeback', ply: 1, position });
 
     expect(channel.result.current.view?.game.replacements[0].ply).toBe(1);
+  });
+
+  describe('what the player on move is considering', () => {
+    const considering = {
+      ply: 0,
+      side: 'white' as const,
+      thoughts: { candidates: [{ uci: 'e2e4', san: 'e4', probability: 0.9 }], wdl: null },
+    };
+
+    it('is kept until the game moves on', () => {
+      const { channel, socket } = following();
+
+      socket.deliver({ type: 'considering', considering });
+      expect(channel.result.current.view?.game.considering).toEqual(considering);
+
+      socket.deliver({
+        type: 'move',
+        ply: 1,
+        move: { uci: 'e2e4', san: 'e4', thoughts: considering.thoughts },
+        position: startPosition as PositionSnapshot,
+      });
+      expect(channel.result.current.view?.game.considering).toBeNull();
+    });
+
+    it('ends with a takeback', () => {
+      const { channel, socket } = following();
+      socket.deliver({ type: 'considering', considering });
+
+      socket.deliver({ type: 'takeback', ply: 0, position: startPosition as PositionSnapshot });
+
+      expect(channel.result.current.view?.game.considering).toBeNull();
+    });
+
+    it('is ignored when it is about a position the game has left', () => {
+      const { channel, socket } = following();
+
+      socket.deliver({ type: 'considering', considering: { ...considering, ply: 3 } });
+
+      expect(channel.result.current.view?.game.considering).toBeNull();
+    });
   });
 });

@@ -67,6 +67,8 @@ export interface PositionSnapshot {
 export interface CandidateMove {
   uci: string;
   probability: number;
+  /** The move as written in the position it was considered in; absent from older thoughts. */
+  san?: string | null;
 }
 
 /** Probabilities from the point of view of the player who is moving. */
@@ -86,6 +88,18 @@ export interface MoveRecord {
   uci: string;
   san: string;
   thoughts: Thoughts | null;
+}
+
+/**
+ * What the player on move has chosen from, while its move is held back by the move delay: the
+ * same thoughts its move carries once it is played. Mirrors chess_ai.game_session.Considering.
+ */
+export interface Considering {
+  /** How many moves had been played: it is about the position after that many. */
+  ply: number;
+  /** The side whose player is considering. */
+  side: Color;
+  thoughts: Thoughts;
 }
 
 /** How a model turns its distribution over moves into the one move it plays. */
@@ -174,6 +188,8 @@ export interface GameState {
   paused: Paused | null;
   /** Every player replaced so far, in the order it happened. */
   replacements: Replacement[];
+  /** What the player on move is considering while its move is held back, if it says. */
+  considering: Considering | null;
 }
 
 /**
@@ -214,8 +230,8 @@ export interface NewGame {
 /**
  * What the game channel sends: the full state first, as the link sees it, then everything
  * that happens. A move, a takeback or the end of the game also ends any request that was
- * waiting for an answer. An error answers something this viewer sent, and reaches nobody
- * else.
+ * waiting for an answer, and whatever the player on move was considering. An error answers
+ * something this viewer sent, and reaches nobody else.
  */
 export type GameEvent =
   | SeatView
@@ -225,6 +241,7 @@ export type GameEvent =
   | { type: 'game_over'; position: PositionSnapshot }
   | { type: 'paused'; paused: Paused }
   | { type: 'replaced'; replacement: Replacement }
+  | { type: 'considering'; considering: Considering }
   | { type: 'error'; message: string };
 
 /**

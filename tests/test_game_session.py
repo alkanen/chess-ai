@@ -180,6 +180,134 @@ async def test_players_thoughts_reach_subscribers():
     assert replay(received) == session.state
 
 
+CONSIDERED = Thoughts(
+    candidates=[
+        CandidateMove(uci="e7e5", san="e5", probability=0.6),
+        CandidateMove(uci="c7c5", san="c5", probability=0.3),
+    ],
+    wdl=WinDrawLoss(win=0.3, draw=0.4, loss=0.3),
+)
+"""What Black's scripted model is thinking, in the games below where it waits out a delay."""
+
+
+async def soon(events):
+    """The next event, failing rather than hanging when it does not come."""
+    return await asyncio.wait_for(anext(events), timeout=5)
+
+
+def thinking_black(delay: float = 10) -> GameSession:
+    """A person playing White against a model that thinks, with ``delay`` to wait out."""
+    return GameSession(
+        HumanPlayer(), ScriptedPlayer(["e7e5"], thoughts=CONSIDERED), move_delay=delay
+    )
+
+
+async def test_a_player_waiting_out_the_move_delay_says_what_it_is_considering():
+    # It has chosen, and the move is held back so viewers can follow the game. What it
+    # considered is shown while it waits, the same as once the move is played.
+    session = thinking_black(delay=0.2)
+
+    async with playing(session) as events:
+        assert (await soon(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await soon(events)).type == "move"
+        considering = await soon(events)
+        assert considering.type == "considering"
+        assert considering.considering.ply == 1
+        assert considering.considering.side == "black"
+        assert considering.considering.thoughts == CONSIDERED
+        assert session.state.considering == considering.considering
+        played = await soon(events)
+
+    assert played.type == "move" and played.move.thoughts == CONSIDERED
+    assert session.state.considering is None, "the move is what it was considering"
+
+
+async def test_a_player_with_no_delay_to_wait_out_only_says_it_with_its_move():
+    white = ScriptedPlayer(["f2f3", "g2g4"], thoughts=CONSIDERED)
+    black = ScriptedPlayer(["e7e5", "d8h4"])
+    session = GameSession(white, black)
+
+    with session.subscribe() as events:
+        await session.play()
+        received = await collect(events)
+
+    assert "considering" not in [event.type for event in received]
+
+
+async def test_a_player_without_thoughts_considers_nothing_out_loud():
+    session = GameSession(HumanPlayer(), ScriptedPlayer(["e7e5"]), move_delay=0.2)
+
+    async with playing(session) as events:
+        assert (await soon(events)).type == "state"
+        session.submit_move("e2e4")
+        assert [(await soon(events)).type, (await soon(events)).type] == ["move", "move"]
+
+
+async def test_a_viewer_arriving_during_the_wait_is_told_what_it_is_considering():
+    session = thinking_black()
+
+    async with playing(session) as events:
+        assert (await soon(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await soon(events)).type == "move"
+        assert (await soon(events)).type == "considering"
+        with session.subscribe() as late:
+            first = await soon(late)
+
+    assert first.type == "state"
+    assert first.game.considering is not None
+    assert first.game.considering.thoughts == CONSIDERED
+
+
+async def test_a_takeback_during_the_wait_ends_what_it_was_considering():
+    # The position it was thinking about is gone, and so is the move it chose in it.
+    session = thinking_black()
+
+    async with playing(session) as events:
+        assert (await soon(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await soon(events)).type == "move"
+        assert (await soon(events)).type == "considering"
+        session.take_back()
+        taken = await soon(events)
+        await settled()
+        with session.subscribe() as late:
+            first = await soon(late)
+
+    assert taken.type == "takeback"
+    assert session.state.considering is None
+    assert first.game.considering is None
+    assert session.state.moves == []
+
+
+async def test_what_it_considers_is_not_kept_for_a_restart():
+    # A restart asks the player again, which thinks again: nothing it said is carried over.
+    session = thinking_black()
+
+    async with playing(session) as events:
+        assert (await soon(events)).type == "state"
+        session.submit_move("e2e4")
+        assert (await soon(events)).type == "move"
+        assert (await soon(events)).type == "considering"
+        record = session.record
+
+    assert "considering" not in record.model_dump()
+
+
+async def test_a_subscriber_following_a_game_with_waits_ends_up_with_its_state():
+    session = thinking_black(delay=0.05)
+
+    async with playing(session) as events:
+        received = [await soon(events)]
+        session.submit_move("e2e4")
+        for _ in range(3):
+            received.append(await soon(events))
+
+    assert [event.type for event in received] == ["state", "move", "considering", "move"]
+    assert replay(received) == session.state
+
+
 @pytest.mark.parametrize(
     "illegal",
     [

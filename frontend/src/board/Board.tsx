@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import type { LegalMove, Piece, PositionSnapshot } from '../api';
+import type { Arrow } from '../thoughts';
 import {
   BOARD,
   FILES,
@@ -58,6 +59,49 @@ interface BoardProps {
   interactive?: boolean;
   /** Submits a move in UCI. The server decides whether it is played. */
   onMove?: (uci: string) => void;
+  /**
+   * Moves to draw as arrows over the pieces, such as what a model was considering. At most one
+   * between any two squares: they are told apart by their squares.
+   */
+  arrows?: Arrow[];
+}
+
+/** How thick an arrow's shaft is drawn, at no weight and at full weight, in SVG units. */
+const ARROW_WIDTH = { least: 8, most: 26 };
+
+/**
+ * The outline of an arrow between the centres of two squares: a shaft as thick as the move
+ * was likely, and a head that ends a little short of the centre, so the piece shows through.
+ */
+export function arrowPoints(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  weight: number,
+): string {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy);
+  const half = (ARROW_WIDTH.least + (ARROW_WIDTH.most - ARROW_WIDTH.least) * weight) / 2;
+  const head = { half: half * 2.2, length: half * 3.2 };
+  // Along the arrow and across it, as unit vectors.
+  const [ux, uy] = [dx / length, dy / length];
+  const [nx, ny] = [-uy, ux];
+  const tip = length - SQUARE * 0.12;
+  const neck = Math.max(0, tip - head.length);
+  const at = (along: number, across: number) => {
+    const x = from.x + ux * along + nx * across;
+    const y = from.y + uy * along + ny * across;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  };
+  return [
+    at(0, half),
+    at(neck, half),
+    at(neck, head.half),
+    at(tip, 0),
+    at(neck, -head.half),
+    at(neck, -half),
+    at(0, -half),
+  ].join(' ');
 }
 
 /**
@@ -72,6 +116,7 @@ export function Board({
   orientation = 'white',
   interactive = false,
   onMove,
+  arrows = [],
 }: BoardProps) {
   const svg = useRef<SVGSVGElement>(null);
   const [hovered, setHovered] = useState<string | null>(null);
@@ -302,6 +347,22 @@ export function Board({
       {pieces
         .filter(([square]) => drag?.from !== square)
         .map(([square, piece]) => drawPiece(square, piece))}
+      {/* Over the pieces, as annotations are, and under anything the move being made shows. */}
+      {arrows.map((arrow) => (
+        <polygon
+          key={`arrow-${arrow.from}${arrow.to}`}
+          className={arrow.played ? 'thought-arrow played' : 'thought-arrow'}
+          data-from={arrow.from}
+          data-to={arrow.to}
+          points={arrowPoints(
+            squareCentre(arrow.from, orientation),
+            squareCentre(arrow.to, orientation),
+            arrow.weight,
+          )}
+          // Fainter as the move was less likely, but never so faint it cannot be seen.
+          opacity={0.35 + 0.5 * arrow.weight}
+        />
+      ))}
       {/* Above the pieces, so that a capture is drawn around the piece it takes. */}
       {destinations.map((move) => {
         const kind = destinationKind(move);

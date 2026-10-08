@@ -82,3 +82,14 @@
   stroke: rgb(220 140 20 / 80%);
   stroke-dasharray: 18 12;
 }
+
+/* A move a model considered: it says nothing about what can be clicked. */
+.thought-arrow {
+  fill: rgb(30 110 200);
+  pointer-events: none;
+}
+
+/* The one it played, told apart by colour as well as by being the likeliest. */
+.thought-arrow.played {
+  fill: rgb(20 150 70);
+}

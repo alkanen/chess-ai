@@ -431,6 +431,10 @@ class GameRegistry:
         """Keep a game that has just changed: as PGN once it has a result, and in the store."""
         if self._hosted.get(hosted.session.id) is not hosted:
             return
+        if event.type == "considering":
+            # What a player is considering is not kept for a restart, which asks it again, so
+            # nothing the store holds has changed.
+            return
         over = hosted.session.position.game_over
         if event.type in ("move", "game_over") and over is not None:
             if over.reason == "abort":

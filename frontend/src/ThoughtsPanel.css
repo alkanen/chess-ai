@@ -1,0 +1,102 @@
+.thoughts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.thoughts-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+.thoughts .note,
+.thoughts-heading,
+.thoughts-odds {
+  margin: 0;
+}
+
+.thoughts .note {
+  opacity: 0.7;
+}
+
+.thoughts-heading {
+  font-weight: 600;
+}
+
+.candidates {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.2rem 0.6rem;
+  align-items: center;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Each candidate lays its three parts out in the list's own columns. */
+.candidate {
+  display: contents;
+}
+
+.candidate.played .candidate-move {
+  font-weight: 700;
+  color: rgb(20 150 70);
+}
+
+.candidate-meter {
+  height: 0.5rem;
+  overflow: hidden;
+  background: rgb(128 128 128 / 20%);
+  border-radius: 3px;
+}
+
+.candidate-meter span {
+  display: block;
+  height: 100%;
+  background: rgb(30 110 200);
+}
+
+.candidate.played .candidate-meter span {
+  background: rgb(20 150 70);
+}
+
+.candidate-share {
+  text-align: right;
+}
+
+.thoughts-odds {
+  font-size: 0.9em;
+  opacity: 0.85;
+}
+
+/* Beside the board and as tall as it, White's chances at White's end of it. */
+.eval-bar {
+  display: flex;
+  flex: 0 0 1.25rem;
+  flex-direction: column;
+  align-self: stretch;
+  overflow: hidden;
+  background: rgb(128 128 128 / 25%);
+  border-radius: 3px;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 35%);
+}
+
+.eval-segment {
+  flex-basis: 0;
+  transition: flex-grow 0.3s ease;
+}
+
+.eval-segment.white {
+  background: #f4f4f4;
+}
+
+.eval-segment.draw {
+  background: #8a8a8a;
+}
+
+.eval-segment.black {
+  background: #1e1e1e;
+}

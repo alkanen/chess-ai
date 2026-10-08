@@ -119,6 +119,20 @@ class Replacement(BaseModel):
     """The player that took its place."""
 
 
+class Considering(BaseModel):
+    """What the player on move has chosen from, while its move is held back by the move delay.
+
+    The same thoughts its move carries once it is played, shown while viewers wait for it.
+    The move itself is not said: it is played when the wait is over.
+    """
+
+    ply: int
+    """How many moves had been played: it is about the position after that many."""
+    side: Color
+    """The side whose player is considering."""
+    thoughts: Thoughts
+
+
 class GameState(BaseModel):
     id: str
     """Tells this game apart from the one that replaces it; see ``GameSession.id``."""
@@ -137,6 +151,8 @@ class GameState(BaseModel):
     """Set while the game waits for another player to take over a side that cannot go on."""
     replacements: list[Replacement] = []
     """Every player replaced so far, in the order it happened."""
+    considering: Considering | None = None
+    """What the player on move is considering while its move is held back, if it says."""
 
 
 class GameStateEvent(BaseModel):
@@ -192,6 +208,17 @@ class PausedEvent(BaseModel):
     paused: Paused
 
 
+class ConsideringEvent(BaseModel):
+    """The player on move has chosen, and says what it chose from while its move is held back.
+
+    Over once the game moves on: the move it chose, a takeback, or the end of the game ends it
+    without an event of its own.
+    """
+
+    type: Literal["considering"] = "considering"
+    considering: Considering
+
+
 class ReplacedEvent(BaseModel):
     """Another player has taken over a side, so the game is no longer paused."""
 
@@ -207,6 +234,7 @@ GameEvent = (
     | GameOverEvent
     | PausedEvent
     | ReplacedEvent
+    | ConsideringEvent
 )
 
 
@@ -288,6 +316,9 @@ class GameSession:
         self._request: PendingRequest | None = None
         self._requests_made = 0
         self._paused: Paused | None = None
+        self._considering: Considering | None = None
+        """What the player on move said it is considering; never kept for a restart, after
+        which it is asked again."""
         # Set while the game waits for another player, for that player to be handed over by.
         self._replaced: asyncio.Future[None] | None = None
         self._replacements: list[Replacement] = []
@@ -386,6 +417,7 @@ class GameSession:
             request=self._request,
             paused=self._paused,
             replacements=list(self._replacements),
+            considering=self._considering,
         )
 
     @property
@@ -469,6 +501,7 @@ class GameSession:
             self._moves.pop()
         self._position = snapshot(self._board)
         self._request = None
+        self._considering = None
         # A player that took over is the one playing from the position the game is back in.
         played = len(self._moves)
         self._replacements = [
@@ -688,7 +721,9 @@ class GameSession:
         # just as it was when the game awaited the player itself. A person's browser can
         # have a move on its way already, and the player has to be there to take it.
         asking = asyncio.Task(
-            self._choose(player, earliest), loop=asyncio.get_running_loop(), eager_start=True
+            self._choose(player, earliest, asked_after),
+            loop=asyncio.get_running_loop(),
+            eager_start=True,
         )
         self._asking = asking
         try:
@@ -712,8 +747,14 @@ class GameSession:
         # here, and that answer is about a position just as gone as a cancelled one.
         return None if asked_after != self._takebacks else asking.result()
 
-    async def _choose(self, player: Player, earliest: float) -> PlayerMove:
-        """``player``'s move, held back until ``earliest`` if it worked the move out itself."""
+    async def _choose(self, player: Player, earliest: float, asked_after: int) -> PlayerMove:
+        """``player``'s move, held back until ``earliest`` if it worked the move out itself.
+
+        While it is held back, viewers are told what the player considered, if it says: the
+        same thoughts the move carries once it is played. ``asked_after`` is how many takebacks
+        there had been when it was asked, and one since means the position it answered is gone.
+        """
+        moves = len(self._moves)
         choice = await player.choose_move(GameContext(self._board.copy()))
         # The delay paces players that move instantly. Someone who submits a move has
         # already taken as long as they took, so their move is played at once. Sleeping
@@ -721,6 +762,18 @@ class GameSession:
         # instant players doesn't hold up everything else.
         loop = asyncio.get_running_loop()
         pause = 0.0 if isinstance(player, SubmittedMovePlayer) else earliest - loop.time()
+        if (
+            pause > 0
+            and choice.thoughts is not None
+            and not self._closed
+            and asked_after == self._takebacks
+        ):
+            self._considering = Considering(
+                ply=moves,
+                side="white" if self._board.turn == chess.WHITE else "black",
+                thoughts=choice.thoughts,
+            )
+            self._broadcast(ConsideringEvent(considering=self._considering))
         await asyncio.sleep(max(0.0, pause))
         return choice
 
@@ -768,6 +821,7 @@ class GameSession:
         )
         self._request = None
         self._paused = None
+        self._considering = None
         # A game that has just ended is kept its full time from now, for its result to be seen.
         # Not one a player failed in, which is kept as still being played, from its last move:
         # a player that fails again on every restart is no reason to keep it for ever.
@@ -785,8 +839,9 @@ class GameSession:
         self._moves.append(record)
         self._position = snapshot(self._board)
         # A request was about the position before this move, which is no longer the one
-        # anybody would be agreeing to.
+        # anybody would be agreeing to. What the player was considering is this move.
         self._request = None
+        self._considering = None
         self.updated = datetime.now(UTC)
         self._broadcast(MoveEvent(ply=len(self._moves), move=record, position=self._position))
 
