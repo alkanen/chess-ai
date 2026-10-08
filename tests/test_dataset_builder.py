@@ -543,18 +543,23 @@ def test_a_report_that_cannot_be_made_does_not_lose_the_build(tmp_path, caplog):
     assert len(warnings) == 1, "and says so once"
 
 
-def test_a_build_that_fails_part_way_leaves_nothing_to_trip_over(tmp_path):
+def test_a_build_that_fails_part_way_is_kept_to_resume_and_says_so(tmp_path):
     # An interrupted build used to leave a manifest-less directory that list_datasets and
-    # stats both denied existed, and that blocked the obvious retry.
+    # stats both denied existed, and that blocked the obvious retry. Now it is kept on purpose,
+    # with a checkpoint, and the retry is told what to do about it rather than tripping over it.
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(store._StreamWriter, "append", _failing_append(5))
         with pytest.raises(OSError, match="No space left"):
             build(tmp_path, validation_fraction=0.0)
+    assert list_datasets(tmp_path) == [], "it is not a dataset"
 
-    retried = build(tmp_path, validation_fraction=0.0)
+    with pytest.raises(DatasetError, match="interrupted build.*--resume.*--discard-interrupted"):
+        build(tmp_path, validation_fraction=0.0)
+    retried = build(tmp_path, validation_fraction=0.0, discard_interrupted=True)
 
     assert retried.games == GOOD_GAMES
     assert list_datasets(tmp_path) == ["test"]
+    assert not builder.interrupted_builds(tmp_path, "test"), "the discarded one is gone"
 
 
 @pytest.mark.skipif(
@@ -752,11 +757,13 @@ def test_an_interrupted_build_is_reported_as_interrupted(tmp_path):
             build(tmp_path, validation_fraction=0.0)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(os, "fsync", out_of_space)
+        # The shards' flushes, and not the checkpoint's: a disk that cannot take the first
+        # checkpoint ends the build before it has opened anything to close.
+        patch.setattr(store, "sync_file", lambda file: out_of_space(file.fileno()))
         patch.setattr(store._StreamWriter, "append", _raising_append(5, KeyboardInterrupt))
 
         with pytest.raises(KeyboardInterrupt):
-            build(tmp_path, validation_fraction=0.0)
+            build(tmp_path, validation_fraction=0.0, discard_interrupted=True)
 
     assert list_datasets(tmp_path) == []
 

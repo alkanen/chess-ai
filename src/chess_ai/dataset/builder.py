@@ -18,6 +18,13 @@ build abandoned four hours in, and the manifest says afterwards how many were lo
 The manifest is written last, which makes it the mark of a finished build: a build that died
 partway leaves records nothing will read, because there is no manifest pointing at them.
 
+What it does leave is a checkpoint, written about once a minute once the records it counts are on
+the disk: where the reading had got to, and the counts so far. A build or append that stopped part
+way is carried on from there by cutting the records back to what the checkpoint counts and reading
+on; see :mod:`~chess_ai.dataset.checkpoint`. Where it can be carried on from is wherever
+everything read is in the dataset and nothing else is -- between pieces, or between games of a
+stretch read in this process -- which is where :meth:`_Build.checkpoint` is called.
+
 A build is an append to an empty dataset. :func:`append_dataset` reads more sources into a dataset
 that is already there, through the filters it was built with, and adds what they kept to the end
 of it as a new version; :func:`build_dataset` does the same into a directory of its own and moves
@@ -45,6 +52,15 @@ from typing import Final
 import chess.pgn
 import numpy as np
 
+from chess_ai.dataset.checkpoint import (
+    Checkpoint,
+    Counts,
+    PlannedSource,
+    SourceState,
+    has_checkpoint,
+    load_checkpoint,
+    remove_checkpoint,
+)
 from chess_ai.dataset.download import dump_month
 from chess_ai.dataset.files import sha256_of, sync_directory
 from chess_ai.dataset.filters import FilterReason, Screen
@@ -81,6 +97,7 @@ from chess_ai.dataset.records import (
     TimeControl,
 )
 from chess_ai.dataset.sources import (
+    ByteRange,
     CompressedTail,
     PgnReader,
     Piece,
@@ -99,11 +116,13 @@ from chess_ai.dataset.store import (
     SplitWriter,
     abandoned_partials,
     cut_back,
+    cut_back_to,
     dataset_lock,
     dataset_path,
     discarded_datasets,
     discarded_path,
     new_partial_path,
+    records_missing,
     records_past,
     replaced_datasets,
     replaced_path,
@@ -186,7 +205,17 @@ also holds up to :data:`MAX_PIECE_BYTES` of PGN here until its worker is done wi
 HASH_REPORT_BYTES: Final = 64 << 20
 """Bytes checksummed between progress reports while the sources are being fingerprinted."""
 
+CHECKPOINT_SECONDS: Final = 60.0
+"""How often a build writes down where it has got to, so that it can be carried on from there.
+
+Each one flushes every open shard to the disk, which costs a fraction of a second; a minute of
+reading is what an interrupted build loses at most.
+"""
+
 ProgressCallback = Callable[[Progress], None]
+
+Confirm = Callable[[str], bool]
+"""Asks a person a yes-or-no question, and says whether they answered yes."""
 
 LOGGER = logging.getLogger(__name__)
 
@@ -279,6 +308,9 @@ def build_dataset(
     now: datetime | None = None,
     filters: Filters | None = None,
     allow_repeat: bool = False,
+    resume: bool = False,
+    discard_interrupted: bool = False,
+    confirm: Confirm | None = None,
 ) -> Manifest:
     """Build the dataset ``name`` under ``data_dir`` from the PGN files ``patterns`` name.
 
@@ -289,7 +321,7 @@ def build_dataset(
     Raises :exc:`~chess_ai.dataset.store.DatasetError` for a name or a source that is not
     usable, or for a dataset that is already there and ``overwrite`` not asked for. Anything
     wrong with a *game* is counted instead, and the manifest that comes back says what was. A
-    failure in *writing* the dataset is neither: it ends the build and leaves nothing behind.
+    failure in *writing* the dataset is neither: it ends the build.
 
     ``workers`` is how many processes parse the PGN files, defaulting to
     :func:`default_workers`. The files are cut into pieces of whole games and the pieces are read
@@ -314,12 +346,26 @@ def build_dataset(
     and not, is refused unless ``allow_repeat`` says it is meant; see :func:`_check_repeats`.
 
     The dataset this makes is version 1 of it; :func:`append_dataset` adds the next.
+
+    A build that stops part way through reading -- interrupted, killed, out of disk or memory --
+    keeps its working directory and the checkpoint in it, and ``resume`` carries it on from there
+    with the sources and settings it was started with, which are then not given again; see
+    :mod:`~chess_ai.dataset.checkpoint`. A new build of a dataset that has an interrupted one
+    asks ``confirm`` whether to discard it, or discards it without asking if
+    ``discard_interrupted`` says to. With neither it is refused: that build's hours are not this
+    one's to throw away.
     """
     valid_name(name)
     if not 0.0 <= validation_fraction <= 1.0:
         raise DatasetError(f"validation fraction {validation_fraction} is not between 0 and 1")
     _check_workers(workers)
-    sources = resolve_sources(patterns)
+    if resume and patterns:
+        raise DatasetError(
+            "a resumed build reads the sources the interrupted one was started with; name none"
+        )
+    if resume and discard_interrupted:
+        raise DatasetError("an interrupted build can be resumed or discarded, not both")
+    sources = [] if resume else resolve_sources(patterns)
     directory = dataset_path(data_dir, name)
     # Held for the whole build, so that a second build of this dataset says so now rather than
     # reading the same files for hours and then throwing the work away.
@@ -329,27 +375,42 @@ def build_dataset(
                 f"dataset {name!r} is already in {directory}; "
                 "build it with --overwrite to replace it"
             )
+        interrupted = interrupted_builds(data_dir, name)
+        checkpoint: Checkpoint | None = None
+        if resume:
+            partial, checkpoint = _build_to_resume(name, interrupted)
+        else:
+            if interrupted:
+                _settle_interrupted_builds(
+                    name, interrupted, discard=discard_interrupted, confirm=confirm
+                )
+            # Built beside where it belongs and moved there when it is finished, so that a
+            # dataset directory always holds a whole dataset: an interrupted build leaves
+            # nothing for a reader to find.
+            partial = new_partial_path(data_dir, name)
+            if partial.exists():
+                # Whatever is there belongs to another build, and nothing below may remove it.
+                # The name is random, so this is a sanity check rather than something anyone
+                # should meet.
+                raise DatasetError(f"the working directory {partial} for dataset {name!r} is taken")
         _report_rubble(data_dir, name)
-        # Built beside where it belongs and moved there when it is finished, so that a dataset
-        # directory always holds a whole dataset: an interrupted build leaves nothing for a
-        # reader to find, for the next build to trip over, or for anyone to wonder about.
-        partial = new_partial_path(data_dir, name)
-        if partial.exists():
-            # Whatever is there belongs to another build, and nothing below may remove it. The
-            # name is random, so this is a sanity check rather than something anyone should meet.
-            raise DatasetError(f"the working directory {partial} for dataset {name!r} is taken")
+        build: _Build | None = None
         try:
             # Inside the guard, because constructing the writer is what makes the working
             # directory: an interrupt an instant later would otherwise leave it behind for good.
             try:
-                build = _Build(
-                    directory=partial,
-                    shards=shards,
-                    sources=sources,
-                    rating_source=rating_source,
-                    validation_fraction=validation_fraction,
-                    progress=progress,
-                    filters=filters if filters is not None else Filters(),
+                build = (
+                    _Build.resuming(partial, checkpoint, progress=progress)
+                    if checkpoint is not None
+                    else _Build(
+                        directory=partial,
+                        shards=shards,
+                        sources=sources,
+                        rating_source=rating_source,
+                        validation_fraction=validation_fraction,
+                        progress=progress,
+                        filters=filters if filters is not None else Filters(),
+                    )
                 )
             except OSError as e:
                 raise DatasetError(
@@ -362,18 +423,47 @@ def build_dataset(
                 now=now,
                 allow_repeat=allow_repeat,
             )
-            _check_worth_publishing(manifest, directory, replacing=directory.exists())
+            try:
+                _check_worth_publishing(manifest, directory, replacing=directory.exists())
+            except DatasetError:
+                # Read to the end and found nothing worth publishing, which reading it again
+                # would find too: there is nothing to carry on, and nothing worth keeping.
+                remove_checkpoint(partial)
+                raise
+            # The checkpoint stays until the dataset is in place, so that a disk filling up or a
+            # Ctrl-C while the manifest is written or the dataset moved costs the last minute of
+            # reading rather than all of it. Removed from where the dataset now is: one left
+            # behind there by a crash is of a version the dataset has, which the next append
+            # recognises and clears away.
             manifest.save(partial)
             _publish(partial, directory, name=name, overwrite=overwrite)
+            remove_checkpoint(directory)
             # After everything that can still fail: closing the shards flushes them, and
             # publishing renames them. A summary printed before those would say the build was
             # finished and then be followed by the reason it was not. Before the warnings
             # below, because it is what ends the progress line on this path.
             build.report(done=True)
         except BaseException:
-            # Including a Ctrl-C: what was written is unreadable without a manifest, so leaving
-            # it behind would only be rubble for the next build to clear up.
-            shutil.rmtree(partial, ignore_errors=True)
+            # Whatever failed, the working directory is gone once the dataset has been put in
+            # place, and has no checkpoint if nothing was worth publishing.
+            if has_checkpoint(partial):
+                # Hours of reading, which a resume carries on from; including after a Ctrl-C,
+                # which is as likely to be "not now" as "not this", and including at the very
+                # end, when the last flush of the shards finds the disk full.
+                _end_progress_line(progress)
+                LOGGER.warning(
+                    "chess-ai: the build of dataset %r stopped part way; what it had read is "
+                    "kept in %s. Carry it on with 'chess-ai dataset build %s --resume', or "
+                    "start again with --discard-interrupted.",
+                    name,
+                    partial,
+                    name,
+                )
+            else:
+                # What was written is unreadable without a manifest, and there is no checkpoint
+                # to carry on from, so leaving it behind would only be rubble for the next
+                # build to clear up.
+                shutil.rmtree(partial, ignore_errors=True)
             raise
         finally:
             # After the attempt rather than before it, because what to say about a dataset an
@@ -401,6 +491,8 @@ def append_dataset(
     now: datetime | None = None,
     allow_repeat: bool = False,
     discard_interrupted: bool = False,
+    resume: bool = False,
+    confirm: Confirm | None = None,
 ) -> Manifest:
     """Read the PGN files ``patterns`` name into dataset ``name``, as its next version.
 
@@ -414,15 +506,27 @@ def append_dataset(
 
     The manifest is written last, as a build's is, so a run reading an earlier version carries on
     undisturbed while this runs, and an append that dies leaves records past the last version that
-    nothing reads. Those are left where they are rather than cleaned up behind anyone's back, and
-    the next append refuses to start over them unless ``discard_interrupted`` says to cut them off.
+    nothing reads, with the checkpoint it last wrote. ``resume`` carries that append on from the
+    checkpoint, with the sources and maximum it was started with, which are then not given again.
+    A new append on top of one asks ``confirm`` whether to cut its records off, or cuts them off
+    without asking if ``discard_interrupted`` says to; with neither it is refused. Records are
+    never left in the middle of a dataset: they are at its end, or they are gone.
 
     Raises :exc:`~chess_ai.dataset.store.DatasetError` for anything that stops the append from
     starting, and for an append that kept no games.
     """
     valid_name(name)
     _check_workers(workers)
-    sources = resolve_sources(patterns)
+    if resume:
+        if patterns:
+            raise DatasetError(
+                "a resumed append reads the sources the interrupted one was started with; name none"
+            )
+        if discard_interrupted:
+            raise DatasetError("an interrupted append can be resumed or discarded, not both")
+        if max_games is not None:
+            raise DatasetError("a resumed append keeps the maximum the interrupted one was given")
+    sources = [] if resume else resolve_sources(patterns)
     directory = dataset_path(data_dir, name)
     with dataset_lock(data_dir, name):
         if not directory.is_dir():
@@ -435,48 +539,228 @@ def append_dataset(
         except ManifestError as e:
             raise DatasetError(f"cannot append to dataset {name!r}: {e}") from e
         _check_appendable(base)
+        checkpoint, unreadable = _append_checkpoint(directory, base)
         past = records_past(directory, base)
-        if past:
-            if not discard_interrupted:
+        if resume:
+            if unreadable is not None:
+                raise unreadable
+            if checkpoint is None:
                 raise DatasetError(
                     f"dataset {name!r} has records past its version {base.version} that an "
-                    f"interrupted append left behind, in {len(past)} shard(s) such as {past[0]}. "
-                    "Nothing reads them. Resuming that append is not supported yet; append with "
-                    "--discard-interrupted to cut them off and start this one from version "
-                    f"{base.version}"
+                    "interrupted append left behind, but no checkpoint to carry them on from; "
+                    "append with --discard-interrupted to cut them off"
+                    if past
+                    else f"there is no interrupted append to dataset {name!r} to resume"
                 )
-            LOGGER.warning(
-                "chess-ai: discarding the records an interrupted append left past version %d "
-                "of dataset %r",
-                base.version,
-                name,
+            build = _Build.resuming(directory, checkpoint, progress=progress, base=base)
+        else:
+            if past or checkpoint is not None or unreadable is not None:
+                _settle_interrupted_append(
+                    base,
+                    directory,
+                    checkpoint,
+                    past,
+                    discard=discard_interrupted,
+                    confirm=confirm,
+                )
+            filters = base.filters.model_copy(
+                update={"max_games": _cap(base, max_games)},
             )
-            cut_back(directory, base)
-        filters = base.filters.model_copy(
-            update={"max_games": _cap(base, max_games)},
-        )
-        build = _Build(
-            directory=directory,
-            shards=base.shards,
-            sources=sources,
-            rating_source=(
-                None
-                if base.rating_source == AUTO_RATING_SOURCE
-                else RatingSource[base.rating_source.upper()]
-            ),
-            validation_fraction=base.validation_fraction,
-            progress=progress,
-            filters=filters,
-            base=base,
-        )
+            build = _Build(
+                directory=directory,
+                shards=base.shards,
+                sources=sources,
+                rating_source=(
+                    None
+                    if base.rating_source == AUTO_RATING_SOURCE
+                    else RatingSource[base.rating_source.upper()]
+                ),
+                validation_fraction=base.validation_fraction,
+                progress=progress,
+                filters=filters,
+                base=base,
+            )
         try:
             manifest = build.run(name=name, workers=workers, now=now, allow_repeat=allow_repeat)
-            _check_worth_publishing(manifest, directory, replacing=False)
+            try:
+                _check_worth_publishing(manifest, directory, replacing=False)
+            except DatasetError:
+                # Read to the end and found nothing worth a version, which reading it again
+                # would find too. Nothing was kept, so nothing was written past the version.
+                remove_checkpoint(directory)
+                raise
             manifest.save(directory)
+            # After the manifest: a checkpoint left behind by a crash between the two is one for
+            # a version the dataset has, which the next append recognises and removes.
+            remove_checkpoint(directory)
             build.report(done=True)
+        except BaseException:
+            if has_checkpoint(directory):
+                _end_progress_line(progress)
+                LOGGER.warning(
+                    "chess-ai: the append to dataset %r stopped part way; what it had read is "
+                    "kept past version %d, where nothing reads it. Carry it on with "
+                    "'chess-ai dataset append %s --resume', or cut it off with "
+                    "--discard-interrupted on the next append.",
+                    name,
+                    base.version,
+                    name,
+                )
+            raise
         finally:
             _end_progress_line(progress)
     return manifest
+
+
+def interrupted_builds(data_dir: Path, name: str) -> list[Path]:
+    """Working directories of builds of ``name`` that stopped part way and can be carried on.
+
+    Those with a checkpoint in them; the rest are rubble, as they always were.
+    """
+    return [path for path in abandoned_partials(data_dir, name) if has_checkpoint(path)]
+
+
+def _build_to_resume(name: str, interrupted: Sequence[Path]) -> tuple[Path, Checkpoint]:
+    """The interrupted build of ``name`` to carry on, and its checkpoint, if there is just one."""
+    if not interrupted:
+        raise DatasetError(f"there is no interrupted build of dataset {name!r} to resume")
+    if len(interrupted) > 1:
+        raise DatasetError(
+            f"there are {len(interrupted)} interrupted builds of dataset {name!r}, in "
+            f"{', '.join(str(path) for path in interrupted)}; remove all but the one to resume"
+        )
+    (partial,) = interrupted
+    checkpoint = load_checkpoint(partial)
+    assert checkpoint is not None, "interrupted_builds only finds directories with one"
+    if checkpoint.version != 1 or checkpoint.base_created is not None:
+        raise DatasetError(f"the checkpoint in {partial} is not one of a build")
+    return partial, checkpoint
+
+
+def _settle_interrupted_builds(
+    name: str, interrupted: Sequence[Path], *, discard: bool, confirm: Confirm | None
+) -> None:
+    """Discard interrupted builds of ``name`` if that is what was asked for, or refuse."""
+    described = "; ".join(_described_build(path) for path in interrupted)
+    if not discard:
+        if confirm is None:
+            raise DatasetError(
+                f"an interrupted build of dataset {name!r} is in {described}. Carry it on with "
+                f"'chess-ai dataset build {name} --resume', or build with --discard-interrupted "
+                "to throw it away and start this one"
+            )
+        if not confirm(
+            f"An interrupted build of dataset {name!r} is in {described}.\n"
+            "Discard it and start this build from scratch?"
+        ):
+            raise DatasetError(
+                f"left the interrupted build of dataset {name!r} alone; carry it on with "
+                f"'chess-ai dataset build {name} --resume'"
+            )
+    for path in interrupted:
+        LOGGER.warning("chess-ai: discarding the interrupted build of %r in %s", name, path)
+        # The checkpoint first, so that a delete which stops part way leaves rubble that is
+        # reported as such, and never a checkpoint over records that are no longer all there.
+        remove_checkpoint(path)
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _described_build(path: Path) -> str:
+    """Which interrupted build is in ``path``, for a person deciding whether to keep it."""
+    try:
+        checkpoint = load_checkpoint(path)
+    except DatasetError:
+        return f"{path} (its checkpoint cannot be read)"
+    assert checkpoint is not None
+    return f"{path} ({_described_checkpoint(checkpoint)})"
+
+
+def _described_checkpoint(checkpoint: Checkpoint) -> str:
+    """What an interrupted build or append was doing, in a line."""
+    names = [Path(source.path).name for source in checkpoint.sources]
+    shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+    return (
+        f"started {checkpoint.started.astimezone():%Y-%m-%d %H:%M} on {shown}, "
+        f"{checkpoint.games:,} games kept by its last checkpoint"
+    )
+
+
+def _append_checkpoint(
+    directory: Path, base: Manifest
+) -> tuple[Checkpoint | None, DatasetError | None]:
+    """The checkpoint of an interrupted append to ``base``, or why it cannot be read.
+
+    One for a version the dataset already has is of an append that finished and was stopped
+    before it could remove it. It is of no use to anyone, and is removed here.
+    """
+    try:
+        checkpoint = load_checkpoint(directory)
+    except DatasetError as e:
+        return None, e
+    if checkpoint is not None and checkpoint.version <= base.version:
+        remove_checkpoint(directory)
+        return None, None
+    return checkpoint, None
+
+
+def _settle_interrupted_append(
+    base: Manifest,
+    directory: Path,
+    checkpoint: Checkpoint | None,
+    past: Sequence[Path],
+    *,
+    discard: bool,
+    confirm: Confirm | None,
+) -> None:
+    """Cut off what an interrupted append left if that is what was asked for, or refuse.
+
+    Cut off rather than written after: a dataset whose interrupted records were left in the middle
+    of it would have them in every version from then on, and nothing to say which they were.
+    """
+    name = base.name
+    if checkpoint is not None:
+        what = f"an interrupted append ({_described_checkpoint(checkpoint)})"
+    elif past:
+        what = (
+            f"records past its version {base.version} that an interrupted append left behind, "
+            f"in {len(past)} shard(s) such as {past[0]}"
+        )
+    else:
+        what = "an interrupted append whose checkpoint cannot be read"
+    resumable = checkpoint is not None
+    if not discard:
+        if confirm is None:
+            raise DatasetError(
+                f"dataset {name!r} has {what}. Nothing reads its records. "
+                + (
+                    f"Carry it on with 'chess-ai dataset append {name} --resume', or append"
+                    if resumable
+                    else "Append"
+                )
+                + " with --discard-interrupted to cut them off and start this one from version "
+                f"{base.version}"
+            )
+        if not confirm(
+            f"Dataset {name!r} has {what}.\n"
+            f"Discard its records and append these sources after version {base.version}?"
+        ):
+            raise DatasetError(
+                f"left the interrupted append to dataset {name!r} alone"
+                + (
+                    f"; carry it on with 'chess-ai dataset append {name} --resume'"
+                    if resumable
+                    else ""
+                )
+            )
+    LOGGER.warning(
+        "chess-ai: discarding the records an interrupted append left past version %d of dataset %r",
+        base.version,
+        name,
+    )
+    # The checkpoint first, so that a cut that stops part way leaves records that can only be
+    # discarded, and never a checkpoint counting records that are no longer there.
+    remove_checkpoint(directory)
+    cut_back(directory, base)
 
 
 def _check_workers(workers: int | None) -> None:
@@ -767,6 +1051,9 @@ def _report_rubble(data_dir: Path, name: str) -> None:
     three others is worth telling first.
     """
     for path in abandoned_partials(data_dir, name):
+        if has_checkpoint(path):
+            # An interrupted build, which resuming or discarding is the answer to, not this.
+            continue
         LOGGER.warning(
             "chess-ai: %s is a working directory of another build of %r — one that was killed, or "
             "one running elsewhere. It is not a dataset and nothing will read it; remove it once "
@@ -906,6 +1193,43 @@ class _Tally:
                 traceback.format_exception(type(error), error, error.__traceback__)
             )
 
+    def to_counts(self) -> Counts:
+        """This, as a checkpoint writes it down: every count by the name of what it counts."""
+        return Counts(
+            games_read=self.games_read,
+            results=_named(self.results),
+            time_controls=_named(self.time_controls),
+            rating_sources=_named(self.rating_sources),
+            ratings=dict(self.ratings),
+            ratings_unknown=self.ratings_unknown,
+            skipped=_named(self.skipped),
+            filtered=_named(self.filtered),
+            not_targets=_named(self.not_targets),
+            unexpected=self.unexpected,
+        )
+
+    @classmethod
+    def from_counts(cls, counts: Counts) -> "_Tally":
+        """The tally a checkpoint wrote down."""
+        return cls(
+            games_read=counts.games_read,
+            results=Counter({Result[key]: value for key, value in counts.results.items()}),
+            time_controls=Counter(
+                {TimeControl[key]: value for key, value in counts.time_controls.items()}
+            ),
+            rating_sources=Counter(
+                {RatingSource[key]: value for key, value in counts.rating_sources.items()}
+            ),
+            ratings=Counter(counts.ratings),
+            ratings_unknown=counts.ratings_unknown,
+            skipped=Counter({SkipReason[key]: value for key, value in counts.skipped.items()}),
+            filtered=Counter({FilterReason[key]: value for key, value in counts.filtered.items()}),
+            not_targets=Counter(
+                {FilterReason[key]: value for key, value in counts.not_targets.items()}
+            ),
+            unexpected=counts.unexpected,
+        )
+
     def add(self, other: "_Tally") -> None:
         """Take another tally's counts into this one."""
         self.games_read += other.games_read
@@ -932,6 +1256,8 @@ class _Job:
     source_offset: int = 0
     """How many sources the dataset had before this build's, which its games' source indices
     count on from."""
+    passing: int = 0
+    """How many games at the start of the piece a resumed build had read already."""
 
 
 @dataclass
@@ -995,6 +1321,16 @@ class _SourceTally:
     explained: bool = False
     """Whether this file has already been named as one being read the slow way."""
 
+    def saved(self) -> SourceState:
+        """This, as a checkpoint writes it down."""
+        return SourceState(
+            read=self.read,
+            kept=self.kept,
+            error=self.error,
+            went_away=self.went_away,
+            stopped=self.stopped,
+        )
+
 
 def _read_piece(job: _Job) -> _Read:
     """Read one piece of one PGN file into records. This is what runs in a worker process.
@@ -1018,7 +1354,9 @@ def _read_piece(job: _Job) -> _Read:
     # Applied here as well as in the parent: a worker started by spawn or forkserver rather than
     # fork inherits nothing, and a dump of millions of games has thousands of unreadable ones.
     with quiet_parser():
-        reading = games_in_piece(job.piece, skip=lambda headers: skips_moves(headers, screen))
+        reading = games_in_piece(
+            job.piece, skip=lambda headers: skips_moves(headers, screen), passing=job.passing
+        )
         while True:
             try:
                 # The offset is for a caller reading a piece itself; a worker reports one figure
@@ -1187,20 +1525,45 @@ class _Build:
         progress: ProgressCallback | None,
         filters: Filters,
         base: Manifest | None = None,
+        resume: Checkpoint | None = None,
     ) -> None:
-        """``base`` is the dataset being appended to, or ``None`` for a build of a new one."""
+        """``base`` is the dataset being appended to, or ``None`` for a build of a new one.
+
+        ``resume`` is the checkpoint of an interrupted build or append to carry on from, in
+        ``directory``; see :meth:`resuming`.
+        """
         self.filters = filters
         self.screen = filters.screen()
         self.base = base
-        self.writer = DatasetWriter(directory, shards, targets=self.screen.per_position, base=base)
+        self.resume = resume
+        self.writer = DatasetWriter(
+            directory,
+            shards,
+            targets=self.screen.per_position,
+            counts=(
+                resume.splits if resume is not None else base.splits if base is not None else None
+            ),
+        )
         self._source_offset = len(base.sources) if base is not None else 0
         self._games_before = base.games if base is not None else 0
         self._positions_before = base.positions if base is not None else 0
         self._sources = list(sources)
-        self._fingerprints: list[tuple[str | None, str | None]] = [
-            (None, dump_month(source.path.name)) for source in sources
-        ]
+        self._fingerprints: list[tuple[str | None, str | None]] = (
+            [(source.sha256, source.month) for source in resume.sources]
+            if resume is not None
+            else [(None, dump_month(source.path.name)) for source in sources]
+        )
         """Each source's SHA-256 and Lichess month; see :meth:`fingerprint`."""
+        self._named = (
+            [source.path for source in resume.sources]
+            if resume is not None
+            else [str(source.path) for source in sources]
+        )
+        """Each source's path as it was given, which the manifest records whichever directory a
+        resumed build runs in; the sources themselves are read by their absolute paths."""
+        self._started_at = resume.started if resume is not None else datetime.now(UTC)
+        """When the build started, which a checkpoint says to tell one interrupted build from
+        another; a resumed one is the build it carries on."""
         self.shards = shards
         self.rating_source = rating_source
         self.validation_fraction = validation_fraction
@@ -1211,6 +1574,8 @@ class _Build:
         """When the current phase started: the checksums, then the reading. A rate and a time
         left are worked out from this, so the checksums do not count as time spent reading."""
         self._bytes_total = sum(source.bytes for source in sources)
+        self._hash_total = self._bytes_total
+        """The bytes the checksums are taken of, which a resumed build takes of fewer sources."""
         self._bytes_before = 0
         """Bytes of the sources already finished, which the current file's count adds to."""
         self._bytes_read = 0
@@ -1219,6 +1584,74 @@ class _Build:
         self._said_unexpected = False
         self.full = False
         """Whether the build has kept its ``max_games`` and reads no further."""
+        self.states: dict[int, _SourceTally] = {}
+        """What has become of each source the reading has reached."""
+        self._position = (0, 0, 0)
+        """Where the reading is: the source, the start of the piece of it being read, and how many
+        games of that piece are in the dataset. What a checkpoint says to carry on from."""
+        self.parallel = False
+        """Whether the sources are read a piece at a time in several processes."""
+        self._checkpointed_at = 0.0
+        self._catching_up = resume is not None
+        """Whether a resumed build is still getting back to where it was, which is not reading;
+        see :meth:`_caught_up`."""
+        self._games_resumed = 0
+        self._bytes_resumed = 0
+        if resume is not None:
+            self.tally = _Tally.from_counts(resume.counts)
+            self._said_unexpected = self.tally.unexpected is not None
+            self.full = resume.full
+            self.states = {
+                index: _SourceTally(
+                    read=state.read,
+                    kept=state.kept,
+                    error=state.error,
+                    went_away=state.went_away,
+                    stopped=state.stopped,
+                )
+                for index, state in enumerate(resume.states)
+            }
+            self._position = (resume.source, resume.offset, resume.passing)
+            self.parallel = resume.parallel
+            self._bytes_read = self._bytes_resumed = resume.bytes_read
+            self._games_resumed = self.tally.games_read
+            self._bytes_before = sum(source.bytes for source in sources[: resume.source])
+
+    @classmethod
+    def resuming(
+        cls,
+        directory: Path,
+        checkpoint: Checkpoint,
+        *,
+        progress: ProgressCallback | None,
+        base: Manifest | None = None,
+    ) -> "_Build":
+        """A build carrying on from ``checkpoint``, with the sources and settings it was started
+        with. ``base`` is the dataset an append was appending to, or ``None`` for a build.
+
+        Raises :exc:`~chess_ai.dataset.store.DatasetError` for a checkpoint that cannot be carried
+        on from: one of another dataset, one whose records are not all on the disk, or one whose
+        sources are not the size they were. The checksums are compared when the build runs.
+        """
+        _check_resumable(directory, checkpoint, base)
+        return cls(
+            directory=directory,
+            shards=checkpoint.shards,
+            sources=[
+                Source(path=Path(source.absolute), bytes=source.bytes)
+                for source in checkpoint.sources
+            ],
+            rating_source=(
+                None
+                if checkpoint.rating_source == AUTO_RATING_SOURCE
+                else RatingSource[checkpoint.rating_source.upper()]
+            ),
+            validation_fraction=checkpoint.validation_fraction,
+            progress=progress,
+            filters=checkpoint.filters,
+            base=base,
+            resume=checkpoint,
+        )
 
     @property
     def kept(self) -> int:
@@ -1235,9 +1668,21 @@ class _Build:
 
         The manifest that comes back is the dataset with this build's version on the end. Writing
         it is the caller's, since only the caller knows where it goes.
+
+        A resumed build checks that its sources are the files it was reading, cuts the dataset
+        back to what its checkpoint counts, and reads on from there. Its sources were checked
+        for repeats when it started.
         """
         self.fingerprint()
-        if not allow_repeat:
+        workers = default_workers() if workers is None else workers
+        if self.resume is not None:
+            assert self.writer.directory.is_dir()
+            # Only now, after the checksums: a build refused for a source that changed has not
+            # touched the records it would have been carried on from.
+            cut_back_to(self.writer.directory, self.resume.shards, self.resume.splits)
+        else:
+            self.parallel = workers > 1 and self._bytes_total >= PARALLEL_FROM_BYTES
+        if self.resume is None and not allow_repeat:
             # Only sources something was read from. One a build never opened, because it was full
             # before getting there, or one that went away before giving a game, has none of its
             # games in the dataset, and appending it is how they get there. One that was read and
@@ -1252,14 +1697,17 @@ class _Build:
                 name,
                 known,
                 [
-                    self._source_info(index, source, read=0, kept=0)
+                    self._source_info(index, source, None)
                     for index, source in enumerate(self._sources)
                 ],
             )
         with self.writer, quiet_parser():
-            self.read_sources(
-                self._sources, workers=default_workers() if workers is None else workers
-            )
+            if self.resume is None:
+                # Before a record is written, so that whatever an interrupted build leaves past
+                # the end of a dataset has a checkpoint saying what it is.
+                self.states[0] = _SourceTally()
+                self.checkpoint(force=True)
+            self.read_sources(self._sources, workers=workers)
             return self.manifest(name=name, created=now if now is not None else datetime.now(UTC))
 
     def fingerprint(self) -> None:
@@ -1269,9 +1717,21 @@ class _Build:
         start rather than hours into reading it. A pass over every byte, at the speed of the disk:
         tens of seconds for a Lichess month. A file that cannot be read has none, and is counted
         as unreadable when the reading gets to it, as it always was.
+
+        A resumed build takes them again of the sources it has still to read, and refuses to go on
+        if any is not the file it was: reading on from an offset into other bytes would put games
+        in the dataset that are not in any file, or the same games twice.
         """
-        if not self._sources:
+        indices = list(range(len(self._sources)))
+        if self.resume is not None:
+            indices = [
+                index
+                for index in indices[self.resume.source :]
+                if not (index == self.resume.source and self.states[index].stopped)
+            ]
+        if not indices:
             return
+        self._hash_total = sum(self._sources[index].bytes for index in indices)
         hashed = 0
         reported = 0
 
@@ -1284,38 +1744,42 @@ class _Build:
                 self.report(hashing=True)
 
         self.report(hashing=True)
-        for index, source in enumerate(self._sources):
+        for index in indices:
+            source = self._sources[index]
             before = hashed
             try:
                 digest = sha256_of(source.path, on_read)
             except OSError:
                 digest = None
             hashed = before + source.bytes
-            self._fingerprints[index] = (digest, self._fingerprints[index][1])
-        self._bytes_read = 0
+            if self.resume is None:
+                self._fingerprints[index] = (digest, self._fingerprints[index][1])
+            elif digest != self._fingerprints[index][0]:
+                raise DatasetError(
+                    f"{source.path} is not the file the interrupted "
+                    f"{'append' if self.base is not None else 'build'} was reading: "
+                    + ("it cannot be read" if digest is None else "its contents have changed")
+                    + ". Put that file back to carry it on, or discard it with "
+                    "--discard-interrupted"
+                )
+        self._bytes_read = self._bytes_resumed
+        self._hash_total = self._bytes_total
         self._started = time.monotonic()
 
-    def _source_info(
-        self,
-        index: int,
-        source: Source,
-        *,
-        read: int,
-        kept: int,
-        error: str | None = None,
-        went_away: bool = False,
-    ) -> SourceInfo:
-        """What the manifest says about source ``index`` of this build."""
+    def _source_info(self, index: int, source: Source, state: "_SourceTally | None") -> SourceInfo:
+        """What the manifest says about source ``index`` of this build, which made ``state`` of
+        it; ``None`` for one it never reached."""
+        state = state if state is not None else _SourceTally()
         sha256, month = self._fingerprints[index]
         return SourceInfo(
-            path=str(source.path),
+            path=self._named[index],
             bytes=source.bytes,
-            games_read=read,
-            games_kept=kept,
-            error=error,
+            games_read=state.read,
+            games_kept=state.kept,
+            error=state.error,
             sha256=sha256,
             month=month,
-            went_away=went_away,
+            went_away=state.went_away,
         )
 
     def _skip(self, headers: chess.pgn.Headers) -> bool:
@@ -1325,21 +1789,34 @@ class _Build:
         """Read every source into the dataset, in this process or in ``workers`` of them.
 
         One process below :data:`PARALLEL_FROM_BYTES` of input whatever was asked for, because
-        starting processes for a directory of exports costs more than reading it does.
+        starting processes for a directory of exports costs more than reading it does. Which of
+        the two was decided when the build started, and a resumed build keeps to it.
         """
-        if workers > 1 and self._bytes_total >= PARALLEL_FROM_BYTES:
+        if self.parallel:
             self._read_in_parallel(sources, workers=workers)
             return
         # Before the first source, as the parallel path does, so there is a line on the screen
         # from the first moment rather than from the 128th game: _read_games reports on its own
         # cadence, and a source that gives no games never reaches it at all.
         self.report()
+        resumed_at = self.resume.source if self.resume is not None else 0
         for index, source in enumerate(sources):
-            if self.full:
-                # Never opened, and not missing anything: the build had what it was asked for.
-                self.sources.append(self._source_info(index, source, read=0, kept=0))
+            state = self.states.get(index)
+            if index < resumed_at or self.full:
+                # Finished by the build this one resumes, or never opened and not missing
+                # anything: the build had what it was asked for.
+                self.sources.append(self._source_info(index, source, state))
                 continue
-            self.read_source(source, index)
+            if state is not None and state.stopped:
+                # Given up on by the build this one resumes.
+                self._bytes_before += source.bytes
+                self.sources.append(self._source_info(index, source, state))
+                continue
+            if state is None:
+                state = self.states[index] = _SourceTally()
+            self._position = (index, 0, state.read)
+            self.checkpoint()
+            self.read_source(source, index, state)
 
     def _read_in_parallel(self, sources: Sequence[Source], *, workers: int) -> None:
         """Read the sources with ``workers`` processes parsing pieces of them at once.
@@ -1369,22 +1846,31 @@ class _Build:
         for index, source in enumerate(sources):
             before[index] = running
             running += source.bytes
-        found = {index: _SourceTally() for index in range(len(sources))}
+        found = self.states
+        for index in range(len(sources)):
+            found.setdefault(index, _SourceTally())
+        resumed_at, offset, passing = self._position if self.resume is not None else (0, 0, 0)
         jobs: list[Iterable[_Job]] = []
         # Before the cutting rather than after it, so there is a line on the screen from the
         # first moment. It says zeros until a piece comes back, which is what is true: the
         # bytes it counts are bytes games have been read from, and cutting has read none.
         self.report(scanning=True)
         for index, source in enumerate(sources):
+            if index < resumed_at or found[index].stopped:
+                # Read by the build this one resumes, or given up on by it.
+                continue
+            at, past = (offset, passing) if index == resumed_at else (0, 0)
             try:
                 if source.compressed:
                     # Cut as it is read, since it cannot be cut any other way; see text_pieces.
                     # Opened here all the same, so that a file that cannot be read at all is
                     # counted as one, just as cutting a plain file counts it.
                     _try_opening(source)
-                    jobs.append(self._text_jobs(source, index, found[index]))
+                    jobs.append(self._text_jobs(source, index, found[index], at, past))
                     continue
-                pieces = game_ranges(source, index, CHUNK_BYTES, on_scan=self._scanning())
+                pieces = _from(
+                    game_ranges(source, index, CHUNK_BYTES, on_scan=self._scanning()), at, source
+                )
             except DatasetError as e:
                 # The file cannot be read at all, which is what PgnReader.open failing means in
                 # the serial path, and gets the same answer: counted, and not the end of a build.
@@ -1392,7 +1878,9 @@ class _Build:
                 found[index].went_away = True
                 LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
                 continue
-            jobs.append([self._job(piece) for piece in pieces])
+            jobs.append(
+                [self._job(piece, passing=past if piece.start == at else 0) for piece in pieces]
+            )
             # Cutting a well-formed file reads under a percent of it and is over in
             # milliseconds, but a file with no boundary in it is scanned to the end before it
             # yields its single piece -- 300 MB/s, so half a minute for a Lichess month and
@@ -1414,7 +1902,7 @@ class _Build:
         try:
             for outcome in _in_order(
                 pool,
-                chain.from_iterable(jobs),
+                self._handing_out(chain.from_iterable(jobs)),
                 in_flight=workers * IN_FLIGHT_PER_WORKER,
                 wanted=lambda job: not found[job.piece.source].stopped and not self.full,
             ):
@@ -1435,6 +1923,11 @@ class _Build:
                     if isinstance(outcome, _Job):
                         self._read_here(outcome, state, before=before[index])
                     else:
+                        # Caught up already: as this piece was handed out, or by _read_here once
+                        # the stretch before it had passed its games, whether or not any game
+                        # followed them. A no-op unless the first piece had games to pass and went
+                        # to a worker, which only piece sizes changed between the two runs can do.
+                        self._caught_up()
                         self._take(outcome, state)
                 self._bytes_read = (
                     self._bytes_total
@@ -1443,6 +1936,11 @@ class _Build:
                     + (sources[index].bytes if state.stopped else outcome.piece.end)
                 )
                 self.report()
+                if not isinstance(outcome.piece, CompressedTail):
+                    # The next piece of the file starts where this one stopped. A tail has no
+                    # next piece, and _read_here left the place in it as it went.
+                    self._position = (index, _after(outcome.piece), 0)
+                self.checkpoint()
         except BrokenProcessPool as e:
             # Every way a worker can stop answering arrives here, and the common one is not the
             # one worth advising about: a Ctrl-C goes to the whole process group, so the workers
@@ -1460,43 +1958,72 @@ class _Build:
             # this build is being cleared up after.
             pool.shutdown(wait=True, cancel_futures=True)
         for index, source in enumerate(sources):
-            state = found[index]
-            self.sources.append(
-                self._source_info(
-                    index,
-                    source,
-                    read=state.read,
-                    kept=state.kept,
-                    error=state.error,
-                    went_away=state.went_away,
-                )
-            )
+            self.sources.append(self._source_info(index, source, found[index]))
         self._bytes_read = self._bytes_total
 
-    def _job(self, piece: Piece) -> _Job:
-        """What a worker is told to read ``piece``."""
+    def _handing_out(self, jobs: Iterator[_Job]) -> Iterator[_Job]:
+        """``jobs``, with the reading's clock restarted as the first is handed out.
+
+        At that moment a resumed build is back at its place: a compressed file has been
+        decompressed up to it, and a plain one had nothing to catch up. Restarted any later, when
+        the first piece comes back, the whole first wave of pieces -- one per worker, read in the
+        same seconds -- counted as read in no time, and the time left started out near zero.
+
+        Not for a first piece that has games to pass first, which is a stretch read in this
+        process: :meth:`_read_here` restarts it once they are passed. Decided by the first job
+        alone, because :func:`_in_order` pulls a batch before it reads any: a later piece of the
+        batch restarting it would count the passing as reading again. The workers start on those
+        pieces while the games are passed, so the restart is a little late, which is the smaller
+        error.
+        """
+        first = True
+        for job in jobs:
+            if first and not job.passing:
+                self._caught_up()
+            first = False
+            yield job
+
+    def _job(self, piece: Piece, passing: int = 0) -> _Job:
+        """What a worker is told to read ``piece``, past its first ``passing`` games."""
         return _Job(
             piece=piece,
             rating_source=self.rating_source,
             validation_fraction=self.validation_fraction,
             screen=self.screen,
             source_offset=self._source_offset,
+            passing=passing,
         )
 
-    def _text_jobs(self, source: Source, index: int, state: _SourceTally) -> Iterator[_Job]:
+    def _text_jobs(
+        self, source: Source, index: int, state: _SourceTally, at: int = 0, passing: int = 0
+    ) -> Iterator[_Job]:
         """The jobs of a compressed file, cut as its text is decompressed in this process.
 
         Stops decompressing when the build is full or an earlier piece of the file gave up, as
         ``wanted`` stops handing out the pieces of a plain file: neither has a use for the rest.
+
+        ``at`` is where in the text a resumed build carries on, which has to be where a piece
+        starts, and ``passing`` how many games of that piece it had read. The text before it is
+        decompressed and cut again, without being read; see :func:`text_pieces`.
         """
+        first = True
         for piece in text_pieces(
             source,
             index,
             CHUNK_BYTES,
             MAX_PIECE_BYTES,
             stop=lambda: state.stopped or self.full,
+            resume_at=at,
+            on_passing=lambda: self.report(scanning=True),
         ):
-            yield self._job(piece)
+            if first and at and piece.start != at:
+                raise DatasetError(
+                    f"{source.path} no longer cuts where the interrupted build's checkpoint says "
+                    f"it was, at {at:,} bytes into its text; discard it with "
+                    "--discard-interrupted"
+                )
+            yield self._job(piece, passing=passing if first else 0)
+            first = False
 
     def _take(self, read: _Read, state: _SourceTally) -> None:
         """Write one worker's piece into the dataset, and take its counts into the build's.
@@ -1626,8 +2153,13 @@ class _Build:
                 "the rest of the file" if isinstance(job.piece, CompressedTail) else "that stretch",
             )
         reading = games_in_piece(
-            job.piece, on_read=self._reading(before, job.piece.end), skip=self._skip
+            job.piece,
+            on_read=self._reading(before, job.piece.end),
+            skip=self._skip,
+            passing=job.passing,
+            on_passing=lambda _: self.report(scanning=True),
         )
+        here = job.passing
         while True:
             if self.full:
                 return
@@ -1644,14 +2176,26 @@ class _Build:
                 state.went_away = isinstance(e, OSError)
                 state.stopped = True
                 return
+            finally:
+                # The first of these is what passes the games a resumed build had read, and
+                # however it ends -- a game, the end of the stretch, a failure -- the build is
+                # back at its place. Left to the first game, a stretch with none past its place
+                # left the restart to the first piece a worker handed back, and the wave of
+                # pieces read meanwhile counted as read in no time.
+                self._caught_up()
             state.read += 1
+            here += 1
             self.tally.games_read += 1
             state.kept += self._add_game(record, job.piece.source)
             if state.read % REPORT_EVERY == 0:
                 self._bytes_read = before + position
                 self.report()
+            # A stretch like this can be a whole file read for hours, so it is checkpointed as it
+            # goes, by how many of its games are in.
+            self._position = (job.piece.source, job.piece.start, here)
+            self.checkpoint()
 
-    def read_source(self, source: Source, index: int) -> None:
+    def read_source(self, source: Source, index: int, state: _SourceTally) -> None:
         """Read every game in one file into the dataset, whatever the file turns out to hold.
 
         What goes wrong in the *file* is counted and the rest of the file given up on. What goes
@@ -1659,10 +2203,6 @@ class _Build:
         not this method's to forgive: it ends the build, because counting it as one skipped game
         would abandon the rest of the file and then report a clean build over what was lost.
         """
-        read = 0
-        kept = 0
-        error: str | None = None
-        went_away = False
         reader = PgnReader(
             source, on_read=self._reading(self._bytes_before, source.bytes), skip=self._skip
         )
@@ -1676,12 +2216,13 @@ class _Build:
             # it is opened hours later, so this is a file that went away or changed hands rather
             # than one that was never there: resolve_sources refuses those up front. Hours of
             # reading is not worth throwing away over one file of a hundred.
-            error = str(e)
-            went_away = True
+            state.error = str(e)
+            state.went_away = True
+            state.stopped = True
             LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
         else:
             try:
-                read, kept, error, went_away = self._read_games(reader, index)
+                self._read_games(reader, index, state)
             finally:
                 reader.close()
         self._bytes_before += source.bytes
@@ -1690,29 +2231,28 @@ class _Build:
         # are read bytes. Without this a source that gave nothing passes in silence -- which for
         # a 20 GB file that is not PGN is the whole read with a blank terminal.
         self.report()
-        self.sources.append(
-            self._source_info(index, source, read=read, kept=kept, error=error, went_away=went_away)
-        )
+        self.sources.append(self._source_info(index, source, state))
 
-    def _read_games(self, reader: PgnReader, index: int) -> tuple[int, int, str | None, bool]:
-        """Read an open file's games: how many it held, how many were kept, why not, and whose
-        fault it was.
+    def _read_games(self, reader: PgnReader, index: int, state: _SourceTally) -> None:
+        """Read an open file's games into ``state``: how many it held, how many were kept, why
+        not, and whose fault it was.
+
+        A resumed build passes over the games of the file it had read already, which is
+        ``state.read`` of them.
 
         Only the parsing of each game is forgiven here. Everything the loop body does — writing
         the records, counting them — is outside that, because a write failure is not a broken
         game: counted as one it would abandon the rest of the file and then report a clean build
         over what was lost.
         """
-        read = 0
-        kept = 0
-        games = reader.games()
+        games = reader.games(state.read, on_passing=lambda _: self.report(scanning=True))
         while True:
             if self.full:
-                return read, kept, None, False
+                return
             try:
                 record = next(games)
             except StopIteration:
-                return read, kept, None, False
+                return
             except Exception as e:
                 # The file stopped, mid-game. What was read is kept, the rest of the file is not,
                 # and the count says a game was lost. Whether the file went away or the chess in
@@ -1721,18 +2261,25 @@ class _Build:
                 # file, and anything else is what the parser found in it.
                 self._note_failure(e)
                 self.tally.skipped[SkipReason.UNREADABLE] += 1
-                why = f"stopped reading after {read} games: {_described(e)}"
-                return read, kept, why, isinstance(e, OSError)
-            read += 1
+                state.error = f"stopped reading after {state.read} games: {_described(e)}"
+                state.went_away = isinstance(e, OSError)
+                state.stopped = True
+                return
+            finally:
+                # As in _read_here: back at its place however the passing ended.
+                self._caught_up()
+            state.read += 1
             self.tally.games_read += 1
             # Clamped for the same reason the cut is: the reader follows the file to its real end
             # and the source's size is the one recorded when the build started, so a file that
             # grew in between would count into the next source's share -- past the total, for
             # the last one, and the estimate below zero -- and then step back when it finished.
             self._bytes_read = self._bytes_before + min(reader.bytes_read, reader.source.bytes)
-            kept += self._add_game(record, index)
-            if read % REPORT_EVERY == 0:
+            state.kept += self._add_game(record, index)
+            if state.read % REPORT_EVERY == 0:
                 self.report()
+            self._position = (index, 0, state.read)
+            self.checkpoint()
 
     def _add_game(self, record: chess.pgn.Game, index: int) -> int:
         """Add one game, or count why it could not be added. Returns 1 if it was kept."""
@@ -1810,7 +2357,7 @@ class _Build:
                     positions=sum(split.positions for split in self.writer.splits.values())
                     - self._positions_before,
                     bytes_read=self._bytes_total if done else self._bytes_read,
-                    bytes_total=self._bytes_total,
+                    bytes_total=self._hash_total if hashing else self._bytes_total,
                     # Always the whole build's, which a printer throttles on and so must never go
                     # back; the phase's own time is beside it, for the rate and the time left.
                     seconds=now - self._began,
@@ -1818,6 +2365,8 @@ class _Build:
                     done=done,
                     scanning=scanning,
                     hashing=hashing,
+                    games_before=self._games_resumed,
+                    bytes_before=0 if hashing else self._bytes_resumed,
                 )
             )
         except Exception as e:
@@ -1826,6 +2375,72 @@ class _Build:
                 "chess-ai: progress reporting stopped, and the build carries on: %s",
                 _described(e),
             )
+
+    def _caught_up(self) -> None:
+        """Start the reading's clock again, the first time a resumed build reads past its place.
+
+        Getting back there is minutes of decompressing a dump or passing over games, in which
+        nothing new is read. Timed as reading, it made the time left for a build resumed at 90%
+        come out at about six times what it was. Called before the first game past the place
+        is counted, so the counts the rate leaves out are still the ones it was resumed with.
+        """
+        if self._catching_up:
+            self._catching_up = False
+            self._started = time.monotonic()
+
+    def checkpoint(self, *, force: bool = False) -> None:
+        """Write down where the build has got to, if it has been :data:`CHECKPOINT_SECONDS` since
+        it last did, so that it can be carried on from here if it stops.
+
+        Called only where everything the reading has done is in the dataset, and nothing it has
+        not: between pieces, between games. The records are flushed to the disk first, since a
+        checkpoint counting records the disk lost is one that cannot be carried on from.
+        """
+        now = time.monotonic()
+        if not force and now - self._checkpointed_at < CHECKPOINT_SECONDS:
+            return
+        self._checkpointed_at = now
+        self.writer.flush()
+        source, offset, passing = self._position
+        Checkpoint(
+            format_version=FORMAT_VERSION,
+            version=self.base.version + 1 if self.base is not None else 1,
+            base_created=self.base.created if self.base is not None else None,
+            started=self._started_at,
+            validation_fraction=self.validation_fraction,
+            rating_source=self._rating_source_name,
+            filters=self.filters,
+            shards=self.shards,
+            sources=[
+                PlannedSource(
+                    path=named,
+                    absolute=str(item.path.absolute()),
+                    bytes=item.bytes,
+                    sha256=sha256,
+                    month=month,
+                )
+                for item, named, (sha256, month) in zip(
+                    self._sources, self._named, self._fingerprints, strict=True
+                )
+            ],
+            parallel=self.parallel,
+            splits={split: writer.counts for split, writer in self.writer.splits.items()},
+            source=source,
+            offset=offset,
+            passing=passing,
+            states=[
+                self.states.get(index, _SourceTally()).saved()
+                for index in range(min(source + 1, len(self._sources)))
+            ],
+            counts=self.tally.to_counts(),
+            bytes_read=self._bytes_read,
+            full=self.full,
+        ).save(self.writer.directory)
+
+    @property
+    def _rating_source_name(self) -> str:
+        """The rating source as a manifest and a checkpoint write it."""
+        return AUTO_RATING_SOURCE if self.rating_source is None else self.rating_source.name.lower()
 
     def manifest(self, *, name: str, created: datetime) -> Manifest:
         """Everything now known about the dataset: what it was, and this build's version of it."""
@@ -1872,11 +2487,7 @@ class _Build:
             created=created if self.base is None else self.base.created,
             move_vocabulary_size=VOCABULARY_SIZE,
             validation_fraction=self.validation_fraction,
-            rating_source=(
-                AUTO_RATING_SOURCE
-                if self.rating_source is None
-                else self.rating_source.name.lower()
-            ),
+            rating_source=self._rating_source_name,
             filters=self.filters,
             shards=self.shards,
             versions=[*(self.base.versions if self.base is not None else []), version],
@@ -1892,6 +2503,96 @@ def _added(writer: SplitWriter, before: SplitCounts | None) -> SplitCounts:
         positions=writer.positions - before.positions,
         targets=None if targets is None else targets - before.trained_on,
     )
+
+
+def _named(counts: Counter) -> dict[str, int]:
+    """Counted enum members by name, as a checkpoint writes them; see :meth:`_Tally.to_counts`."""
+    return {member.name: count for member, count in counts.items() if count}
+
+
+def _after(piece: ByteRange | TextPiece) -> int:
+    """Where the piece of a file after ``piece`` starts, in the units a checkpoint counts in."""
+    return piece.end if isinstance(piece, ByteRange) else piece.stop
+
+
+def _from(pieces: list[ByteRange], at: int, source: Source) -> list[ByteRange]:
+    """The pieces of a plain file from ``at`` on, where a resumed build carries on reading it.
+
+    ``at`` was where a piece started when the build was interrupted, and a file cut the same way
+    is cut the same again. If no piece starts there now, something about the cutting has changed
+    and carrying on would leave games out or read some twice, so it is refused.
+    """
+    if not at:
+        return pieces
+    if at < (pieces[-1].end if pieces else 0) and not any(piece.start == at for piece in pieces):
+        raise DatasetError(
+            f"{source.path} no longer cuts where the interrupted build's checkpoint says it was, "
+            f"at byte {at:,}; discard it with --discard-interrupted"
+        )
+    return [piece for piece in pieces if piece.start >= at]
+
+
+def _check_resumable(directory: Path, checkpoint: Checkpoint, base: Manifest | None) -> None:
+    """Refuse a checkpoint that cannot be carried on from in ``directory``, before anything is
+    read or changed. Whether its sources are the same files is checked by their checksums later.
+    """
+    doing = "append" if base is not None else "build"
+    discard = f"discard the interrupted {doing} with --discard-interrupted"
+    if checkpoint.format_version != FORMAT_VERSION:
+        raise DatasetError(
+            f"the interrupted {doing} wrote records of format version "
+            f"{checkpoint.format_version}, and this code writes version {FORMAT_VERSION}; "
+            + discard
+        )
+    if base is not None and (
+        checkpoint.version != base.version + 1 or checkpoint.base_created != base.created
+    ):
+        raise DatasetError(
+            f"the checkpoint in {directory} is of an append to another dataset {base.name!r} "
+            f"than the one there now; {discard}"
+        )
+    sources = len(checkpoint.sources)
+    if checkpoint.source > sources or len(checkpoint.states) != min(checkpoint.source + 1, sources):
+        raise DatasetError(f"the checkpoint in {directory} does not add up; {discard}")
+    if base is not None and any(
+        counts.games < before.games
+        or counts.positions < before.positions
+        or counts.trained_on < before.trained_on
+        for split, before in base.splits.items()
+        for counts in [checkpoint.splits.get(split, SplitCounts())]
+    ):
+        # Cutting back to it would cut into the versions before it, which are other runs' data.
+        raise DatasetError(
+            f"the checkpoint in {directory} counts fewer records than version {base.version} "
+            f"has; {discard}"
+        )
+    missing = records_missing(directory, checkpoint.shards, checkpoint.splits)
+    if missing:
+        raise DatasetError(
+            f"the records the interrupted {doing} wrote are not all there any more, in "
+            f"{missing[0]} and {len(missing) - 1} other stream(s); {discard}"
+            if len(missing) > 1
+            else f"the records the interrupted {doing} wrote are not all there any more, in "
+            f"{missing[0]}; {discard}"
+        )
+    for index, source in enumerate(checkpoint.sources):
+        if index < checkpoint.source or (
+            index == checkpoint.source and index < sources and checkpoint.states[index].stopped
+        ):
+            continue
+        try:
+            size = Path(source.absolute).stat().st_size
+        except OSError as e:
+            raise DatasetError(
+                f"cannot read {source.absolute}, which the interrupted {doing} had still to read: "
+                f"{e.strerror}. Put it back to carry the {doing} on, or {discard}"
+            ) from e
+        if size != source.bytes:
+            raise DatasetError(
+                f"{source.absolute} is not the file the interrupted {doing} was reading: it was "
+                f"{source.bytes:,} bytes and is {size:,}. Put that file back to carry the "
+                f"{doing} on, or {discard}"
+            )
 
 
 def _try_opening(source: Source) -> None:

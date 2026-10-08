@@ -380,9 +380,33 @@ it anyway. A build refuses the same file named twice under two names in the same
 
 An append holds the dataset's lock, and runs reading the dataset are not disturbed by it. The
 manifest is written last, so an append that is killed leaves records past the last version that
-nothing reads; the next append refuses to start over them until it is told
-`--discard-interrupted`, which cuts them off. `dataset stats` lists the versions, and
-`dataset stats NAME --version N` describes an earlier one.
+nothing reads. `dataset stats` lists the versions, and `dataset stats NAME --version N` describes
+an earlier one.
+
+#### Resuming an interrupted build or append
+
+A build or append writes a checkpoint about once a minute, after flushing what it has written to
+the disk. One that stops part way, whether it was interrupted, killed, or ran out of disk or
+memory, can be carried on from its last checkpoint rather than started again:
+
+```sh
+uv run chess-ai dataset append lichess-2024-q1 --resume
+uv run chess-ai dataset build lichess-2024-q1 --resume
+```
+
+A resume takes no files or filters. It reads the same sources with the same settings, and checks
+the SHA-256 of each file it still has to read against the one taken when it started; a file that
+changed is refused. The dataset comes out the same, to the byte, as one that was never
+interrupted. Carrying on in a plain file is a seek. A `.pgn.zst` file is decompressed again from
+its start up to the checkpoint, which takes minutes for a Lichess month. A build whose files could
+not be cut into pieces reads past the games it had read already.
+
+An interrupted build keeps its working directory (`.NAME.<id>.partial` beside the datasets)
+until it is resumed or discarded. An interrupted append's records stay past the last version.
+Starting a different build or append over one asks whether to discard it, but only on a terminal;
+otherwise it is refused, and `--discard-interrupted` says to throw the interrupted one away
+without asking. Records are never left in the middle of a dataset: discarding cuts them off, and
+the previous version is left exactly as it was.
 
 ### Train a model
 
