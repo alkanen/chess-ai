@@ -579,4 +579,73 @@ describe('Board', () => {
       expect(ys).toEqual(['700', '600', '500', '400']);
     });
   });
+
+  describe('arrows', () => {
+    const arrows = [
+      { from: 'g1', to: 'f3', weight: 0.2, played: false },
+      { from: 'e2', to: 'e4', weight: 0.7, played: true },
+    ];
+
+    function drawn(container: HTMLElement) {
+      return Array.from(container.querySelectorAll('.thought-arrow')).map((arrow) => [
+        arrow.getAttribute('data-from'),
+        arrow.getAttribute('data-to'),
+        arrow.classList.contains('played'),
+      ]);
+    }
+
+    /** The first point of an arrow's outline, which is beside the centre it starts from. */
+    function start(container: HTMLElement, from: string): [number, number] {
+      const points = container
+        .querySelector(`.thought-arrow[data-from="${from}"]`)
+        ?.getAttribute('points');
+      const [x, y] = (points ?? '').split(' ')[0].split(',').map(Number);
+      return [x, y];
+    }
+
+    it('draws each move it is given, marking the one played', () => {
+      const { container } = render(
+        <Board snapshot={startPosition as PositionSnapshot} arrows={arrows} />,
+      );
+      expect(drawn(container)).toEqual([
+        ['g1', 'f3', false],
+        ['e2', 'e4', true],
+      ]);
+    });
+
+    it('draws a likelier move more heavily', () => {
+      const { container } = render(
+        <Board snapshot={startPosition as PositionSnapshot} arrows={arrows} />,
+      );
+      const opacity = (from: string) =>
+        Number(
+          container.querySelector(`.thought-arrow[data-from="${from}"]`)?.getAttribute('opacity'),
+        );
+      expect(opacity('e2')).toBeGreaterThan(opacity('g1'));
+    });
+
+    it('starts each arrow at its square whichever way round the board is', () => {
+      const white = render(<Board snapshot={startPosition as PositionSnapshot} arrows={arrows} />);
+      // e2's centre is (450, 650) with White at the bottom, and (350, 150) turned round.
+      const [wx, wy] = start(white.container, 'e2');
+      expect(Math.abs(wx - 450)).toBeLessThan(20);
+      expect(wy).toBe(650);
+      white.unmount();
+      const black = render(
+        <Board
+          snapshot={startPosition as PositionSnapshot}
+          orientation="black"
+          arrows={arrows}
+        />,
+      );
+      const [bx, by] = start(black.container, 'e2');
+      expect(Math.abs(bx - 350)).toBeLessThan(20);
+      expect(by).toBe(150);
+    });
+
+    it('draws none by default', () => {
+      const { container } = render(<Board snapshot={startPosition as PositionSnapshot} />);
+      expect(drawn(container)).toEqual([]);
+    });
+  });
 });

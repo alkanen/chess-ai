@@ -155,8 +155,15 @@ def replay(events: Sequence[GameEvent]) -> GameState:
         if event.type == "request":
             game.request = event.request
             continue
-        # Whatever happens next in the game is an answer to any request made before it.
+        if event.type == "considering":
+            # About the position the game stands in, and over once it moves on.
+            assert event.considering.ply == len(game.moves)
+            game.considering = event.considering
+            continue
+        # Whatever happens next in the game is an answer to any request made before it, and
+        # ends whatever the player on move was considering.
         game.request = None
+        game.considering = None
         if event.type == "game_over":
             # Nothing happens in a game after it has been resigned or aborted.
             assert index == len(rest) - 1

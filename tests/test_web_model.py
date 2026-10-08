@@ -595,3 +595,41 @@ def test_a_checkpoint_deleted_while_the_server_was_down_pauses_the_game(tmp_path
         paused = pause(after, links, runs)
 
     assert paused["type"] == "paused"
+
+
+def test_a_checkpoint_waiting_out_the_move_delay_shows_watchers_what_it_is_considering(
+    client, monkeypatch
+):
+    from chess_ai.web.game_store import GameStore
+
+    written = []
+    real_write = GameStore.write
+    monkeypatch.setattr(
+        GameStore, "write", lambda self, game: (written.append(game), real_write(self, game))[1]
+    )
+    started = start(
+        client, {"kind": "human"}, model(checkpoint="latest", rating=1600), move_delay=0.5
+    )
+    links = started.json()["links"]
+
+    with (
+        watching(client, started) as watcher,
+        client.websocket_connect(f"{PREFIX}/api/games/{links['white']}/ws") as white,
+    ):
+        assert watcher.receive_json()["type"] == "state"
+        assert white.receive_json()["type"] == "state"
+        white.send_json({"type": "move", "uci": "e2e4"})
+        assert watcher.receive_json()["type"] == "move"
+        writes_before = len(written)
+        considering = watcher.receive_json()
+        assert considering["type"] == "considering"
+        assert len(written) == writes_before, "nothing stored changes, so nothing is written"
+        played = watcher.receive_json()
+
+    assert considering["considering"]["ply"] == 1
+    assert considering["considering"]["side"] == "black"
+    thoughts = considering["considering"]["thoughts"]
+    assert thoughts["candidates"] and thoughts["wdl"] is not None
+    assert all(candidate["san"] for candidate in thoughts["candidates"])
+    assert played["type"] == "move"
+    assert played["move"]["thoughts"] == thoughts, "the same overlay once the move is played"

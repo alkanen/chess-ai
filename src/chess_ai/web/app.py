@@ -40,6 +40,7 @@ from chess_ai.config import Config
 from chess_ai.dataset import DatasetError, ManifestError
 from chess_ai.game_session import (
     ActionRejectedError,
+    ConsideringEvent,
     GameEvent,
     GameOverEvent,
     GameSession,
@@ -350,6 +351,7 @@ ViewerEvent = (
     | GameOverEvent
     | PausedEvent
     | ReplacedEvent
+    | ConsideringEvent
     | ErrorEvent
 )
 """What the game WebSocket sends: the game's events, plus this viewer's own errors."""

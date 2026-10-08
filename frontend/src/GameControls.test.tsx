@@ -44,6 +44,7 @@ function gameOf(white: Playing, black: Playing, moves = 0): GameState {
     request: null,
     paused: null,
     replacements: [],
+    considering: null,
   };
 }
 

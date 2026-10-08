@@ -15,6 +15,8 @@ import { MoveList, type MoveMark } from './MoveList';
 import { forgetGame, goToNewGame, rememberGame } from './myGames';
 import { PausedPanel } from './PausedPanel';
 import { RequestPanel } from './RequestPanel';
+import { candidateArrows, shownThoughts, whiteOdds } from './thoughts';
+import { EvalBar, modelPlays, ThoughtsPanel, useShowThoughts } from './ThoughtsPanel';
 import { useGameChannel } from './useGameChannel';
 import './App.css';
 
@@ -126,6 +128,7 @@ export function GameView({ link }: GameViewProps) {
   } = useGameChannel(link);
   const access = view?.access ?? null;
   const [orientation, flip] = useOrientation(access);
+  const [showThoughts, setShowThoughts] = useShowThoughts();
 
   // Kept in this browser's list of games once the server has said what the link is, so that
   // the game can be found again from the Game tab; and dropped once it is gone.
@@ -155,18 +158,38 @@ export function GameView({ link }: GameViewProps) {
   }
   const { game } = view;
   const aborted = view.position.game_over?.reason === 'abort';
+  // Only where a model plays, which is the only player that has thoughts to show.
+  const thinking = modelPlays(game);
+  const overlay = thinking && showThoughts;
+  const shown = overlay ? shownThoughts(game) : null;
+  const board = (
+    <div className="board-frame">
+      <Board
+        snapshot={view.position}
+        orientation={orientation}
+        interactive={connected && !movePending && yourTurn(access, view.position)}
+        onMove={submitMove}
+        arrows={shown === null ? [] : candidateArrows(shown)}
+      />
+    </div>
+  );
   return (
     <>
       <GameStatus position={view.position} inGame />
       <div className="game-view">
-        <div className="board-frame">
-          <Board
-            snapshot={view.position}
-            orientation={orientation}
-            interactive={connected && !movePending && yourTurn(access, view.position)}
-            onMove={submitMove}
-          />
-        </div>
+        {overlay ? (
+          <div className="board-row">
+            <EvalBar
+              odds={
+                shown?.thoughts.wdl != null ? whiteOdds(shown.thoughts.wdl, shown.side) : null
+              }
+              orientation={orientation}
+            />
+            {board}
+          </div>
+        ) : (
+          board
+        )}
         <aside className="side-panel">
           {!connected && view.position.game_over === null && (
             <p role="alert">Lost the connection to the server. Reconnecting…</p>
@@ -211,6 +234,14 @@ export function GameView({ link }: GameViewProps) {
             onTakeBack={takeBack}
             onPlayAgain={async () => goToNewGame(await rematch(link), view.access)}
           />
+          {thinking && (
+            <ThoughtsPanel
+              game={game}
+              shown={shown}
+              show={showThoughts}
+              onShow={setShowThoughts}
+            />
+          )}
           <MoveList
             moves={game.moves}
             startFen={game.start_fen}

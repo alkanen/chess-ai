@@ -365,6 +365,11 @@ def test_a_model_player_says_what_it_was_considering(tmp_path):
     assert chosen.thoughts.wdl is not None
     considered = sum(candidate.probability for candidate in chosen.thoughts.candidates)
     assert 0.0 < considered <= 1.0
+    # Written out in the position it was considered in, which the browser no longer has.
+    assert [candidate.san for candidate in chosen.thoughts.candidates] == [
+        chess.Board().san(chess.Move.from_uci(candidate.uci))
+        for candidate in chosen.thoughts.candidates
+    ]
 
 
 def test_a_game_between_two_checkpoints_is_played_to_its_end(tmp_path):

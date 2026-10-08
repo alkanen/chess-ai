@@ -9,6 +9,8 @@ import asyncio
 import random
 from typing import Final
 
+import chess
+
 from chess_ai.inference.engine import Evaluation, InferenceEngine
 from chess_ai.inference.selection import DEFAULT_TEMPERATURE, select_move
 from chess_ai.players import (
@@ -91,14 +93,18 @@ class ModelPlayer:
             temperature=self._temperature,
             rng=self._rng,
         )
-        return PlayerMove(move, thoughts=_thoughts(evaluation))
+        return PlayerMove(move, thoughts=_thoughts(evaluation, context.board))
 
 
-def _thoughts(evaluation: Evaluation) -> Thoughts:
-    """What the model was considering, for the browser to show over the board."""
+def _thoughts(evaluation: Evaluation, board: chess.Board) -> Thoughts:
+    """What the model was considering in ``board``, for the browser to show over the board.
+
+    Each candidate comes written out as well, since the browser only has the position the game
+    has moved on to by the time it shows them.
+    """
     return Thoughts(
         candidates=[
-            CandidateMove(uci=move.uci(), probability=probability)
+            CandidateMove(uci=move.uci(), san=board.san(move), probability=probability)
             for move, probability in evaluation.top(TOP_CANDIDATES)
         ],
         wdl=evaluation.wdl,
