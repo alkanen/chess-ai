@@ -12,11 +12,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import chess
 from pydantic import BaseModel, ConfigDict
 
+from chess_ai.position_view import PositionSnapshot, snapshot
+from chess_ai.probes import ProbeOutcome, ProbeResult, read_probes
 from chess_ai.training.run_store import (
     TRAIN,
     VALIDATION,
+    EvaluationEntry,
     Heartbeat,
     LatestMetrics,
     RunError,
@@ -273,7 +277,53 @@ class MetricsEvent(BaseModel):
     records: list[dict[str, Any]]
 
 
-RunEvent = RunStateEvent | MetricsEvent
+class EvaluationsEvent(BaseModel):
+    """Which suites have a result about which checkpoints, all of them each time.
+
+    Sent first, and again whenever a result is added or replaced; the results themselves are
+    asked for when they are wanted, which is one checkpoint's at a time.
+    """
+
+    type: Literal["evaluations"] = "evaluations"
+    results: list[EvaluationEntry]
+
+
+RunEvent = RunStateEvent | MetricsEvent | EvaluationsEvent
+
+
+class ShownProbe(ProbeOutcome):
+    """One probe's outcome, with the position to draw it on."""
+
+    snapshot: PositionSnapshot
+
+
+class ShownProbes(ProbeResult):
+    """A checkpoint's probe result, each position with a snapshot for the browser to draw.
+
+    The browser has no rules of its own to read a FEN with, so the server reads it.
+    """
+
+    positions: list[ShownProbe]  # type: ignore[assignment]
+
+
+def show_probes(run: RunReader, step: int) -> ShownProbes | None:
+    """The probe result for ``run``'s checkpoint from ``step``, ready to draw, if it has one.
+
+    Raises:
+        RunError: it has one, and it cannot be read.
+    """
+    result = read_probes(run, step)
+    if result is None:
+        return None
+    shown = []
+    for outcome in result.positions:
+        board = chess.Board(outcome.start) if outcome.start is not None else chess.Board()
+        for move in outcome.moves:
+            board.push_uci(move)
+        shown.append(
+            ShownProbe(**outcome.model_dump(), snapshot=snapshot(board, legal_moves=False))
+        )
+    return ShownProbes(**{**result.model_dump(), "positions": shown})
 
 
 class RunStream:
@@ -292,6 +342,7 @@ class RunStream:
         self._clock = clock
         self._tail = run.tail_metrics()
         self._sent: RunStateEvent | None = None
+        self._evaluations: list[EvaluationEntry] | None = None
 
     @property
     def name(self) -> str:
@@ -312,6 +363,10 @@ class RunStream:
         records, reset = self._tail.read()
         if records or reset:
             events.append(MetricsEvent(reset=reset, records=records))
+        evaluations = self._run.evaluations()
+        if evaluations != self._evaluations:
+            events.append(EvaluationsEvent(results=evaluations))
+            self._evaluations = evaluations
         return events
 
     def _state(self) -> RunStateEvent:

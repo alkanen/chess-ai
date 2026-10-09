@@ -122,3 +122,31 @@ openings = "standard"
 # there is one. Unlike [inference] device, a GPU by default: a ladder asks about
 # thousands of positions, which is slow on a CPU and light work for a GPU.
 device = "auto"
+
+[evaluator]
+# The evaluator, `chess-ai evaluator`, is a process of its own that evaluates every
+# new checkpoint of every run (archived ones aside) with the suites its experiment
+# config names, once each. `chess-ai evaluate` runs suites again on demand.
+
+# Where a checkpoint's network runs: "cpu", "cuda", or "auto" for a GPU if there
+# is one. The CPU by default, so that a training run keeps the card to itself.
+device = "cpu"
+
+# How many positions go through the network at once.
+batch_size = 16
+
+# How many CPU threads the network may use. Torch would otherwise take every core,
+# and a training run's data loaders are using them.
+threads = 2
+
+# How many seconds to wait before looking for new checkpoints again, once every
+# checkpoint found has been evaluated.
+poll_seconds = 30
+
+# The rating a checkpoint is asked about the probe positions at, for both sides.
+rating = 2000
+
+# The probe positions: a set that comes with chess-ai, or the path of a file of
+# your own. A different set, or a new version of this one, probes every
+# checkpoint still on disk again.
+probe_set = "standard"

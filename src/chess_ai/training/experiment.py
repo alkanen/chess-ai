@@ -194,6 +194,36 @@ class CheckpointSection(_Section):
         )
 
 
+EVALUATION_SUITES: Final = ("probe-positions",)
+"""The evaluation suites a run can ask for, each of which the evaluator knows how to run."""
+
+
+class EvaluationSection(_Section):
+    """What the evaluator finds out about each of the run's checkpoints.
+
+    The evaluator runs every suite named here on every checkpoint the run saves, once each, as
+    a process of its own beside the trainer; ``chess-ai evaluate`` runs them again on demand. A
+    run whose config says nothing about evaluation, which every run from before there was an
+    evaluator is, gets the default.
+    """
+
+    suites: list[str] = ["probe-positions"]
+    """By name: ``probe-positions`` records what the checkpoint makes of a fixed set of
+    positions. An empty list evaluates nothing."""
+
+    @field_validator("suites")
+    @classmethod
+    def _known_suites(cls, value: list[str]) -> list[str]:
+        unknown = [suite for suite in value if suite not in EVALUATION_SUITES]
+        if unknown:
+            raise ValueError(
+                f"unknown suite {unknown[0]!r}; choose from {', '.join(EVALUATION_SUITES)}"
+            )
+        if len(set(value)) != len(value):
+            raise ValueError("each suite can only be named once")
+        return value
+
+
 class InitializeSection(_Section):
     """Another run's checkpoint to start the weights from, instead of drawing them from the seed.
 
@@ -250,6 +280,7 @@ class ExperimentConfig(BaseModel):
     schedule: ScheduleSection = ScheduleSection()
     validation: ValidationSection = ValidationSection()
     checkpoints: CheckpointSection = CheckpointSection()
+    evaluation: EvaluationSection = EvaluationSection()
     initialize_from: InitializeSection | None = None
 
     @field_validator("name")

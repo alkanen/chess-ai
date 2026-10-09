@@ -27,6 +27,7 @@ from chess_ai.training.run_store import (
     DatasetReference,
     ModelReference,
     RunInfo,
+    RunReader,
     RunStatus,
     RunWriter,
 )
@@ -133,6 +134,7 @@ def model_run(
     depth: int = 1,
     width: int = 4,
     seed: int = 7,
+    config: dict | None = None,
 ) -> Path:
     """A run directory with real checkpoints in it, written without training anything.
 
@@ -141,6 +143,9 @@ def model_run(
     step gets weights of its own, so a test can tell two checkpoints apart by the moves they
     play, and the validation metrics fall as the steps rise — which makes the *first* step the
     best one, so that "best" and "latest" are never the same checkpoint.
+
+    ``config`` is what run.json records of the experiment config; nothing by default, as a run
+    from before most of it existed would.
     """
     encoder = create_encoder("board-planes")
     options = {"depth": depth, "width": width}
@@ -166,7 +171,7 @@ def model_run(
             options=options,
             parameter_count=create_model("mlp", encoder.spec, **options).parameter_count,
         ),
-        config={},
+        config=config or {},
         steps=max(steps),
         batch_size=8,
     )
@@ -174,24 +179,41 @@ def model_run(
         directory, info, config_text="", policy=CheckpointPolicy(keep=len(steps))
     ) as writer:
         for index, step in enumerate(steps):
-            # A seed per step, so that two checkpoints of one run are two different models.
-            torch.manual_seed(seed + step)
-            model = create_model("mlp", encoder.spec, **options)
-            metrics = {"policy_loss": 1.0 + index}
-            payload = checkpoint.build(
-                step=step,
-                run=name,
-                seed=seed,
-                architecture="mlp",
-                model_options=options,
-                spec=encoder.spec,
-                config={},
-                model_state=model.state_dict(),
-                optimizer_state={},
-                metrics=metrics,
-            )
-            writer.save_checkpoint(
-                step, lambda path, saved=payload: checkpoint.save(saved, path), metrics=metrics
-            )
+            _save_model(writer, name, step, seed=seed, options=options, loss=1.0 + index)
         writer.finish(RunStatus.FINISHED, step=max(steps), steps=max(steps))
     return directory
+
+
+def add_checkpoint(directory: Path, step: int, *, keep: int = 10, seed: int = 7) -> None:
+    """Save one more checkpoint into the :func:`model_run` in ``directory``, as a trainer would.
+
+    ``keep`` is the retention it is saved under: a smaller number prunes older checkpoints.
+    """
+    info = RunReader(directory).info
+    with RunWriter.reopen(directory, policy=CheckpointPolicy(keep=keep)) as writer:
+        _save_model(writer, info.name, step, seed=seed, options=info.model.options, loss=0.5)
+
+
+def _save_model(
+    writer: RunWriter, name: str, step: int, *, seed: int, options: dict, loss: float
+) -> None:
+    encoder = create_encoder("board-planes")
+    # A seed per step, so that two checkpoints of one run are two different models.
+    torch.manual_seed(seed + step)
+    model = create_model("mlp", encoder.spec, **options)
+    metrics = {"policy_loss": loss}
+    payload = checkpoint.build(
+        step=step,
+        run=name,
+        seed=seed,
+        architecture="mlp",
+        model_options=options,
+        spec=encoder.spec,
+        config={},
+        model_state=model.state_dict(),
+        optimizer_state={},
+        metrics=metrics,
+    )
+    writer.save_checkpoint(
+        step, lambda path, saved=payload: checkpoint.save(saved, path), metrics=metrics
+    )

@@ -203,6 +203,33 @@ class LadderConfig(BaseModel):
         return tuple(sorted(value))
 
 
+class EvaluatorConfig(BaseModel):
+    """How the evaluator works through checkpoints, and what the probes ask about them.
+
+    The defaults keep it out of a training run's way: the CPU, two threads of it, and small
+    batches. Probing a checkpoint is a few dozen positions, which that does in a second or two.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    device: Device = "cpu"
+    """Where a checkpoint's network runs: "cpu", "cuda", or "auto" for a GPU if there is one."""
+    batch_size: int = Field(default=16, ge=1, le=1024)
+    """How many positions go through the network at once."""
+    threads: int = Field(default=2, ge=1)
+    """How many CPU threads the network may use. Torch would otherwise take every core, which
+    a training run's data loaders are using."""
+    poll_seconds: float = Field(default=30.0, gt=0)
+    """How long the evaluator waits before looking for new checkpoints again, once it has
+    evaluated every checkpoint it found."""
+    rating: int = Field(default=2000, ge=0, le=4000)
+    """The rating a checkpoint is asked about the probe positions at, for both sides. Results
+    already saved keep the rating they were measured at; ``chess-ai evaluate`` redoes them."""
+    probe_set: str = "standard"
+    """The probe positions: a set that comes with chess-ai, or a file's path. Probing with a
+    different set, or a new version of this one, probes every checkpoint on disk again."""
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -212,6 +239,7 @@ class Config(BaseModel):
     stockfish: StockfishConfig = StockfishConfig()
     games: GamesConfig = GamesConfig()
     ladder: LadderConfig = LadderConfig()
+    evaluator: EvaluatorConfig = EvaluatorConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> Config:

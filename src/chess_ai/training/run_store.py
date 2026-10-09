@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import uuid
@@ -92,6 +93,10 @@ one saved at a particular step. See :func:`choose_checkpoint`."""
 
 class RunError(Exception):
     """A run directory cannot be read or written, or a name cannot be a run's."""
+
+
+class CheckpointChanged(RunError):
+    """An evaluation was not saved, because its checkpoint was replaced or deleted meanwhile."""
 
 
 class RunStatus(StrEnum):
@@ -565,6 +570,9 @@ class RunWriter:
         for path in checkpoints.glob(f"*{CHECKPOINT_SUFFIX}"):
             path.unlink(missing_ok=True)
         (checkpoints / CHECKPOINT_INDEX).unlink(missing_ok=True)
+        # The evaluations were of the replaced run's checkpoints, and would be taken for this
+        # one's: shown on its page, and its own checkpoints of the same steps never evaluated.
+        shutil.rmtree(directory / EVALUATIONS_DIR, ignore_errors=True)
         # And whatever a process killed mid-write left: SIGKILL, the OOM killer and a power cut
         # give it no chance to tidy up, and a notes file's temporary name is never used twice.
         for path in (
@@ -904,6 +912,20 @@ class RunReader:
         """Where ``info``'s file is, which is what a checkpoint is loaded from."""
         return self.directory / CHECKPOINTS_DIR / info.file
 
+    def checkpoint_written(self, info: CheckpointInfo) -> datetime | None:
+        """When ``info``'s file was last written, or ``None`` if it is gone.
+
+        What tells two checkpoints of one step apart, as a run started again under its name or
+        resumed from an earlier checkpoint saves: the file's own time rather than the index's,
+        which is written a moment after the file and so cannot be read at the same moment.
+        """
+        try:
+            return datetime.fromtimestamp(self.checkpoint_path(info).stat().st_mtime, UTC)
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise RunError(f"cannot look at {self.checkpoint_path(info)}: {e.strerror or e}") from e
+
     def evaluation_directory(self, step: int) -> Path:
         """Where the evaluations of the checkpoint from ``step`` are kept, made or not.
 
@@ -911,6 +933,66 @@ class RunReader:
         policy leaves what was found out about it behind.
         """
         return self.directory / EVALUATIONS_DIR / f"step-{step:0{CHECKPOINT_STEP_DIGITS}d}"
+
+    def evaluations(self) -> list["EvaluationEntry"]:
+        """Every suite's result about every checkpoint, by step and then suite.
+
+        Only the results themselves: a save in progress, the games beside a result and the
+        lock are left out. A checkpoint pruned since it was evaluated still has its results.
+        """
+        found: list[EvaluationEntry] = []
+        try:
+            directories = list(os.scandir(self.directory / EVALUATIONS_DIR))
+        except OSError:
+            return []
+        for directory in directories:
+            match = _EVALUATION_DIRECTORY.fullmatch(directory.name)
+            if match is None:
+                continue
+            try:
+                files = list(os.scandir(directory.path))
+            except OSError:
+                # Gone between the two listings, or not a directory after all.
+                continue
+            for file in files:
+                suite = file.name.removesuffix(_RESULT_SUFFIX)
+                if suite == file.name or not _NAME.fullmatch(suite):
+                    continue
+                try:
+                    updated = datetime.fromtimestamp(file.stat().st_mtime, UTC)
+                except OSError:
+                    continue
+                found.append(EvaluationEntry(step=int(match[1]), suite=suite, updated=updated))
+        return sorted(found, key=lambda entry: (entry.step, entry.suite))
+
+    def evaluation(self, step: int, suite: str) -> str | None:
+        """What ``suite`` found out about the checkpoint from ``step``, or ``None`` if nothing.
+
+        The text of the result, as the suite wrote it: what it means is the suite's to say.
+        """
+        if not _NAME.fullmatch(suite):
+            raise RunError(f"invalid suite name {suite!r}")
+        path = self.evaluation_directory(step) / f"{suite}{_RESULT_SUFFIX}"
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            raise RunError(f"cannot read {path}: {e.strerror or e}") from e
+
+
+class EvaluationEntry(BaseModel):
+    """That a suite has a result about a checkpoint, and when it was last written."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    step: int
+    suite: str
+    updated: datetime
+
+
+_EVALUATION_DIRECTORY: Final = re.compile(r"step-(\d+)")
+_RESULT_SUFFIX: Final = ".json"
 
 
 class MetricsTail:
@@ -1191,7 +1273,11 @@ def evaluation_lock(directory: Path) -> Iterator[None]:
 
 
 def save_evaluation(
-    directory: Path, texts: Mapping[str, str], moves: Mapping[str, Path] | None = None
+    directory: Path,
+    texts: Mapping[str, str],
+    moves: Mapping[str, Path] | None = None,
+    *,
+    current: Callable[[], bool] | None = None,
 ) -> None:
     """Put what a suite found out into the evaluation directory ``directory``, as one set.
 
@@ -1202,11 +1288,19 @@ def save_evaluation(
     result, once it is there, has whatever was moved in with it beside it. The whole save
     holds :func:`evaluation_lock`, so that the last save to finish is the set that stays.
 
+    ``current`` is asked once the lock is held, and a save it says no to is not made: it is
+    whether the checkpoint the result is about is still the one on the disk. A run overwritten,
+    or a checkpoint saved again, while it was being evaluated would otherwise be given the
+    result about the one it replaced.
+
     Raises:
+        CheckpointChanged: ``current`` said no. Nothing was saved or moved.
         RunError: the directory cannot be written. Whatever was to be moved in is where it
             was, unless the failure came after it had been moved.
     """
     with evaluation_lock(directory):
+        if current is not None and not current():
+            raise CheckpointChanged(f"the checkpoint {directory.name} is about has changed")
         staged: dict[Path, Path] = {}
         try:
             for name, text in texts.items():

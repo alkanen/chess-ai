@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, a runs dashboard follows training live in the browser, `chess-ai match` plays two checkpoints (or a checkpoint and Stockfish) against each other over a set of openings, and `chess-ai ladder` estimates a checkpoint's Elo against Stockfish; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, a runs dashboard follows training live in the browser, `chess-ai match` plays two checkpoints (or a checkpoint and Stockfish) against each other over a set of openings, `chess-ai ladder` estimates a checkpoint's Elo against Stockfish, and `chess-ai evaluator` records what every new checkpoint makes of a set of probe positions; the probe view on the run page and the transformers come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -211,6 +211,28 @@ The levels, games per level, the rating the checkpoint is asked to play like, St
 The estimate is the maximum-likelihood rating on the Elo curve, and the range the ratings whose results are not much less likely. A checkpoint that loses every game, or whose estimate falls below the lowest level, is reported as below it (with the top of its range) rather than given an extrapolated number, and likewise above the highest. Stockfish 14 plays no weaker than 1350, so that is the floor. The rating is on Stockfish's scale at the move time played, which is below its calibrated strength at a tenth of a second, and is not a Lichess rating: compare ladders played at the same move time.
 
 The result goes to `evaluations/step-<step>/stockfish-ladder.json` in the run directory, and the games, with `Event` "chess-ai ladder", to `stockfish-ladder.pgn` beside it; a second ladder of the same checkpoint replaces both. While the ladder plays, its games are written to a `.partial` file of its own there; a ladder stopped with ctrl-c or by a failure saves no result, leaves that file behind if it finished any games, and says where it is. Two ladders of one checkpoint can run at once, and the one that finishes last is the result that stays, always beside its own games.
+
+### Evaluate checkpoints as they are saved
+
+`chess-ai evaluator` is a long-lived process of its own, beside the web server and any trainers. It looks through the runs directory for checkpoints that lack a result from the evaluation suites their run's experiment config names (`[evaluation] suites`), evaluates each one once per suite, newest first, and then looks again every `[evaluator] poll_seconds`:
+
+```sh
+uv run chess-ai evaluator          # until ctrl-c or SIGTERM
+uv run chess-ai evaluator --once   # what lacks a result now, then exit
+```
+
+The one suite so far is **probe positions**: a curated, versioned set of labelled positions (openings, tactics, middlegames, endgames) in `src/chess_ai/probe_sets/standard.toml`. For each one the evaluator records the checkpoint's five most likely moves with their probabilities, its win/draw/loss estimate, and, for the positions that have a solution, whether its top move is one. Each probe is reached by playing moves from a starting position, so models that read the moves before a position see real ones. A run whose config says nothing about evaluation, as every run from before the evaluator does, gets probe positions. When the set's version goes up, every checkpoint still on disk is probed again; checkpoints pruned since keep the result they had.
+
+By default it runs the networks on the CPU with two threads and batches of 16, so that a training run keeps the card and most of the cores; see `[evaluator]` in `chess-ai.example.toml`. Probing a checkpoint takes a second or two. Archived runs are left alone, and one evaluator works on a runs directory at a time.
+
+To run suites again on chosen checkpoints, replacing what they found before (all of a run's checkpoints on disk when no step is given):
+
+```sh
+uv run chess-ai evaluate resnet10x256
+uv run chess-ai evaluate resnet10x256@best mlp@48000 --suite probe-positions
+```
+
+The results go to `evaluations/step-<step>/<suite>.json` in the run directory, beside any ladder of the same checkpoint, and the run's live stream tells the browser when one arrives.
 
 ### Build a dataset
 

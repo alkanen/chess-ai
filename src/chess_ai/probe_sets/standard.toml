@@ -1,0 +1,262 @@
+# The standard probe set: positions every checkpoint of a run is shown, to see what it makes
+# of them as it trains.
+#
+# A probe is a position and a label. The position is reached by playing ``moves`` (standard
+# notation) from ``fen``, which is the usual starting position when left out, so that a model
+# that reads the moves before a position sees the ones that led here. ``best`` lists the moves
+# that solve a probe that has a solution: a mate, a tactic, a won endgame with one way to win.
+# Positions without one are there to watch what the model prefers, and say nothing is wrong.
+#
+# Every ``best`` was checked with Stockfish 14.1 at depth 20 when it was added: each listed move
+# is clearly better than every move left out. ``id`` names a probe across versions of the set,
+# so it never changes once a probe has it, even when its name or comment does.
+#
+# The set is versioned: results measured on one version are compared only with results
+# measured on the same one. Changing, adding, removing or reordering a probe raises the
+# version, and the test that pins this set's contents with it. Raising it makes the evaluator
+# probe every checkpoint still on disk again.
+
+name = "standard"
+version = 1
+
+# Openings: what the model has picked up of how games start.
+
+[[probes]]
+id = "start"
+name = "Starting position"
+category = "opening"
+
+[[probes]]
+id = "after-e4"
+name = "After 1.e4"
+category = "opening"
+moves = "e4"
+
+[[probes]]
+id = "after-d4"
+name = "After 1.d4"
+category = "opening"
+moves = "d4"
+
+[[probes]]
+id = "ruy-lopez"
+name = "Ruy Lopez"
+category = "opening"
+moves = "e4 e5 Nf3 Nc6 Bb5"
+
+[[probes]]
+id = "sicilian-d4"
+name = "Sicilian Defence, Open: 3.d4"
+category = "opening"
+moves = "e4 c5 Nf3 d6 d4"
+
+[[probes]]
+id = "queens-gambit"
+name = "Queen's Gambit"
+category = "opening"
+moves = "d4 d5 c4"
+
+[[probes]]
+id = "berlin"
+name = "Ruy Lopez, Berlin Defence"
+category = "opening"
+moves = "e4 e5 Nf3 Nc6 Bb5 Nf6"
+
+[[probes]]
+id = "french"
+name = "French Defence"
+category = "opening"
+moves = "e4 e6 d4 d5"
+
+[[probes]]
+id = "kings-indian"
+name = "King's Indian Defence, Classical"
+category = "opening"
+moves = "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6 Nf3 O-O"
+
+[[probes]]
+id = "exchange-recapture"
+name = "Ruy Lopez, Exchange Variation: recapture"
+category = "opening"
+moves = "e4 e5 Nf3 Nc6 Bb5 a6 Bxc6"
+best = ["dxc6", "bxc6"]
+
+[[probes]]
+id = "scandinavian-queen"
+name = "Scandinavian Defence: the queen is attacked"
+category = "opening"
+moves = "e4 d5 exd5 Qxd5 Nc3"
+
+# Tactics: a move that wins or saves the game, which a model that only learned to look like a
+# player may or may not find.
+
+[[probes]]
+id = "fried-liver-d5"
+name = "Two Knights Defence: 4.Ng5, defend f7"
+category = "tactic"
+moves = "e4 e5 Nf3 Nc6 Bc4 Nf6 Ng5"
+best = ["d5"]
+
+[[probes]]
+id = "fried-liver-take"
+name = "Fried Liver Attack: take the knight"
+category = "tactic"
+moves = "e4 e5 Nf3 Nc6 Bc4 Nf6 Ng5 d5 exd5 Nxd5 Nxf7"
+best = ["Kxf7"]
+
+[[probes]]
+id = "scholars-defence"
+name = "Scholar's mate threatened: defend f7"
+category = "tactic"
+moves = "e4 e5 Bc4 Nc6 Qh5"
+best = ["g6", "Qe7", "Qf6", "Nh6"]
+
+[[probes]]
+id = "scholars-mate"
+name = "Scholar's mate"
+category = "tactic"
+moves = "e4 e5 Bc4 Nc6 Qh5 Nf6"
+best = ["Qxf7#"]
+
+[[probes]]
+id = "fools-mate"
+name = "Fool's mate"
+category = "tactic"
+moves = "f3 e5 g4"
+best = ["Qh4#"]
+
+[[probes]]
+id = "free-queen"
+name = "A queen left en prise"
+category = "tactic"
+moves = "e4 e5 Nf3 Nc6 Bc4 Qg5"
+best = ["Nxg5", "Bxf7+"]
+comment = "Bxf7+ wins it too: Kxf7 Nxg5+ forks king and queen."
+
+[[probes]]
+id = "blackburne-shilling"
+name = "Blackburne Shilling Gambit: 4.Nxe5"
+category = "tactic"
+moves = "e4 e5 Nf3 Nc6 Bc4 Nd4 Nxe5"
+comment = "Qg5 sets the famous trap, but engines rate it only a little better than the rest."
+
+[[probes]]
+id = "legals-mate"
+name = "Légal's mate"
+category = "tactic"
+moves = "e4 e5 Nf3 d6 Bc4 Bg4 Nc3 g6 Nxe5 Bxd1"
+best = ["Bxf7+"]
+comment = "Mate in two: 1.Bxf7+ Ke7 2.Nd5#."
+
+[[probes]]
+id = "back-rank"
+name = "Back-rank mate"
+category = "tactic"
+fen = "6k1/5ppp/8/8/8/8/5PPP/3R2K1 w - - 0 1"
+best = ["Rd8#"]
+
+[[probes]]
+id = "smothered-mate"
+name = "Smothered mate"
+category = "tactic"
+fen = "6rk/6pp/8/6N1/8/8/8/6K1 w - - 0 1"
+best = ["Nf7#"]
+
+[[probes]]
+id = "queen-mate"
+name = "Queen and king: mate in one"
+category = "tactic"
+fen = "k7/8/1K6/8/8/8/8/6Q1 w - - 0 1"
+best = ["Qg8#"]
+
+[[probes]]
+id = "skewer"
+name = "Bishop skewers king and queen"
+category = "tactic"
+fen = "6q1/8/8/3k4/8/8/6P1/1B2K3 w - - 0 1"
+best = ["Ba2+"]
+
+[[probes]]
+id = "knight-fork"
+name = "Knight forks king and queen"
+category = "tactic"
+fen = "6k1/3q4/8/8/4N3/8/PP6/4K3 w - - 0 1"
+best = ["Nf6+"]
+
+# Middlegames: well-known plans, where there is no one right move but a strong player has a
+# good idea which kind of move is.
+
+[[probes]]
+id = "carlsbad-white"
+name = "Queen's Gambit Declined, Carlsbad structure: White"
+category = "middlegame"
+moves = "d4 d5 c4 e6 Nc3 Nf6 cxd5 exd5 Bg5 Be7 e3 c6 Bd3 Nbd7 Qc2 O-O Nf3 Re8 O-O Nf8"
+comment = "The minority attack, Rab1 and b4, is the classic plan."
+
+[[probes]]
+id = "carlsbad-black"
+name = "Queen's Gambit Declined, Carlsbad structure: Black"
+category = "middlegame"
+moves = "d4 d5 c4 e6 Nc3 Nf6 cxd5 exd5 Bg5 Be7 e3 c6 Bd3 Nbd7 Qc2 O-O Nf3 Re8 O-O Nf8 Rab1"
+
+[[probes]]
+id = "english-attack"
+name = "Sicilian Najdorf, English Attack"
+category = "middlegame"
+moves = "e4 c5 Nf3 d6 d4 cxd4 Nxd4 Nf6 Nc3 a6 Be3 e5 Nb3 Be6 f3 Be7 Qd2 O-O O-O-O Nbd7 g4"
+comment = "Opposite-side castling: both sides race to attack the other's king."
+
+[[probes]]
+id = "closed-ruy-lopez"
+name = "Ruy Lopez, Closed"
+category = "middlegame"
+moves = "e4 e5 Nf3 Nc6 Bb5 a6 Ba4 Nf6 O-O Be7 Re1 b5 Bb3 d6 c3 O-O h3"
+
+[[probes]]
+id = "kings-indian-mar-del-plata"
+name = "King's Indian Defence, Mar del Plata"
+category = "middlegame"
+moves = "d4 Nf6 c4 g6 Nc3 Bg7 e4 d6 Nf3 O-O Be2 e5 O-O Nc6 d5 Ne7"
+
+# Endgames: few pieces, where knowing the technique is everything.
+
+[[probes]]
+id = "promotion"
+name = "Promote the pawn"
+category = "endgame"
+fen = "8/P7/8/8/8/8/k7/7K w - - 0 1"
+
+[[probes]]
+id = "pawn-opposition"
+name = "King and pawn against king: win"
+category = "endgame"
+fen = "4k3/8/4K3/4P3/8/8/8/8 w - - 0 1"
+best = ["Kd6", "Kf6"]
+comment = "Every other move lets Black draw."
+
+[[probes]]
+id = "pawn-draw"
+name = "King and pawn against king: drawn"
+category = "endgame"
+fen = "8/8/8/4k3/8/8/4P3/4K3 b - - 0 1"
+comment = "A draw with correct play, which the win/draw/loss estimate should say."
+
+[[probes]]
+id = "rule-of-the-square"
+name = "Rule of the square"
+category = "endgame"
+fen = "8/8/8/8/k7/8/7P/7K w - - 0 1"
+comment = "The black king cannot catch the pawn."
+
+[[probes]]
+id = "lucena"
+name = "Lucena position"
+category = "endgame"
+fen = "1K1k4/1P6/8/8/8/8/r7/2R5 w - - 0 1"
+comment = "Won by building a bridge: Rd1+ and Rd4, or Rc4 at once."
+
+[[probes]]
+id = "queen-against-king"
+name = "Queen against king"
+category = "endgame"
+fen = "8/8/8/4k3/8/8/8/3QK3 w - - 0 1"

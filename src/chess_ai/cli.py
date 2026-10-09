@@ -142,6 +142,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_runs_commands(commands)
     _add_match_command(commands)
     _add_ladder_command(commands)
+    _add_evaluation_commands(commands)
     return parser
 
 
@@ -1608,3 +1609,266 @@ def _with_available(error: Exception, data_dir: Path) -> str:
     if not names:
         return f"{error} (no datasets in {data_dir}; build one with 'chess-ai dataset build')"
     return f"{error} (datasets in {data_dir}: {', '.join(names)})"
+
+
+def _add_evaluation_commands(commands: argparse._SubParsersAction) -> None:
+    """``chess-ai evaluator`` and ``chess-ai evaluate``: suites run on checkpoints."""
+    evaluator = commands.add_parser(
+        "evaluator",
+        help="evaluate every new checkpoint of every run, as they are saved",
+        description=(
+            "Run the evaluator: look through the runs directory for checkpoints that lack a\n"
+            "result from a suite their run's experiment config names ([evaluation] suites),\n"
+            "evaluate them, newest first, and look again every [evaluator] poll_seconds. Each\n"
+            "checkpoint is evaluated once per suite; one probed with an older version of the\n"
+            "probe set is probed again. Archived runs are left alone. The results go into each\n"
+            "run's directory, under evaluations/, where the run's page finds them.\n"
+            "\n"
+            "Ctrl-c or SIGTERM stops it once the checkpoint being evaluated is done, with or\n"
+            "without --once; a second ctrl-c stops it at once. One evaluator works on a runs\n"
+            "directory at a time."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    evaluator.add_argument(
+        "--once",
+        action="store_true",
+        help="evaluate what lacks a result now, then exit instead of waiting for more",
+    )
+    evaluator.set_defaults(handler=_evaluator)
+
+    evaluate = commands.add_parser(
+        "evaluate",
+        help="run evaluation suites on chosen checkpoints, replacing earlier results",
+        description=(
+            "Run evaluation suites on the checkpoints named, whether or not they have results\n"
+            "already, and replace those. The suites default to the ones the run's experiment\n"
+            "config names. Settings come from the [evaluator] section of the configuration."
+        ),
+        epilog=(
+            "examples:\n"
+            "  chess-ai evaluate resnet10x256\n"
+            "  chess-ai evaluate resnet10x256@best mlp@48000 --suite probe-positions\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    evaluate.add_argument(
+        "checkpoints",
+        nargs="+",
+        type=_evaluated_checkpoints,
+        metavar="RUN[@CHECKPOINT]",
+        help="the checkpoints: all of the run's on disk (the default), best, latest or a step",
+    )
+    evaluate.add_argument(
+        "--suite",
+        dest="suites",
+        action="append",
+        type=_suite,
+        metavar="NAME",
+        help="a suite to run, given once for each; probe-positions is the one there is",
+    )
+    evaluate.set_defaults(handler=_evaluate)
+
+
+def _evaluated_checkpoints(text: str) -> "tuple[str, CheckpointChoice | None]":
+    """A run, and which of its checkpoints: ``None`` for all of them."""
+    run, at, which = text.partition("@")
+    if not run:
+        raise argparse.ArgumentTypeError(f"{text!r} names no run")
+    if not at or which == "all":
+        return run, None
+    if which in ("best", "latest"):
+        return run, which  # type: ignore[return-value]
+    return run, _number(int, which, "a checkpoint", text, 0, None)
+
+
+def _suite(text: str) -> str:
+    from chess_ai.training.experiment import EVALUATION_SUITES
+
+    if text not in EVALUATION_SUITES:
+        raise argparse.ArgumentTypeError(
+            f"there is no suite {text!r}; choose from {', '.join(EVALUATION_SUITES)}"
+        )
+    return text
+
+
+def _evaluation_suites(config: Config) -> "dict[str, Any]":
+    """The suites the evaluator and ``chess-ai evaluate`` run, set up as the config says.
+
+    Also takes the CPU threads the config allows, since everything that follows is evaluation.
+    """
+    import torch
+
+    from chess_ai.evaluator import ProbeSuite
+    from chess_ai.probes import ProbeSetError, load_probe_set
+
+    settings = config.evaluator
+    torch.set_num_threads(settings.threads)
+    try:
+        probes = load_probe_set(settings.probe_set)
+    except ProbeSetError as e:
+        raise _UserError(e) from e
+    return {ProbeSuite.name: ProbeSuite(probes, rating=settings.rating)}
+
+
+def _evaluation_loader(config: Config) -> "Callable[[Path], Any]":
+    """Loads a checkpoint to evaluate, where and in the batches the config says."""
+    from chess_ai.inference import load_engine
+    from chess_ai.training.hardware import HardwareError, resolve_device
+
+    settings = config.evaluator
+    try:
+        resolve_device(settings.device)
+    except HardwareError as e:
+        raise _UserError(f"[evaluator] device: {e}") from e
+    return lambda path: load_engine(path, device=settings.device, batch_size=settings.batch_size)
+
+
+def _evaluator(config: Config, args: argparse.Namespace) -> int:
+    import signal
+    import threading
+
+    from chess_ai.evaluator import Evaluator, EvaluatorBusy, Stopped, evaluator_lock
+
+    runs = config.paths.runs
+    evaluator = Evaluator(
+        runs,
+        _evaluation_suites(config),
+        load=_evaluation_loader(config),
+        say=_say,
+        warn=lambda text: _say(f"chess-ai: warning: {text}", err=True),
+    )
+    stop = threading.Event()
+    stopped_by: list[int] = []
+
+    def now(signal_number: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    def stopping(signal_number: int, frame: Any) -> None:
+        # Nothing is printed here, which could be in the middle of another print.
+        if not stop.is_set():
+            stopped_by.append(signal_number)
+        stop.set()
+        signal.signal(signal.SIGINT, now)
+
+    try:
+        with evaluator_lock(runs):
+            previous = {
+                each: signal.signal(each, stopping) for each in (signal.SIGINT, signal.SIGTERM)
+            }
+            try:
+                if args.once:
+                    try:
+                        done = evaluator.run_once(stop=stop)
+                    except Stopped as e:
+                        # Not the end of a pass: a script that goes on from here would take
+                        # every checkpoint to have its results, so the status says it stopped.
+                        _say(
+                            "chess-ai: evaluator stopped before every checkpoint was evaluated: "
+                            f"{e.left} {'is' if e.left == 1 else 'are'} left",
+                            err=True,
+                        )
+                        return 128 + stopped_by[0]
+                    if not done:
+                        _say("chess-ai: every checkpoint has its results already")
+                    return 0
+                else:
+                    _say(
+                        f"chess-ai: evaluating the checkpoints of the runs in {runs} as they are "
+                        f"saved, on the {config.evaluator.device} device, looking every "
+                        f"{config.evaluator.poll_seconds:g} s; ctrl-c to stop"
+                    )
+                    evaluator.run(poll_seconds=config.evaluator.poll_seconds, stop=stop)
+            finally:
+                for each, handler in previous.items():
+                    signal.signal(each, handler)
+    except EvaluatorBusy as e:
+        raise _UserError(e) from e
+    except OSError as e:
+        raise _UserError(f"cannot lock {runs}: {e.strerror or e}") from e
+    except KeyboardInterrupt:
+        _say("chess-ai: interrupted", err=True)
+        return 130
+    _say("chess-ai: evaluator stopped", err=True)
+    return 0
+
+
+def _evaluate(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.evaluator import configured_suites
+    from chess_ai.inference import InferenceError
+    from chess_ai.probes import DivergedError
+    from chess_ai.training.run_store import (
+        CheckpointChanged,
+        RunError,
+        choose_checkpoint,
+        open_run,
+    )
+
+    # Each checkpoint with its suites, and whether it was named or is one of all of a run's.
+    chosen = []
+    try:
+        for name, choice in args.checkpoints:
+            run = open_run(config.paths.runs, name)
+            if choice is None:
+                checkpoints = run.checkpoints()
+                if not checkpoints:
+                    raise RunError(f"run {name!r} has not saved a checkpoint yet")
+            else:
+                checkpoints = [choose_checkpoint(run, choice)]
+            suites = args.suites or configured_suites(run)
+            if not suites:
+                raise _UserError(f"run {name!r} names no evaluation suites; say which with --suite")
+            chosen.extend((run, checkpoint, suites, choice is None) for checkpoint in checkpoints)
+    except RunError as e:
+        raise _UserError(e) from e
+    available = _evaluation_suites(config)
+    load = _evaluation_loader(config)
+    failed: set[str] = set()
+    try:
+        for run, checkpoint, suites, one_of_all in chosen:
+            label = f"{run.name}@{checkpoint.step}"
+            try:
+                written = run.checkpoint_written(checkpoint)
+                engine = None if written is None else load(run.checkpoint_path(checkpoint))
+            except (InferenceError, RunError) as e:
+                if run.checkpoint_path(checkpoint).exists():
+                    raise _UserError(f"{label}: {e}") from e
+                engine = None
+            if engine is None:
+                # Pruned by its run since the checkpoints were listed: a run still training
+                # deletes its older checkpoints while the newer ones are evaluated.
+                if not one_of_all:
+                    raise _UserError(f"{label} was pruned before it could be evaluated")
+                _say(
+                    f"chess-ai: warning: {label} was pruned before it could be evaluated", err=True
+                )
+                continue
+            for suite in dict.fromkeys(suites):
+                try:
+                    said = available[suite].evaluate(run, checkpoint, written, engine)
+                except CheckpointChanged as e:
+                    why = f"{label} changed while it was evaluated, so its result was not saved"
+                    # As for a checkpoint pruned before its turn: one asked for by name has no
+                    # result to show for it, and a script has to be able to tell.
+                    if not one_of_all:
+                        raise _UserError(why) from e
+                    _say(f"chess-ai: warning: {why}", err=True)
+                    break
+                except DivergedError as e:
+                    why = f"{label} {suite}: {e}"
+                    # One diverged checkpoint of a run says nothing about the others, which are
+                    # evaluated all the same; the exit status still says this one was not.
+                    if not one_of_all:
+                        raise _UserError(why) from e
+                    _say(f"chess-ai: warning: {why}", err=True)
+                    failed.add(label)
+                    continue
+                except RunError as e:
+                    raise _UserError(e) from e
+                _say(f"{label} {suite}: {said}")
+    except KeyboardInterrupt:
+        _say("chess-ai: interrupted", err=True)
+        return 130
+    if failed:
+        raise _UserError(f"{_count(len(failed), 'checkpoint')} could not be evaluated")
+    return 0

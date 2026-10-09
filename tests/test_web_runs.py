@@ -13,9 +13,13 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
+from training_helpers import model_run
 
 from chess_ai.config import Config, PathsConfig, ServerConfig
 from chess_ai.encoders import create_encoder
+from chess_ai.evaluator import ProbeSuite
+from chess_ai.inference import load_engine
+from chess_ai.probes import SUITE, load_probe_set
 from chess_ai.training.run_store import (
     METRICS_FILE,
     NOTES_FILE,
@@ -33,7 +37,13 @@ from chess_ai.training.run_store import (
     save_notes,
 )
 from chess_ai.web import create_app
-from chess_ai.web.runs import MetricsEvent, RunStateEvent, RunStream, is_stale
+from chess_ai.web.runs import (
+    EvaluationsEvent,
+    MetricsEvent,
+    RunStateEvent,
+    RunStream,
+    is_stale,
+)
 
 PREFIX = "/chess"
 
@@ -562,7 +572,7 @@ def test_a_stream_sends_the_run_state_only_when_it_changes(runs):
         stream = RunStream(RunReader(runs / "live"), stale_after=60, clock=lambda: NOW)
 
         first = stream.poll()
-        assert [type(event) for event in first] == [RunStateEvent, MetricsEvent]
+        assert [type(event) for event in first] == [RunStateEvent, MetricsEvent, EvaluationsEvent]
         assert stream.poll() == []
 
         run.log(step=1, split="train", loss=1.0)
@@ -587,12 +597,13 @@ def test_a_stream_follows_a_run_whose_files_are_not_written_yet(runs):
     (runs / "early").mkdir(parents=True)
     stream = RunStream(RunReader(runs / "early"), stale_after=60, clock=lambda: NOW)
 
-    state, metrics = stream.poll()
+    state, metrics, evaluations = stream.poll()
 
     assert isinstance(state, RunStateEvent)
     assert (state.info, state.heartbeat) == (None, None)
     assert isinstance(metrics, MetricsEvent)
     assert (metrics.reset, metrics.records) == (True, [])
+    assert evaluations == EvaluationsEvent(results=[])
 
 
 def test_a_stream_starts_again_on_a_new_run_whose_log_reuses_the_old_ones_file(runs):
@@ -619,3 +630,106 @@ def test_a_stream_starts_again_on_a_new_run_whose_log_reuses_the_old_ones_file(r
     assert isinstance(metrics, MetricsEvent)
     assert metrics.reset is True
     assert [record["step"] for record in metrics.records] == list(range(1, 20))
+
+
+# Evaluation results.
+
+
+def probed(runs: Path, name: str = "tiny", *, steps=(2, 4)) -> RunReader:
+    """A run with real checkpoints, the first of them probed."""
+    run = RunReader(model_run(runs, name, steps=steps))
+    suite = ProbeSuite(load_probe_set("standard"), rating=1800)
+    first = run.checkpoints()[0]
+    suite.evaluate(
+        run, first, run.checkpoint_written(first), load_engine(run.checkpoint_path(first))
+    )
+    return run
+
+
+def test_a_stream_says_which_checkpoints_have_results_and_when_another_arrives(runs):
+    run = probed(runs)
+    stream = RunStream(run, stale_after=60, clock=lambda: NOW)
+
+    *_, first = stream.poll()
+    nothing_new = stream.poll()
+    later = run.checkpoints()[1]
+    ProbeSuite(load_probe_set("standard"), rating=1800).evaluate(
+        run, later, run.checkpoint_written(later), load_engine(run.checkpoint_path(later))
+    )
+    [added] = stream.poll()
+
+    assert isinstance(first, EvaluationsEvent)
+    assert [(entry.step, entry.suite) for entry in first.results] == [(2, SUITE)]
+    assert nothing_new == []
+    assert isinstance(added, EvaluationsEvent)
+    assert [(entry.step, entry.suite) for entry in added.results] == [(2, SUITE), (4, SUITE)]
+
+
+def test_a_viewer_hears_of_a_new_evaluation_result(client, runs):
+    run = probed(runs)
+
+    with follow(client, "tiny") as websocket:
+        first = next_of(websocket, "evaluations")
+        later = run.checkpoints()[1]
+        ProbeSuite(load_probe_set("standard"), rating=1800).evaluate(
+            run, later, run.checkpoint_written(later), load_engine(run.checkpoint_path(later))
+        )
+        added = next_of(websocket, "evaluations")
+
+    assert [result["step"] for result in first["results"]] == [2]
+    assert [result["step"] for result in added["results"]] == [2, 4]
+
+
+def test_the_evaluation_results_of_a_run_are_listed(client, runs):
+    probed(runs)
+
+    response = client.get(f"{PREFIX}/api/runs/tiny/evaluations")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    [entry] = response.json()
+    assert (entry["step"], entry["suite"]) == (2, SUITE)
+
+
+def test_a_probe_result_comes_with_each_position_to_draw(client, runs):
+    probed(runs)
+
+    response = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/probe-positions")
+
+    assert response.status_code == 200
+    result = response.json()
+    assert (result["model"]["checkpoint"], result["model"]["rating"]) == (2, 1800)
+    mate = next(position for position in result["positions"] if position["id"] == "scholars-mate")
+    assert mate["best"] == ["h5f7"]
+    snapshot = mate["snapshot"]
+    assert snapshot["turn"] == "white"
+    assert snapshot["last_move"] == {"from_square": "g8", "to_square": "f6"}
+    assert snapshot["pieces"]["h5"] == {"color": "white", "type": "queen"}
+    assert snapshot["legal_moves"] == {}
+
+
+@pytest.mark.parametrize(
+    ("path", "complaint"),
+    [
+        ("missing/evaluations/2/probe-positions", "missing"),
+        ("tiny/evaluations/4/probe-positions", "no probe result for the checkpoint from step 4"),
+        ("tiny/evaluations/2/tournament", "Not Found"),
+        ("missing/evaluations", "missing"),
+    ],
+)
+def test_a_result_that_is_not_here_is_not_found(client, runs, path, complaint):
+    probed(runs)
+
+    response = client.get(f"{PREFIX}/api/runs/{path}")
+
+    assert response.status_code == 404
+    assert complaint in response.json()["detail"]
+
+
+def test_a_probe_result_that_cannot_be_read_is_the_servers_fault(client, runs):
+    run = probed(runs)
+    (run.evaluation_directory(2) / f"{SUITE}.json").write_text("{")
+
+    response = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/probe-positions")
+
+    assert response.status_code == 500
