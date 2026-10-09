@@ -10,6 +10,7 @@ import pytest
 import uvicorn
 from dataset_helpers import FIXTURES, GOOD_GAMES, fixture
 from fastapi.testclient import TestClient
+from stockfish_helpers import STOCKFISH, needs_stockfish
 
 from chess_ai.cli import main
 from chess_ai.dataset import load_manifest
@@ -1490,3 +1491,249 @@ def test_an_append_over_an_interrupted_one_is_refused_off_a_terminal(tmp_path, m
         main(["dataset", "append", "games", fixture("custom-start.pgn"), "--discard-interrupted"])
         == 0
     )
+
+
+def ladder_config(tmp_path, *engine_options: str, ladder: str = "") -> tuple[Path, Path]:
+    """A config with the tiny run, a stand-in Stockfish, and a quick ladder on the CPU."""
+    from stockfish_helpers import fake_engine
+
+    engine = fake_engine(tmp_path / "engine", *engine_options)
+    settings = 'device = "cpu"\nmove_time = 0.01\n' + ladder
+    return match_config(tmp_path, stockfish=f'path = "{engine}"', ladder=settings), engine
+
+
+def ladder_games(path: Path) -> list:
+    import chess.pgn
+
+    with path.open(encoding="utf-8") as file:
+        return list(iter(lambda: chess.pgn.read_game(file), None))
+
+
+def test_ladder_plays_each_level_and_saves_the_result_and_games_in_the_run(tmp_path, capsys):
+    from stockfish_helpers import started, wait_until_gone
+
+    from chess_ai.ladder import LadderResult
+
+    config, engine = ladder_config(tmp_path)
+
+    status = main(
+        ["--config", str(config), "ladder", "tiny@4", "--levels", "1500,1350", "--games", "2"]
+    )
+
+    out = capsys.readouterr().out
+    assert status == 0
+    assert "tiny step 4 at rating 2000 against Stockfish at 1350, 1500, 2 games each" in out
+    assert "4/4 game 2/2" in out
+    assert "\nElo: " in out
+    evaluations = tmp_path / "runs/tiny/evaluations/step-000000004"
+    assert sorted(path.name for path in evaluations.iterdir()) == [
+        "evaluation.lock",
+        "stockfish-ladder.json",
+        "stockfish-ladder.pgn",
+    ]
+    result = LadderResult.model_validate_json((evaluations / "stockfish-ladder.json").read_text())
+    assert (result.model.run, result.model.checkpoint, result.model.rating) == ("tiny", 4, 2000)
+    assert [(level.elo, level.games, level.move_time) for level in result.levels] == [
+        (1350, 2, 0.01),
+        (1500, 2, 0.01),
+    ]
+    assert f"Elo: {result.estimate.describe()}" in out
+    games = ladder_games(evaluations / "stockfish-ladder.pgn")
+    assert [game.headers["Event"] for game in games] == ["chess-ai ladder"] * 4
+    assert [game.headers["Black"].startswith("Stockfish") for game in games] == [
+        True,
+        False,
+        True,
+        False,
+    ]
+    assert len(started(engine)) == 2, "one engine a level"
+    wait_until_gone(*started(engine))
+    assert not (tmp_path / "games").exists(), "a ladder's games are kept with the run"
+
+
+def test_ladder_takes_its_defaults_from_the_config(tmp_path, capsys):
+    from stockfish_helpers import told
+
+    from chess_ai.ladder import LadderResult
+
+    config, engine = ladder_config(
+        tmp_path, ladder="levels = [1600]\ngames_per_level = 1\nrating = 1234\n"
+    )
+
+    assert main(["--config", str(config), "ladder", "tiny"]) == 0
+
+    path = tmp_path / "runs/tiny/evaluations/step-000000002/stockfish-ladder.json"
+    result = LadderResult.model_validate_json(path.read_text())
+    assert result.model.rating == 1234
+    assert [(level.elo, level.games) for level in result.levels] == [(1600, 1)]
+    assert "setoption name UCI_Elo value 1600" in told(engine)
+
+
+def test_ladder_says_when_stockfish_cannot_play_a_level(tmp_path, capsys):
+    from chess_ai.ladder import LadderResult
+
+    config, _ = ladder_config(tmp_path, "--elo-range", "1350", "2850")
+
+    status = main(["--config", str(config), "ladder", "tiny", "--levels", "1000", "--games", "1"])
+
+    assert status == 0
+    assert "level 1000 is played at 1350" in capsys.readouterr().err
+    path = tmp_path / "runs/tiny/evaluations/step-000000002/stockfish-ladder.json"
+    (level,) = LadderResult.model_validate_json(path.read_text()).levels
+    assert (level.elo, level.requested_elo) == (1350, 1000)
+
+
+def test_a_ladder_that_fails_before_finishing_a_game_leaves_nothing_behind(tmp_path, capsys):
+    from stockfish_helpers import started, wait_until_gone
+
+    config, engine = ladder_config(tmp_path, "--exit-after", "3")
+
+    with pytest.raises(SystemExit) as exited:
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "2"])
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err
+    assert "game 1 could not be finished: Stockfish stopped" in err
+    assert "games played" not in err
+    assert list((tmp_path / "runs/tiny/evaluations/step-000000002").iterdir()) == []
+    wait_until_gone(*started(engine))
+
+
+def test_a_second_ladder_replaces_the_first(tmp_path, capsys):
+    config, _ = ladder_config(tmp_path)
+    command = ["--config", str(config), "ladder", "tiny", "--levels", "1350"]
+
+    assert main([*command, "--games", "2"]) == 0
+    assert main([*command, "--games", "1"]) == 0
+
+    path = tmp_path / "runs/tiny/evaluations/step-000000002/stockfish-ladder.pgn"
+    assert len(ladder_games(path)) == 1
+
+
+@pytest.mark.parametrize(
+    ("arguments", "complaint"),
+    [
+        (["tiny,rating=1500"], "a ladder's checkpoint takes no settings; see --rating"),
+        (["tiny@soon"], "a checkpoint is a number of at least 0, not 'soon'"),
+        (["tiny", "--levels", "1350,strong"], "'1350,strong'"),
+        (["tiny", "--levels", "1350,1350"], "each level can only be on the ladder once"),
+        (["tiny", "--levels", ","], "a ladder needs at least one level"),
+        (["tiny", "--levels", "5000"], "a level is an Elo from 0 to 4000"),
+        (["tiny", "--games", "0"], "a whole number of at least 1, not '0'"),
+        (["tiny", "--rating", "-1"], "a rating is a number from 0 to 4000"),
+        (["tiny", "--move-time", "0"], "a move time is a number from 0.01 to 60"),
+    ],
+)
+def test_ladder_refuses_what_it_cannot_read(capsys, arguments, complaint):
+    with pytest.raises(SystemExit) as exited:
+        main(["ladder", *arguments])
+
+    assert exited.value.code == 2
+    assert complaint in capsys.readouterr().err
+
+
+def test_ladder_refuses_a_run_that_is_not_there_before_starting_stockfish(tmp_path, capsys):
+    from stockfish_helpers import started
+
+    config, engine = ladder_config(tmp_path)
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config), "ladder", "nonesuch"])
+
+    assert "nonesuch" in capsys.readouterr().err
+    assert started(engine) == []
+    assert not (tmp_path / "runs/nonesuch").exists()
+
+
+@needs_stockfish
+def test_ladder_against_the_real_stockfish(tmp_path, capsys):
+    config = match_config(
+        tmp_path,
+        stockfish=f'path = "{STOCKFISH}"',
+        ladder='device = "cpu"\nmove_time = 0.01\n',
+    )
+
+    status = main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "2"])
+
+    assert status == 0
+    # Two games against an untrained network are two lost games, or near enough.
+    assert "\nElo: below 1350" in capsys.readouterr().out
+
+
+def engine_that_starts_once(directory: Path) -> Path:
+    """The stand-in Stockfish, which cannot be started a second time, as on a machine that
+    has run out of memory in the meantime."""
+    from stockfish_helpers import fake_engine
+
+    engine = fake_engine(directory)
+    wrapper = directory / "starts-once"
+    wrapper.write_text(
+        f'#!/bin/sh\nif [ -e "{directory / "pids"}" ]; then exit 1; fi\nexec "{engine}"\n'
+    )
+    wrapper.chmod(0o755)
+    return wrapper
+
+
+def test_a_level_whose_stockfish_will_not_start_says_where_the_games_so_far_are(tmp_path, capsys):
+    from stockfish_helpers import started, wait_until_gone
+
+    engine = engine_that_starts_once(tmp_path / "engine")
+    config = match_config(
+        tmp_path,
+        stockfish=f'path = "{engine}"',
+        ladder='device = "cpu"\nmove_time = 0.01\n',
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350,1500", "--games", "2"])
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err
+    (partial,) = (tmp_path / "runs/tiny/evaluations/step-000000002").iterdir()
+    assert "Stockfish could not be started for level 1500" in err
+    assert f"the 2 games played are in {partial}" in err
+    assert len(ladder_games(partial)) == 2
+    wait_until_gone(*started(tmp_path / "engine" / "fake-stockfish"))
+
+
+def test_a_ladder_whose_first_stockfish_will_not_start_leaves_no_empty_games_file(tmp_path, capsys):
+    config = match_config(
+        tmp_path,
+        stockfish=f'path = "{tmp_path / "nonesuch"}"',
+        ladder='device = "cpu"\n',
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350"])
+
+    assert exited.value.code == 2
+    err = capsys.readouterr().err
+    assert "Stockfish could not be started for level 1350" in err
+    assert "games played" not in err
+    evaluations = tmp_path / "runs/tiny/evaluations/step-000000002"
+    # Emptied but kept: another ladder or save of the step may be about to write into it.
+    assert list(evaluations.iterdir()) == []
+
+
+def test_a_ladder_whose_result_cannot_be_saved_says_where_its_games_really_are(
+    tmp_path, capsys, monkeypatch
+):
+    from chess_ai.training import run_store
+
+    config, _ = ladder_config(tmp_path)
+    real_replace = os.replace
+
+    def result_fails(source, destination):
+        if str(destination).endswith("stockfish-ladder.json"):
+            raise OSError(errno.EACCES, "Permission denied")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(run_store.os, "replace", result_fails)
+    with pytest.raises(SystemExit):
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "1"])
+
+    err = capsys.readouterr().err
+    games = tmp_path / "runs/tiny/evaluations/step-000000002/stockfish-ladder.pgn"
+    assert "Permission denied" in err
+    assert f"the 1 game played is in {games}" in err
+    assert len(ladder_games(games)) == 1

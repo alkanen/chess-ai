@@ -13,6 +13,8 @@ kills a run nor loses track of one, and a run from six months ago is still brows
     <runs>/<name>/status.json       the heartbeat: replaced whole, never appended to
     <runs>/<name>/checkpoints/      step-<step>.pt, and an index naming the best of them
     <runs>/<name>/notes.json        a title, tags and notes: written by people, never by the trainer
+    <runs>/<name>/evaluations/      step-<step>/, one per checkpoint evaluated, holding what each
+                                    evaluation suite wrote about it: <suite>.json and its games
     <runs>/<name>/writer.lock       locked by the one process writing the run, while it does
 
 Two write disciplines, because two kinds of reader:
@@ -40,7 +42,7 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Callable, Collection, Iterator, Mapping
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib import metadata
@@ -67,6 +69,8 @@ STATUS_FILE: Final = "status.json"
 NOTES_FILE: Final = "notes.json"
 LOCK_FILE: Final = "writer.lock"
 CHECKPOINTS_DIR: Final = "checkpoints"
+EVALUATIONS_DIR: Final = "evaluations"
+EVALUATION_LOCK: Final = "evaluation.lock"
 CHECKPOINT_INDEX: Final = "index.json"
 CHECKPOINT_SUFFIX: Final = ".pt"
 CHECKPOINT_STEP_DIGITS: Final = 9
@@ -900,6 +904,14 @@ class RunReader:
         """Where ``info``'s file is, which is what a checkpoint is loaded from."""
         return self.directory / CHECKPOINTS_DIR / info.file
 
+    def evaluation_directory(self, step: int) -> Path:
+        """Where the evaluations of the checkpoint from ``step`` are kept, made or not.
+
+        Kept apart from the checkpoint itself, so that a checkpoint pruned by the run's retention
+        policy leaves what was found out about it behind.
+        """
+        return self.directory / EVALUATIONS_DIR / f"step-{step:0{CHECKPOINT_STEP_DIGITS}d}"
+
 
 class MetricsTail:
     """Where a reader following a metrics log has got to, so that each read returns what is new.
@@ -1155,6 +1167,64 @@ def _best_step(checkpoints, policy: CheckpointPolicy) -> int | None:
     if policy.higher_is_better:
         return max(scored, key=lambda scoring: (scoring[0], scoring[1]))[1]
     return min(scored, key=lambda scoring: (scoring[0], -scoring[1]))[1]
+
+
+@contextmanager
+def evaluation_lock(directory: Path) -> Iterator[None]:
+    """Hold the lock on the evaluation directory ``directory``, making it if need be.
+
+    Whoever saves into an evaluation directory holds it for as long as the save takes, so that
+    two saves that finish together cannot interleave their files: the evaluator and a one-off
+    evaluation from the command line can both be finishing one suite about one checkpoint. The
+    lock goes with the process that holds it, however that process ends.
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(directory / EVALUATION_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        raise RunError(f"cannot lock {directory}: {e.strerror or e}") from e
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def save_evaluation(
+    directory: Path, texts: Mapping[str, str], moves: Mapping[str, Path] | None = None
+) -> None:
+    """Put what a suite found out into the evaluation directory ``directory``, as one set.
+
+    ``texts`` are written whole under their names, and the files in ``moves`` are moved in
+    under theirs, all replacing what was there. The texts are written to temporary files
+    before anything is moved, which is where a full disk or a missing permission stops a save,
+    so that a save that fails changes nothing; and they are renamed into place last, so that a
+    result, once it is there, has whatever was moved in with it beside it. The whole save
+    holds :func:`evaluation_lock`, so that the last save to finish is the set that stays.
+
+    Raises:
+        RunError: the directory cannot be written. Whatever was to be moved in is where it
+            was, unless the failure came after it had been moved.
+    """
+    with evaluation_lock(directory):
+        staged: dict[Path, Path] = {}
+        try:
+            for name, text in texts.items():
+                temporary = directory / f"{name}.{uuid.uuid4().hex}{TEMPORARY_SUFFIX}"
+                staged[temporary] = directory / name
+                with temporary.open("x", encoding="utf-8") as f:
+                    f.write(text)
+                    sync_file(f)
+            for name, source in (moves or {}).items():
+                os.replace(source, directory / name)
+            for temporary, path in staged.items():
+                os.replace(temporary, path)
+            sync_directory(directory)
+        except OSError as e:
+            raise RunError(f"cannot write in {directory}: {e.strerror or e}") from e
+        finally:
+            for temporary in staged:
+                temporary.unlink(missing_ok=True)
 
 
 def _read_model(path: Path, model: type[BaseModel]) -> Any:

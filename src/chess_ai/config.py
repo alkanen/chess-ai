@@ -151,6 +151,58 @@ class GamesConfig(BaseModel):
     with its links. Starting a game, every move, and the game ending start the count again."""
 
 
+class LadderConfig(BaseModel):
+    """The Stockfish ladder a checkpoint's Elo is measured on, unless a ladder is told otherwise.
+
+    The defaults play a hundred games, about ten minutes' worth for a mid-sized network on a
+    GPU, and span Stockfish's lowest levels, which is where a network that only predicts moves
+    plays.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    levels: tuple[int, ...] = (1350, 1500, 1700, 1900, 2100)
+    """The Elo levels Stockfish plays the checkpoint at, weakest first. A level outside the range
+    Stockfish supports is played at the nearest end of it (1350 to 2850 for Stockfish 14)."""
+    games_per_level: int = Field(default=20, ge=1)
+    """How many games the checkpoint plays against each level, the colours swapped every game."""
+    rating: int = Field(default=2000, ge=0, le=4000)
+    """The rating the checkpoint is asked to play like. Always one: asked for none, a model
+    plays like a game that claims no rating, which is far below what it can do."""
+    move_time: float = Field(default=0.1, ge=0.01, le=60.0)
+    """Seconds Stockfish has for each move. Its levels were calibrated at a few seconds a move,
+    so at this one it plays below them and the ratings are higher than they would be there:
+    compare ladders played at one move time only."""
+    openings: str = "standard"
+    """The opening set the games start from: one that comes with chess-ai, or a file's path."""
+    device: Device = "auto"
+    """Where the checkpoint's network runs: "cpu", "cuda", or "auto" for a GPU if there is one.
+
+    Not ``[inference] device``, which is the CPU so that games played in the browser leave a
+    training run the card. A ladder asks about thousands of positions one after another, which
+    takes a mid-sized network over a minute a game on a busy CPU, and a GPU a fraction of that
+    at a share of the card a training run does not notice."""
+
+    @field_validator("levels", mode="before")
+    @classmethod
+    def _split_levels(cls, value: Any) -> Any:
+        """Read ``"1350,1500"``, as an environment variable or the command line says it."""
+        if isinstance(value, str):
+            return [level.strip() for level in value.split(",") if level.strip()]
+        return value
+
+    @field_validator("levels")
+    @classmethod
+    def _sorted_levels(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not value:
+            raise ValueError("a ladder needs at least one level")
+        if any(not 0 <= level <= 4000 for level in value):
+            raise ValueError("a level is an Elo from 0 to 4000")
+        if len(set(value)) != len(value):
+            raise ValueError("each level can only be on the ladder once")
+        return tuple(sorted(value))
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -159,6 +211,7 @@ class Config(BaseModel):
     inference: InferenceConfig = InferenceConfig()
     stockfish: StockfishConfig = StockfishConfig()
     games: GamesConfig = GamesConfig()
+    ladder: LadderConfig = LadderConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> Config:
