@@ -1728,12 +1728,20 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
     import signal
     import threading
 
-    from chess_ai.evaluator import Evaluator, EvaluatorBusy, Stopped, evaluator_lock
+    from chess_ai.evaluator import (
+        Evaluator,
+        EvaluatorBusy,
+        ProbeSuite,
+        Stopped,
+        evaluator_lock,
+    )
+    from chess_ai.probes import save_current_set
 
     runs = config.paths.runs
+    suites = _evaluation_suites(config)
     evaluator = Evaluator(
         runs,
-        _evaluation_suites(config),
+        suites,
         load=_evaluation_loader(config),
         say=_say,
         warn=lambda text: _say(f"chess-ai: warning: {text}", err=True),
@@ -1753,6 +1761,12 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
 
     try:
         with evaluator_lock(runs):
+            # What the run page compares results with: this evaluator probes with this set
+            # until it is started again, whatever happens to the set's file meanwhile.
+            try:
+                save_current_set(runs, suites[ProbeSuite.name].probes)
+            except OSError as e:
+                raise _UserError(f"cannot write to {runs}: {e.strerror or e}") from e
             previous = {
                 each: signal.signal(each, stopping) for each in (signal.SIGINT, signal.SIGTERM)
             }

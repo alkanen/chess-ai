@@ -22,7 +22,7 @@ from chess_ai.evaluator import (
     evaluator_lock,
 )
 from chess_ai.inference import load_engine
-from chess_ai.probes import SUITE, load_probe_set, read_probes
+from chess_ai.probes import SUITE, ProbeSetVersion, load_probe_set, read_current_set, read_probes
 from chess_ai.training.run_store import (
     ARCHIVED_TAG,
     CheckpointPolicy,
@@ -292,6 +292,35 @@ def test_evaluate_refuses_what_it_cannot_do(tmp_path, capsys, arguments, complai
 
     assert exited.value.code == 2
     assert complaint in capsys.readouterr().err
+
+
+def test_the_evaluator_records_which_probe_set_it_probes_with(tmp_path):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2,))
+    small_set(tmp_path, version=3)
+    (tmp_path / "chess-ai.toml").write_text(
+        f'[paths]\nruns = "{runs}"\n[evaluator]\nprobe_set = "{tmp_path / "small-v3.toml"}"\n'
+    )
+    assert read_current_set(runs) is None
+
+    assert main(["evaluator", "--once"]) == 0
+
+    assert read_current_set(runs) == ProbeSetVersion(name="small", version=3)
+
+
+def test_evaluating_on_demand_leaves_the_record_of_the_evaluators_set_alone(tmp_path):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2,))
+    (tmp_path / "chess-ai.toml").write_text(f'[paths]\nruns = "{runs}"\n')
+    assert main(["evaluator", "--once"]) == 0
+    small_set(tmp_path, version=3)
+    (tmp_path / "chess-ai.toml").write_text(
+        f'[paths]\nruns = "{runs}"\n[evaluator]\nprobe_set = "{tmp_path / "small-v3.toml"}"\n'
+    )
+
+    assert main(["evaluate", "tiny"]) == 0
+
+    assert read_current_set(runs) == ProbeSetVersion(name="standard", version=1)
 
 
 def test_the_evaluator_refuses_to_start_beside_another(tmp_path, capsys):

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { GpuStats } from './api';
 import { MetricChart } from './MetricChart';
+import { PROBE_SUITE } from './probes';
+import { ProbeView } from './ProbeView';
 import { CHARTS, chartData, logs, xAxis } from './runCharts';
 import { RunStateBadge } from './RunState';
 import {
@@ -183,6 +185,14 @@ export function RunView({ name }: RunViewProps) {
               />
             ))}
           </div>
+          {/* Another run's checkpoints are others: nothing chosen or kept of one carries over. */}
+          <ProbeView
+            key={name}
+            run={name}
+            evaluations={run.evaluations}
+            currentSet={run.probeSet}
+            probed={info?.config?.evaluation?.suites?.includes(PROBE_SUITE) ?? true}
+          />
         </>
       )}
     </section>

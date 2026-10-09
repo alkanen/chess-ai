@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { GpuStats, Heartbeat, RunEvent, RunInfo } from './api';
+import type { GpuStats, Heartbeat, ProbeResult, RunEvent, RunInfo } from './api';
 import { RunView } from './RunView';
 import { FakeUPlot } from './test/fakeUPlot';
 import { FakeWebSocket } from './test/fakeWebSocket';
@@ -669,5 +669,72 @@ describe('RunView', () => {
     await waitFor(() =>
       expect(window.localStorage.getItem('chess-ai.chart-x-axis')).toBe('time'),
     );
+  });
+
+  describe('probe positions', () => {
+    const PROBED: ProbeResult = {
+      model: { run: 'mlp-big', checkpoint: 500, rating: 2000 },
+      finished: '2026-10-09T12:00:00Z',
+      probe_set: 'standard',
+      probe_set_version: 1,
+      positions: [
+        {
+          id: 'start',
+          name: 'Starting position',
+          category: 'opening',
+          comment: null,
+          start: null,
+          line: '',
+          fen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+          best: [],
+          top: [{ uci: 'e2e4', san: 'e4', probability: 0.5 }],
+          wdl: { win: 0.3, draw: 0.5, loss: 0.2 },
+          illegal_mass: 0,
+          best_probability: null,
+          snapshot: {
+            fen: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1',
+            turn: 'white',
+            pieces: { e1: { color: 'white', type: 'king' }, e8: { color: 'black', type: 'king' } },
+            last_move: null,
+            check_square: null,
+            legal_moves: {},
+            game_over: null,
+          },
+        },
+      ],
+    };
+
+    it('shows a probe result as soon as the run channel says there is one', async () => {
+      const fetch = vi.fn(async () => Response.json(PROBED));
+      vi.stubGlobal('fetch', fetch);
+      render(<RunView name="mlp-big" />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(runEvent());
+      expect(screen.getByText(/No checkpoint has been probed yet/)).toBeInTheDocument();
+
+      socket.deliver({
+        type: 'evaluations',
+        results: [{ step: 500, suite: 'probe-positions', updated: '2026-10-09T12:00:00Z' }],
+        current_set: { name: 'standard', version: 2 },
+      });
+
+      expect(await screen.findByRole('article', { name: 'Starting position' })).toBeVisible();
+      expect(screen.getByRole('note')).toHaveTextContent('older version than the standard v2');
+      // Heartbeats change everything around the probes and nothing in them.
+      socket.deliver(runEvent({ heartbeat: heartbeat({ step: 1_100 }) }));
+      socket.deliver(runEvent({ heartbeat: heartbeat({ step: 1_200 }) }));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(fetch).toHaveBeenCalledOnce();
+    });
+
+    it('leaves the probes out for a run whose config asks for none', () => {
+      render(<RunView name="mlp-big" />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(runEvent({ info: { ...INFO, config: { evaluation: { suites: [] } } } }));
+
+      expect(screen.queryByRole('heading', { name: 'Probe positions' })).not.toBeInTheDocument();
+    });
   });
 });

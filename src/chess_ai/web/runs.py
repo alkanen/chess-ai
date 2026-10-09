@@ -16,7 +16,13 @@ import chess
 from pydantic import BaseModel, ConfigDict
 
 from chess_ai.position_view import PositionSnapshot, snapshot
-from chess_ai.probes import ProbeOutcome, ProbeResult, read_probes
+from chess_ai.probes import (
+    ProbeOutcome,
+    ProbeResult,
+    ProbeSetVersion,
+    read_current_set,
+    read_probes,
+)
 from chess_ai.training.run_store import (
     TRAIN,
     VALIDATION,
@@ -278,14 +284,21 @@ class MetricsEvent(BaseModel):
 
 
 class EvaluationsEvent(BaseModel):
-    """Which suites have a result about which checkpoints, all of them each time.
+    """Which suites have a result about which checkpoints, all of them each time, and which
+    probe set the evaluator probes with.
 
-    Sent first, and again whenever a result is added or replaced; the results themselves are
-    asked for when they are wanted, which is one checkpoint's at a time.
+    Sent first, and again whenever a result is added or replaced or the evaluator says it probes
+    with another set; the results themselves are asked for when they are wanted, which is one
+    checkpoint's at a time.
     """
 
     type: Literal["evaluations"] = "evaluations"
     results: list[EvaluationEntry]
+    current_set: ProbeSetVersion | None
+    """The set the evaluator probes checkpoints with, as it said when it last started, or
+    ``None`` when none has said. A result measured on another set, or an older version of it,
+    is from before the set changed: its checkpoint has been pruned since, or the evaluator has
+    not reached it again yet."""
 
 
 RunEvent = RunStateEvent | MetricsEvent | EvaluationsEvent
@@ -342,7 +355,7 @@ class RunStream:
         self._clock = clock
         self._tail = run.tail_metrics()
         self._sent: RunStateEvent | None = None
-        self._evaluations: list[EvaluationEntry] | None = None
+        self._evaluations: EvaluationsEvent | None = None
 
     @property
     def name(self) -> str:
@@ -363,9 +376,13 @@ class RunStream:
         records, reset = self._tail.read()
         if records or reset:
             events.append(MetricsEvent(reset=reset, records=records))
-        evaluations = self._run.evaluations()
+        # The record is in the runs directory, beside every run, and as small as a heartbeat.
+        evaluations = EvaluationsEvent(
+            results=self._run.evaluations(),
+            current_set=read_current_set(self._run.directory.parent),
+        )
         if evaluations != self._evaluations:
-            events.append(EvaluationsEvent(results=evaluations))
+            events.append(evaluations)
             self._evaluations = evaluations
         return events
 

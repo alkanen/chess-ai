@@ -4,9 +4,11 @@ The runs here are fake run directories written through the run store and appende
 viewer is connected, which is all the web server ever sees of a trainer.
 """
 
+import dataclasses
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -15,11 +17,18 @@ from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 from training_helpers import model_run
 
-from chess_ai.config import Config, PathsConfig, ServerConfig
+from chess_ai.config import Config, EvaluatorConfig, PathsConfig, ServerConfig
 from chess_ai.encoders import create_encoder
 from chess_ai.evaluator import ProbeSuite
 from chess_ai.inference import load_engine
-from chess_ai.probes import SUITE, load_probe_set
+from chess_ai.probes import (
+    CURRENT_SET_FILE,
+    SUITE,
+    ProbeSet,
+    ProbeSetVersion,
+    load_probe_set,
+    save_current_set,
+)
 from chess_ai.training.run_store import (
     METRICS_FILE,
     NOTES_FILE,
@@ -98,10 +107,13 @@ def runs(tmp_path) -> Path:
     return tmp_path / "runs"
 
 
-def serve(tmp_path: Path, runs: Path, **server) -> TestClient:
+def serve(
+    tmp_path: Path, runs: Path, *, evaluator: EvaluatorConfig | None = None, **server
+) -> TestClient:
     config = Config(
         server=ServerConfig(path_prefix=PREFIX, **server),
         paths=PathsConfig(games=tmp_path / "games", runs=runs),
+        evaluator=evaluator or EvaluatorConfig(),
     )
     return TestClient(create_app(config, static_dir=tmp_path / "static", run_poll_seconds=0.02))
 
@@ -603,7 +615,7 @@ def test_a_stream_follows_a_run_whose_files_are_not_written_yet(runs):
     assert (state.info, state.heartbeat) == (None, None)
     assert isinstance(metrics, MetricsEvent)
     assert (metrics.reset, metrics.records) == (True, [])
-    assert evaluations == EvaluationsEvent(results=[])
+    assert evaluations == EvaluationsEvent(results=[], current_set=None)
 
 
 def test_a_stream_starts_again_on_a_new_run_whose_log_reuses_the_old_ones_file(runs):
@@ -635,6 +647,16 @@ def test_a_stream_starts_again_on_a_new_run_whose_log_reuses_the_old_ones_file(r
 # Evaluation results.
 
 
+def small_set_version(version: int) -> ProbeSet:
+    """The standard set, as if at ``version``."""
+    return dataclasses.replace(load_probe_set("standard"), version=version)
+
+
+def load_probe_set_text(name: str) -> str:
+    """The TOML of a set that comes with chess-ai."""
+    return resources.files("chess_ai").joinpath("probe_sets", f"{name}.toml").read_text("utf-8")
+
+
 def probed(runs: Path, name: str = "tiny", *, steps=(2, 4)) -> RunReader:
     """A run with real checkpoints, the first of them probed."""
     run = RunReader(model_run(runs, name, steps=steps))
@@ -663,6 +685,60 @@ def test_a_stream_says_which_checkpoints_have_results_and_when_another_arrives(r
     assert nothing_new == []
     assert isinstance(added, EvaluationsEvent)
     assert [(entry.step, entry.suite) for entry in added.results] == [(2, SUITE), (4, SUITE)]
+
+
+def test_a_stream_says_which_set_the_evaluator_probes_with_and_when_that_changes(runs):
+    run = probed(runs)
+    stream = RunStream(run, stale_after=60, clock=lambda: NOW)
+
+    *_, unsaid = stream.poll()
+    save_current_set(runs, small_set_version(1))
+    [first] = stream.poll()
+    nothing_new = stream.poll()
+    save_current_set(runs, small_set_version(2))
+    [changed] = stream.poll()
+
+    assert isinstance(unsaid, EvaluationsEvent)
+    assert unsaid.current_set is None
+    assert isinstance(first, EvaluationsEvent)
+    assert first.current_set == ProbeSetVersion(name="standard", version=1)
+    assert [entry.step for entry in first.results] == [2]
+    assert nothing_new == []
+    assert isinstance(changed, EvaluationsEvent)
+    assert changed.current_set == ProbeSetVersion(name="standard", version=2)
+    assert changed.results == first.results
+
+
+def test_which_set_is_current_is_what_the_evaluator_says_not_the_servers_config(tmp_path, runs):
+    probed(runs)
+    save_current_set(runs, small_set_version(1))
+    newer = tmp_path / "newer.toml"
+    newer.write_text(
+        load_probe_set_text("standard").replace("version = 1", "version = 2", 1), encoding="utf-8"
+    )
+
+    # An evaluator not started again since the set changed still probes with the old one.
+    with (
+        serve(tmp_path, runs, evaluator=EvaluatorConfig(probe_set=str(newer))) as client,
+        follow(client, "tiny") as websocket,
+    ):
+        event = next_of(websocket, "evaluations")
+
+    assert event["current_set"] == {"name": "standard", "version": 1}
+
+
+@pytest.mark.parametrize("record", ["{", '{"name": "standard"}', b"\xff\xfe"])
+def test_a_stream_says_no_set_is_current_when_the_record_cannot_be_read(runs, record):
+    run = probed(runs)
+    if isinstance(record, bytes):
+        (runs / CURRENT_SET_FILE).write_bytes(record)
+    else:
+        (runs / CURRENT_SET_FILE).write_text(record)
+
+    *_, event = RunStream(run, stale_after=60, clock=lambda: NOW).poll()
+
+    assert isinstance(event, EvaluationsEvent)
+    assert event.current_set is None
 
 
 def test_a_viewer_hears_of_a_new_evaluation_result(client, runs):
