@@ -615,7 +615,55 @@ export type RunEvent =
       notes: RunNotes | null;
     }
   | { type: 'metrics'; reset: boolean; records: MetricsRecord[] }
+  | { type: 'evaluations'; results: EvaluationEntry[] }
   | { type: 'error'; message: string };
+
+/** That a suite has a result about a checkpoint; mirrors run_store.EvaluationEntry. */
+export interface EvaluationEntry {
+  step: number;
+  suite: string;
+  /** When the result was last written. */
+  updated: string;
+}
+
+/** One of the moves a checkpoint thought most likely in a probe. */
+export interface ProbeMove {
+  uci: string;
+  san: string;
+  /** Out of the legal moves alone, which sum to one. */
+  probability: number;
+}
+
+export type ProbeCategory = 'opening' | 'middlegame' | 'tactic' | 'endgame';
+
+/** What a checkpoint made of one probe position; mirrors chess_ai.web.runs.ShownProbe. */
+export interface ProbeOutcome {
+  id: string;
+  name: string;
+  category: ProbeCategory;
+  comment: string | null;
+  /** The moves that led to the position, numbered, such as "1. e4 e5 2. Nf3". */
+  line: string;
+  fen: string;
+  /** The moves that solve it, in UCI; empty for a position without one solution. */
+  best: string[];
+  /** Most likely first. */
+  top: ProbeMove[];
+  /** From the side to move's point of view. */
+  wdl: WinDrawLoss;
+  illegal_mass: number;
+  best_probability: number | null;
+  snapshot: PositionSnapshot;
+}
+
+/** A checkpoint's probe result; mirrors chess_ai.web.runs.ShownProbes. */
+export interface ProbeResult {
+  model: { run: string; checkpoint: number; rating: number | null };
+  finished: string;
+  probe_set: string;
+  probe_set_version: number;
+  positions: ProbeOutcome[];
+}
 
 /** One checkpoint of a run, as the form lists it. */
 export interface CheckpointSummary {
@@ -820,6 +868,17 @@ export async function fetchCheckpoints(run: string): Promise<RunCheckpoints> {
     throw new Error(await refusal(response));
   }
   return (await response.json()) as RunCheckpoints;
+}
+
+/** What the checkpoint from `step` of `run` made of the probe positions. */
+export async function fetchProbes(run: string, step: number): Promise<ProbeResult> {
+  const response = await fetch(
+    apiUrl(`runs/${encodeURIComponent(run)}/evaluations/${step}/probe-positions`),
+  );
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as ProbeResult;
 }
 
 /** The WebSocket URL of one run's live stream, under the path prefix like every API URL. */

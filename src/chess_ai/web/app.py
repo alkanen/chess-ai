@@ -83,6 +83,7 @@ from chess_ai.stockfish import (
 )
 from chess_ai.training.run_store import (
     CheckpointChoice,
+    EvaluationEntry,
     RunError,
     RunNotes,
     RunReader,
@@ -128,8 +129,10 @@ from chess_ai.web.runs import (
     RunEvent,
     RunStream,
     RunSummary,
+    ShownProbes,
     describe_checkpoints,
     describe_run,
+    show_probes,
 )
 
 logger = logging.getLogger(__name__)
@@ -641,6 +644,45 @@ def create_app(
         except RunError as missing:
             raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
         return describe_checkpoints(run)
+
+    @api.get(
+        "/runs/{name}/evaluations",
+        responses={404: {"description": "No run of that name is kept here"}},
+    )
+    def run_evaluations(name: str, response: Response) -> list[EvaluationEntry]:
+        """Which suites have a result about which of a run's checkpoints, by step and suite.
+
+        Checkpoints the run has since pruned are among them: their results are kept.
+        """
+        response.headers.update(NO_STORE)
+        return _open_run(name).evaluations()
+
+    @api.get(
+        "/runs/{name}/evaluations/{step}/probe-positions",
+        responses={
+            404: {"description": "No run of that name, or no probe result for that step"},
+            500: {"description": "The result is there and cannot be read"},
+        },
+    )
+    def run_probes(name: str, step: int, response: Response) -> ShownProbes:
+        """What a checkpoint made of the probe positions, each with its position to draw.
+
+        Replaced when the checkpoint is probed again, so it is kept by nobody.
+        """
+        response.headers.update(NO_STORE)
+        run = _open_run(name)
+        try:
+            shown = show_probes(run, step)
+        except RunError as unreadable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unreadable)
+            ) from unreadable
+        if shown is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"run {name!r} has no probe result for the checkpoint from step {step}",
+            )
+        return shown
 
     @api.get(
         "/runs/{name}/notes",

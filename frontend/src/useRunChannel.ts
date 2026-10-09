@@ -1,6 +1,7 @@
 import { useEffect, useReducer, useState } from 'react';
 import {
   runChannelUrl,
+  type EvaluationEntry,
   type Heartbeat,
   type MetricsRecord,
   type RunEvent,
@@ -20,6 +21,8 @@ export interface RunView {
   notes: RunNotes | null;
   /** Every line of its metrics log so far, oldest first. */
   metrics: MetricsRecord[];
+  /** Which suites have a result about which checkpoints, by step and suite. */
+  evaluations: EvaluationEntry[];
 }
 
 export interface RunChannel {
@@ -40,6 +43,16 @@ const MAX_RETRY_DELAY_MS = 10_000;
 
 const NOTHING: ChannelState = { run: null, error: null };
 
+/** A run the channel has sent something about before saying what it is. */
+const UNKNOWN_RUN: RunView = {
+  info: null,
+  heartbeat: null,
+  stale: false,
+  notes: null,
+  metrics: [],
+  evaluations: [],
+};
+
 function retryDelayMs(failures: number): number {
   return Math.min(1000 * 2 ** failures, MAX_RETRY_DELAY_MS);
 }
@@ -51,19 +64,18 @@ function applyEvent(state: ChannelState, event: RunEvent | 'reset'): ChannelStat
   switch (event.type) {
     case 'run': {
       const metrics = state.run?.metrics ?? [];
+      const evaluations = state.run?.evaluations ?? [];
       const { info, heartbeat, stale, notes } = event;
-      return { run: { info, heartbeat, stale, notes, metrics }, error: null };
+      return { run: { info, heartbeat, stale, notes, metrics, evaluations }, error: null };
     }
     case 'metrics': {
-      const run = state.run ?? {
-        info: null,
-        heartbeat: null,
-        stale: false,
-        notes: null,
-        metrics: [],
-      };
+      const run = state.run ?? UNKNOWN_RUN;
       const metrics = event.reset ? event.records : [...run.metrics, ...event.records];
       return { run: { ...run, metrics }, error: null };
+    }
+    case 'evaluations': {
+      const run = state.run ?? UNKNOWN_RUN;
+      return { run: { ...run, evaluations: event.results }, error: null };
     }
     case 'error':
       return { ...state, error: event.message };
