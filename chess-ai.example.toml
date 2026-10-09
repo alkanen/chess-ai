@@ -89,3 +89,36 @@ checkpoint_idle_hours = 24
 # is deleted along with its links. Every move, and the game ending, starts the
 # count again.
 expire_after_days = 7
+
+[ladder]
+# The Stockfish ladder that `chess-ai ladder` measures a checkpoint's Elo on: the
+# checkpoint plays a match against Stockfish at each level, and its Elo, with a
+# 95% range, is worked out from how it scored. The command line can override
+# each of these for one ladder.
+
+# Stockfish's Elo levels. A level outside the range Stockfish supports is played
+# at the nearest end of it (1350 to 2850 for Stockfish 14), and a checkpoint that
+# scores below the lowest level is reported as below it, not given a number.
+levels = [1350, 1500, 1700, 1900, 2100]
+
+# How many games the checkpoint plays against each level, the colours swapped
+# every game.
+games_per_level = 20
+
+# The rating the checkpoint is asked to play like. A model asked for no rating
+# plays far below what it can do, so a ladder always asks for one.
+rating = 2000
+
+# Seconds Stockfish has for each move. Its levels were calibrated at a few seconds
+# a move, so at a tenth of a second it plays below them: the Elo is on Stockfish's
+# scale at this move time, and only ladders played at one move time compare.
+move_time = 0.1
+
+# The opening set the games start from: one that comes with chess-ai, or the
+# path of a file of your own.
+openings = "standard"
+
+# Where the checkpoint's network runs: "cpu", "cuda", or "auto" for a GPU if
+# there is one. Unlike [inference] device, a GPU by default: a ladder asks about
+# thousands of positions, which is slow on a CPU and light work for a GPU.
+device = "auto"

@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import atexit
+import dataclasses
 import math
 import os
 import secrets
@@ -140,6 +141,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_train_command(commands)
     _add_runs_commands(commands)
     _add_match_command(commands)
+    _add_ladder_command(commands)
     return parser
 
 
@@ -907,6 +909,242 @@ def _match_summary(played: "list[MatchGame]", names: list[str]) -> str:
     if len(played) >= 2:
         lines.append("± is a rough 95% range for the score, from how the games went")
     return "\n".join(lines)
+
+
+def _add_ladder_command(commands: argparse._SubParsersAction) -> None:
+    """``chess-ai ladder``: a checkpoint against Stockfish at several levels, and its Elo."""
+    ladder = commands.add_parser(
+        "ladder",
+        help="measure a checkpoint's Elo against Stockfish at several strengths",
+        description=(
+            "Play a checkpoint against Stockfish at each level of a ladder in turn, as matches\n"
+            "from the lines of an opening set, and estimate its Elo, with a 95% range, from how\n"
+            "it scored. A checkpoint that loses every game, or whose estimate is below the\n"
+            "lowest level, is reported as below it rather than given a number; likewise above\n"
+            "the highest. The result and the games are saved in the run directory, under\n"
+            "evaluations/, replacing any earlier ladder of the same checkpoint.\n"
+            "\n"
+            "The levels, games, rating, move time and opening set default to the [ladder]\n"
+            "section of the configuration. The Elo is on Stockfish's scale at the move time\n"
+            "played, not a Lichess rating: compare ladders played at the same move time."
+        ),
+        epilog=(
+            "examples:\n"
+            "  chess-ai ladder resnet10x256\n"
+            "  chess-ai ladder resnet10x256@48000 --levels 1350,1500,1700 --games 10\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ladder.add_argument(
+        "checkpoint",
+        type=_ladder_checkpoint,
+        metavar="RUN[@CHECKPOINT]",
+        help="the checkpoint: best (the default), latest or a step",
+    )
+    ladder.add_argument(
+        "--levels",
+        type=_levels,
+        metavar="ELO,ELO,...",
+        help="Stockfish's levels, which are played weakest first",
+    )
+    ladder.add_argument(
+        "--games", type=_positive, metavar="N", help="how many games to play against each level"
+    )
+    ladder.add_argument(
+        "--rating",
+        type=lambda value: _number(int, value, "a rating", value, 0, _MAX_RATING),
+        metavar="R",
+        help="the rating the checkpoint is asked to play like",
+    )
+    ladder.add_argument(
+        "--move-time",
+        type=_move_time,
+        metavar="SECONDS",
+        help="how long Stockfish thinks about each move",
+    )
+    ladder.add_argument("--openings", metavar="SET", help="the opening set the games start from")
+    ladder.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        help="where the checkpoint's network runs; auto is the GPU if there is one",
+    )
+    ladder.set_defaults(handler=_ladder)
+
+
+def _ladder_checkpoint(text: str) -> _ModelSide:
+    if "," in text:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: a ladder's checkpoint takes no settings; see --rating"
+        )
+    return _model_side(text, text, {})
+
+
+def _levels(text: str) -> tuple[int, ...]:
+    from pydantic import ValidationError
+
+    from chess_ai.config import LadderConfig
+
+    try:
+        return LadderConfig(levels=text).levels  # type: ignore[arg-type]
+    except ValidationError as e:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: {'; '.join(error['msg'] for error in e.errors())}"
+        ) from e
+
+
+def _move_time(value: str) -> float:
+    from chess_ai.stockfish import MAX_MOVE_TIME, MIN_MOVE_TIME
+
+    return _number(float, value, "a move time", value, MIN_MOVE_TIME, MAX_MOVE_TIME)
+
+
+class _LevelNotStarted(Exception):
+    """Stockfish could not be started for a level of a ladder, which ``__cause__`` says why."""
+
+    def __init__(self, level: int, error: Exception) -> None:
+        super().__init__(level, error)
+        self.level = level
+
+
+def _ladder(config: Config, args: argparse.Namespace) -> int:
+    from datetime import UTC, datetime
+
+    import chess.engine
+
+    from chess_ai.ladder import (
+        games_path,
+        ladder_result,
+        play_ladder,
+        result_path,
+        save_ladder,
+        start_games_file,
+    )
+    from chess_ai.match import append_game, distinct_games
+    from chess_ai.openings import OpeningSetError, load_opening_set
+    from chess_ai.stockfish import StockfishError, start_stockfish
+    from chess_ai.training.run_store import RunError, code_version
+
+    settings = config.ladder
+    levels = args.levels or settings.levels
+    games = args.games or settings.games_per_level
+    rating = args.rating if args.rating is not None else settings.rating
+    move_time = args.move_time if args.move_time is not None else settings.move_time
+    try:
+        openings = load_opening_set(args.openings or settings.openings)
+    except OpeningSetError as e:
+        raise _UserError(e) from e
+    side = dataclasses.replace(args.checkpoint, rating=rating)
+    ((run, chosen),) = _choose_checkpoints([side], config).values()
+    inference = config.inference.model_copy(update={"device": args.device or settings.device})
+    model, label = _model_player(
+        side, run, chosen, None, config.model_copy(update={"inference": inference}), 0, {}
+    )
+    try:
+        partial = start_games_file(run, chosen.step)
+    except OSError as e:
+        raise _UserError(f"cannot write the ladder's games in {run.directory}: {e}") from e
+    played = 0
+    total = games * len(levels)
+
+    def on_game(stockfish, game: "MatchGame") -> None:
+        nonlocal played
+        try:
+            append_game(partial, game)
+        except OSError as e:
+            raise _UserError(f"could not save a game to {partial}: {e.strerror}") from e
+        played += 1
+        line = _game_line(game, games, [label, f"Stockfish {stockfish.elo}"])
+        _say(f"{played}/{total} {line}")
+
+    def games_note() -> str:
+        """Where the games played so far are, for a ladder that stopped before its end.
+
+        A ladder that played none deletes its empty games file and has nothing to tell. The
+        directory it was in stays, empty or not: another ladder or save of the same checkpoint
+        may have just made sure it is there, and be about to write into it.
+        """
+        if played == 0:
+            partial.unlink(missing_ok=True)
+            return ""
+        # A save that failed may have done so after the games were moved into place.
+        place = partial if partial.exists() else games_path(run, chosen.step)
+        return f"; the {_count(played, 'game')} played {'is' if played == 1 else 'are'} in {place}"
+
+    async def opponent(level: int) -> "Player":
+        try:
+            stockfish = await start_stockfish(config.stockfish.path, elo=level, move_time=move_time)
+        except StockfishError as e:
+            raise _LevelNotStarted(level, e) from e
+        if stockfish.stockfish.clamped:
+            _say(
+                f"chess-ai: warning: Stockfish plays from {stockfish.stockfish.min_elo} to "
+                f"{stockfish.stockfish.max_elo}, so level {level} is played at "
+                f"{stockfish.stockfish.elo}",
+                err=True,
+            )
+        return stockfish
+
+    _say(
+        f"chess-ai: {label} at rating {rating} against Stockfish at "
+        f"{', '.join(str(level) for level in levels)}, {_count(games, 'game')} each at "
+        f"{move_time:g} s a move, from opening set {openings.label}"
+    )
+    if games > distinct_games(openings):
+        _say(
+            f"chess-ai: warning: opening set {openings.label} has "
+            f"{_count(len(openings.openings), 'line')}, so from game "
+            f"{distinct_games(openings) + 1} of each level on the games start as earlier ones "
+            "did, and the checkpoint, which plays its most likely move, will repeat them",
+            err=True,
+        )
+    started = datetime.now(UTC)
+    try:
+        levels_played = asyncio.run(
+            play_ladder(
+                model, levels, games=games, openings=openings, opponent=opponent, on_game=on_game
+            )
+        )
+    except KeyboardInterrupt:
+        _say(
+            f"chess-ai: interrupted after {played} of {total} games, so no result was saved"
+            f"{games_note()}",
+            err=True,
+        )
+        return 130
+    except _LevelNotStarted as e:
+        raise _UserError(
+            f"Stockfish could not be started for level {e.level}, so no result was saved: "
+            f"{e.__cause__}{games_note()}"
+        ) from e
+    except (StockfishError, TimeoutError, chess.engine.EngineError) as e:
+        raise _UserError(
+            f"game {played + 1} could not be finished: {_engine_failure(e)}{games_note()}"
+        ) from e
+    result = ladder_result(
+        model.model,
+        levels_played,
+        openings=openings,
+        games_per_level=games,
+        started=started,
+        finished=datetime.now(UTC),
+        code_version=code_version(),
+    )
+    for level in result.levels:
+        fraction = level.points / level.games
+        _say(
+            f"Stockfish {level.elo}: {level.points:g}/{level.games} = {100 * fraction:.1f}% "
+            f"(+{level.wins} ={level.draws} -{level.losses})"
+        )
+    _say(
+        f"Elo: {result.estimate.describe()}, a {100 * result.estimate.confidence:g}% range, "
+        f"on Stockfish's scale at {move_time:g} s a move"
+    )
+    try:
+        save_ladder(run, result, partial)
+    except RunError as e:
+        raise _UserError(f"{e}, so no result was saved{games_note()}") from e
+    _say(f"chess-ai: result saved in {result_path(run, chosen.step)}")
+    return 0
 
 
 def _list_runs(config: Config, args: argparse.Namespace) -> int:

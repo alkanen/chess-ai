@@ -83,11 +83,13 @@ async def play_match(
     games: int,
     openings: OpeningSet,
     on_game: Callable[[MatchGame], None] | None = None,
+    event: str = EVENT,
 ) -> list[MatchGame]:
     """Play ``games`` games between ``first`` and ``second``, and return every one of them.
 
     ``on_game`` is handed each game as soon as it is over, which is where a match saves its
     games and says how it is going, so that a match stopped half-way has kept what it played.
+    ``event`` is what the games' PGN says they were played for, such as a ladder.
 
     The players are not closed here: whoever made them may have more for them to play.
 
@@ -106,7 +108,7 @@ async def play_match(
         await session.play()
         state = session.state
         headers = {
-            "Event": EVENT,
+            "Event": event,
             "Round": str(number),
             "Opening": opening.name,
             # A tag of this project's own: which set, and which version of it, the line was

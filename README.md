@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, a runs dashboard follows training live in the browser, and `chess-ai match` plays two checkpoints (or a checkpoint and Stockfish) against each other over a set of openings; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, a runs dashboard follows training live in the browser, `chess-ai match` plays two checkpoints (or a checkpoint and Stockfish) against each other over a set of openings, and `chess-ai ladder` estimates a checkpoint's Elo against Stockfish; the transformers and the evaluator come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -196,6 +196,21 @@ Playing its best move, a checkpoint plays the same game from the same position e
 Sampling with `--temperature` or `temperature=` varies the games further, and `--seed` (printed when it was not given) replays a match move for move. A low temperature such as 0.25 only changes a game where the moves are close, so on its own it can give near-copies; the openings are what make the games differ. Stockfish's own play is not seeded, so a match against it does not replay exactly.
 
 The `±` after each score is a rough 95% range from how the games went: about ±14 points of score over 50 games and ±7 over 200, less with draws. It says how much a rerun might differ, not an Elo difference. Every game is appended as it ends to one PGN file in the games directory, `YYYYMMDD-HHMMSS-match-ID.pgn`, so a match stopped with ctrl-c keeps the games it finished; the replay view opens the file as a list of its games. The games carry the usual model and Stockfish headers, plus `Event` "chess-ai match", the game's number as `Round`, the line as `Opening` and the set as `OpeningSet`.
+
+### Measure a checkpoint's Elo
+
+`chess-ai ladder` plays a checkpoint against Stockfish at each level of a ladder in turn, as matches over the opening set, and estimates the checkpoint's Elo from how it scored, with a 95% range:
+
+```sh
+uv run chess-ai ladder resnet10x256
+uv run chess-ai ladder resnet10x256@48000 --levels 1350,1500,1700 --games 10
+```
+
+The levels, games per level, the rating the checkpoint is asked to play like, Stockfish's move time, the opening set and the device the network runs on default to the `[ladder]` section of the configuration (see `chess-ai.example.toml`): five levels from 1350 to 2100, 20 games each, rating 2000, a tenth of a second a move, on the GPU if there is one. The checkpoint always plays at a stated rating, since asked for none it plays far below what it can do.
+
+The estimate is the maximum-likelihood rating on the Elo curve, and the range the ratings whose results are not much less likely. A checkpoint that loses every game, or whose estimate falls below the lowest level, is reported as below it (with the top of its range) rather than given an extrapolated number, and likewise above the highest. Stockfish 14 plays no weaker than 1350, so that is the floor. The rating is on Stockfish's scale at the move time played, which is below its calibrated strength at a tenth of a second, and is not a Lichess rating: compare ladders played at the same move time.
+
+The result goes to `evaluations/step-<step>/stockfish-ladder.json` in the run directory, and the games, with `Event` "chess-ai ladder", to `stockfish-ladder.pgn` beside it; a second ladder of the same checkpoint replaces both. While the ladder plays, its games are written to a `.partial` file of its own there; a ladder stopped with ctrl-c or by a failure saves no result, leaves that file behind if it finished any games, and says where it is. Two ladders of one checkpoint can run at once, and the one that finishes last is the result that stays, always beside its own games.
 
 ### Build a dataset
 
