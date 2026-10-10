@@ -4,6 +4,7 @@ import {
   type EvaluationEntry,
   type Heartbeat,
   type MetricsRecord,
+  type ProbeSetVersion,
   type RunEvent,
   type RunInfo,
   type RunNotes,
@@ -23,6 +24,8 @@ export interface RunView {
   metrics: MetricsRecord[];
   /** Which suites have a result about which checkpoints, by step and suite. */
   evaluations: EvaluationEntry[];
+  /** The probe set the evaluator probes with, or null when none has said. */
+  probeSet: ProbeSetVersion | null;
 }
 
 export interface RunChannel {
@@ -51,6 +54,7 @@ const UNKNOWN_RUN: RunView = {
   notes: null,
   metrics: [],
   evaluations: [],
+  probeSet: null,
 };
 
 function retryDelayMs(failures: number): number {
@@ -65,8 +69,12 @@ function applyEvent(state: ChannelState, event: RunEvent | 'reset'): ChannelStat
     case 'run': {
       const metrics = state.run?.metrics ?? [];
       const evaluations = state.run?.evaluations ?? [];
+      const probeSet = state.run?.probeSet ?? null;
       const { info, heartbeat, stale, notes } = event;
-      return { run: { info, heartbeat, stale, notes, metrics, evaluations }, error: null };
+      return {
+        run: { info, heartbeat, stale, notes, metrics, evaluations, probeSet },
+        error: null,
+      };
     }
     case 'metrics': {
       const run = state.run ?? UNKNOWN_RUN;
@@ -75,7 +83,10 @@ function applyEvent(state: ChannelState, event: RunEvent | 'reset'): ChannelStat
     }
     case 'evaluations': {
       const run = state.run ?? UNKNOWN_RUN;
-      return { run: { ...run, evaluations: event.results }, error: null };
+      return {
+        run: { ...run, evaluations: event.results, probeSet: event.current_set },
+        error: null,
+      };
     }
     case 'error':
       return { ...state, error: event.message };

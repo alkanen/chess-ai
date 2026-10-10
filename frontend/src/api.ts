@@ -596,7 +596,7 @@ export interface RunInfo {
   steps: number;
   batch_size: number;
   /** The run's config with every default filled in; only the parts the dashboard reads. */
-  config?: { optimizer?: { gradient_clip?: number } };
+  config?: { optimizer?: { gradient_clip?: number }; evaluation?: { suites?: string[] } };
 }
 
 /**
@@ -615,7 +615,12 @@ export type RunEvent =
       notes: RunNotes | null;
     }
   | { type: 'metrics'; reset: boolean; records: MetricsRecord[] }
-  | { type: 'evaluations'; results: EvaluationEntry[] }
+  | {
+      type: 'evaluations';
+      results: EvaluationEntry[];
+      /** The set the evaluator probes with, as it said when it last started, or null. */
+      current_set: ProbeSetVersion | null;
+    }
   | { type: 'error'; message: string };
 
 /** That a suite has a result about a checkpoint; mirrors run_store.EvaluationEntry. */
@@ -642,6 +647,8 @@ export interface ProbeOutcome {
   name: string;
   category: ProbeCategory;
   comment: string | null;
+  /** The FEN the moves were played from, or null for the usual starting position. */
+  start: string | null;
   /** The moves that led to the position, numbered, such as "1. e4 e5 2. Nf3". */
   line: string;
   fen: string;
@@ -663,6 +670,12 @@ export interface ProbeResult {
   probe_set: string;
   probe_set_version: number;
   positions: ProbeOutcome[];
+}
+
+/** A probe set by name and version; mirrors chess_ai.probes.ProbeSetVersion. */
+export interface ProbeSetVersion {
+  name: string;
+  version: number;
 }
 
 /** One checkpoint of a run, as the form lists it. */

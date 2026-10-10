@@ -1,5 +1,5 @@
 import { useId, useState } from 'react';
-import type { Color, GameState } from './api';
+import type { CandidateMove, Color, GameState } from './api';
 import type { Orientation } from './board/geometry';
 import { percent, type ShownThoughts, type WhiteOdds, whiteOdds } from './thoughts';
 import './ThoughtsPanel.css';
@@ -40,7 +40,7 @@ export function modelPlays(game: GameState): boolean {
 }
 
 /** The chances of each result as words, for the bar's label and the panel. */
-function described(odds: WhiteOdds): string {
+export function described(odds: WhiteOdds): string {
   const { white, draw, black } = odds;
   return `White wins ${percent(white)}, draw ${percent(draw)}, Black wins ${percent(black)}`;
 }
@@ -80,6 +80,43 @@ export function EvalBar({ odds, orientation }: EvalBarProps) {
         />
       ))}
     </div>
+  );
+}
+
+interface CandidateListProps {
+  label: string;
+  /** Most likely first. */
+  candidates: CandidateMove[];
+  /** Whether a move is singled out, such as the one the model played. */
+  marked: (uci: string) => boolean;
+  /** What a move singled out is, said to a screen reader after it, such as "played". */
+  markedAs: string;
+}
+
+/** Candidate moves with how likely each was, as words and as a meter. */
+export function CandidateList({ label, candidates, marked, markedAs }: CandidateListProps) {
+  return (
+    <ol className="candidates" aria-label={label}>
+      {candidates.map((candidate) => {
+        const singled = marked(candidate.uci);
+        return (
+          <li
+            key={candidate.uci}
+            className={singled ? 'candidate marked' : 'candidate'}
+            data-uci={candidate.uci}
+          >
+            <span className="candidate-move">
+              {candidate.san ?? candidate.uci}
+              {singled && <span className="visually-hidden"> ({markedAs})</span>}
+            </span>
+            <span className="candidate-meter" aria-hidden="true">
+              <span style={{ width: percent(candidate.probability) }} />
+            </span>
+            <span className="candidate-share">{percent(candidate.probability)}</span>
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -124,27 +161,12 @@ export function ThoughtsPanel({ game, shown, show, onShow }: ThoughtsPanelProps)
       {show && shown !== null && (
         <>
           <p className="thoughts-heading">{heading(game, shown)}</p>
-          <ol className="candidates" aria-label={`${sideOf(shown.side)}'s candidate moves`}>
-            {shown.thoughts.candidates.map((candidate) => {
-              const played = candidate.uci === shown.played;
-              return (
-                <li
-                  key={candidate.uci}
-                  className={played ? 'candidate played' : 'candidate'}
-                  data-uci={candidate.uci}
-                >
-                  <span className="candidate-move">
-                    {candidate.san ?? candidate.uci}
-                    {played && <span className="visually-hidden"> (played)</span>}
-                  </span>
-                  <span className="candidate-meter" aria-hidden="true">
-                    <span style={{ width: percent(candidate.probability) }} />
-                  </span>
-                  <span className="candidate-share">{percent(candidate.probability)}</span>
-                </li>
-              );
-            })}
-          </ol>
+          <CandidateList
+            label={`${sideOf(shown.side)}'s candidate moves`}
+            candidates={shown.thoughts.candidates}
+            marked={(uci) => uci === shown.played}
+            markedAs="played"
+          />
           {shown.thoughts.wdl !== null && (
             <p className="thoughts-odds">
               {described(whiteOdds(shown.thoughts.wdl, shown.side))}

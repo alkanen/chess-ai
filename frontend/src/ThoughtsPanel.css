@@ -41,7 +41,7 @@
   display: contents;
 }
 
-.candidate.played .candidate-move {
+.candidate.marked .candidate-move {
   font-weight: 700;
   color: rgb(20 150 70);
 }
@@ -59,7 +59,7 @@
   background: rgb(30 110 200);
 }
 
-.candidate.played .candidate-meter span {
+.candidate.marked .candidate-meter span {
   background: rgb(20 150 70);
 }
 

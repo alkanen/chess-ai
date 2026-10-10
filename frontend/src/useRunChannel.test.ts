@@ -4,6 +4,7 @@ import { FakeWebSocket } from './test/fakeWebSocket';
 import { useRunChannel } from './useRunChannel';
 
 const RESULT = { step: 2000, suite: 'probe-positions', updated: '2026-10-09T12:00:00Z' };
+const V1 = { name: 'standard', version: 1 };
 
 describe('useRunChannel', () => {
   beforeEach(() => {
@@ -25,7 +26,7 @@ describe('useRunChannel', () => {
     const socket = FakeWebSocket.latest;
     socket.open();
 
-    socket.deliver({ type: 'evaluations', results: [RESULT] });
+    socket.deliver({ type: 'evaluations', results: [RESULT], current_set: V1 });
     socket.deliver({
       type: 'run',
       name: 'live',
@@ -35,10 +36,12 @@ describe('useRunChannel', () => {
       notes: null,
     });
     expect(channel.result.current.run?.evaluations).toEqual([RESULT]);
+    expect(channel.result.current.run?.probeSet).toEqual(V1);
 
     const later = { ...RESULT, step: 4000 };
-    socket.deliver({ type: 'evaluations', results: [RESULT, later] });
+    socket.deliver({ type: 'evaluations', results: [RESULT, later], current_set: null });
     expect(channel.result.current.run?.evaluations).toEqual([RESULT, later]);
+    expect(channel.result.current.run?.probeSet).toBeNull();
     expect(channel.result.current.run?.metrics).toEqual([]);
   });
 });

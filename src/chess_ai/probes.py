@@ -18,6 +18,7 @@ was measured on and which checkpoint file it was measured with, which is how the
 tells a result that still stands from one to measure again.
 """
 
+import logging
 import math
 import tomllib
 from dataclasses import dataclass
@@ -31,10 +32,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from chess_ai.players import ModelDescription, WinDrawLoss
 from chess_ai.position_view import InvalidFenError, board_from_fen
-from chess_ai.training.run_store import CheckpointInfo, RunError, RunReader, save_evaluation
+from chess_ai.training.run_store import (
+    CheckpointInfo,
+    RunError,
+    RunReader,
+    _replace_file,
+    save_evaluation,
+)
 
 if TYPE_CHECKING:
     from chess_ai.inference import InferenceEngine
+
+LOGGER = logging.getLogger(__name__)
 
 SUITE: Final = "probe-positions"
 """What probing is called among the evaluation suites, and what its result file is named."""
@@ -168,6 +177,8 @@ def _read(name_or_path: str) -> tuple[str, str]:
     path = Path(name_or_path)
     try:
         return path.read_text(encoding="utf-8"), str(path)
+    except UnicodeDecodeError as e:
+        raise ProbeSetError(f"{path} is not UTF-8 text: {e}") from e
     except FileNotFoundError as e:
         raise ProbeSetError(
             f"there is no probe set {name_or_path!r}: give the path of a file, or one of "
@@ -385,6 +396,44 @@ def stands(result: ProbeResult, step: int, written: datetime, probes: ProbeSet) 
         and result.model.checkpoint == step
         and result.checkpoint_written == written
     )
+
+
+CURRENT_SET_FILE: Final = "probe-set.json"
+"""In the runs directory: which set the evaluator working on it probes checkpoints with."""
+
+
+class ProbeSetVersion(BaseModel):
+    """A probe set by name and version."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    version: int
+
+
+def save_current_set(runs_dir: Path, probes: ProbeSet) -> None:
+    """Record that the evaluator working on ``runs_dir`` probes checkpoints with ``probes``.
+
+    Only that evaluator writes it, and only one works on a runs directory at a time, so the
+    record has one writer. It says what the evaluator reads when it starts, which is what it
+    goes on probing with until it is started again, whatever happens to the set's file.
+    """
+    record = ProbeSetVersion(name=probes.name, version=probes.version)
+    _replace_file(runs_dir / CURRENT_SET_FILE, record.model_dump_json(indent=2) + "\n")
+
+
+def read_current_set(runs_dir: Path) -> ProbeSetVersion | None:
+    """Which set the evaluator working on ``runs_dir`` probes checkpoints with, or ``None`` when
+    no evaluator has said, or what it said cannot be read."""
+    path = runs_dir / CURRENT_SET_FILE
+    try:
+        return ProbeSetVersion.model_validate_json(path.read_bytes())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValidationError) as e:
+        # Debug: every viewer of a run asks about once a second.
+        LOGGER.debug("Cannot tell which probe set the evaluator uses: %s: %s", path, e)
+        return None
 
 
 def summary(result: ProbeResult) -> str:

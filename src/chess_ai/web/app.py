@@ -909,12 +909,16 @@ def create_app(
 
     @api.websocket("/runs/{name}/ws")
     async def follow_run(websocket: WebSocket, name: str) -> None:
-        """Send what a run is, its whole metrics log, and then whatever it adds to either.
+        """Send what a run is, its whole metrics log, which of its checkpoints have evaluation
+        results, and then whatever changes in any of them.
 
-        The first two messages are a ``run`` event and a ``metrics`` event with ``reset`` set.
-        After that a ``run`` event comes whenever the heartbeat changes or goes stale, and a
-        ``metrics`` event whenever the log has grown. A run that is not here is answered with
-        an ``error`` event, and the connection is closed.
+        The first three messages are a ``run`` event, a ``metrics`` event with ``reset`` set, and
+        an ``evaluations`` event, which lists the results and says which probe set the evaluator
+        probes with. After that a ``run`` event comes whenever the run's description, notes or
+        heartbeat change or the heartbeat goes stale, a ``metrics`` event whenever the log has
+        grown, and an ``evaluations`` event, with every result again, whenever a result is added
+        or replaced or the evaluator says it probes with another set. A run that is not here is
+        answered with an ``error`` event, and the connection is closed.
         """
         await websocket.accept()
         connection = _Connection(websocket)

@@ -191,6 +191,14 @@ def test_two_probes_with_one_id_or_one_position_are_refused(tmp_path):
         load_probe_set(same_position)
 
 
+def test_a_set_file_that_is_not_text_is_refused(tmp_path):
+    latin1 = tmp_path / "latin1.toml"
+    latin1.write_bytes('name = "café"\nversion = 1\n'.encode("latin-1"))
+
+    with pytest.raises(ProbeSetError, match=r"latin1\.toml is not UTF-8 text"):
+        load_probe_set(latin1)
+
+
 def test_a_set_that_is_not_there_is_refused_by_name():
     with pytest.raises(ProbeSetError, match="there is no probe set 'nowhere'.*standard"):
         load_probe_set("nowhere")

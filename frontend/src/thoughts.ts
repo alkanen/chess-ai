@@ -8,7 +8,7 @@
  * model has thought again.
  */
 
-import type { Color, GameState, Thoughts, WinDrawLoss } from './api';
+import type { CandidateMove, Color, GameState, Thoughts, WinDrawLoss } from './api';
 
 /** The thoughts the overlay shows, and whose they are. */
 export interface ShownThoughts {
@@ -60,7 +60,10 @@ export interface Arrow {
   to: string;
   /** How likely the model thought the move, from 0 to 1, which is how heavily it is drawn. */
   weight: number;
-  /** Whether it is the move the model played. */
+  /**
+   * Whether it is the move singled out, drawn in another colour: the one the model played, or
+   * on a probe position, one that solves it.
+   */
   played: boolean;
 }
 
@@ -75,17 +78,21 @@ export interface Arrow {
  * if any of them was; the list still tells them apart.
  */
 export function candidateArrows(shown: ShownThoughts): Arrow[] {
+  return moveArrows(shown.thoughts.candidates, (uci) => uci === shown.played);
+}
+
+/** Candidate moves as arrows, as candidateArrows draws them, the ones `marked` singled out. */
+export function moveArrows(candidates: CandidateMove[], marked: (uci: string) => boolean): Arrow[] {
   const arrows = new Map<string, Arrow>();
-  for (const candidate of shown.thoughts.candidates) {
+  for (const candidate of candidates) {
     const from = candidate.uci.slice(0, 2);
     const to = candidate.uci.slice(2, 4);
-    const played = candidate.uci === shown.played;
     const before = arrows.get(from + to);
     arrows.set(from + to, {
       from,
       to,
       weight: (before?.weight ?? 0) + Math.max(0, candidate.probability),
-      played: (before?.played ?? false) || played,
+      played: (before?.played ?? false) || marked(candidate.uci),
     });
   }
   return [...arrows.values()]
