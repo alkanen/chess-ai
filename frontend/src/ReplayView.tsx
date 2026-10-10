@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'reac
 import {
   openDatasetGame,
   openPgn,
+  openSampleGame,
   openSavedGame,
   PGN_MEDIA_TYPE,
   type PositionSnapshot,
@@ -19,6 +20,8 @@ import {
 import { describeResult, GameStatus } from './GameStatus';
 import { MoveList } from './MoveList';
 import { ReplayControls } from './ReplayControls';
+import { formatCount } from './runFormat';
+import { sampleGameHash, sampleGameInHash, type SampleGameRef } from './sampleGames';
 import { SavedGames } from './SavedGames';
 // The board and the panel beside it are laid out as the game view's are.
 import './App.css';
@@ -29,12 +32,15 @@ import './ReplayView.css';
  *
  * A file the viewer opened is kept here as its text, because the server keeps nothing:
  * moving to another game in the same file sends it up again. A dataset game is one game,
- * named by the address, and is opened from the dataset's page.
+ * named by the address, and is opened from the dataset's page. A sample game is one of the
+ * games a run's checkpoint played, named by the address, and is opened from the run's page;
+ * the checkpoint's other games are in the same file.
  */
 type Source =
   | { kind: 'saved'; name: string }
   | { kind: 'file'; name: string; pgn: string }
-  | { kind: 'dataset'; game: DatasetGameRef };
+  | { kind: 'dataset'; game: DatasetGameRef }
+  | { kind: 'sample'; game: SampleGameRef };
 
 /** Reads one game of a source, as a file of games with that one selected. */
 async function read(source: Source, game: number): Promise<ReplayFile> {
@@ -49,7 +55,34 @@ async function read(source: Source, game: number): Promise<ReplayFile> {
       // A dataset game is opened on its own: there is nothing in the same file to move to.
       return { games: [selected], selected };
     }
+    case 'sample':
+      return await openSampleGame(source.game.run, source.game.step, game);
   }
+}
+
+/**
+ * The address a game is opened at, or null for one that has none: a file or a saved game is
+ * opened from this view, and a reload brings back the view rather than the game.
+ */
+function addressOf(source: Source, game: number): string | null {
+  switch (source.kind) {
+    case 'dataset':
+      return datasetGameHash(source.game);
+    case 'sample':
+      return sampleGameHash({ ...source.game, index: game });
+    default:
+      return null;
+  }
+}
+
+/** The game an address names, or null for an address that names none. */
+function sourceInAddress(hash: string): Source | null {
+  const dataset = datasetGameInHash(hash);
+  if (dataset !== null) {
+    return { kind: 'dataset', game: dataset };
+  }
+  const sample = sampleGameInHash(hash);
+  return sample === null ? null : { kind: 'sample', game: sample };
 }
 
 /** What the arrow keys do, which is what the buttons under the board do. */
@@ -92,9 +125,11 @@ function said(part: string): boolean {
 interface ReplayViewProps {
   /** A dataset game the address names, to open as the view is shown; null for none. */
   datasetGame?: DatasetGameRef | null;
+  /** A run's sample game the address names, to open as the view is shown; null for none. */
+  sampleGame?: SampleGameRef | null;
 }
 
-export function ReplayView({ datasetGame = null }: ReplayViewProps) {
+export function ReplayView({ datasetGame = null, sampleGame = null }: ReplayViewProps) {
   const [source, setSource] = useState<Source | null>(null);
   const [file, setFile] = useState<ReplayFile | null>(null);
   /** How many moves of the game are on the board; 0 is the position it started from. */
@@ -127,17 +162,24 @@ export function ReplayView({ datasetGame = null }: ReplayViewProps) {
     return () => window.removeEventListener('keydown', step);
   }, [file, plies]);
 
-  // The dataset game the address names, opened when the view is shown with one, and again
-  // when the address moves on to another. Keyed by the address, which says all there is to
-  // say about which game it is.
-  const datasetAddress = datasetGame === null ? null : datasetGameHash(datasetGame);
+  // The dataset game or sample game the address names, opened when the view is shown with one,
+  // and again when the address moves on to another. Keyed by the address, which says all there
+  // is to say about which game it is.
+  const gameAddress =
+    datasetGame !== null
+      ? datasetGameHash(datasetGame)
+      : sampleGame !== null
+        ? sampleGameHash(sampleGame)
+        : null;
   useEffect(() => {
-    const named = datasetAddress === null ? null : datasetGameInHash(datasetAddress);
-    if (named !== null) {
-      void openGame({ kind: 'dataset', game: named }, 0);
+    const named = gameAddress === null ? null : sourceInAddress(gameAddress);
+    if (named?.kind === 'dataset') {
+      void openGame(named, 0);
+    } else if (named?.kind === 'sample') {
+      void openGame(named, named.game.index);
     }
     // Not on openGame, which is a new function every render: only the address says when to open.
-  }, [datasetAddress]);
+  }, [gameAddress]);
 
   /**
    * Take the next request, and say afterwards whether it is still the one being waited
@@ -156,10 +198,13 @@ export function ReplayView({ datasetGame = null }: ReplayViewProps) {
    * whichever one the server finished reading last.
    */
   async function openGame(opened: Source, game: number): Promise<void> {
-    if (opened.kind !== 'dataset' && datasetGameInHash(window.location.hash) !== null) {
-      // Otherwise a reload would bring back the dataset game rather than this one. Replaced
-      // rather than followed, so that Back still goes to the dataset the game was opened from.
-      window.history.replaceState(window.history.state, '', '#replay');
+    const address = addressOf(opened, game);
+    const { hash } = window.location;
+    if (address !== null ? hash !== address : sourceInAddress(hash) !== null) {
+      // Otherwise a reload would bring back the game the address named rather than this one,
+      // such as another of a checkpoint's games chosen here. Replaced rather than followed, so
+      // that Back still goes to the page the first game was opened from.
+      window.history.replaceState(window.history.state, '', address ?? '#replay');
     }
     const wanted = asking();
     setOpening(true);
@@ -260,6 +305,11 @@ export function ReplayView({ datasetGame = null }: ReplayViewProps) {
                   <a href={datasetHash(pageOf(source.game))}>
                     {source.game.name}, {source.game.split} game {source.game.index + 1}
                   </a>
+                ) : source.kind === 'sample' ? (
+                  <>
+                    <a href={`#runs/${encodeURIComponent(source.game.run)}`}>{source.game.run}</a>
+                    , sample games of step {formatCount(source.game.step)}
+                  </>
                 ) : (
                   source.name
                 )}

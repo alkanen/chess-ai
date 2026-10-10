@@ -13,6 +13,7 @@ import {
 import { FakeWebSocket } from './test/fakeWebSocket';
 import startPosition from './test/fixtures/start-position.json';
 import { foolsMateMoves, foolsMateStart, type StateEvent } from './test/foolsMate';
+import { foolsMateFile } from './test/replayFile';
 import { castling, check, drawnByFiftyMoves, promotion } from './test/positions';
 
 // uPlot draws on a canvas, which jsdom does not have; see RunView.test.tsx for the charts.
@@ -152,6 +153,29 @@ describe('App', () => {
 
       expect(await screen.findByText('No games have been saved here yet.')).toBeInTheDocument();
       expect(screen.getByRole('heading', { name: 'Replay' })).toBeInTheDocument();
+    });
+
+    it('opens a run’s sample game the address names in the replay viewer', async () => {
+      const fetch = vi.fn((url: string) =>
+        Promise.resolve(
+          Response.json(new URL(url).pathname.endsWith('/replay/saved') ? [] : foolsMateFile),
+        ),
+      );
+      vi.stubGlobal('fetch', fetch);
+      window.location.hash = '#replay/run/tiny/500/1';
+
+      render(<App />);
+
+      expect(await screen.findByRole('link', { name: 'tiny' })).toHaveAttribute(
+        'href',
+        '#runs/tiny',
+      );
+      expect(screen.getByRole('button', { name: 'Replay' })).toHaveAttribute(
+        'aria-current',
+        'page',
+      );
+      const asked = fetch.mock.calls.map(([url]) => new URL(url).pathname + new URL(url).search);
+      expect(asked).toContain('/chess/api/runs/tiny/evaluations/500/sample-games/replay?game=0');
     });
 
     it('opens the runs dashboard, and a run from it', async () => {
