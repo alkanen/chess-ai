@@ -13,6 +13,7 @@ import { GameView } from './GameView';
 import { ReplayView } from './ReplayView';
 import { RunsView } from './RunsView';
 import { RunView } from './RunView';
+import { sampleGameInHash, type SampleGameRef } from './sampleGames';
 import './App.css';
 
 /** The pages there are, in the order they are offered. */
@@ -41,6 +42,8 @@ interface Place {
   dataset?: DatasetPage | null;
   /** The dataset game on show, under the replay view; null for a file or a saved game. */
   datasetGame?: DatasetGameRef | null;
+  /** The run's sample game on show, under the replay view; null for a file or a saved game. */
+  sampleGame?: SampleGameRef | null;
 }
 
 const GAME_PAGE = /^#(?:game|watch)\/(.+)$/;
@@ -68,6 +71,10 @@ function placeInAddress(): Place {
   const datasetGame = datasetGameInHash(hash);
   if (datasetGame !== null) {
     return { view: 'replay', link: null, run: null, compare: null, datasetGame };
+  }
+  const sampleGame = sampleGameInHash(hash);
+  if (sampleGame !== null) {
+    return { view: 'replay', link: null, run: null, compare: null, sampleGame };
   }
   const run = RUN_PAGE.exec(hash);
   if (run !== null) {
@@ -135,7 +142,12 @@ export function App() {
       </header>
       {view === 'game' && place.link === null && <GameLobby />}
       {view === 'game' && place.link !== null && <GameView key={place.link} link={place.link} />}
-      {view === 'replay' && <ReplayView datasetGame={place.datasetGame ?? null} />}
+      {view === 'replay' && (
+        <ReplayView
+          datasetGame={place.datasetGame ?? null}
+          sampleGame={place.sampleGame ?? null}
+        />
+      )}
       {view === 'runs' && place.compare !== null && <CompareView names={place.compare} />}
       {view === 'runs' && place.compare === null && place.run === null && <RunsView />}
       {view === 'runs' && place.run !== null && <RunView key={place.run} name={place.run} />}

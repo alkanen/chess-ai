@@ -89,7 +89,7 @@ function describeStockfish(player: PlayerInfo): string | null {
 }
 
 /** One side of the game: who is playing it, and how they were asked to. */
-function Player({ player }: { player: PlayerInfo }) {
+export function Player({ player }: { player: PlayerInfo }) {
   const note = describeModel(player) ?? describeStockfish(player);
   return (
     <dd>

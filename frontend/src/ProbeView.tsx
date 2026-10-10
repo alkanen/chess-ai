@@ -1,4 +1,4 @@
-import { memo, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { memo, useId, useMemo } from 'react';
 import {
   fetchProbes,
   type EvaluationEntry,
@@ -7,97 +7,19 @@ import {
   type ProbeSetVersion,
 } from './api';
 import { Board } from './board/Board';
-import { CATEGORIES, probedSteps, setMismatch, solved, solvedCount } from './probes';
+import {
+  CheckpointScrubber,
+  resultKey,
+  suiteSteps,
+  useCheckpointResult,
+  useChosenCheckpoint,
+} from './CheckpointResults';
+import { CATEGORIES, PROBE_SUITE, setMismatch, solved, solvedCount } from './probes';
 import { formatCount } from './runFormat';
 import { moveArrows, percent, whiteOdds } from './thoughts';
 import { CandidateList, described } from './ThoughtsPanel';
 import './ThoughtsPanel.css';
 import './ProbeView.css';
-
-/**
- * How long the scrubber has to rest on a checkpoint before its result is asked for, so that
- * dragging it across a long run does not ask for every checkpoint on the way.
- */
-const SETTLE_MS = 120;
-
-/** How many results are kept in the page, so that going back to one shows it at once. */
-const KEPT_RESULTS = 32;
-
-/** A result as one version of it was written, which a newer one replaces. */
-function resultKey(entry: EvaluationEntry): string {
-  return `${entry.step}@${entry.updated}`;
-}
-
-/** How long to wait before asking again for a result that could not be fetched. */
-function retryDelayMs(failures: number): number {
-  return Math.min(1000 * 2 ** (failures - 1), 10_000);
-}
-
-interface ProbeState {
-  /** The last result fetched, and which version of which result it is, or null before any. */
-  shown: { key: string; result: ProbeResult } | null;
-  /** Why the result wanted now could not be fetched, while it is being tried again. */
-  failed: { key: string; message: string } | null;
-}
-
-/**
- * The result `entry` stands for, asked for again whenever it is written again, and the last
- * one there was while it is on its way.
- *
- * Only the latest one asked for is ever shown: the answer to an earlier one, arriving late, is
- * about a checkpoint the viewer has left or a version since replaced. One that cannot be
- * fetched, such as while the server restarts, is asked for again until it comes, since nothing
- * else would ask: the run channel sends the same results again when it reconnects.
- */
-function useProbeResult(run: string, entry: EvaluationEntry | undefined): ProbeState {
-  const [state, setState] = useState<ProbeState>({ shown: null, failed: null });
-  const kept = useRef(new Map<string, ProbeResult>());
-  const key = entry === undefined ? null : resultKey(entry);
-  const step = entry?.step;
-
-  useEffect(() => {
-    if (key === null || step === undefined) {
-      return;
-    }
-    const known = kept.current.get(key);
-    if (known !== undefined) {
-      setState({ shown: { key, result: known }, failed: null });
-      return;
-    }
-    let wanted = true;
-    let failures = 0;
-    const ask = () => {
-      fetchProbes(run, step).then(
-        (result) => {
-          kept.current.set(key, result);
-          if (kept.current.size > KEPT_RESULTS) {
-            // A Map keeps the order things were put in, so the first is the oldest.
-            kept.current.delete(kept.current.keys().next().value!);
-          }
-          if (wanted) {
-            setState({ shown: { key, result }, failed: null });
-          }
-        },
-        (error: unknown) => {
-          if (!wanted) {
-            return;
-          }
-          const message = error instanceof Error ? error.message : String(error);
-          setState((before) => ({ ...before, failed: { key, message } }));
-          failures += 1;
-          timer = setTimeout(ask, retryDelayMs(failures));
-        },
-      );
-    };
-    let timer = setTimeout(ask, SETTLE_MS);
-    return () => {
-      wanted = false;
-      clearTimeout(timer);
-    };
-  }, [run, key, step]);
-
-  return state;
-}
 
 interface ProbeCardProps {
   outcome: ProbeOutcome;
@@ -210,19 +132,10 @@ export const ProbeView = memo(function ProbeView({
   currentSet,
 }: ProbeViewProps) {
   const id = useId();
-  const steps = useMemo(() => probedSteps(evaluations), [evaluations]);
-  /** The step chosen, or null to follow the newest. */
-  const [chosen, setChosen] = useState<number | null>(null);
-  const chosenIndex = chosen === null ? -1 : steps.findIndex((entry) => entry.step === chosen);
-  if (chosen !== null && chosenIndex === -1) {
-    // A chosen step that has no result any more, such as after the run was started again under
-    // the same name, gives way to the newest for good: a step of the same number turning up
-    // later is another checkpoint, which nobody chose.
-    setChosen(null);
-  }
-  const index = chosenIndex === -1 ? steps.length - 1 : chosenIndex;
-  const entry = steps.at(index);
-  const { shown, failed } = useProbeResult(run, entry);
+  const steps = useMemo(() => suiteSteps(evaluations, PROBE_SUITE), [evaluations]);
+  const chosen = useChosenCheckpoint(steps);
+  const { entry } = chosen;
+  const { shown, failed } = useCheckpointResult(run, entry, fetchProbes);
 
   if (steps.length === 0) {
     if (!probed) {
@@ -239,11 +152,6 @@ export const ProbeView = memo(function ProbeView({
     );
   }
 
-  function choose(at: number) {
-    // The last one is the newest, now and as newer ones arrive.
-    setChosen(at >= steps.length - 1 ? null : steps[at].step);
-  }
-
   const result = shown?.result;
   const current = entry !== undefined && shown?.key === resultKey(entry);
   const failure = entry !== undefined && failed?.key === resultKey(entry) ? failed : null;
@@ -252,41 +160,7 @@ export const ProbeView = memo(function ProbeView({
   return (
     <section className="probe-view" aria-labelledby={`${id}-heading`}>
       <h3 id={`${id}-heading`}>Probe positions</h3>
-      <div className="probe-scrubber">
-        <button
-          type="button"
-          onClick={() => choose(index - 1)}
-          disabled={index === 0}
-          aria-label="Earlier checkpoint"
-        >
-          ‹
-        </button>
-        <input
-          type="range"
-          min={0}
-          max={steps.length - 1}
-          step={1}
-          value={index}
-          onChange={(event) => choose(Number(event.target.value))}
-          aria-label="Checkpoint"
-          aria-valuetext={`Step ${formatCount(entry?.step)}`}
-        />
-        <button
-          type="button"
-          onClick={() => choose(index + 1)}
-          disabled={index === steps.length - 1}
-          aria-label="Later checkpoint"
-        >
-          ›
-        </button>
-        <span className="probe-step">
-          Step {formatCount(entry?.step)}{' '}
-          <span className="note">
-            ({index + 1} of {steps.length}
-            {chosen === null || chosenIndex === -1 ? ', newest' : ''})
-          </span>
-        </span>
-      </div>
+      <CheckpointScrubber steps={steps} chosen={chosen} />
       {failure !== null && (
         <p role="alert">
           Cannot load step {formatCount(entry?.step)} ({failure.message}); trying again.
