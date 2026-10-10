@@ -42,6 +42,7 @@ from chess_ai.training.run_store import (
 
 if TYPE_CHECKING:
     from chess_ai.inference import InferenceEngine
+    from chess_ai.inference.engine import Evaluation
 
 LOGGER = logging.getLogger(__name__)
 
@@ -297,6 +298,26 @@ class ProbeResult(BaseModel):
         return sum(marked), len(marked)
 
 
+def check_finite(evaluation: "Evaluation", what: str) -> None:
+    """Make sure ``evaluation``, of the position ``what`` names, is made of numbers.
+
+    Raises:
+        DivergedError: some of it is NaN or infinite, as the outputs of diverged weights are.
+    """
+    # The illegal mass too: it is a softmax over every logit, so a NaN in one the legal moves
+    # leave out shows only there.
+    numbers = [
+        *evaluation.probabilities(),
+        *evaluation.wdl.model_dump().values(),
+        evaluation.illegal_mass,
+    ]
+    if not all(math.isfinite(number) for number in numbers):
+        raise DivergedError(
+            f"the network's outputs for {what} are not a number: its weights have most likely "
+            "diverged"
+        )
+
+
 def probe(engine: "InferenceEngine", probes: ProbeSet, *, rating: int | None) -> list[ProbeOutcome]:
     """What ``engine`` makes of every probe in ``probes``, with both sides at ``rating``.
 
@@ -307,19 +328,8 @@ def probe(engine: "InferenceEngine", probes: ProbeSet, *, rating: int | None) ->
     evaluations = engine.evaluate_many(boards, mover_rating=rating, opponent_rating=rating)
     outcomes = []
     for each, board, evaluation in zip(probes.probes, boards, evaluations, strict=True):
-        # The illegal mass too: it is a softmax over every logit, so a NaN in one the legal
-        # moves leave out shows only there.
-        numbers = [
-            *evaluation.probabilities(),
-            *evaluation.wdl.model_dump().values(),
-            evaluation.illegal_mass,
-        ]
-        if not all(math.isfinite(number) for number in numbers):
-            # Written down, a NaN is a null that no result can be read back from.
-            raise DivergedError(
-                f"the network's outputs for {each.id!r} are not a number: its weights have "
-                "most likely diverged"
-            )
+        # Written down, a NaN is a null that no result can be read back from.
+        check_finite(evaluation, repr(each.id))
         best = {move.uci() for move in each.best}
         outcomes.append(
             ProbeOutcome(

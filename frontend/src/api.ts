@@ -599,6 +599,22 @@ export interface RunInfo {
   config?: { optimizer?: { gradient_clip?: number }; evaluation?: { suites?: string[] } };
 }
 
+/** A sample game the evaluator is playing with a checkpoint, as it stands. */
+export interface LiveGame {
+  run: string;
+  /** The checkpoint playing it. */
+  step: number;
+  /** Where it will be among the checkpoint's sample games, counting from 0. */
+  index: number;
+  /** How many games the checkpoint plays in all. */
+  games: number;
+  opponent: 'self' | 'stockfish';
+  /** When the evaluator last wrote it. */
+  updated: string;
+  /** Only the last move has its thoughts, and the position offers no moves. */
+  game: GameState;
+}
+
 /**
  * What the run channel sends: what the run is and where it has got to, first and whenever
  * that changes, and the lines of its metrics log. A metrics event with `reset` set replaces
@@ -620,6 +636,11 @@ export type RunEvent =
       results: EvaluationEntry[];
       /** The set the evaluator probes with, as it said when it last started, or null. */
       current_set: ProbeSetVersion | null;
+    }
+  | {
+      type: 'live_game';
+      /** The sample game being played with one of the run's checkpoints, or null for none. */
+      live: LiveGame | null;
     }
   | { type: 'error'; message: string };
 

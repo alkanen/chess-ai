@@ -2,6 +2,7 @@ import { useEffect, useReducer, useState } from 'react';
 import {
   runChannelUrl,
   type EvaluationEntry,
+  type LiveGame,
   type Heartbeat,
   type MetricsRecord,
   type ProbeSetVersion,
@@ -26,6 +27,8 @@ export interface RunView {
   evaluations: EvaluationEntry[];
   /** The probe set the evaluator probes with, or null when none has said. */
   probeSet: ProbeSetVersion | null;
+  /** The sample game being played with one of its checkpoints, or null for none. */
+  liveGame: LiveGame | null;
 }
 
 export interface RunChannel {
@@ -55,6 +58,7 @@ const UNKNOWN_RUN: RunView = {
   metrics: [],
   evaluations: [],
   probeSet: null,
+  liveGame: null,
 };
 
 function retryDelayMs(failures: number): number {
@@ -70,9 +74,10 @@ function applyEvent(state: ChannelState, event: RunEvent | 'reset'): ChannelStat
       const metrics = state.run?.metrics ?? [];
       const evaluations = state.run?.evaluations ?? [];
       const probeSet = state.run?.probeSet ?? null;
+      const liveGame = state.run?.liveGame ?? null;
       const { info, heartbeat, stale, notes } = event;
       return {
-        run: { info, heartbeat, stale, notes, metrics, evaluations, probeSet },
+        run: { info, heartbeat, stale, notes, metrics, evaluations, probeSet, liveGame },
         error: null,
       };
     }
@@ -87,6 +92,10 @@ function applyEvent(state: ChannelState, event: RunEvent | 'reset'): ChannelStat
         run: { ...run, evaluations: event.results, probeSet: event.current_set },
         error: null,
       };
+    }
+    case 'live_game': {
+      const run = state.run ?? UNKNOWN_RUN;
+      return { run: { ...run, liveGame: event.live }, error: null };
     }
     case 'error':
       return { ...state, error: event.message };

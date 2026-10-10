@@ -71,6 +71,7 @@ from chess_ai.position_view import (
     board_from_fen,
     snapshot,
 )
+from chess_ai.sample_games import SampleGamesResult, read_games, read_sample_games
 from chess_ai.stockfish import (
     DEFAULT_MOVE_TIME,
     MAX_MOVE_TIME,
@@ -685,6 +686,62 @@ def create_app(
         return shown
 
     @api.get(
+        "/runs/{name}/evaluations/{step}/sample-games",
+        responses={
+            404: {"description": "No run of that name, or no sample games for that step"},
+            500: {"description": "The result is there and cannot be read"},
+        },
+    )
+    def run_sample_games(name: str, step: int, response: Response) -> SampleGamesResult:
+        """Which sample games a checkpoint played, and how each ended.
+
+        Replaced when the checkpoint plays them again, so it is kept by nobody.
+        """
+        response.headers.update(NO_STORE)
+        run = _open_run(name)
+        try:
+            result = read_sample_games(run, step)
+        except RunError as unreadable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unreadable)
+            ) from unreadable
+        if result is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"run {name!r} has no sample games for the checkpoint from step {step}",
+            )
+        return result
+
+    @api.get(
+        "/runs/{name}/evaluations/{step}/sample-games/replay",
+        responses={
+            404: {"description": "No run of that name, no sample games, or no such game"},
+            500: {"description": "The games are there and cannot be read"},
+        },
+    )
+    def run_sample_game(
+        name: str,
+        step: int,
+        response: Response,
+        game: Annotated[int, Query(ge=0, description=_WHICH_GAME)] = 0,
+    ) -> replay.ReplayFile:
+        """Replay one of a checkpoint's sample games, as the replay viewer opens a file."""
+        response.headers.update(NO_STORE)
+        run = _open_run(name)
+        try:
+            pgn = read_games(run, step)
+        except RunError as unreadable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unreadable)
+            ) from unreadable
+        if pgn is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"run {name!r} has no sample games for the checkpoint from step {step}",
+            )
+        return _replayed(pgn, game)
+
+    @api.get(
         "/runs/{name}/notes",
         responses={
             404: {"description": "No run of that name is kept here"},
@@ -912,13 +969,15 @@ def create_app(
         """Send what a run is, its whole metrics log, which of its checkpoints have evaluation
         results, and then whatever changes in any of them.
 
-        The first three messages are a ``run`` event, a ``metrics`` event with ``reset`` set, and
-        an ``evaluations`` event, which lists the results and says which probe set the evaluator
-        probes with. After that a ``run`` event comes whenever the run's description, notes or
-        heartbeat change or the heartbeat goes stale, a ``metrics`` event whenever the log has
-        grown, and an ``evaluations`` event, with every result again, whenever a result is added
-        or replaced or the evaluator says it probes with another set. A run that is not here is
-        answered with an ``error`` event, and the connection is closed.
+        The first four messages are a ``run`` event, a ``metrics`` event with ``reset`` set, an
+        ``evaluations`` event, which lists the results and says which probe set the evaluator
+        probes with, and a ``live_game`` event with the sample game being played with one of the
+        run's checkpoints, if any. After that a ``run`` event comes whenever the run's
+        description, notes or heartbeat change or the heartbeat goes stale, a ``metrics`` event
+        whenever the log has grown, an ``evaluations`` event, with every result again, whenever a
+        result is added or replaced or the evaluator says it probes with another set, and a
+        ``live_game`` event whenever the sample game moves on, another begins, or they are over.
+        A run that is not here is answered with an ``error`` event, and the connection is closed.
         """
         await websocket.accept()
         connection = _Connection(websocket)

@@ -70,6 +70,13 @@ class Stopped(Exception):
         """How many of the checkpoints it found still lacked a result when it stopped."""
 
 
+class SuiteStopped(Exception):
+    """A suite gave up on a checkpoint because the evaluator was told to stop, saving nothing.
+
+    Not a failure: the checkpoint still lacks the result, and the next evaluator evaluates it.
+    """
+
+
 class EvaluatorBusy(Exception):
     """Another evaluator is already working on the runs directory."""
 
@@ -116,6 +123,8 @@ class Suite(Protocol):
         checkpoint: CheckpointInfo,
         written: datetime,
         engine: "InferenceEngine",
+        *,
+        stop: threading.Event | None = None,
     ) -> str:
         """Evaluate ``checkpoint``, save the result into ``run``, and say in a line how it did.
 
@@ -123,7 +132,11 @@ class Suite(Protocol):
         before it was loaded: a file replaced in between is then evaluated again, rather than
         its result taken for the new one's.
 
+        ``stop`` is the evaluator's: a suite that takes long enough for the wait to matter
+        looks at it as it goes, and raises :exc:`SuiteStopped` once it is set.
+
         Raises:
+            SuiteStopped: ``stop`` was set before the suite was done; nothing was saved.
             CheckpointChanged: the checkpoint's file was replaced or deleted after ``written``,
                 so the result, which is about the file that was, was not saved.
             RunError: the result cannot be saved.
@@ -153,7 +166,10 @@ class ProbeSuite:
         checkpoint: CheckpointInfo,
         written: datetime,
         engine: "InferenceEngine",
+        *,
+        stop: threading.Event | None = None,
     ) -> str:
+        # A second or two: done before a stop would be waited for long.
         started = datetime.now(UTC)
         positions = probe(engine, self.probes, rating=self.rating)
         result = ProbeResult(
@@ -218,6 +234,45 @@ def configured_suites(run: RunReader) -> list[str]:
     return known
 
 
+def evaluated_runs(runs_dir: Path) -> Iterator[tuple[RunReader, list[str]]]:
+    """Every run in ``runs_dir`` the evaluator looks at, with the suites it asks for.
+
+    Archived runs are left alone, and so are runs that cannot be read.
+    """
+    for name in list_runs(runs_dir):
+        run = RunReader(runs_dir / name)
+        try:
+            if ARCHIVED_TAG in run.notes.tags:
+                continue
+            suites = configured_suites(run)
+        except RunError:
+            LOGGER.debug("run %s cannot be read, so it is not evaluated", name, exc_info=True)
+            continue
+        yield run, suites
+
+
+def runs_lacking(
+    runs_dir: Path, suite: str, stands: Callable[[RunReader, CheckpointInfo, datetime], bool]
+) -> list[str]:
+    """The runs the evaluator looks at that ask for ``suite`` and have a checkpoint on disk
+    without a result from it that ``stands``, by name: the runs a pass without the suite would
+    leave short. ``stands`` is the suite's own :meth:`Suite.stands`, as one that cannot be set
+    up still has to tell."""
+    lacking = []
+    for run, suites in evaluated_runs(runs_dir):
+        if suite not in suites:
+            continue
+        for checkpoint in run.checkpoints():
+            try:
+                written = run.checkpoint_written(checkpoint)
+            except RunError:
+                continue  # Not looked at by a pass either.
+            if written is not None and not stands(run, checkpoint, written):
+                lacking.append(run.name)
+                break
+    return lacking
+
+
 class Evaluator:
     """Finds checkpoints that lack results, and evaluates them.
 
@@ -247,15 +302,9 @@ class Evaluator:
         """Every checkpoint on disk that lacks a result a suite of its run's would give, newest
         checkpoint first. Archived runs are left alone."""
         jobs: list[Job] = []
-        for name in list_runs(self.runs_dir):
-            run = RunReader(self.runs_dir / name)
-            try:
-                if ARCHIVED_TAG in run.notes.tags:
-                    continue
-                wanted = [suite for suite in configured_suites(run) if suite in self.suites]
-            except RunError:
-                LOGGER.debug("run %s cannot be read, so it is not evaluated", name, exc_info=True)
-                continue
+        for run, configured in evaluated_runs(self.runs_dir):
+            name = run.name
+            wanted = [suite for suite in configured if suite in self.suites]
             if not wanted:
                 continue
             for checkpoint in run.checkpoints():
@@ -278,11 +327,13 @@ class Evaluator:
                     )
         return sorted(jobs, key=lambda job: job.written, reverse=True)
 
-    def evaluate(self, job: Job) -> None:
-        """Run the suites ``job`` names on its checkpoint, loading the checkpoint once for all.
+    def evaluate(self, job: Job, *, stop: threading.Event | None = None) -> bool:
+        """Run the suites ``job`` names on its checkpoint, loading the checkpoint once for all,
+        and say whether it got to the end of them.
 
         A checkpoint pruned before its turn came is passed over without a word: it is no longer
-        one to evaluate. Any other failure is said, and the checkpoint not tried again.
+        one to evaluate. Any other failure is said, and the checkpoint not tried again. A suite
+        stopped by ``stop`` part-way is neither: the rest are not run, and ``False`` is returned.
         """
         run, checkpoint = job.run, job.checkpoint
         path = run.checkpoint_path(checkpoint)
@@ -291,16 +342,19 @@ class Evaluator:
         except Exception as e:
             if not path.exists():
                 LOGGER.debug("%s was pruned before it could be evaluated", job.describe())
-                return
+                return True
             self._fail(job, job.suites, f"cannot be loaded: {e}")
-            return
+            return True
         for name in job.suites:
             try:
-                said = self.suites[name].evaluate(run, checkpoint, job.written, engine)
+                said = self.suites[name].evaluate(run, checkpoint, job.written, engine, stop=stop)
+            except SuiteStopped:
+                LOGGER.debug("%s %s was stopped part-way", job.describe(), name)
+                return False
             except CheckpointChanged:
                 # Replaced or pruned meanwhile: the next look finds the new file, if any.
                 LOGGER.debug("%s changed while it was evaluated", job.describe())
-                return
+                return True
             except Exception as e:
                 self._fail(job, (name,), f"{name} failed: {e}")
                 continue
@@ -310,6 +364,7 @@ class Evaluator:
                 self._fail(job, (name,), f"{name} saved a result that does not read back")
                 continue
             self._say(f"{job.describe()} {name}: {said}")
+        return True
 
     def run_once(self, *, stop: threading.Event | None = None) -> list[Job]:
         """Evaluate what lacks a result now, and say what that was, in the order it was done.
@@ -317,7 +372,8 @@ class Evaluator:
         Only the checkpoints the first look finds: one saved meanwhile is left for the next
         time, so that this ends however fast the runs save them. Each turn looks again all the
         same, so that one evaluated, pruned or replaced meanwhile drops out. ``stop`` is looked
-        at between checkpoints.
+        at between checkpoints, and by a suite that takes long, such as the sample games, as it
+        goes.
 
         Raises:
             Stopped: ``stop`` was set while some of them still lacked a result; one set after
@@ -333,21 +389,23 @@ class Evaluator:
                 raise Stopped(done, len(left))
             job = left[0]
             found.discard(_key(job))
-            self.evaluate(job)
+            if not self.evaluate(job, stop=stop):
+                raise Stopped(done, len(left))
             done.append(job)
         return done
 
     def run(self, *, poll_seconds: float, stop: threading.Event) -> None:
         """Evaluate checkpoints as they appear, until ``stop`` is set.
 
-        ``stop`` is looked at between checkpoints, and while waiting for more.
+        ``stop`` is looked at between checkpoints, while waiting for more, and by a suite that
+        takes long as it goes.
         """
         while not stop.is_set():
             job = self._next()
             if job is None:
                 stop.wait(poll_seconds)
             else:
-                self.evaluate(job)
+                self.evaluate(job, stop=stop)
 
     def _next(self) -> Job | None:
         """The newest checkpoint lacking a result, looked for afresh every time.

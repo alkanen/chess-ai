@@ -1272,6 +1272,28 @@ def evaluation_lock(directory: Path) -> Iterator[None]:
         os.close(descriptor)
 
 
+PARTIAL_SUFFIX: Final = ".partial"
+"""What the name of a file an evaluation is still writing ends in, such as its games."""
+
+
+def start_partial_file(directory: Path, name: str) -> Path:
+    """A new, empty file in the evaluation directory ``directory`` to write ``name`` into.
+
+    One of its own for every evaluation that asks, so that two evaluations of one checkpoint
+    going on at once do not write into each other's; :func:`save_evaluation` moves it to
+    ``name`` once the evaluation is over. ``sample-games.pgn`` is started as, for instance,
+    ``sample-games.1a2b3c4d.pgn.partial``.
+
+    Raises:
+        OSError: the directory or the file cannot be made.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    stem, dot, suffix = name.partition(".")
+    path = directory / f"{stem}.{uuid.uuid4().hex[:8]}{dot}{suffix}{PARTIAL_SUFFIX}"
+    path.touch(exist_ok=False)
+    return path
+
+
 def save_evaluation(
     directory: Path,
     texts: Mapping[str, str],

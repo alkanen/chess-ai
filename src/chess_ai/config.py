@@ -15,7 +15,14 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 Device = Literal["auto", "cuda", "cpu"]
 """What a config may ask to run a network on. ``auto`` is the GPU when there is one, else the
@@ -203,6 +210,44 @@ class LadderConfig(BaseModel):
         return tuple(sorted(value))
 
 
+class SampleGamesConfig(BaseModel):
+    """The sample games the evaluator plays with each checkpoint, for the run page to show.
+
+    Played on the evaluator's device, by the checkpoint against itself and, if asked for,
+    against Stockfish. Changing these does not play the games of checkpoints that have theirs
+    again; ``chess-ai evaluate --suite sample-games`` does.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    games: int = Field(default=2, ge=0, le=100)
+    """How many games the checkpoint plays against itself, each from a line of the opening set
+    of its own: a deterministic model playing a line from both sides would play it twice."""
+    stockfish_games: int = Field(default=0, ge=0, le=100)
+    """How many games it plays against Stockfish, the colours swapped every game."""
+    stockfish_elo: int = Field(default=1350, ge=0, le=4000)
+    """The Elo Stockfish plays those at, moved into the range it supports."""
+    stockfish_move_time: float = Field(default=0.1, ge=0.01, le=60.0)
+    """Seconds Stockfish has for each move."""
+    rating: int = Field(default=2000, ge=0, le=4000)
+    """The rating the checkpoint is asked to play like."""
+    openings: str = "standard"
+    """The opening set the games start from: one that comes with chess-ai, or a file's path.
+    Every checkpoint starts from the same lines, so that their games can be compared."""
+    move_delay: float = Field(default=0.0, ge=0.0, le=10.0)
+    """The least number of seconds between two moves, so that the games can be followed live
+    on the run page. Every second of it is a second the evaluator spends per move."""
+
+    @model_validator(mode="after")
+    def _some_games(self) -> "SampleGamesConfig":
+        if self.games + self.stockfish_games == 0:
+            raise ValueError(
+                "games and stockfish_games cannot both be 0; leave sample-games out of a "
+                "run's [evaluation] suites instead"
+            )
+        return self
+
+
 class EvaluatorConfig(BaseModel):
     """How the evaluator works through checkpoints, and what the probes ask about them.
 
@@ -240,6 +285,7 @@ class Config(BaseModel):
     games: GamesConfig = GamesConfig()
     ladder: LadderConfig = LadderConfig()
     evaluator: EvaluatorConfig = EvaluatorConfig()
+    sample_games: SampleGamesConfig = SampleGamesConfig()
 
 
 def load_config(path: Path | None = None, environ: Mapping[str, str] | None = None) -> Config:

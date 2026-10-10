@@ -147,8 +147,10 @@ metric = "policy_loss"                     # default: "policy_loss"
 # What the evaluator (`chess-ai evaluator`, a process of its own beside the trainer) finds
 # out about each checkpoint the run saves, once per suite; `chess-ai evaluate` runs them
 # again on demand. "probe-positions" records the checkpoint's top moves and win/draw/loss
-# estimate on a fixed set of labelled positions, for the run page. [] evaluates nothing.
-suites = ["probe-positions"]               # default: ["probe-positions"]
+# estimate on a fixed set of labelled positions, for the run page. "sample-games" plays a few
+# games with the checkpoint (see [sample_games] in chess-ai.toml), which the run page shows
+# live as they are played. [] evaluates nothing.
+suites = ["probe-positions", "sample-games"] # default: ["probe-positions", "sample-games"]
 
 # Uncomment to start the weights from another run's checkpoint instead of from the seed:
 # fine-tuning. Weights only — the optimizer, the schedule and the step start afresh, on the

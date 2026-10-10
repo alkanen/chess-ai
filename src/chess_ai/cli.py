@@ -8,7 +8,7 @@ import math
 import os
 import secrets
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -1665,7 +1665,7 @@ def _add_evaluation_commands(commands: argparse._SubParsersAction) -> None:
         action="append",
         type=_suite,
         metavar="NAME",
-        help="a suite to run, given once for each; probe-positions is the one there is",
+        help="a suite to run, given once for each: probe-positions or sample-games",
     )
     evaluate.set_defaults(handler=_evaluate)
 
@@ -1692,23 +1692,50 @@ def _suite(text: str) -> str:
     return text
 
 
-def _evaluation_suites(config: Config) -> "dict[str, Any]":
-    """The suites the evaluator and ``chess-ai evaluate`` run, set up as the config says.
+def _evaluation_suites(
+    config: Config, names: "Collection[str]", *, live: "Path | None" = None
+) -> "dict[str, Any]":
+    """The suites called ``names`` that the evaluator and ``chess-ai evaluate`` run, set up as
+    the config says. Only those, so that a setting of one suite that is wrong stops nothing
+    the others would do.
 
-    Also takes the CPU threads the config allows, since everything that follows is evaluation.
+    ``live`` is the runs directory to show the sample game being played in, which only the
+    evaluator does. Also takes the CPU threads the config allows, since everything that
+    follows is evaluation.
+
+    Raises:
+        _UserError: a suite's settings name a set of positions or openings that cannot be read.
     """
     import torch
 
     from chess_ai.evaluator import ProbeSuite
+    from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.probes import ProbeSetError, load_probe_set
+    from chess_ai.sample_games import SampleGamesSuite
+    from chess_ai.stockfish import start_stockfish
 
     settings = config.evaluator
     torch.set_num_threads(settings.threads)
-    try:
-        probes = load_probe_set(settings.probe_set)
-    except ProbeSetError as e:
-        raise _UserError(e) from e
-    return {ProbeSuite.name: ProbeSuite(probes, rating=settings.rating)}
+    suites: dict[str, Any] = {}
+    if ProbeSuite.name in names:
+        try:
+            probes = load_probe_set(settings.probe_set)
+        except ProbeSetError as e:
+            raise _UserError(e) from e
+        suites[ProbeSuite.name] = ProbeSuite(probes, rating=settings.rating)
+    if SampleGamesSuite.name in names:
+        try:
+            openings = load_opening_set(config.sample_games.openings)
+        except OpeningSetError as e:
+            raise _UserError(f"[sample_games] openings: {e}") from e
+
+        async def stockfish(elo: int, move_time: float) -> "Player":
+            return await start_stockfish(config.stockfish.path, elo=elo, move_time=move_time)
+
+        suites[SampleGamesSuite.name] = SampleGamesSuite(
+            config.sample_games, openings, stockfish=stockfish, live=live
+        )
+    return suites
 
 
 def _evaluation_loader(config: Config) -> "Callable[[Path], Any]":
@@ -1734,11 +1761,31 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
         ProbeSuite,
         Stopped,
         evaluator_lock,
+        runs_lacking,
     )
     from chess_ai.probes import save_current_set
+    from chess_ai.sample_games import SUITE as SAMPLE_GAMES
+    from chess_ai.sample_games import clear_live_game
+    from chess_ai.sample_games import stands as sample_games_stand
 
     runs = config.paths.runs
-    suites = _evaluation_suites(config)
+    # Every suite there is, since which ones runs ask for can change while this goes on. The
+    # probes are what the run page compares results with, so without them nothing is done.
+    suites = _evaluation_suites(config, [ProbeSuite.name], live=runs)
+    try:
+        suites |= _evaluation_suites(config, [SAMPLE_GAMES], live=runs)
+    except _UserError as e:
+        # A pass that left out games some checkpoint lacks would end as one that left nothing
+        # out, which is what a script running it checks for, and it has no later to be started
+        # again for. A pass that would play no games goes on as the evaluator would.
+        if args.once and runs_lacking(runs, SAMPLE_GAMES, sample_games_stand):
+            raise
+        # Said once, rather than as a failure for every checkpoint, which keep waiting for
+        # their games until an evaluator that can play them is started.
+        _say(
+            f"chess-ai: warning: {e}; no sample games are played until the evaluator is restarted",
+            err=True,
+        )
     evaluator = Evaluator(
         runs,
         suites,
@@ -1765,6 +1812,8 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
             # until it is started again, whatever happens to the set's file meanwhile.
             try:
                 save_current_set(runs, suites[ProbeSuite.name].probes)
+                # Left by an evaluator that was killed in the middle of a game.
+                clear_live_game(runs)
             except OSError as e:
                 raise _UserError(f"cannot write to {runs}: {e.strerror or e}") from e
             previous = {
@@ -1811,6 +1860,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.evaluator import configured_suites
     from chess_ai.inference import InferenceError
     from chess_ai.probes import DivergedError
+    from chess_ai.stockfish import StockfishError
     from chess_ai.training.run_store import (
         CheckpointChanged,
         RunError,
@@ -1835,7 +1885,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
             chosen.extend((run, checkpoint, suites, choice is None) for checkpoint in checkpoints)
     except RunError as e:
         raise _UserError(e) from e
-    available = _evaluation_suites(config)
+    available = _evaluation_suites(config, {suite for *_, suites, _ in chosen for suite in suites})
     load = _evaluation_loader(config)
     failed: set[str] = set()
     try:
@@ -1879,6 +1929,9 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     continue
                 except RunError as e:
                     raise _UserError(e) from e
+                except StockfishError as e:
+                    # The same for every checkpoint to come: not one to go on past.
+                    raise _UserError(f"{label} {suite}: {e}") from e
                 _say(f"{label} {suite}: {said}")
     except KeyboardInterrupt:
         _say("chess-ai: interrupted", err=True)

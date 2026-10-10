@@ -150,3 +150,35 @@ rating = 2000
 # your own. A different set, or a new version of this one, probes every
 # checkpoint still on disk again.
 probe_set = "standard"
+
+[sample_games]
+# The sample games the evaluator plays with each checkpoint of a run whose
+# [evaluation] suites name "sample-games" (the default), shown live on the run's
+# page as they are played and saved as PGN in the run directory. Changing these
+# plays no checkpoint's games again; `chess-ai evaluate --suite sample-games` does.
+
+# How many games the checkpoint plays against itself, each from a line of the
+# opening set of its own: a model that always plays its likeliest move would play
+# a line the same way from both sides.
+games = 2
+
+# How many games it plays against Stockfish, the colours swapped every game. Not
+# both 0: leave "sample-games" out of a run's suites instead.
+stockfish_games = 0
+
+# The Elo Stockfish plays those at, and the seconds it has for each move.
+stockfish_elo = 1350
+stockfish_move_time = 0.1
+
+# The rating the checkpoint is asked to play like.
+rating = 2000
+
+# The opening set the games start from: one that comes with chess-ai, or the path
+# of a file of your own. Every checkpoint starts from the same lines, so that their
+# games can be compared.
+openings = "standard"
+
+# The least number of seconds between two moves, so that the games can be
+# followed on the run page. Every second of it is a second the evaluator spends
+# on each move, and on a small network on the GPU a game takes a few seconds.
+move_delay = 0
