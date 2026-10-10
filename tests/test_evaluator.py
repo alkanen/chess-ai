@@ -23,6 +23,7 @@ from chess_ai.evaluator import (
 )
 from chess_ai.inference import load_engine
 from chess_ai.probes import SUITE, ProbeSetVersion, load_probe_set, read_current_set, read_probes
+from chess_ai.sample_games import SUITE as SAMPLE_GAMES
 from chess_ai.training.run_store import (
     ARCHIVED_TAG,
     CheckpointPolicy,
@@ -42,6 +43,11 @@ def evaluator(runs_dir, *, probes=None, said=None, warned=None) -> Evaluator:
         say=(said.append if said is not None else lambda text: None),
         warn=(warned.append if warned is not None else lambda text: None),
     )
+
+
+def probed_steps(run: RunReader) -> list[int]:
+    """The steps with a probe result, whatever other suites have results about them."""
+    return [entry.step for entry in run.evaluations() if entry.suite == SUITE]
 
 
 def done(jobs) -> list[tuple[str, int]]:
@@ -259,7 +265,7 @@ def test_evaluate_runs_the_suites_again_and_replaces_earlier_results(tmp_path, c
     assert after.finished > before.finished
     assert read_probes(run, 2) == untouched
     out = capsys.readouterr().out
-    assert f"tiny@4 {SUITE}: solved" in out.splitlines()[-1]
+    assert any(line.startswith(f"tiny@4 {SUITE}: solved") for line in out.splitlines())
 
 
 def test_evaluate_takes_every_checkpoint_of_a_run_and_the_suites_asked_for(tmp_path, capsys):
@@ -354,10 +360,10 @@ def test_the_evaluator_command_evaluates_until_sigterm_and_then_stops(tmp_path):
     )
     try:
         deadline = time.monotonic() + 60
-        while not run.evaluations() and time.monotonic() < deadline:
+        while not probed_steps(run) and time.monotonic() < deadline:
             time.sleep(0.1)
         add_checkpoint(run.directory, 4)
-        while len(run.evaluations()) < 2 and time.monotonic() < deadline:
+        while len(probed_steps(run)) < 2 and time.monotonic() < deadline:
             time.sleep(0.1)
         worker.send_signal(signal.SIGTERM)
         out, err = worker.communicate(timeout=30)
@@ -365,7 +371,7 @@ def test_the_evaluator_command_evaluates_until_sigterm_and_then_stops(tmp_path):
         worker.kill()
 
     assert worker.returncode == 0, err
-    assert [entry.step for entry in run.evaluations()] == [2, 4]
+    assert probed_steps(run) == [2, 4]
     assert f"tiny@4 {SUITE}" in out
     assert "evaluator stopped" in err
 
@@ -497,9 +503,11 @@ def test_evaluator_once_stopped_part_way_says_so_in_its_exit_status(
 
     assert main(["evaluator", "--once"]) == status
 
-    assert [entry.step for entry in RunReader(run).evaluations()] == [6]
+    # The probes of the checkpoint it was loading are done, its games are not: they are
+    # stopped as soon as they look, so the checkpoint is left with the two it never reached.
+    assert probed_steps(RunReader(run)) == [6]
     err = capsys.readouterr().err
-    assert "evaluator stopped before every checkpoint was evaluated: 2 are left" in err
+    assert "evaluator stopped before every checkpoint was evaluated: 3 are left" in err
     # The handlers it put in place are gone with it.
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
@@ -520,7 +528,7 @@ def test_evaluate_passes_over_a_checkpoint_pruned_while_the_others_were_evaluate
 
     assert main(["evaluate", "tiny"]) == 0
 
-    assert [entry.step for entry in RunReader(run).evaluations()] == [2]
+    assert probed_steps(RunReader(run)) == [2]
     assert "tiny@4 was pruned before it could be evaluated" in capsys.readouterr().err
 
 
@@ -545,7 +553,7 @@ class NeverStands:
     def stands(self, run, checkpoint, written) -> bool:
         return False
 
-    def evaluate(self, run, checkpoint, written, engine) -> str:
+    def evaluate(self, run, checkpoint, written, engine, *, stop=None) -> str:
         self.evaluated += 1
         return "done"
 
@@ -635,9 +643,15 @@ def test_evaluate_goes_on_past_a_diverged_checkpoint_and_then_fails(tmp_path, mo
         main(["evaluate", "tiny"])
 
     assert exited.value.code == 2
-    assert [entry.step for entry in RunReader(run).evaluations()] == [2, 6]
+    assert [(entry.step, entry.suite) for entry in RunReader(run).evaluations()] == [
+        (2, SUITE),
+        (2, SAMPLE_GAMES),
+        (6, SUITE),
+        (6, SAMPLE_GAMES),
+    ]
     err = capsys.readouterr().err
     assert "warning: tiny@4 probe-positions: the network's outputs" in err
+    assert "warning: tiny@4 sample-games: the network's outputs" in err
     assert "error: 1 checkpoint could not be evaluated" in err
 
 

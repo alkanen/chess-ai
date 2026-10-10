@@ -24,7 +24,6 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Final, Literal
-from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
 
@@ -39,7 +38,11 @@ from chess_ai.players import (
     wait_players_closed,
 )
 from chess_ai.rating import DEFAULT_CONFIDENCE, Beyond, Estimate, Result, estimate_rating
-from chess_ai.training.run_store import RunReader, save_evaluation
+from chess_ai.training.run_store import (
+    RunReader,
+    save_evaluation,
+    start_partial_file,
+)
 
 SUITE: Final = "stockfish-ladder"
 """What the ladder is called among the evaluation suites, and what its files are named."""
@@ -48,9 +51,6 @@ EVENT: Final = "chess-ai ladder"
 """The ``Event`` of every ladder game's PGN, telling them from the games of a plain match."""
 
 FORMAT_VERSION: Final = 1
-
-PARTIAL_SUFFIX: Final = ".partial"
-"""What the name of a games file ends in while its ladder is still playing."""
 
 CLOSE_TIMEOUT: Final = 5.0
 """How long a level waits for its Stockfish process to exit before going on to the next."""
@@ -254,11 +254,7 @@ def start_games_file(run: RunReader, step: int) -> Path:
     are added with :func:`~chess_ai.match.append_game` as they end. A ladder that is stopped
     leaves its file behind, for whoever stopped it to look at or delete.
     """
-    directory = run.evaluation_directory(step)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{SUITE}.{uuid4().hex[:8]}.pgn{PARTIAL_SUFFIX}"
-    path.touch(exist_ok=False)
-    return path
+    return start_partial_file(run.evaluation_directory(step), f"{SUITE}.pgn")
 
 
 def save_ladder(run: RunReader, result: LadderResult, partial: Path) -> None:

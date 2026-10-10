@@ -60,20 +60,26 @@ class MatchGame:
         return white if self.first_plays_white else 1.0 - white
 
 
-def pairing(number: int, openings: OpeningSet) -> tuple[Opening, bool]:
+def pairing(number: int, openings: OpeningSet, *, paired: bool = True) -> tuple[Opening, bool]:
     """The opening game ``number`` (from 1) starts from, and whether the first player is White.
 
     Games come in pairs, both from one line, the first player taking White in the first of them
     and Black in the second. After the last line the set starts again from its first.
+
+    Unless ``paired`` is false: then every game starts from a line of its own, the first player
+    always White. That is for a player against itself, which the swap would only make replay
+    the game it has just played.
     """
     index = number - 1
     lines = openings.openings
+    if not paired:
+        return lines[index % len(lines)], True
     return lines[(index // 2) % len(lines)], index % 2 == 0
 
 
-def distinct_games(openings: OpeningSet) -> int:
+def distinct_games(openings: OpeningSet, *, paired: bool = True) -> int:
     """How many games a match can play before a game starts the way an earlier one did."""
-    return 2 * len(openings.openings)
+    return (2 if paired else 1) * len(openings.openings)
 
 
 async def play_match(
@@ -83,13 +89,19 @@ async def play_match(
     games: int,
     openings: OpeningSet,
     on_game: Callable[[MatchGame], None] | None = None,
+    on_session: Callable[[int, GameSession], None] | None = None,
     event: str = EVENT,
+    paired: bool = True,
+    move_delay: float = 0.0,
 ) -> list[MatchGame]:
     """Play ``games`` games between ``first`` and ``second``, and return every one of them.
 
     ``on_game`` is handed each game as soon as it is over, which is where a match saves its
     games and says how it is going, so that a match stopped half-way has kept what it played.
-    ``event`` is what the games' PGN says they were played for, such as a ladder.
+    ``on_session`` is handed each game's session, with the game's number, before a move of it is
+    played, which is how a match is watched while it is being played. ``event`` is what the
+    games' PGN says they were played for, such as a ladder. ``paired`` is as :func:`pairing`
+    has it, and ``move_delay`` as :class:`~chess_ai.game_session.GameSession` has it.
 
     The players are not closed here: whoever made them may have more for them to play.
 
@@ -102,9 +114,11 @@ async def play_match(
         raise ValueError(f"a match needs at least one game, not {games}")
     played = []
     for number in range(1, games + 1):
-        opening, first_plays_white = pairing(number, openings)
+        opening, first_plays_white = pairing(number, openings, paired=paired)
         white, black = (first, second) if first_plays_white else (second, first)
-        session = GameSession(white, black, opening=opening.moves)
+        session = GameSession(white, black, opening=opening.moves, move_delay=move_delay)
+        if on_session is not None:
+            on_session(number, session)
         await session.play()
         state = session.state
         headers = {

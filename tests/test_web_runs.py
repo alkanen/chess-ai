@@ -17,10 +17,17 @@ from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 from training_helpers import model_run
 
-from chess_ai.config import Config, EvaluatorConfig, PathsConfig, ServerConfig
+from chess_ai.config import (
+    Config,
+    EvaluatorConfig,
+    PathsConfig,
+    SampleGamesConfig,
+    ServerConfig,
+)
 from chess_ai.encoders import create_encoder
 from chess_ai.evaluator import ProbeSuite
 from chess_ai.inference import load_engine
+from chess_ai.openings import load_opening_set
 from chess_ai.probes import (
     CURRENT_SET_FILE,
     SUITE,
@@ -29,6 +36,7 @@ from chess_ai.probes import (
     load_probe_set,
     save_current_set,
 )
+from chess_ai.sample_games import SampleGamesSuite
 from chess_ai.training.run_store import (
     METRICS_FILE,
     NOTES_FILE,
@@ -48,6 +56,7 @@ from chess_ai.training.run_store import (
 from chess_ai.web import create_app
 from chess_ai.web.runs import (
     EvaluationsEvent,
+    LiveGameEvent,
     MetricsEvent,
     RunStateEvent,
     RunStream,
@@ -584,7 +593,12 @@ def test_a_stream_sends_the_run_state_only_when_it_changes(runs):
         stream = RunStream(RunReader(runs / "live"), stale_after=60, clock=lambda: NOW)
 
         first = stream.poll()
-        assert [type(event) for event in first] == [RunStateEvent, MetricsEvent, EvaluationsEvent]
+        assert [type(event) for event in first] == [
+            RunStateEvent,
+            MetricsEvent,
+            EvaluationsEvent,
+            LiveGameEvent,
+        ]
         assert stream.poll() == []
 
         run.log(step=1, split="train", loss=1.0)
@@ -609,13 +623,14 @@ def test_a_stream_follows_a_run_whose_files_are_not_written_yet(runs):
     (runs / "early").mkdir(parents=True)
     stream = RunStream(RunReader(runs / "early"), stale_after=60, clock=lambda: NOW)
 
-    state, metrics, evaluations = stream.poll()
+    state, metrics, evaluations, live = stream.poll()
 
     assert isinstance(state, RunStateEvent)
     assert (state.info, state.heartbeat) == (None, None)
     assert isinstance(metrics, MetricsEvent)
     assert (metrics.reset, metrics.records) == (True, [])
     assert evaluations == EvaluationsEvent(results=[], current_set=None)
+    assert live == LiveGameEvent(live=None)
 
 
 def test_a_stream_starts_again_on_a_new_run_whose_log_reuses_the_old_ones_file(runs):
@@ -672,7 +687,7 @@ def test_a_stream_says_which_checkpoints_have_results_and_when_another_arrives(r
     run = probed(runs)
     stream = RunStream(run, stale_after=60, clock=lambda: NOW)
 
-    *_, first = stream.poll()
+    *_, first, _ = stream.poll()
     nothing_new = stream.poll()
     later = run.checkpoints()[1]
     ProbeSuite(load_probe_set("standard"), rating=1800).evaluate(
@@ -691,7 +706,7 @@ def test_a_stream_says_which_set_the_evaluator_probes_with_and_when_that_changes
     run = probed(runs)
     stream = RunStream(run, stale_after=60, clock=lambda: NOW)
 
-    *_, unsaid = stream.poll()
+    *_, unsaid, _ = stream.poll()
     save_current_set(runs, small_set_version(1))
     [first] = stream.poll()
     nothing_new = stream.poll()
@@ -735,7 +750,7 @@ def test_a_stream_says_no_set_is_current_when_the_record_cannot_be_read(runs, re
     else:
         (runs / CURRENT_SET_FILE).write_text(record)
 
-    *_, event = RunStream(run, stale_after=60, clock=lambda: NOW).poll()
+    *_, event, _ = RunStream(run, stale_after=60, clock=lambda: NOW).poll()
 
     assert isinstance(event, EvaluationsEvent)
     assert event.current_set is None
@@ -809,3 +824,47 @@ def test_a_probe_result_that_cannot_be_read_is_the_servers_fault(client, runs):
     response = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/probe-positions")
 
     assert response.status_code == 500
+
+
+# Sample games.
+
+
+def test_a_checkpoints_sample_games_are_listed_and_replayed(client, runs):
+    run = RunReader(model_run(runs, "tiny", steps=(2,)))
+    first = run.checkpoints()[0]
+    SampleGamesSuite(SampleGamesConfig(games=2), load_opening_set("standard")).evaluate(
+        run, first, run.checkpoint_written(first), load_engine(run.checkpoint_path(first))
+    )
+
+    listed = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/sample-games")
+    second = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/sample-games/replay?game=1")
+    beyond = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/sample-games/replay?game=2")
+
+    assert listed.status_code == 200
+    assert listed.headers["cache-control"] == "no-store"
+    assert [game["opponent"] for game in listed.json()["games"]] == ["self", "self"]
+    assert second.status_code == 200
+    replayed_game = second.json()
+    assert len(replayed_game["games"]) == 2
+    assert replayed_game["selected"]["index"] == 1
+    assert len(replayed_game["selected"]["moves"]) == listed.json()["games"][1]["plies"]
+    assert beyond.status_code == 404
+
+
+@pytest.mark.parametrize("path", ["sample-games", "sample-games/replay"])
+def test_a_checkpoint_without_sample_games_has_none_to_show(client, runs, path):
+    model_run(runs, "tiny", steps=(2,))
+
+    assert client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/{path}").status_code == 404
+    assert client.get(f"{PREFIX}/api/runs/missing/evaluations/2/{path}").status_code == 404
+
+
+def test_unreadable_sample_games_are_a_server_error(client, runs):
+    run = RunReader(model_run(runs, "tiny", steps=(2,)))
+    directory = run.evaluation_directory(2)
+    directory.mkdir(parents=True)
+    (directory / "sample-games.json").write_text("{")
+    (directory / "sample-games.pgn").write_bytes(b"\xff\xfe")
+
+    for path in ("sample-games", "sample-games/replay"):
+        assert client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/{path}").status_code == 500

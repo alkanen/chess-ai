@@ -23,6 +23,7 @@ from chess_ai.probes import (
     read_current_set,
     read_probes,
 )
+from chess_ai.sample_games import LiveGame, read_live_game
 from chess_ai.training.run_store import (
     TRAIN,
     VALIDATION,
@@ -301,7 +302,18 @@ class EvaluationsEvent(BaseModel):
     not reached it again yet."""
 
 
-RunEvent = RunStateEvent | MetricsEvent | EvaluationsEvent
+class LiveGameEvent(BaseModel):
+    """The sample game the evaluator is playing with one of the run's checkpoints, as it stands.
+
+    Sent first, and again whenever it moves on, another game begins, or the games are over,
+    when ``live`` is ``None``. Finished games are in the checkpoint's ``sample-games`` result.
+    """
+
+    type: Literal["live_game"] = "live_game"
+    live: LiveGame | None
+
+
+RunEvent = RunStateEvent | MetricsEvent | EvaluationsEvent | LiveGameEvent
 
 
 class ShownProbe(ProbeOutcome):
@@ -356,6 +368,7 @@ class RunStream:
         self._tail = run.tail_metrics()
         self._sent: RunStateEvent | None = None
         self._evaluations: EvaluationsEvent | None = None
+        self._live: LiveGameEvent | None = None
 
     @property
     def name(self) -> str:
@@ -384,6 +397,14 @@ class RunStream:
         if evaluations != self._evaluations:
             events.append(evaluations)
             self._evaluations = evaluations
+        # One file for the whole runs directory, about whichever run's checkpoint is playing.
+        live = read_live_game(
+            self._run.directory.parent, now=self._clock(), stale_after=self._stale_after
+        )
+        shown = LiveGameEvent(live=live if live is not None and live.run == self.name else None)
+        if shown != self._live:
+            events.append(shown)
+            self._live = shown
         return events
 
     def _state(self) -> RunStateEvent:

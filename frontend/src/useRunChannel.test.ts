@@ -1,5 +1,6 @@
 import { renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { LiveGame } from './api';
 import { FakeWebSocket } from './test/fakeWebSocket';
 import { useRunChannel } from './useRunChannel';
 
@@ -43,5 +44,35 @@ describe('useRunChannel', () => {
     expect(channel.result.current.run?.evaluations).toEqual([RESULT, later]);
     expect(channel.result.current.run?.probeSet).toBeNull();
     expect(channel.result.current.run?.metrics).toEqual([]);
+  });
+
+  it('keeps the sample game being played until the server says it is over', () => {
+    const channel = renderHook(() => useRunChannel('live'));
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    const live: LiveGame = {
+      run: 'live',
+      step: 2000,
+      index: 0,
+      games: 2,
+      opponent: 'self',
+      updated: '2026-10-10T12:00:00Z',
+      // Only passed along here: what is in it is the run page's to draw.
+      game: { id: 'g', moves: [] } as unknown as LiveGame['game'],
+    };
+
+    socket.deliver({ type: 'live_game', live });
+    socket.deliver({
+      type: 'run',
+      name: 'live',
+      info: null,
+      heartbeat: null,
+      stale: false,
+      notes: null,
+    });
+    expect(channel.result.current.run?.liveGame).toEqual(live);
+
+    socket.deliver({ type: 'live_game', live: null });
+    expect(channel.result.current.run?.liveGame).toBeNull();
   });
 });
