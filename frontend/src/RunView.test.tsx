@@ -4,6 +4,7 @@ import type { GpuStats, Heartbeat, ProbeResult, RunEvent, RunInfo } from './api'
 import { RunView } from './RunView';
 import { FakeUPlot } from './test/fakeUPlot';
 import { FakeWebSocket } from './test/fakeWebSocket';
+import { liveGame, sampleGamesResult } from './test/sampleGames';
 
 vi.mock('uplot', async () => ({ default: (await import('./test/fakeUPlot')).FakeUPlot }));
 
@@ -735,6 +736,52 @@ describe('RunView', () => {
       socket.deliver(runEvent({ info: { ...INFO, config: { evaluation: { suites: [] } } } }));
 
       expect(screen.queryByRole('heading', { name: 'Probe positions' })).not.toBeInTheDocument();
+    });
+  });
+
+  describe('sample games', () => {
+    it('shows the game being played, then the games played, above the probes', async () => {
+      const fetch = vi.fn(async () => Response.json(sampleGamesResult(500)));
+      vi.stubGlobal('fetch', fetch);
+      render(<RunView name="tiny" />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(runEvent());
+      expect(screen.getByText(/No checkpoint has finished its sample games yet/)).toBeVisible();
+
+      socket.deliver({ type: 'live_game', live: liveGame() });
+
+      expect(screen.getByRole('region', { name: /Live/ })).toHaveTextContent(
+        'Step 500 is playing game 1 of 2, against itself',
+      );
+      const headings = screen.getAllByRole('heading', { level: 3 }).map((h) => h.textContent);
+      expect(headings.indexOf('Sample games')).toBeLessThan(headings.indexOf('Probe positions'));
+
+      socket.deliver({ type: 'live_game', live: null });
+      socket.deliver({
+        type: 'evaluations',
+        results: [{ step: 500, suite: 'sample-games', updated: '2026-10-10T12:05:00Z' }],
+        current_set: null,
+      });
+
+      expect(await screen.findByRole('link', { name: 'Game 1' })).toHaveAttribute(
+        'href',
+        '#replay/run/tiny/500/1',
+      );
+      expect(screen.queryByRole('region', { name: /Live/ })).not.toBeInTheDocument();
+      // Heartbeats change everything around the games and nothing in them.
+      socket.deliver(runEvent({ heartbeat: heartbeat({ step: 1_100 }) }));
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(fetch).toHaveBeenCalledOnce();
+    });
+
+    it('leaves the sample games out for a run whose config asks for none', () => {
+      render(<RunView name="mlp-big" />);
+      const socket = FakeWebSocket.latest;
+      socket.open();
+      socket.deliver(runEvent({ info: { ...INFO, config: { evaluation: { suites: [] } } } }));
+
+      expect(screen.queryByRole('heading', { name: 'Sample games' })).not.toBeInTheDocument();
     });
   });
 });

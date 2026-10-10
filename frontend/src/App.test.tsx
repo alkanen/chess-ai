@@ -13,6 +13,7 @@ import {
 import { FakeWebSocket } from './test/fakeWebSocket';
 import startPosition from './test/fixtures/start-position.json';
 import { foolsMateMoves, foolsMateStart, type StateEvent } from './test/foolsMate';
+import { foolsMateFile, scholarsMateFile } from './test/replayFile';
 import { castling, check, drawnByFiftyMoves, promotion } from './test/positions';
 
 // uPlot draws on a canvas, which jsdom does not have; see RunView.test.tsx for the charts.
@@ -152,6 +153,60 @@ describe('App', () => {
 
       expect(await screen.findByText('No games have been saved here yet.')).toBeInTheDocument();
       expect(screen.getByRole('heading', { name: 'Replay' })).toBeInTheDocument();
+    });
+
+    it('opens a run’s sample game the address names in the replay viewer', async () => {
+      const fetch = vi.fn((url: string) =>
+        Promise.resolve(
+          Response.json(new URL(url).pathname.endsWith('/replay/saved') ? [] : foolsMateFile),
+        ),
+      );
+      vi.stubGlobal('fetch', fetch);
+      window.location.hash = '#replay/run/tiny/500/1';
+
+      render(<App />);
+
+      expect(await screen.findByRole('link', { name: 'tiny' })).toHaveAttribute(
+        'href',
+        '#runs/tiny',
+      );
+      expect(screen.getByRole('button', { name: 'Replay' })).toHaveAttribute(
+        'aria-current',
+        'page',
+      );
+      const asked = fetch.mock.calls.map(([url]) => new URL(url).pathname + new URL(url).search);
+      expect(asked).toContain('/chess/api/runs/tiny/evaluations/500/sample-games/replay?game=0');
+    });
+
+    it('opens a sample game again when its address is followed after another was chosen', async () => {
+      const files = [foolsMateFile, scholarsMateFile];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((url: string) => {
+          const asked = new URL(url);
+          return Promise.resolve(
+            Response.json(
+              asked.pathname.endsWith('/replay/saved')
+                ? []
+                : files[Number(asked.searchParams.get('game'))],
+            ),
+          );
+        }),
+      );
+      window.location.hash = '#replay/run/tiny/500/1';
+      render(<App />);
+      expect(await screen.findByText(/Move 0 of 4/)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText('Game'), { target: { value: '1' } });
+      expect(await screen.findByText(/Move 0 of 7/)).toBeInTheDocument();
+      expect(window.location.hash).toBe('#replay/run/tiny/500/2');
+
+      // A link to the first game, followed while the second is on show.
+      act(() => {
+        window.location.hash = '#replay/run/tiny/500/1';
+        window.dispatchEvent(new HashChangeEvent('hashchange'));
+      });
+
+      expect(await screen.findByText(/Move 0 of 4/)).toBeInTheDocument();
     });
 
     it('opens the runs dashboard, and a run from it', async () => {
