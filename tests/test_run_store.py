@@ -21,6 +21,7 @@ from chess_ai.training.run_store import (
     CONFIG_FILE,
     METRICS_FILE,
     NOTES_FILE,
+    ORDERS_DIR,
     STATUS_FILE,
     CheckpointPolicy,
     DatasetReference,
@@ -1040,6 +1041,22 @@ def test_overwriting_throws_away_what_crashes_mid_write_left_behind(tmp_path):
         pass
 
     assert not list(directory.rglob("*.writing"))
+
+
+def test_overwriting_throws_away_the_orders_a_killed_trainer_left_behind(tmp_path):
+    """A trainer removes them when its loader is done, unless it is given no chance to."""
+    with writer(tmp_path):
+        pass
+    directory = run_path(tmp_path, "test")
+    (directory / ORDERS_DIR).mkdir()
+    (directory / ORDERS_DIR / "train-seed0-epoch3.order").write_bytes(b"\0" * 64)
+
+    with RunWriter.create(
+        directory, info("test"), config_text="", policy=CheckpointPolicy(), overwrite=True
+    ):
+        pass
+
+    assert not (directory / ORDERS_DIR).exists()
 
 
 # One writer at a time, and taking a run up again.
