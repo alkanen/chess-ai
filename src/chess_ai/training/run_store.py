@@ -44,7 +44,7 @@ import threading
 import uuid
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from importlib import metadata
 from math import isfinite
@@ -76,6 +76,15 @@ CHECKPOINT_INDEX: Final = "index.json"
 CHECKPOINT_SUFFIX: Final = ".pt"
 CHECKPOINT_STEP_DIGITS: Final = 9
 """Enough that a checkpoint file's name sorts by step as text, up to a billion steps."""
+
+CLOCK_SLACK: Final = timedelta(seconds=2)
+"""How much earlier than its run a checkpoint can seem to be saved without having been saved
+by a run since replaced: two seconds, as FAT stamps a file's time."""
+
+MAX_HELD: Final = 3
+"""The most checkpoints retention keeps for an evaluation still to be made, on top of the newest
+and the best: enough for an evaluator a few ladders behind the run, and not so many that a run
+with no evaluator to make them fills the disk."""
 
 TEMPORARY_SUFFIX: Final = ".writing"
 """What the name of a file being replaced ends in until it is whole; see the module docstring."""
@@ -477,6 +486,10 @@ class RunWriter:
     def __init__(self, directory: Path, policy: CheckpointPolicy, *, lock: "_WriterLock") -> None:
         self.directory = directory
         self.policy = policy
+        self.held: Callable[[CheckpointInfo], bool] | None = None
+        """Which checkpoints retention keeps for now on top of :attr:`policy`'s, such as those
+        an evaluation is due on that has not been made yet: the newest :data:`MAX_HELD` of
+        them. Asked about each checkpoint retention would otherwise delete, at every save."""
         self._lock = lock
         self._metrics = (directory / METRICS_FILE).open("a", encoding="utf-8")
         self._started = _now()
@@ -509,9 +522,14 @@ class RunWriter:
             # started and finished between the first look and the lock.
             check_available(directory, info.name, overwrite=overwrite)
             if overwrite:
-                cls._clear(directory)
-            _replace_file(directory / CONFIG_FILE, config_text)
+                cls._clear_history(directory)
+            # Before the replaced run's checkpoints go, which tells an evaluation of one of them
+            # finishing meanwhile that its run has been replaced rather than its checkpoint
+            # pruned: see still_evaluated.
             _replace_file(directory / RUN_FILE, _as_json(info))
+            if overwrite:
+                cls._clear_results(directory)
+            _replace_file(directory / CONFIG_FILE, config_text)
             (directory / METRICS_FILE).touch()
             return cls(directory, policy, lock=lock)
         except OSError as e:
@@ -560,19 +578,37 @@ class RunWriter:
             raise RunError(f"cannot rewind the run in {self.directory}: {e.strerror or e}") from e
 
     @staticmethod
-    def _clear(directory: Path) -> None:
-        """Throw away what a previous run of this name left, so the two cannot be read as one."""
+    def _clear_history(directory: Path) -> None:
+        """Throw away what a previous run of this name said about itself, so that the two cannot
+        be read as one: :meth:`_clear_results` throws away what it made, once the new run says
+        it is another."""
         # The notes too: they were written about the run being replaced, and a title or a
         # "best so far" tag carried over would describe a run that no longer exists.
         for path in (METRICS_FILE, STATUS_FILE, NOTES_FILE):
             (directory / path).unlink(missing_ok=True)
+
+    @staticmethod
+    def _clear_results(directory: Path) -> None:
+        """Throw away the checkpoints a previous run of this name saved, and their evaluations."""
         checkpoints = directory / CHECKPOINTS_DIR
         for path in checkpoints.glob(f"*{CHECKPOINT_SUFFIX}"):
             path.unlink(missing_ok=True)
         (checkpoints / CHECKPOINT_INDEX).unlink(missing_ok=True)
         # The evaluations were of the replaced run's checkpoints, and would be taken for this
         # one's: shown on its page, and its own checkpoints of the same steps never evaluated.
-        shutil.rmtree(directory / EVALUATIONS_DIR, ignore_errors=True)
+        # Each under its lock, so that a save that had already made sure its checkpoint was
+        # current is over before its directory goes, rather than writing into it as it goes.
+        evaluations = directory / EVALUATIONS_DIR
+        with suppress(OSError):
+            for step in os.scandir(evaluations):
+                if not step.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    with evaluation_lock(Path(step.path)):
+                        shutil.rmtree(step.path, ignore_errors=True)
+                except RunError:
+                    shutil.rmtree(step.path, ignore_errors=True)
+        shutil.rmtree(evaluations, ignore_errors=True)
         # And whatever a process killed mid-write left: SIGKILL, the OOM killer and a power cut
         # give it no chance to tidy up, and a notes file's temporary name is never used twice.
         for path in (
@@ -651,22 +687,7 @@ class RunWriter:
         kept[step] = CheckpointInfo(
             step=step, file=checkpoint_file(step), created=_now(), metrics=metrics
         )
-        best = _best_step(kept.values(), self.policy)
-        # The newest `keep`, plus the best wherever it is: a run's best checkpoint is the one
-        # worth playing against, and retention that could delete it would make the metric
-        # pointless. Kept as a name rather than a second copy of the file.
-        surviving = set(sorted(kept, reverse=True)[: self.policy.keep])
-        if best is not None:
-            surviving.add(best)
-        for gone in set(kept) - surviving:
-            (directory / kept.pop(gone).file).unlink(missing_ok=True)
-        index = CheckpointIndex(
-            policy=self.policy,
-            best_step=best,
-            checkpoints=[kept[step] for step in sorted(kept)],
-        )
-        _replace_file(directory / CHECKPOINT_INDEX, _as_json(index))
-        sync_directory(directory)
+        _retain(directory, kept, self.policy, self.held)
 
     def finish(
         self,
@@ -710,6 +731,79 @@ class RunWriter:
         self.close()
 
 
+def _retain(
+    directory: Path,
+    kept: dict[int, CheckpointInfo],
+    policy: CheckpointPolicy,
+    held: Callable[[CheckpointInfo], bool] | None,
+) -> None:
+    """Delete from the checkpoints directory ``directory`` the checkpoints of ``kept``, by step,
+    that ``policy`` does not keep and ``held`` does not hold, and write the index of the rest."""
+    best = _best_step(kept.values(), policy)
+    # The newest `keep`, plus the best wherever it is: a run's best checkpoint is the one
+    # worth playing against, and retention that could delete it would make the metric
+    # pointless. Kept as a name rather than a second copy of the file.
+    surviving = set(sorted(kept, reverse=True)[: policy.keep])
+    if best is not None:
+        surviving.add(best)
+    if held is not None:
+        holding = [
+            each for each in sorted(set(kept) - surviving, reverse=True) if _holds(held, kept[each])
+        ]
+        surviving.update(holding[:MAX_HELD])
+    for gone in set(kept) - surviving:
+        (directory / kept.pop(gone).file).unlink(missing_ok=True)
+    index = CheckpointIndex(
+        policy=policy,
+        best_step=best,
+        checkpoints=[kept[step] for step in sorted(kept)],
+    )
+    _replace_file(directory / CHECKPOINT_INDEX, _as_json(index))
+    sync_directory(directory)
+
+
+def _holds(held: Callable[[CheckpointInfo], bool], checkpoint: CheckpointInfo) -> bool:
+    """Whether ``held`` holds ``checkpoint``; not, when it cannot tell, since a save that
+    failed for it would lose the step's training rather than an evaluation."""
+    try:
+        return held(checkpoint)
+    except Exception:
+        LOGGER.warning("cannot tell whether step %d is held", checkpoint.step, exc_info=True)
+        return False
+
+
+def prune_released(directory: Path, held: Callable[[CheckpointInfo], bool]) -> None:
+    """Apply the run in ``directory``'s retention again, with ``held`` for
+    :attr:`RunWriter.held`, if nobody is writing the run.
+
+    For checkpoints held for an evaluation made once the run had stopped saving them: a trainer
+    lets go of them at its next save, which a run that has ended does not make. A run being
+    written is left to its trainer, whose next save prunes them, and which nothing else may
+    write the index under.
+
+    Raises:
+        OSError: the checkpoints or the index cannot be deleted or written.
+    """
+    try:
+        # Strict: where nothing can be locked, nothing tells a trainer writing the run from one
+        # that has gone, and the trainer is the run's one writer.
+        lock = _WriterLock.acquire(directory, directory.name, strict=True)
+    except RunError:
+        return  # Being written, or not to be locked at all.
+    try:
+        checkpoints = directory / CHECKPOINTS_DIR
+        try:
+            # Only with the run's own policy: the default one could keep fewer than it did.
+            policy = _read_model(checkpoints / CHECKPOINT_INDEX, CheckpointIndex).policy
+        except RunError:
+            return
+        kept = {info.step: info for info in read_checkpoints(checkpoints)}
+        if kept:
+            _retain(checkpoints, kept, policy, held)
+    finally:
+        lock.release()
+
+
 class _WriterLock:
     """The lock that makes one process the only writer of a run directory.
 
@@ -736,8 +830,12 @@ class _WriterLock:
             self.held.add(descriptor)
 
     @classmethod
-    def acquire(cls, directory: Path, name: str) -> "_WriterLock":
-        """Lock ``directory`` for this process, or raise :exc:`RunError` if another has it."""
+    def acquire(cls, directory: Path, name: str, *, strict: bool = False) -> "_WriterLock":
+        """Lock ``directory`` for this process, or raise :exc:`RunError` if another has it.
+
+        ``strict`` raises :exc:`RunError` too where the file system cannot lock, for a writer
+        that may only write a run nobody else is writing, rather than one that has to.
+        """
         path = directory / LOCK_FILE
         try:
             descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
@@ -752,6 +850,8 @@ class _WriterLock:
             ) from None
         except OSError as e:
             os.close(descriptor)
+            if strict:
+                raise RunError(f"cannot lock {path}: {e.strerror or e}") from e
             LOGGER.warning("cannot lock %s, so nothing stops a second writer: %s", path, e)
             return cls(None)
         return cls(descriptor)
@@ -1270,6 +1370,50 @@ def evaluation_lock(directory: Path) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
+
+
+def created_with(run: RunReader, checkpoint: CheckpointInfo, written: datetime) -> datetime:
+    """When ``run`` was created, read while ``checkpoint`` is still the file written at
+    ``written``: what :func:`still_evaluated` tells the run the checkpoint is from by, once the
+    file may be gone.
+
+    Raises:
+        CheckpointChanged: the file is gone already, or is another, so that which run it was
+            from can no longer be told.
+        RunError: the run does not say when it was created.
+    """
+    created = run.info.created
+    if run.checkpoint_written(checkpoint) != written:
+        raise CheckpointChanged(f"{run.name}@{checkpoint.step} changed before it was evaluated")
+    # A checkpoint saved before its run was created is the replaced run's, left for the moment
+    # between the new run.json and the deleting of the old checkpoints. Told by the index's
+    # time, which the trainer took from the clock it took the run's from, rather than by the
+    # file's, which a file server stamps by its own; with some slack for a checkpoint the index
+    # lost, which only has the file's, stamped in whole seconds by some file systems.
+    if checkpoint.created < created - CLOCK_SLACK:
+        raise CheckpointChanged(f"{run.name}@{checkpoint.step} is from a run since replaced")
+    return created
+
+
+def still_evaluated(
+    run: RunReader, checkpoint: CheckpointInfo, written: datetime, created: datetime
+) -> bool:
+    """Whether a result about ``checkpoint``, whose file was written at ``written`` in the run
+    created at ``created``, may still be saved: for :func:`save_evaluation`'s ``current``.
+
+    It may while the file is the one evaluated, and once it has been deleted from the same run,
+    as retention prunes a checkpoint the run has saved newer ones than: what was found out about
+    it is kept, as a pruned checkpoint's results always are. Not once the file is another, saved
+    again at the same step, nor once the run has been started again under its name, which
+    deletes the files and the results of the run it replaces.
+    """
+    now = run.checkpoint_written(checkpoint)
+    if now is not None:
+        return now == written
+    try:
+        return run.info.created == created
+    except RunError:
+        return False
 
 
 PARTIAL_SUFFIX: Final = ".partial"

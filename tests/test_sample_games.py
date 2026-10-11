@@ -663,3 +663,20 @@ def test_evaluator_once_with_a_bad_opening_set_fails_for_games_of_a_replaced_che
         main(["--config", config, "evaluator", "--once"])
 
     assert exited.value.code == 2
+
+
+def test_sample_games_of_a_checkpoint_pruned_while_they_were_played_are_kept(tmp_path):
+    run = RunReader(model_run(tmp_path / "runs", steps=(2,)))
+    checkpoint = run.checkpoints()[0]
+    written = run.checkpoint_written(checkpoint)
+    engine = load_engine(run.checkpoint_path(checkpoint))
+
+    class Pruning(FakeStockfish):
+        async def choose_move(self, context: GameContext) -> PlayerMove:
+            run.checkpoint_path(checkpoint).unlink(missing_ok=True)
+            return await super().choose_move(context)
+
+    suite(games=0, stockfish_games=1, opponent=Pruning()).evaluate(run, checkpoint, written, engine)
+
+    result = read_sample_games(run, 2)
+    assert result is not None and result.checkpoint_written == written

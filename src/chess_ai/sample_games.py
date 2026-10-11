@@ -12,8 +12,9 @@ the same checkpoint: ``sample-games.json`` lists the games and how they ended, a
 moved into place with the result, as the ladder's are.
 
 While a game is being played it can be watched: the evaluator writes the game as it stands to
-``live-game.json`` in the runs directory after every move, and the web server, which polls the
-runs directory anyway, sends it to whoever is looking at that run. There is one such file for
+``live-game.json`` in the runs directory after every move, as it does a game of the Stockfish
+ladder's, and the web server, which polls the runs directory anyway, sends it to whoever is
+looking at that run. There is one such file for
 the whole runs directory, since only one evaluator works on a runs directory at a time and it
 plays one game at a time. It is deleted when the games are over, and by an evaluator starting;
 one left behind by an evaluator that was killed says when it was last written, which is how a
@@ -24,17 +25,17 @@ import asyncio
 import logging
 import os
 import threading
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 import chess
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from chess_ai.config import SampleGamesConfig
-from chess_ai.evaluator import SuiteStopped
+from chess_ai.evaluator import until_stopped
 from chess_ai.game_session import GameSession, GameState
 from chess_ai.match import MatchGame, append_game, play_match
 from chess_ai.openings import OpeningSet
@@ -54,8 +55,10 @@ from chess_ai.training.run_store import (
     RunError,
     RunReader,
     code_version,
+    created_with,
     save_evaluation,
     start_partial_file,
+    still_evaluated,
 )
 
 if TYPE_CHECKING:
@@ -73,9 +76,6 @@ FORMAT_VERSION: Final = 1
 
 LIVE_FILE: Final = "live-game.json"
 """In the runs directory: the sample game the evaluator is playing now, as it stands."""
-
-STOP_POLL_SECONDS: Final = 0.1
-"""How often the games look at whether the evaluator has been told to stop."""
 
 CLOSE_TIMEOUT: Final = 5.0
 """How long the games wait for their Stockfish process to exit once they are over."""
@@ -126,18 +126,23 @@ class SampleGamesResult(BaseModel):
 
 
 class LiveGame(BaseModel):
-    """The sample game being played now, as ``live-game.json`` holds it."""
+    """The game the evaluator is playing now, as ``live-game.json`` holds it: a sample game, or
+    a game of the Stockfish ladder."""
 
     model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
+    suite: Literal["sample-games", "stockfish-ladder"] = SUITE
+    """Which suite is playing it."""
     run: str
     step: int
     """The checkpoint playing it."""
     index: int
-    """Where it will be in the checkpoint's ``sample-games.pgn``, counting from 0."""
+    """Where it will be in the checkpoint's games file of the suite, counting from 0."""
     games: int
-    """How many games the checkpoint plays in all."""
+    """How many games the checkpoint plays in all, in the suite."""
     opponent: Opponent
+    level: int | None = None
+    """The Elo Stockfish plays at, in a ladder; ``None`` for a sample game."""
     updated: datetime
     """When the file was last written: after the last move, or when the game began."""
     game: GameState
@@ -221,8 +226,17 @@ def save_live_game(runs_dir: Path, live: LiveGame) -> None:
         raise
 
 
+def show_live_game(runs_dir: Path, live: LiveGame) -> None:
+    """:func:`save_live_game`, as far as it can be: watching is a nicety, and the games
+    themselves go on, and are saved as they end, whether or not they can be watched."""
+    try:
+        save_live_game(runs_dir, live)
+    except OSError as e:
+        LOGGER.debug("Cannot show the game being played: %s", e)
+
+
 def clear_live_game(runs_dir: Path) -> None:
-    """Say that no sample game is being played, by deleting the file that says one is."""
+    """Say that no game is being played, by deleting the file that says one is."""
     (runs_dir / LIVE_FILE).unlink(missing_ok=True)
 
 
@@ -255,6 +269,26 @@ def watched(game: GameState) -> GameState:
             "moves": [*moves, *game.moves[-1:]],
             "position": game.position.model_copy(update={"legal_moves": {}}),
         }
+    )
+
+
+async def check_playable(engine: "InferenceEngine", openings: OpeningSet, rating: int) -> None:
+    """Make sure ``engine`` has not diverged, before any game is played with it, as the probes
+    do: a diverged network plays legal moves all the same, chosen from NaNs, and games of that
+    would be taken for the games of a model.
+
+    Raises:
+        DivergedError: what it makes of the position after the first line of ``openings`` is
+            not a number.
+    """
+    board = chess.Board()
+    for move in openings.openings[0].moves:
+        board.push(move)
+    check_finite(
+        await asyncio.to_thread(
+            engine.evaluate, board, mover_rating=rating, opponent_rating=rating
+        ),
+        f"the position after {openings.openings[0].name}",
     )
 
 
@@ -291,6 +325,12 @@ class SampleGamesSuite:
         self._live = live
         self._clock = clock
 
+    def wants(self, run: RunReader, checkpoint: CheckpointInfo) -> bool:
+        return True
+
+    def after(self, run: RunReader) -> None:
+        pass
+
     def stands(self, run: RunReader, checkpoint: CheckpointInfo, written: datetime) -> bool:
         return stands(run, checkpoint, written)
 
@@ -305,44 +345,8 @@ class SampleGamesSuite:
     ) -> str:
         saved: list[SampleGamesResult] = []
         playing = self._play(run, checkpoint, written, engine, saved)
-        result = asyncio.run(self._until_stopped(playing, stop, saved))
+        result = asyncio.run(until_stopped(playing, stop, saved))
         return summary(result)
-
-    async def _until_stopped(
-        self,
-        playing: Coroutine[Any, Any, SampleGamesResult],
-        stop: threading.Event | None,
-        saved: list[SampleGamesResult],
-    ) -> SampleGamesResult:
-        """What ``playing`` comes to, unless ``stop`` is set before it has saved it in ``saved``.
-
-        Games take minutes, and a stop that waited for them would be a stop a service manager
-        gives up on and turns into a kill, which leaves the games' files behind. So the games
-        are cancelled, in the middle of a move if need be, and their own cleaning up — the
-        partial games file, the game shown as being played, Stockfish — is done on the way out.
-
-        Raises:
-            SuiteStopped: ``stop`` was set before the games were over; nothing was saved.
-        """
-        task = asyncio.create_task(playing)
-        if stop is None:
-            return await task
-        while not task.done():
-            # A threading event, set by a signal handler: there is nothing to await it with.
-            await asyncio.wait({task}, timeout=STOP_POLL_SECONDS)
-            if stop.is_set() and not task.done():
-                task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await task
-                # Finished after all, the moment before it would have been cancelled.
-                if not task.cancelled():
-                    return task.result()
-                # Cancelled in its cleaning up, such as waiting for Stockfish to exit, after the
-                # games were saved: they are done, and the next evaluator would find them so.
-                if saved:
-                    return saved[0]
-                raise SuiteStopped("stopped before the sample games were over")
-        return task.result()
 
     async def _play(
         self,
@@ -356,21 +360,9 @@ class SampleGamesSuite:
         from chess_ai.inference.player import ModelPlayer
 
         settings = self.settings
+        created = created_with(run, checkpoint, written)
         started = self._clock()
-        # Before any game, as the probes do: a diverged network plays legal moves all the same,
-        # chosen from NaNs, and games of that would be taken for the games of a model.
-        board = chess.Board()
-        for move in self.openings.openings[0].moves:
-            board.push(move)
-        check_finite(
-            await asyncio.to_thread(
-                engine.evaluate,
-                board,
-                mover_rating=settings.rating,
-                opponent_rating=settings.rating,
-            ),
-            f"the position after {self.openings.openings[0].name}",
-        )
+        await check_playable(engine, self.openings, settings.rating)
         model = ModelPlayer(
             engine, run=run.name, checkpoint=checkpoint.step, rating=settings.rating
         )
@@ -450,7 +442,7 @@ class SampleGamesSuite:
                 run.evaluation_directory(checkpoint.step),
                 {f"{SUITE}.json": result.model_dump_json(indent=2) + "\n"},
                 {f"{SUITE}.pgn": partial},
-                current=lambda: run.checkpoint_written(checkpoint) == written,
+                current=lambda: still_evaluated(run, checkpoint, written, created),
             )
             saved.append(result)
             return result
@@ -487,11 +479,7 @@ class SampleGamesSuite:
             updated=self._clock(),
             game=watched(game),
         )
-        try:
-            save_live_game(self._live, live)
-        except OSError as e:
-            # Watching is a nicety; the games themselves go on, and are saved as they end.
-            LOGGER.debug("Cannot show the sample game being played: %s", e)
+        show_live_game(self._live, live)
 
 
 def _listed(index: int, opponent: Opponent, game: MatchGame) -> SampleGame:

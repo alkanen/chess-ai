@@ -16,16 +16,17 @@ The newest checkpoints come first, so that a run being trained hears about its l
 before the evaluator gets on with older ones it has not done yet.
 """
 
+import asyncio
 import fcntl
 import logging
 import os
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pydantic import ValidationError
 
@@ -58,6 +59,9 @@ LOGGER = logging.getLogger(__name__)
 LOCK_FILE: Final = "evaluator.lock"
 """Locked in the runs directory by the evaluator working on it, for as long as it does."""
 
+STOP_POLL_SECONDS: Final = 0.1
+"""How often a suite that plays games looks at whether the evaluator has been told to stop."""
+
 
 class Stopped(Exception):
     """:meth:`Evaluator.run_once` was told to stop before it had evaluated all it found."""
@@ -75,6 +79,41 @@ class SuiteStopped(Exception):
 
     Not a failure: the checkpoint still lacks the result, and the next evaluator evaluates it.
     """
+
+
+async def until_stopped[T](
+    playing: Coroutine[Any, Any, T], stop: threading.Event | None, saved: list[T]
+) -> T:
+    """What ``playing`` comes to, unless ``stop`` is set before it has saved it in ``saved``.
+
+    For a suite that plays games, which take minutes: a stop that waited for them would be a
+    stop a service manager gives up on and turns into a kill, which leaves the games' files
+    behind. So the games are cancelled, in the middle of a move if need be, and their own
+    cleaning up — the partial games file, the game shown as being played, Stockfish — is done
+    on the way out. ``playing`` adds its result to ``saved`` once it has saved it.
+
+    Raises:
+        SuiteStopped: ``stop`` was set before the games were over; nothing was saved.
+    """
+    task = asyncio.create_task(playing)
+    if stop is None:
+        return await task
+    while not task.done():
+        # A threading event, set by a signal handler: there is nothing to await it with.
+        await asyncio.wait({task}, timeout=STOP_POLL_SECONDS)
+        if stop.is_set() and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            # Finished after all, the moment before it would have been cancelled.
+            if not task.cancelled():
+                return task.result()
+            # Cancelled in its cleaning up, such as waiting for Stockfish to exit, after the
+            # games were saved: they are done, and the next evaluator would find them so.
+            if saved:
+                return saved[0]
+            raise SuiteStopped("stopped before the games were over")
+    return task.result()
 
 
 class EvaluatorBusy(Exception):
@@ -108,6 +147,14 @@ class Suite(Protocol):
     """One kind of evaluation, as the evaluator runs it."""
 
     name: str
+
+    def wants(self, run: RunReader, checkpoint: CheckpointInfo) -> bool:
+        """Whether ``checkpoint`` is one this suite evaluates at all, such as every so many
+        steps for a suite that takes too long to evaluate every checkpoint a run saves.
+
+        One it does not want is not lacking its result, whatever :meth:`stands` would say.
+        """
+        ...
 
     def stands(self, run: RunReader, checkpoint: CheckpointInfo, written: datetime) -> bool:
         """Whether ``checkpoint``, whose file was written at ``written``, has a result from this
@@ -143,6 +190,14 @@ class Suite(Protocol):
         """
         ...
 
+    def after(self, run: RunReader) -> None:
+        """Called once a checkpoint of ``run``, a run that asks for this suite, has been through
+        all the suites it was to be evaluated by, whether or not they succeeded and whether or
+        not this one was among them; not when they were stopped part-way. For what must wait
+        until no suite needs a checkpoint any more, such as pruning checkpoints that were only
+        kept for this suite."""
+        ...
+
 
 class ProbeSuite:
     """The probe positions, as a suite: see :mod:`chess_ai.probes`."""
@@ -152,6 +207,12 @@ class ProbeSuite:
     def __init__(self, probes: ProbeSet, *, rating: int | None) -> None:
         self.probes = probes
         self.rating = rating
+
+    def wants(self, run: RunReader, checkpoint: CheckpointInfo) -> bool:
+        return True
+
+    def after(self, run: RunReader) -> None:
+        pass
 
     def stands(self, run: RunReader, checkpoint: CheckpointInfo, written: datetime) -> bool:
         try:
@@ -252,17 +313,22 @@ def evaluated_runs(runs_dir: Path) -> Iterator[tuple[RunReader, list[str]]]:
 
 
 def runs_lacking(
-    runs_dir: Path, suite: str, stands: Callable[[RunReader, CheckpointInfo, datetime], bool]
+    runs_dir: Path,
+    suite: str,
+    stands: Callable[[RunReader, CheckpointInfo, datetime], bool],
+    wants: Callable[[RunReader, CheckpointInfo], bool] = lambda run, checkpoint: True,
 ) -> list[str]:
     """The runs the evaluator looks at that ask for ``suite`` and have a checkpoint on disk
-    without a result from it that ``stands``, by name: the runs a pass without the suite would
-    leave short. ``stands`` is the suite's own :meth:`Suite.stands`, as one that cannot be set
-    up still has to tell."""
+    it ``wants`` without a result from it that ``stands``, by name: the runs a pass without the
+    suite would leave short. ``stands`` and ``wants`` are the suite's own :meth:`Suite.stands`
+    and :meth:`Suite.wants`, as one that cannot be set up still has to tell."""
     lacking = []
     for run, suites in evaluated_runs(runs_dir):
         if suite not in suites:
             continue
         for checkpoint in run.checkpoints():
+            if not wants(run, checkpoint):
+                continue
             try:
                 written = run.checkpoint_written(checkpoint)
             except RunError:
@@ -319,6 +385,7 @@ class Evaluator:
                     suite
                     for suite in wanted
                     if (name, checkpoint.step, written, suite) not in self._failed
+                    and self.suites[suite].wants(run, checkpoint)
                     and not self.suites[suite].stands(run, checkpoint, written)
                 )
                 if missing:
@@ -354,7 +421,7 @@ class Evaluator:
             except CheckpointChanged:
                 # Replaced or pruned meanwhile: the next look finds the new file, if any.
                 LOGGER.debug("%s changed while it was evaluated", job.describe())
-                return True
+                break
             except Exception as e:
                 self._fail(job, (name,), f"{name} failed: {e}")
                 continue
@@ -364,7 +431,23 @@ class Evaluator:
                 self._fail(job, (name,), f"{name} saved a result that does not read back")
                 continue
             self._say(f"{job.describe()} {name}: {said}")
+        self._after(job)
         return True
+
+    def _after(self, job: Job) -> None:
+        """Tell the suites of ``job``'s run that a checkpoint of it is done with: every suite the
+        run asks for, not only those of the job. A job stopped part-way says nothing, and the
+        one that later finishes the checkpoint may name none of the suites that ran before the
+        stop, such as a ladder that is already saved and whose checkpoint is to be let go of."""
+        try:
+            names = [name for name in configured_suites(job.run) if name in self.suites]
+        except RunError:
+            names = list(job.suites)
+        for name in names:
+            try:
+                self.suites[name].after(job.run)
+            except Exception as e:
+                self._warn(f"{job.describe()} {name}: {e}")
 
     def run_once(self, *, stop: threading.Event | None = None) -> list[Job]:
         """Evaluate what lacks a result now, and say what that was, in the order it was done.

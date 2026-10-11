@@ -15,7 +15,7 @@ the same order every time.
 """
 
 import math
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -202,6 +202,24 @@ def score(
         draws=results.count(0.5),
         losses=results.count(0.0),
         margin=margin,
+    )
+
+
+def game_line(game: MatchGame, names: Sequence[str], *, number: int, games: int) -> str:
+    """One finished game in a line: which of how many it was, who had which colour, and how it
+    went, such as ``game 3/20, Italian Game: Stockfish 1350 – tiny 1-0 (checkmate, 41 moves)``.
+
+    ``names`` are the first player's and the second's, which the game puts in colour order.
+    """
+    state = game.game
+    over = state.position.game_over
+    result = over.result if over is not None else "*"
+    how = f"{over.reason.replace('_', ' ')}, " if over is not None else ""
+    moves = (len(state.moves) + 1) // 2
+    white, black = names if game.first_plays_white else reversed(names)
+    return (
+        f"game {number}/{games}, {game.opening.name}: {white} – {black} {result} "
+        f"({how}{moves} moves)"
     )
 
 

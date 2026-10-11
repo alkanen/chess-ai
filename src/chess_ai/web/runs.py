@@ -15,6 +15,8 @@ from typing import Any, Literal
 import chess
 from pydantic import BaseModel, ConfigDict
 
+from chess_ai.ladder import SUITE as LADDER
+from chess_ai.ladder import LadderEstimate, read_ladder
 from chess_ai.position_view import PositionSnapshot, snapshot
 from chess_ai.probes import (
     ProbeOutcome,
@@ -303,10 +305,11 @@ class EvaluationsEvent(BaseModel):
 
 
 class LiveGameEvent(BaseModel):
-    """The sample game the evaluator is playing with one of the run's checkpoints, as it stands.
+    """The game the evaluator is playing with one of the run's checkpoints, as it stands: a
+    sample game or a game of the Stockfish ladder.
 
     Sent first, and again whenever it moves on, another game begins, or the games are over,
-    when ``live`` is ``None``. Finished games are in the checkpoint's ``sample-games`` result.
+    when ``live`` is ``None``. Finished games are in the checkpoint's result of the suite.
     """
 
     type: Literal["live_game"] = "live_game"
@@ -349,6 +352,49 @@ def show_probes(run: RunReader, step: int) -> ShownProbes | None:
             ShownProbe(**outcome.model_dump(), snapshot=snapshot(board, legal_moves=False))
         )
     return ShownProbes(**{**result.model_dump(), "positions": shown})
+
+
+class LadderPoint(BaseModel):
+    """One checkpoint's ladder, as the run page charts Elo over training."""
+
+    step: int
+    estimate: LadderEstimate
+    levels: list[int]
+    """The Elo of every level it was played against, weakest first."""
+    games_per_level: int
+    move_time: float
+    """Seconds Stockfish had for each move, which the rating is only comparable at."""
+    rating: int | None
+    """The rating the checkpoint was asked to play like."""
+
+
+def ladder_points(run: RunReader) -> list[LadderPoint]:
+    """Every ladder of ``run``'s checkpoints, by step: the ones it has pruned among them.
+
+    A result that cannot be read is left out, rather than costing the chart the rest of them.
+    """
+    points = []
+    for entry in run.evaluations():
+        if entry.suite != LADDER:
+            continue
+        try:
+            result = read_ladder(run, entry.step)
+        except RunError:
+            logger.debug("run %s ladder at %d cannot be read", run.name, entry.step, exc_info=True)
+            continue
+        if result is None or not result.levels:
+            continue  # Deleted since it was listed.
+        points.append(
+            LadderPoint(
+                step=entry.step,
+                estimate=result.estimate,
+                levels=[level.elo for level in result.levels],
+                games_per_level=result.games_per_level,
+                move_time=result.levels[0].move_time,
+                rating=result.model.rating,
+            )
+        )
+    return points
 
 
 class RunStream:

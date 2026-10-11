@@ -13,6 +13,7 @@ import { GameView } from './GameView';
 import { ReplayView } from './ReplayView';
 import { RunsView } from './RunsView';
 import { RunView } from './RunView';
+import { ladderGameInHash, type LadderGameRef } from './ladder';
 import { sampleGameInHash, type SampleGameRef } from './sampleGames';
 import './App.css';
 
@@ -44,6 +45,8 @@ interface Place {
   datasetGame?: DatasetGameRef | null;
   /** The run's sample game on show, under the replay view; null for a file or a saved game. */
   sampleGame?: SampleGameRef | null;
+  /** The run's ladder game on show, under the replay view; null for a file or a saved game. */
+  ladderGame?: LadderGameRef | null;
 }
 
 const GAME_PAGE = /^#(?:game|watch)\/(.+)$/;
@@ -75,6 +78,10 @@ function placeInAddress(): Place {
   const sampleGame = sampleGameInHash(hash);
   if (sampleGame !== null) {
     return { view: 'replay', link: null, run: null, compare: null, sampleGame };
+  }
+  const ladderGame = ladderGameInHash(hash);
+  if (ladderGame !== null) {
+    return { view: 'replay', link: null, run: null, compare: null, ladderGame };
   }
   const run = RUN_PAGE.exec(hash);
   if (run !== null) {
@@ -146,6 +153,7 @@ export function App() {
         <ReplayView
           datasetGame={place.datasetGame ?? null}
           sampleGame={place.sampleGame ?? null}
+          ladderGame={place.ladderGame ?? null}
         />
       )}
       {view === 'runs' && place.compare !== null && <CompareView names={place.compare} />}

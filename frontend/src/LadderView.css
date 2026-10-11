@@ -1,0 +1,22 @@
+.ladder-view .elo-chart {
+  margin-bottom: 1rem;
+}
+
+.ladder-view .elo-chart .note {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+}
+
+.ladder-estimate {
+  margin: 0 0 0.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.ladder-levels {
+  margin-bottom: 0.75rem;
+}
+
+.ladder-games summary {
+  cursor: pointer;
+  margin-bottom: 0.5rem;
+}

@@ -20,13 +20,13 @@ const SERIES_FALLBACKS = [
 ];
 
 /** The colours a chart is drawn in, read from the CSS tokens of the scheme in use. */
-interface Palette {
+export interface Palette {
   series: string[];
   text: string;
   grid: string;
 }
 
-function readPalette(element: HTMLElement): Palette {
+export function readPalette(element: HTMLElement): Palette {
   const style = getComputedStyle(element);
   const token = (name: string, fallback: string) =>
     style.getPropertyValue(name).trim() || fallback;
@@ -38,7 +38,7 @@ function readPalette(element: HTMLElement): Palette {
 }
 
 /** Whether the page is in its dark scheme, followed as the system setting changes. */
-function useDarkScheme(): boolean {
+export function useDarkScheme(): boolean {
   const [dark, setDark] = useState(() => darkQuery()?.matches ?? false);
   useEffect(() => {
     const query = darkQuery();

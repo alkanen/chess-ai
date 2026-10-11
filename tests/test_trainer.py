@@ -212,6 +212,30 @@ def test_checkpoints_are_saved_on_schedule_and_at_the_end(tmp_path, data_dir):
     assert [info.step for info in reader.checkpoints()] == [3, 6, 7]
 
 
+def test_retention_keeps_the_checkpoints_a_ladder_is_due_on_until_it_is_played(tmp_path, data_dir):
+    config = load_experiment(
+        experiment(
+            tmp_path / "tiny.toml",
+            schedule="steps = 11\nwarmup_steps = 2",
+            checkpoints="every_steps = 1\nkeep = 1",
+            evaluation='suites = ["stockfish-ladder"]',
+        )
+    )
+
+    train(
+        config,
+        data_dir=data_dir,
+        runs_dir=tmp_path / "runs",
+        config_text="",
+        say=lambda line: None,
+        ladder_every=2,
+    )
+
+    # The newest few due a ladder, and the newest; none has been laddered.
+    kept = [info.step for info in open_run(tmp_path / "runs", "tiny").checkpoints()]
+    assert kept == [6, 8, 10, 11]
+
+
 def test_checkpoint_retention_keeps_the_most_recent_and_the_best(tmp_path, data_dir):
     reader = run(
         tmp_path,

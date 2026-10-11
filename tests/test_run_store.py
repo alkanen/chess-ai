@@ -1,12 +1,14 @@
 """The run directory: what it writes, what it keeps, and what a reader sees mid-write."""
 
+import errno
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -33,6 +35,7 @@ from chess_ai.training.run_store import (
     checkpoint_file,
     choose_checkpoint,
     code_version,
+    evaluation_lock,
     list_runs,
     open_run,
     read_checkpoints,
@@ -1188,3 +1191,193 @@ def test_a_run_says_whose_weights_it_started_from(tmp_path):
     writer(tmp_path, initialized_from=lineage).close()
 
     assert RunReader(run_path(tmp_path, "test")).info.initialized_from == lineage
+
+
+def test_a_result_about_the_replaced_run_is_refused_all_the_while_it_is_cleared(
+    tmp_path, monkeypatch
+):
+    """An evaluation finishing while a run is overwritten must not be taken for the new run's,
+    as it would be if the checkpoint were gone while ``run.json`` still named the old run."""
+    with writer(tmp_path) as first:
+        save(first, 4, policy_loss=9.0)
+    old = open_run(tmp_path, "test")
+    checkpoint = old.checkpoints()[0]
+    written = old.checkpoint_written(checkpoint)
+    created = old.info.created
+    old.evaluation_directory(4).mkdir(parents=True)
+    seen: list[bool] = []
+    removing = shutil.rmtree
+
+    def looked_at_while_removing(path, *args, **kwargs):
+        seen.append(run_store.still_evaluated(old, checkpoint, written, created))
+        removing(path, *args, **kwargs)
+
+    monkeypatch.setattr(run_store.shutil, "rmtree", looked_at_while_removing)
+
+    RunWriter.create(
+        run_path(tmp_path, "test"),
+        info("test", created=datetime(2030, 1, 1, tzinfo=UTC)),
+        config_text="",
+        policy=CheckpointPolicy(),
+        overwrite=True,
+    ).close()
+
+    assert seen and not any(seen)
+
+
+def test_an_evaluation_being_saved_is_finished_before_its_directory_is_cleared(tmp_path):
+    with writer(tmp_path) as first:
+        save(first, 4, policy_loss=9.0)
+    old = open_run(tmp_path, "test")
+    directory = old.evaluation_directory(4)
+    saving = threading.Event()
+    finish = threading.Event()
+
+    def save_slowly() -> None:
+        with evaluation_lock(directory):
+            saving.set()
+            finish.wait(5)
+            (directory / "suite.json").write_text("{}")
+
+    saver = threading.Thread(target=save_slowly)
+    saver.start()
+    saving.wait(5)
+    replacing = threading.Thread(
+        target=lambda: RunWriter.create(
+            run_path(tmp_path, "test"),
+            info("test"),
+            config_text="",
+            policy=CheckpointPolicy(),
+            overwrite=True,
+        ).close()
+    )
+    replacing.start()
+    time.sleep(0.2)
+    assert replacing.is_alive(), "the save was cleared from under it"
+
+    finish.set()
+    saver.join(5)
+    replacing.join(5)
+
+    assert not directory.exists()
+
+
+def test_retention_keeps_the_newest_few_checkpoints_held_for_an_evaluation(tmp_path):
+    """Such as the ladder's, which an evaluator behind the run would otherwise never get."""
+    held = {2, 4, 6, 8}
+    with writer(tmp_path, policy=CheckpointPolicy(keep=1)) as run:
+        run.held = lambda checkpoint: checkpoint.step in held
+        for step in range(1, 10):
+            save(run, step)
+        kept = [info.step for info in open_run(tmp_path, "test").checkpoints()]
+        assert kept == [4, 6, 8, 9], f"the newest {run_store.MAX_HELD} held, and the newest"
+
+        # Evaluated: let go of at the next save.
+        held.discard(4)
+        held.discard(6)
+        save(run, 10)
+
+    assert [info.step for info in open_run(tmp_path, "test").checkpoints()] == [8, 10]
+
+
+def test_a_checkpoint_older_than_its_run_is_one_the_run_replaced(tmp_path):
+    """Overwriting writes the new run.json before it deletes the old checkpoints: for that
+    moment, the old file and the new run's creation are there together."""
+    with writer(tmp_path, created=datetime(2030, 1, 1, tzinfo=UTC)) as run:
+        save(run, 4)
+    reader = open_run(tmp_path, "test")
+    checkpoint = reader.checkpoints()[0]
+    written = reader.checkpoint_written(checkpoint)
+
+    with pytest.raises(run_store.CheckpointChanged):
+        run_store.created_with(reader, checkpoint, written)
+
+
+def test_a_checkpoint_stamped_by_a_clock_behind_the_trainers_is_not_taken_for_a_replaced_one(
+    tmp_path,
+):
+    """A file server's clock sets the mtime; whether the run was replaced is told by the
+    index, which the trainer stamps with the clock it stamped the run with."""
+    with writer(tmp_path) as run:
+        save(run, 4)
+    reader = open_run(tmp_path, "test")
+    checkpoint = reader.checkpoints()[0]
+    created = reader.info.created
+    behind = (created - timedelta(minutes=5)).timestamp()
+    os.utime(reader.checkpoint_path(checkpoint), (behind, behind))
+    written = reader.checkpoint_written(checkpoint)
+
+    assert run_store.created_with(reader, checkpoint, written) == created
+
+
+def test_a_checkpoint_the_index_lost_is_judged_by_its_file_within_a_coarse_timestamp(tmp_path):
+    with writer(tmp_path) as run:
+        save(run, 4)
+    reader = open_run(tmp_path, "test")
+    (reader.directory / CHECKPOINTS_DIR / CHECKPOINT_INDEX).unlink()
+    created = reader.info.created
+    # Written in the second the run was created, as a file system that stamps whole seconds
+    # has it: up to a second before the run itself.
+    truncated = (created - timedelta(seconds=0.9)).timestamp()
+    path = reader.checkpoint_path(reader.checkpoints()[0])
+    os.utime(path, (truncated, truncated))
+    checkpoint = reader.checkpoints()[0]
+
+    assert (
+        run_store.created_with(reader, checkpoint, reader.checkpoint_written(checkpoint)) == created
+    )
+
+
+def test_checkpoints_no_longer_held_are_pruned_once_nobody_is_writing_the_run(tmp_path):
+    held = {2, 4}
+    with writer(tmp_path, policy=CheckpointPolicy(keep=1)) as run:
+        run.held = lambda checkpoint: checkpoint.step in held
+        for step in range(1, 6):
+            save(run, step)
+        directory = run.directory
+
+        # Still being written: its own next save prunes, and nothing else may.
+        held.clear()
+        run_store.prune_released(directory, lambda checkpoint: False)
+        assert [info.step for info in open_run(tmp_path, "test").checkpoints()] == [2, 4, 5]
+
+    held.add(4)
+    run_store.prune_released(directory, lambda checkpoint: checkpoint.step in held)
+
+    reader = open_run(tmp_path, "test")
+    assert [info.step for info in reader.checkpoints()] == [4, 5]
+    assert reader.checkpoint_index().policy.keep == 1
+
+
+def test_a_run_whose_index_cannot_be_read_is_not_pruned_after_it_ends(tmp_path):
+    """Its own retention is not known, and the default one could keep less than it did."""
+    with writer(tmp_path, policy=CheckpointPolicy(keep=10)) as run:
+        for step in range(1, 6):
+            save(run, step)
+        directory = run.directory
+    (directory / CHECKPOINTS_DIR / CHECKPOINT_INDEX).write_text("{")
+
+    run_store.prune_released(directory, lambda checkpoint: False)
+
+    assert [info.step for info in open_run(tmp_path, "test").checkpoints()] == [1, 2, 3, 4, 5]
+
+
+def test_a_run_that_cannot_be_locked_is_not_pruned_by_anyone_but_its_trainer(
+    tmp_path, monkeypatch, caplog
+):
+    """Without a lock nothing tells a trainer writing the run from one that has gone."""
+    with writer(tmp_path, policy=CheckpointPolicy(keep=1)) as run:
+        run.held = lambda checkpoint: checkpoint.step == 2
+        for step in range(1, 4):
+            save(run, step)
+        directory = run.directory
+
+    def no_locks(descriptor, operation):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(run_store.fcntl, "flock", no_locks)
+
+    run_store.prune_released(directory, lambda checkpoint: False)
+
+    assert [info.step for info in open_run(tmp_path, "test").checkpoints()] == [2, 3]
+    assert "cannot lock" not in caplog.text

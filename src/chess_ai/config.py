@@ -173,6 +173,12 @@ class LadderConfig(BaseModel):
     Stockfish supports is played at the nearest end of it (1350 to 2850 for Stockfish 14)."""
     games_per_level: int = Field(default=20, ge=1)
     """How many games the checkpoint plays against each level, the colours swapped every game."""
+    every: int = Field(default=10_000, ge=1)
+    """Which checkpoints the evaluator ladders, for a run whose config asks for the
+    ``stockfish-ladder`` suite: those from a step that is a multiple of this, and the last one
+    of a run that has finished. A ladder takes minutes, and runs save far more often. Training
+    keeps the checkpoints due a ladder until the evaluator has played it, the newest three at
+    most, on top of the ones its retention keeps."""
     rating: int = Field(default=2000, ge=0, le=4000)
     """The rating the checkpoint is asked to play like. Always one: asked for none, a model
     plays like a game that claims no rating, which is far below what it can do."""

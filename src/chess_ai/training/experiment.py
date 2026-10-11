@@ -194,7 +194,7 @@ class CheckpointSection(_Section):
         )
 
 
-EVALUATION_SUITES: Final = ("probe-positions", "sample-games")
+EVALUATION_SUITES: Final = ("probe-positions", "sample-games", "stockfish-ladder")
 """The evaluation suites a run can ask for, each of which the evaluator knows how to run."""
 
 
@@ -209,8 +209,9 @@ class EvaluationSection(_Section):
 
     suites: list[str] = ["probe-positions", "sample-games"]
     """By name: ``probe-positions`` records what the checkpoint makes of a fixed set of
-    positions, and ``sample-games`` plays a few games with it, which the run page shows live
-    as they are played. An empty list evaluates nothing."""
+    positions, ``sample-games`` plays a few games with it, which the run page shows live as
+    they are played, and ``stockfish-ladder`` measures its Elo against Stockfish, every so
+    many steps (``[ladder]`` in the global config). An empty list evaluates nothing."""
 
     @field_validator("suites")
     @classmethod
