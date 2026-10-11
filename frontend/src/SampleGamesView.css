@@ -1,0 +1,94 @@
+.sample-games {
+  margin-top: 1.5rem;
+}
+
+.sample-games h3 {
+  margin: 0 0 0.5rem;
+}
+
+.sample-games h4 {
+  margin: 0.75rem 0 0.5rem;
+  font-size: 1rem;
+}
+
+.sample-games .note {
+  margin: 0 0 0.75rem;
+  opacity: 0.7;
+}
+
+.sample-games p[role='alert'] {
+  margin: 0 0 0.75rem;
+  font-weight: 600;
+  color: #c33;
+}
+
+.live-sample-game {
+  margin-bottom: 1rem;
+}
+
+.live-badge {
+  display: inline-block;
+  margin-right: 0.25rem;
+  padding: 0 0.4rem;
+  border-radius: 3px;
+  color: #fff;
+  background: rgb(200 40 40);
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  vertical-align: 0.1em;
+}
+
+/* Smaller than in a game of its own: the board is one thing on a page of many, and the charts
+   and probes above and below it are what the page is for. */
+.live-sample-game .board-frame {
+  flex-basis: min(28rem, 100%);
+}
+
+.live-sample-game .board-row {
+  flex-basis: calc(min(28rem, 100%) + 1.75rem);
+}
+
+.live-sample-game .board-row > .board-frame {
+  flex-basis: auto;
+}
+
+.live-sample-game .flip {
+  margin: 0;
+}
+
+.sample-summary {
+  margin: 0 0 0.75rem;
+}
+
+/* The checkpoint left, while the one chosen is on its way. */
+.sample-result.loading {
+  opacity: 0.55;
+}
+
+.sample-game-list {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.sample-game-list th,
+.sample-game-list td {
+  padding: 0.25rem 0.75rem 0.25rem 0;
+  text-align: left;
+  vertical-align: top;
+  /* An opening's name is the long one, and it wraps rather than widen the page on a phone. */
+  overflow-wrap: anywhere;
+}
+
+.sample-game-list th {
+  border-bottom: 1px solid rgb(128 128 128 / 50%);
+}
+
+.sample-game-list .number {
+  text-align: right;
+}
+
+.sample-game-list a {
+  color: inherit;
+  white-space: nowrap;
+}

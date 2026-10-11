@@ -1,6 +1,5 @@
 /**
- * What the run page makes of a run's probe results: which checkpoints have one, and how a
- * result reads.
+ * What the run page makes of a run's probe results: how a result reads.
  *
  * A probe is a fixed position every checkpoint of a run is shown, to see what it makes of it:
  * its most likely moves, how likely, and who it thinks is winning. Some have a solution, such as
@@ -8,7 +7,6 @@
  */
 
 import type {
-  EvaluationEntry,
   ProbeCategory,
   ProbeOutcome,
   ProbeResult,
@@ -25,16 +23,6 @@ export const CATEGORIES: { category: ProbeCategory; heading: string }[] = [
   { category: 'tactic', heading: 'Tactics' },
   { category: 'endgame', heading: 'Endgames' },
 ];
-
-/**
- * The checkpoints that have a probe result, by step, earliest first. Pruned checkpoints are
- * among them: their results are kept after the checkpoints themselves are gone.
- */
-export function probedSteps(evaluations: EvaluationEntry[]): EvaluationEntry[] {
-  return evaluations
-    .filter((entry) => entry.suite === PROBE_SUITE)
-    .sort((one, other) => one.step - other.step);
-}
 
 /** Whether the checkpoint's most likely move solves the probe, or null for one without a solution. */
 export function solved(outcome: ProbeOutcome): boolean | null {

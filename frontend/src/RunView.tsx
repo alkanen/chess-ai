@@ -5,6 +5,8 @@ import { PROBE_SUITE } from './probes';
 import { ProbeView } from './ProbeView';
 import { CHARTS, chartData, logs, xAxis } from './runCharts';
 import { RunStateBadge } from './RunState';
+import { SAMPLE_SUITE } from './sampleGames';
+import { SampleGamesView } from './SampleGamesView';
 import {
   datasetLabel,
   formatAgo,
@@ -186,6 +188,13 @@ export function RunView({ name }: RunViewProps) {
             ))}
           </div>
           {/* Another run's checkpoints are others: nothing chosen or kept of one carries over. */}
+          <SampleGamesView
+            key={`${name}-games`}
+            run={name}
+            evaluations={run.evaluations}
+            liveGame={run.liveGame}
+            playing={info?.config?.evaluation?.suites?.includes(SAMPLE_SUITE) ?? true}
+          />
           <ProbeView
             key={name}
             run={name}

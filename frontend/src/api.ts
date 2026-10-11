@@ -615,6 +615,35 @@ export interface LiveGame {
   game: GameState;
 }
 
+/** One of a checkpoint's sample games, as its result lists it; mirrors sample_games.SampleGame. */
+export interface SampleGame {
+  /** Where the game is among the checkpoint's games, counting from 0; how it is replayed. */
+  index: number;
+  opponent: 'self' | 'stockfish';
+  /** Which side the checkpoint played: both, against itself. */
+  model_color: Color | 'both';
+  /** The name of the line it started from. */
+  opening: string;
+  white: string;
+  black: string;
+  result: Result;
+  termination: GameOverReason | null;
+  /** How many moves were played, the opening's among them. */
+  plies: number;
+}
+
+/** What a checkpoint's sample games came to: mirrors chess_ai.sample_games.SampleGamesResult. */
+export interface SampleGamesResult {
+  model: ModelDescription;
+  started: string;
+  finished: string;
+  /** The opening set the games started from, and its version. */
+  openings: string;
+  /** How strong Stockfish played, or null when it was not played. */
+  stockfish: StockfishDescription | null;
+  games: SampleGame[];
+}
+
 /**
  * What the run channel sends: what the run is and where it has got to, first and whenever
  * that changes, and the lines of its metrics log. A metrics event with `reset` set replaces
@@ -913,6 +942,22 @@ export async function fetchProbes(run: string, step: number): Promise<ProbeResul
     throw new Error(await refusal(response));
   }
   return (await response.json()) as ProbeResult;
+}
+
+/** Which sample games the checkpoint from `step` of `run` played, and how each ended. */
+export async function fetchSampleGames(run: string, step: number): Promise<SampleGamesResult> {
+  return await fetched<SampleGamesResult>(
+    apiUrl(`runs/${encodeURIComponent(run)}/evaluations/${step}/sample-games`),
+  );
+}
+
+/** Replays one of the sample games the checkpoint from `step` of `run` played. */
+export async function openSampleGame(run: string, step: number, game = 0): Promise<ReplayFile> {
+  const url = new URL(
+    apiUrl(`runs/${encodeURIComponent(run)}/evaluations/${step}/sample-games/replay`),
+  );
+  url.searchParams.set('game', String(game));
+  return await replayed(url);
 }
 
 /** The WebSocket URL of one run's live stream, under the path prefix like every API URL. */

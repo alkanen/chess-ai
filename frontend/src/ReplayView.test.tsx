@@ -401,4 +401,54 @@ describe('ReplayView', () => {
       expect(screen.queryByText(/Move 0 of 4/)).not.toBeInTheDocument();
     });
   });
+
+  describe('a run’s sample game', () => {
+    afterEach(() => {
+      window.location.hash = '';
+    });
+
+    it('opens the game the address names, with a way back to its run', async () => {
+      window.location.hash = '#replay/run/tiny%20run/500/2';
+      render(<ReplayView sampleGame={{ run: 'tiny run', step: 500, index: 1 }} />);
+
+      await waitFor(() => expect(screen.getByText(/Move 0 of 7/)).toBeInTheDocument());
+      const [url] = fetch.mock.calls.at(-1) as [string];
+      expect(url).toBe(
+        new URL(
+          '/chess/api/runs/tiny%20run/evaluations/500/sample-games/replay?game=1',
+          location.href,
+        ).href,
+      );
+      expect(screen.getByRole('link', { name: 'tiny run' })).toHaveAttribute(
+        'href',
+        '#runs/tiny%20run',
+      );
+      expect(screen.getByText(/sample games of step 500/)).toBeInTheDocument();
+      expect(window.location.hash).toBe('#replay/run/tiny%20run/500/2');
+    });
+
+    it('keeps the address on the checkpoint’s game that is chosen', async () => {
+      window.location.hash = '#replay/run/tiny/500/2';
+      render(<ReplayView sampleGame={{ run: 'tiny', step: 500, index: 1 }} />);
+      await waitFor(() => expect(screen.getByText(/Move 0 of 7/)).toBeInTheDocument());
+
+      fireEvent.change(screen.getByLabelText('Game'), { target: { value: '0' } });
+
+      await waitFor(() => expect(screen.getByText(/Move 0 of 4/)).toBeInTheDocument());
+      const [url] = fetch.mock.calls.at(-1) as [string];
+      expect(url).toMatch(/\/runs\/tiny\/evaluations\/500\/sample-games\/replay\?game=0$/);
+      expect(window.location.hash).toBe('#replay/run/tiny/500/1');
+    });
+
+    it('takes the address off it when a saved game is opened', async () => {
+      window.location.hash = '#replay/run/tiny/500/2';
+      render(<ReplayView sampleGame={{ run: 'tiny', step: 500, index: 1 }} />);
+      await waitFor(() => expect(screen.getByText(/Move 0 of 7/)).toBeInTheDocument());
+
+      fireEvent.click(await screen.findByRole('button', { name: /Human – Random mover/ }));
+
+      await waitFor(() => expect(screen.getByText(SAVED[0].name)).toBeInTheDocument());
+      expect(window.location.hash).toBe('#replay');
+    });
+  });
 });
