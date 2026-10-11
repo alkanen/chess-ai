@@ -91,3 +91,59 @@ export function eloChartData(points: LadderPoint[]): ChartData {
     ),
   ];
 }
+
+/**
+ * The ladder that speaks for the checkpoint from `step`: its own, or failing that the one
+ * nearest it by step, the earlier of two as near; null when no checkpoint has one.
+ */
+export function nearestLadder(step: number, points: LadderPoint[]): LadderPoint | null {
+  let nearest: LadderPoint | null = null;
+  for (const point of points) {
+    const distance = Math.abs(point.step - step);
+    const best = nearest === null ? Infinity : Math.abs(nearest.step - step);
+    if (distance < best || (distance === best && nearest !== null && point.step < nearest.step)) {
+      nearest = point;
+    }
+  }
+  return nearest;
+}
+
+/**
+ * How strong a checkpoint played on the ladder, in words for a player choosing it, after a
+ * subject such as "Step 4000": which Stockfish setting it scored about as well as, with its
+ * range, and which rating it was asked to play like there. `asked` is the rating the player
+ * wants it to play like, which it may well play differently at.
+ *
+ * Stockfish's Elo setting at a fraction of a second a move is a scale of its own, so the
+ * words never call the number a rating.
+ */
+export function describeStrength(point: LadderPoint, asked: number | null): string {
+  const round = (value: number | null) => (value === null ? '?' : String(Math.round(value)));
+  const { estimate } = point;
+  let strength: string;
+  if (estimate.beyond === 'below_floor') {
+    const top = estimate.high === null ? '' : ` (likely at most ${round(estimate.high)})`;
+    strength = `below Stockfish ${round(estimate.floor)}, the ladder’s lowest level${top}`;
+  } else if (estimate.beyond === 'above_ceiling') {
+    const bottom = estimate.low === null ? '' : ` (likely at least ${round(estimate.low)})`;
+    strength = `above Stockfish ${round(estimate.ceiling)}, the ladder’s highest level${bottom}`;
+  } else {
+    strength =
+      `about as well as Stockfish set to ${round(estimate.rating)} ` +
+      `(likely ${round(estimate.low)} to ${round(estimate.high)})`;
+  }
+  const rating =
+    point.rating === null
+      ? 'asked to claim no rating'
+      : `asked to play like a player rated ${point.rating}`;
+  const sentences = [
+    `played ${strength} at ${point.move_time} s a move on the Stockfish ladder, ${rating}.`,
+    'That is Stockfish’s own scale, not a Lichess rating.',
+  ];
+  if (asked !== point.rating) {
+    sentences.push(
+      `You have asked for ${asked === null ? 'no rating' : asked}, so it may play differently.`,
+    );
+  }
+  return sentences.join(' ');
+}

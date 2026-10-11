@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   fetchCheckpoints,
+  fetchLadderPoints,
   PLAYER_NAMES,
   type CheckpointChoice,
   type CheckpointSummary,
+  type LadderPoint,
   type PlayerKind,
   type PlayerSpec,
   type RunSummary,
   type SelectionStrategy,
   type StockfishInfo,
 } from './api';
+import { describeStrength, nearestLadder } from './ladder';
 import { describeRun, runLabels } from './runLabels';
 
 const PLAYER_KINDS = Object.keys(PLAYER_NAMES) as PlayerKind[];
@@ -73,11 +76,16 @@ export function playerSpec(choice: PlayerChoice): PlayerSpec {
     kind: 'model',
     run: choice.run,
     checkpoint: choice.checkpoint,
-    // An empty box is not a rating: that model plays a position that claims none.
-    rating: choice.rating.trim() === '' ? null : Number(choice.rating),
+    rating: askedRating(choice),
     strategy: choice.strategy,
     temperature: choice.temperature,
   };
+}
+
+/** The rating a model is to play like, as the server wants it. */
+function askedRating(choice: PlayerChoice): number | null {
+  // An empty box is not a rating: that model plays a position that claims none.
+  return choice.rating.trim() === '' ? null : Number(choice.rating);
 }
 
 /**
@@ -110,31 +118,56 @@ export function resolved(choice: PlayerChoice, runs: RunSummary[] | null): Playe
   return { ...choice, run: runs?.[0]?.name ?? '' };
 }
 
-/** The checkpoints of `run`, or null until they arrive; [] for a run without any. */
-function useCheckpoints(run: string): CheckpointSummary[] | null {
-  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[] | null>(null);
+/**
+ * What `ask` answers about `run`, or null until it does (or while no run is chosen), and
+ * `failed` if it will not.
+ *
+ * A run being trained saves checkpoints and ladders them as it goes, so this is asked again
+ * whenever the run changes rather than kept: a fresh answer is one change of the run away.
+ */
+function useRunAnswer<T>(
+  run: string,
+  ask: (run: string) => Promise<T>,
+  failed: T | null,
+): T | null {
+  const [answer, setAnswer] = useState<T | null>(null);
 
   useEffect(() => {
     if (run === '') {
-      setCheckpoints(null);
+      setAnswer(null);
       return;
     }
-    // A run being trained saves checkpoints as it goes, so this is asked for whenever the
-    // run changes rather than kept: reopening the list is one change of the run away.
     let dropped = false;
-    setCheckpoints(null);
-    fetchCheckpoints(run).then(
-      (found) => !dropped && setCheckpoints(found.checkpoints),
-      // A run that has gone, or a server that will not answer, leaves the two choices that
-      // need no list: the best checkpoint and the latest one.
-      () => !dropped && setCheckpoints([]),
+    setAnswer(null);
+    ask(run).then(
+      (found) => !dropped && setAnswer(found),
+      () => !dropped && setAnswer(failed),
     );
     return () => {
       dropped = true;
     };
-  }, [run]);
+  }, [run, ask, failed]);
 
-  return checkpoints;
+  return answer;
+}
+
+const askCheckpoints = async (run: string) => (await fetchCheckpoints(run)).checkpoints;
+const NO_CHECKPOINTS: CheckpointSummary[] = [];
+
+/** The checkpoints of `run`, or null until they arrive; [] for a run without any. */
+function useCheckpoints(run: string): CheckpointSummary[] | null {
+  // A run that has gone, or a server that will not answer, leaves the two choices that need
+  // no list: the best checkpoint and the latest one.
+  return useRunAnswer(run, askCheckpoints, NO_CHECKPOINTS);
+}
+
+/**
+ * The ladders of `run`'s checkpoints, pruned ones among them; [] for a run without any, and
+ * null until they arrive or when they cannot be listed, which is not the same as there being
+ * none: the picker says nothing of strength then rather than that no checkpoint has any.
+ */
+function useLadders(run: string): LadderPoint[] | null {
+  return useRunAnswer(run, fetchLadderPoints, null);
 }
 
 interface PlayerPickerProps {
@@ -154,6 +187,7 @@ export function PlayerPicker({ label, value, onChange, runs, stockfish }: Player
   // person can see chosen, which for a model chosen before the runs arrived is the first.
   const choice = resolved(value, runs);
   const checkpoints = useCheckpoints(choice.kind === 'model' ? choice.run : '');
+  const ladders = useLadders(choice.kind === 'model' ? choice.run : '');
 
   return (
     <div className="player">
@@ -177,6 +211,7 @@ export function PlayerPicker({ label, value, onChange, runs, stockfish }: Player
           onChange={onChange}
           runs={runs}
           checkpoints={checkpoints}
+          ladders={ladders}
         />
       )}
       {choice.kind === 'stockfish' && (
@@ -202,6 +237,7 @@ interface ModelPickerProps {
 export function ModelPicker({ label, value, onChange, runs }: ModelPickerProps) {
   const choice = resolved({ ...value, kind: 'model' }, runs);
   const checkpoints = useCheckpoints(choice.run);
+  const ladders = useLadders(choice.run);
   return (
     <ModelFields
       label={label}
@@ -209,6 +245,7 @@ export function ModelPicker({ label, value, onChange, runs }: ModelPickerProps) 
       onChange={onChange}
       runs={runs}
       checkpoints={checkpoints}
+      ladders={ladders}
     />
   );
 }
@@ -266,10 +303,11 @@ function StockfishFields({ label, value, onChange, info }: StockfishFieldsProps)
 
 interface ModelFieldsProps extends Omit<PlayerPickerProps, 'stockfish'> {
   checkpoints: CheckpointSummary[] | null;
+  ladders: LadderPoint[] | null;
 }
 
 /** Which checkpoint plays this side, how well it should play, and how it picks its move. */
-function ModelFields({ label, value, onChange, runs, checkpoints }: ModelFieldsProps) {
+function ModelFields({ label, value, onChange, runs, checkpoints, ladders }: ModelFieldsProps) {
   const labels = useMemo(() => runLabels(runs ?? []), [runs]);
   if (runs !== null && runs.length === 0) {
     return <p className="note">No training runs have been kept here yet.</p>;
@@ -312,6 +350,11 @@ function ModelFields({ label, value, onChange, runs, checkpoints }: ModelFieldsP
           ))}
         </select>
       </label>
+      <CheckpointStrength
+        step={chosenStep(value.checkpoint, checkpoints)}
+        ladders={ladders}
+        asked={askedRating(value)}
+      />
       <label>
         {label} rating{' '}
         <input
@@ -357,6 +400,52 @@ function ModelFields({ label, value, onChange, runs, checkpoints }: ModelFieldsP
       )}
     </div>
   );
+}
+
+/**
+ * The step a checkpoint choice means, or null while that is not known: the best and the
+ * latest are found in the list of checkpoints, which may not have arrived, or be empty.
+ */
+function chosenStep(
+  checkpoint: CheckpointChoice,
+  checkpoints: CheckpointSummary[] | null,
+): number | null {
+  if (typeof checkpoint === 'number') {
+    return checkpoint;
+  }
+  const found = checkpoints?.find((each) => (checkpoint === 'best' ? each.best : each.latest));
+  return found?.step ?? null;
+}
+
+interface CheckpointStrengthProps {
+  /** The step of the checkpoint chosen, or null while that is not known. */
+  step: number | null;
+  /** The run's ladders, or null until they arrive. */
+  ladders: LadderPoint[] | null;
+  /** The rating the checkpoint is to play like, or null for none. */
+  asked: number | null;
+}
+
+/**
+ * How strong the chosen checkpoint played on the Stockfish ladder, so the player knows roughly
+ * what they are taking on; for one with no ladder, that it has none, and the nearest that has.
+ */
+function CheckpointStrength({ step, ladders, asked }: CheckpointStrengthProps) {
+  if (step === null || ladders === null) {
+    return null;
+  }
+  const nearest = nearestLadder(step, ladders);
+  let text: string;
+  if (nearest === null) {
+    text = `Step ${step} has not been on the Stockfish ladder, nor has any other checkpoint of this run.`;
+  } else if (nearest.step === step) {
+    text = `Step ${step} ${describeStrength(nearest, asked)}`;
+  } else {
+    text =
+      `Step ${step} has not been on the Stockfish ladder. ` +
+      `The nearest that has, step ${nearest.step}, ${describeStrength(nearest, asked)}`;
+  }
+  return <p className="note strength">{text}</p>;
 }
 
 /** A checkpoint in one line: which step it is, and whether it is the best or the newest. */
