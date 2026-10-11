@@ -14,10 +14,17 @@ positions never reaches a second epoch in the first place.
 
 Shuffling is a permutation per epoch, derived from the run's seed and the epoch number, so every
 worker process computes the same one without being told and the same seed replays the same run.
-It is built as the narrowest integer type that can index the split, because at Lichess scale each
-worker holds one: 4 bytes a position rather than 8 is the difference between a gigabyte and two.
+It is built as the narrowest integer type that can index the split: 4 bytes a position, which at
+Lichess scale is 2.5 GB for an order. Held once per worker, as it was at first, that is 10 GB over
+four of them for four copies of the same array, and twice that at an epoch boundary. So a loader
+is given a directory to share it through: the first worker into an epoch writes its order to a
+file there, and every worker maps that file. It is then page cache held once for all of them,
+which the kernel can drop and read back rather than swap; see
+:meth:`PositionBatches.sharing_orders`.
 """
 
+import copy
+import fcntl
 import multiprocessing
 import os
 import signal
@@ -25,6 +32,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from multiprocessing import resource_tracker
+from pathlib import Path
 from typing import Any, Final, NamedTuple
 
 import numpy as np
@@ -37,6 +45,16 @@ from chess_ai.encoders import Encoder, create_encoder
 
 PREFETCH_BATCHES: Final = 4
 """Batches each worker reads ahead, so that the GPU is not waiting on the disk."""
+
+ORDER_SUFFIX: Final = ".order"
+"""What an epoch's order is called in a directory orders are shared through."""
+WRITING_SUFFIX: Final = ".writing"
+"""What an order is called while it is being written, until it is whole."""
+ORDER_LOCK: Final = "orders.lock"
+"""Held by the worker writing an order, so that only one does and the rest wait for it."""
+_FILL_CHUNK: Final = 1 << 24
+"""Positions an order file is numbered in at a time, before it is shuffled, so that numbering
+it never needs an array of the whole split in memory."""
 
 
 class Batch(NamedTuple):
@@ -113,6 +131,29 @@ class PositionBatches(TorchDataset):
         self._dataset: Dataset | None = None
         self._encoder: Encoder | None = None
         self._shuffled: tuple[int, np.ndarray] | None = None
+        self._orders: Path | None = None
+
+    def sharing_orders(self, directory: Path) -> "PositionBatches":
+        """These batches, with each epoch's order shared through files in ``directory``.
+
+        Every process asking for a batch of an epoch maps the same file, written once by
+        whichever got there first while the others wait on a lock, so the order is held once
+        however many workers there are. The order itself is the one an unshared object
+        shuffles, number for number, so a run started before orders were shared resumes with
+        the batches it would have had.
+
+        Writing an epoch's order removes those older than the epoch before it, which a worker
+        a batch behind may still be reading, and whatever a writer that died left
+        half-written; never a newer one, which with epochs of a few batches a worker ahead
+        may be on. The directory is the caller's to remove once the workers are done with it.
+
+        A copy, holding none of what this one cached, so that none of it is pickled into
+        workers; this one is left as it is.
+        """
+        shared = copy.copy(self)
+        shared._forget()
+        shared._orders = Path(directory)
+        return shared
 
     def __len__(self) -> int:
         return self._batches
@@ -138,12 +179,93 @@ class PositionBatches(TorchDataset):
 
         One epoch's worth is kept at a time. A loader hands consecutive batches to its workers in
         turn, so each worker is always within a batch or two of the others and never needs two.
+        The last epoch's is let go before the next is built, rather than when it replaces it:
+        at Lichess scale holding both is another 2.5 GB in every worker at every boundary.
         """
         if self._shuffled is None or self._shuffled[0] != epoch:
-            order = np.arange(self.positions, dtype=_index_dtype(self.positions))
-            np.random.default_rng([self._seed, epoch]).shuffle(order)
+            self._shuffled = None
+            if self._orders is None:
+                order = _shuffle(np.arange(self.positions, dtype=self._dtype()), self._seed, epoch)
+            else:
+                order = self._shared_order(epoch)
             self._shuffled = (epoch, order)
         return self._shuffled[1]
+
+    def _shared_order(self, epoch: int) -> np.ndarray:
+        """``epoch``'s order mapped from its file, written first if no process has yet."""
+        assert self._orders is not None
+        path = self._orders / self._order_name(epoch)
+        order = self._mapped(path)
+        if order is not None:
+            return order
+        self._orders.mkdir(parents=True, exist_ok=True)
+        with _locked(self._orders / ORDER_LOCK):
+            # Looked for again: another worker may have written it while this one waited.
+            order = self._mapped(path)
+            if order is not None:
+                return order
+            for stale in self._orders.iterdir():
+                # Only the lock's holder writes, so a half-written order is a dead writer's.
+                # Older epochs only: with epochs of a few batches, a worker that is behind can
+                # be writing one while the others are more than an epoch ahead of it.
+                stale_epoch = self._epoch_of(stale.name)
+                if stale.name.endswith(WRITING_SUFFIX) or (
+                    stale_epoch is not None and stale_epoch < epoch - 1
+                ):
+                    stale.unlink(missing_ok=True)
+            writing = path.with_name(path.name + WRITING_SUFFIX)
+            try:
+                self._write_order(writing, epoch)
+            except BaseException:
+                writing.unlink(missing_ok=True)
+                raise
+            os.replace(writing, path)
+            order = self._mapped(path)
+        assert order is not None, f"{path} was written and is not there"
+        return order
+
+    def _write_order(self, path: Path, epoch: int) -> None:
+        """Write ``epoch``'s order to ``path``, whole and on the disk."""
+        size = self.positions * self._dtype().itemsize
+        with path.open("wb") as file:
+            # Room for all of it first. A mapped file is otherwise sparse, and a page the
+            # disk has no block for kills the process with SIGBUS rather than raising.
+            if hasattr(os, "posix_fallocate"):
+                os.posix_fallocate(file.fileno(), 0, size)
+            else:
+                file.truncate(size)
+        order = np.memmap(path, dtype=self._dtype(), mode="r+", shape=(self.positions,))
+        for start in range(0, self.positions, _FILL_CHUNK):
+            stop = min(start + _FILL_CHUNK, self.positions)
+            order[start:stop] = np.arange(start, stop, dtype=order.dtype)
+        # Shuffled through a plain view of the map: numpy only shuffles a base-class array in
+        # place in C, and swaps a subclass's elements one at a time in Python.
+        _shuffle(np.asarray(order), self._seed, epoch)
+        order.flush()
+
+    def _order_name(self, epoch: int) -> str:
+        return f"{self._split}-seed{self._seed}-epoch{epoch}{ORDER_SUFFIX}"
+
+    def _epoch_of(self, name: str) -> int | None:
+        """The epoch an order of this split and seed called ``name`` is of, if it is one."""
+        prefix = f"{self._split}-seed{self._seed}-epoch"
+        if not (name.startswith(prefix) and name.endswith(ORDER_SUFFIX)):
+            return None
+        number = name[len(prefix) : -len(ORDER_SUFFIX)]
+        return int(number) if number.isdigit() else None
+
+    def _mapped(self, path: Path) -> np.ndarray | None:
+        """The order in ``path``, or ``None`` if there is no whole one there."""
+        try:
+            if path.stat().st_size != self.positions * self._dtype().itemsize:
+                return None
+            # The lock's holder may remove an old order between the look and the open.
+            return np.memmap(path, dtype=self._dtype(), mode="r", shape=(self.positions,))
+        except FileNotFoundError:
+            return None
+
+    def _dtype(self) -> np.dtype:
+        return _index_dtype(self.positions)
 
     def close(self) -> None:
         """Drop everything a batch caused to be cached, leaving the object as it started.
@@ -164,6 +286,10 @@ class PositionBatches(TorchDataset):
         """
         if self._reader is not None:
             self._reader.close()
+        self._forget()
+
+    def _forget(self) -> None:
+        """Let go of everything cached, without closing what another object may share."""
         self._reader = self._dataset = self._opened_by = None
         self._shuffled = self._encoder = None
 
@@ -179,6 +305,23 @@ class PositionBatches(TorchDataset):
         if self._encoder is None:
             self._encoder = create_encoder(self._encoder_name, **self._encoder_options)
         return self._encoder
+
+
+def _shuffle(order: np.ndarray, seed: int, epoch: int) -> np.ndarray:
+    """``order`` shuffled in place into ``epoch``'s order, and returned."""
+    np.random.default_rng([seed, epoch]).shuffle(order)
+    return order
+
+
+@contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on ``path`` for the block, waiting while another process has it."""
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _index_dtype(positions: int) -> np.dtype:

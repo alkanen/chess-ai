@@ -39,6 +39,7 @@ from chess_ai.training import checkpoint as checkpoints
 from chess_ai.training.experiment import OptimizerSection
 from chess_ai.training.run_store import (
     CHECKPOINTS_DIR,
+    ORDERS_DIR,
     CheckpointPolicy,
     RunError,
     RunWriter,
@@ -372,6 +373,30 @@ def test_data_workers_read_batches_in_their_own_processes(tmp_path, data_dir):
 
     assert reader.status.status == RunStatus.FINISHED
     assert [line["step"] for line in reader.metrics() if line["split"] == "train"] == [6]
+
+
+def test_the_workers_share_one_order_in_the_run_directory_while_the_run_goes(
+    tmp_path, data_dir, monkeypatch
+):
+    """Held once in a file for all of them rather than once in each, and gone afterwards."""
+    orders = tmp_path / "runs" / "tiny" / ORDERS_DIR
+    seen = []
+    after_steps(monkeypatch, 2, lambda: seen.extend(path.name for path in orders.iterdir()))
+
+    reader = run(tmp_path, data_dir, training='device = "cpu"\nbatch_size = 8\ndata_workers = 2')
+
+    assert [name for name in seen if name.endswith(".order")], seen
+    assert reader.status.status == RunStatus.FINISHED
+    assert not orders.exists()
+
+
+def test_a_stopped_run_leaves_no_orders_behind(tmp_path, data_dir, monkeypatch):
+    signal_after(monkeypatch, 5)
+
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+
+    assert not (tmp_path / "runs" / "tiny" / ORDERS_DIR).exists()
 
 
 def test_the_metrics_log_is_json_lines_one_object_at_a_time(tmp_path, data_dir):

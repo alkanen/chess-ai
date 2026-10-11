@@ -27,6 +27,7 @@ is two days in.
 import copy
 import logging
 import math
+import shutil
 import signal
 import threading
 import time
@@ -67,9 +68,8 @@ from chess_ai.training.hardware import (
     gpu_stats,
     resolve_device,
 )
-from chess_ai.training.run_store import TRAIN as TRAIN_SPLIT
-from chess_ai.training.run_store import VALIDATION as VALIDATION_SPLIT
 from chess_ai.training.run_store import (
+    ORDERS_DIR,
     CheckpointPolicy,
     DatasetReference,
     Lineage,
@@ -85,6 +85,8 @@ from chess_ai.training.run_store import (
     open_run,
     run_path,
 )
+from chess_ai.training.run_store import TRAIN as TRAIN_SPLIT
+from chess_ai.training.run_store import VALIDATION as VALIDATION_SPLIT
 from chess_ai.training.validate import validate
 
 LOGGER = logging.getLogger(__name__)
@@ -835,7 +837,7 @@ def _loop(
         # Last, so that nothing between here and the first step draws from it.
         _restore_rng(start.rng_state, run.device)
 
-    for batch in _stream(run, first=start.step):
+    for batch in _stream(run, first=start.step, orders=writer.directory / ORDERS_DIR):
         batch = batch.to(run.device, non_blocking=run.device.type == "cuda")
         # Read before the scheduler moves on: this is the rate the weights just moved by, and
         # get_last_lr() after scheduler.step() is already the next step's.
@@ -972,21 +974,32 @@ def _best(writer: RunWriter, config: ExperimentConfig) -> str:
     return f", best {config.checkpoints.metric} {value:.4f} at step {best.step:,}"
 
 
-def _stream(run: _Run, *, first: int = 0) -> Iterator[Batch]:
+def _stream(run: _Run, *, first: int = 0, orders: Path) -> Iterator[Batch]:
     """Every batch of the run from ``first`` on, in one pass over one loader.
 
     A batch is numbered over the whole run, and which positions it holds is a function of that
     number and the seed, so a resumed run starts at the batch it would have trained on next and
     sees exactly what it would have seen. See :mod:`chess_ai.training.batches`.
+
+    The loader's workers share each epoch's order through files in ``orders``, which go with
+    the loader. A killed trainer leaves them behind, and a resumed run may then map its epoch's
+    order from there: it is the order it would have written, a function of the seed, the epoch
+    and the number of positions, and one of another size is written again.
     """
-    batches = run.batches if not first else Subset(run.batches, range(first, len(run.batches)))
+    shared = run.batches.sharing_orders(orders)
+    batches = shared if not first else Subset(shared, range(first, len(shared)))
     loader = batch_loader(batches, workers=run.config.training.data_workers, device=run.device)
     try:
         yield from iterate(loader)
     finally:
-        # Lets the worker processes go rather than leaving them to a finalizer, which matters
-        # when the run is ending because something went wrong.
-        del loader
+        try:
+            # Lets the worker processes go rather than leaving them to a finalizer, which
+            # matters when the run is ending because something went wrong.
+            del loader
+        finally:
+            # With workers=0 the order is mapped in this process, and goes with the object.
+            del batches, shared
+            shutil.rmtree(orders, ignore_errors=True)
 
 
 class _Window:

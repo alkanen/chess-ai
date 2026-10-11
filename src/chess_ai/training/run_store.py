@@ -16,6 +16,9 @@ kills a run nor loses track of one, and a run from six months ago is still brows
     <runs>/<name>/evaluations/      step-<step>/, one per checkpoint evaluated, holding what each
                                     evaluation suite wrote about it: <suite>.json and its games
     <runs>/<name>/writer.lock       locked by the one process writing the run, while it does
+    <runs>/<name>/orders/           the order the training loader's workers visit the current
+                                    epoch in, shared between them: there while the loader runs,
+                                    removed after it, and left behind only by a killed trainer
 
 Two write disciplines, because two kinds of reader:
 
@@ -72,6 +75,7 @@ LOCK_FILE: Final = "writer.lock"
 CHECKPOINTS_DIR: Final = "checkpoints"
 EVALUATIONS_DIR: Final = "evaluations"
 EVALUATION_LOCK: Final = "evaluation.lock"
+ORDERS_DIR: Final = "orders"
 CHECKPOINT_INDEX: Final = "index.json"
 CHECKPOINT_SUFFIX: Final = ".pt"
 CHECKPOINT_STEP_DIGITS: Final = 9
@@ -609,6 +613,8 @@ class RunWriter:
                 except RunError:
                     shutil.rmtree(step.path, ignore_errors=True)
         shutil.rmtree(evaluations, ignore_errors=True)
+        # Left by a trainer that was killed, and of no use to a run with another seed.
+        shutil.rmtree(directory / ORDERS_DIR, ignore_errors=True)
         # And whatever a process killed mid-write left: SIGKILL, the OOM killer and a power cut
         # give it no chance to tidy up, and a notes file's temporary name is never used twice.
         for path in (

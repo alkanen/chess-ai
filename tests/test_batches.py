@@ -1,5 +1,6 @@
 """Batches: what order positions are visited in, and that a worker process sees the same one."""
 
+import errno
 import multiprocessing
 import os
 import pickle
@@ -7,6 +8,7 @@ import signal
 import subprocess
 import sys
 import threading
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,7 @@ from chess_ai.dataset import Result, open_dataset
 from chess_ai.dataset.manifest import Filters
 from chess_ai.encoders import create_encoder
 from chess_ai.move_codec import MIRRORED_INDEX, VOCABULARY_SIZE
+from chess_ai.training import batches as batches_module
 from chess_ai.training.batches import PositionBatches, batch_loader, iterate
 
 
@@ -190,6 +193,172 @@ def test_closing_leaves_nothing_of_the_split_to_pickle(directory):
         f"closing left {closed - untouched} bytes behind that a new object does not carry"
     )
     assert len(source[0]) == 4, "and it maps and shuffles again when asked for another batch"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_the_last_epochs_order_is_let_go_before_the_next_is_built(
+    directory, tmp_path, monkeypatch, shared
+):
+    """At Lichess scale an order is 2.5 GB, and a worker holding two is what ran out of memory."""
+    source = batches(directory)
+    if shared:
+        source = source.sharing_orders(tmp_path / "orders")
+    real = batches_module._shuffle
+    previous: list[weakref.ref] = []
+    still_held = []
+
+    def shuffle(order, seed, epoch):
+        still_held.extend(epoch for ref in previous if ref() is not None)
+        return real(order, seed, epoch)
+
+    monkeypatch.setattr(batches_module, "_shuffle", shuffle)
+    for epoch in range(3):
+        previous.append(weakref.ref(source._order(epoch)))
+
+    assert not still_held, f"epochs {still_held} were built while the last one was held"
+
+
+def test_a_shared_order_is_the_order_an_unshared_one_has(directory, tmp_path):
+    """So a run started before orders were shared resumes with the batches it would have had."""
+    alone = batches(directory, batches=400)
+    shared = batches(directory, batches=400).sharing_orders(tmp_path / "orders")
+    assert 2 * alone.batches_per_epoch < 400, "into a third epoch"
+
+    for epoch in range(3):
+        assert np.array_equal(shared._order(epoch), alone._order(epoch)), epoch
+        assert shared._order(epoch).dtype == alone._order(epoch).dtype
+    assert moves(shared, 400) == moves(alone, 400)
+
+
+def test_processes_sharing_orders_write_each_once(directory, tmp_path, monkeypatch):
+    calls = []
+    real = batches_module._shuffle
+    monkeypatch.setattr(
+        batches_module, "_shuffle", lambda *args: calls.append(args[1:]) or real(*args)
+    )
+    one = batches(directory).sharing_orders(tmp_path / "orders")
+    other = batches(directory).sharing_orders(tmp_path / "orders")
+
+    assert moves(one, 3) == moves(other, 3)
+    assert calls == [(0, 0)]
+    assert isinstance(other._order(0), np.memmap), "mapped from the file, not built again"
+
+
+def test_only_the_current_and_the_last_epochs_orders_are_kept(directory, tmp_path):
+    """The last one for a worker a batch behind the rest, and nothing older to fill the disk."""
+    source = batches(directory).sharing_orders(tmp_path / "orders")
+
+    for epoch in range(4):
+        source._order(epoch)
+
+    assert sorted(path.name for path in (tmp_path / "orders").glob("*.order")) == [
+        "train-seed0-epoch2.order",
+        "train-seed0-epoch3.order",
+    ]
+
+
+def test_writing_an_order_leaves_alone_the_newer_ones_workers_ahead_are_on(directory, tmp_path):
+    """With epochs of a few batches, a worker can be more than an epoch behind the others."""
+    ahead = batches(directory).sharing_orders(tmp_path / "orders")
+    behind = batches(directory).sharing_orders(tmp_path / "orders")
+    ahead._order(3)
+
+    behind._order(0)
+
+    assert sorted(path.name for path in (tmp_path / "orders").glob("*.order")) == [
+        "train-seed0-epoch0.order",
+        "train-seed0-epoch3.order",
+    ]
+
+
+def test_an_order_removed_as_it_is_mapped_is_written_again(directory, tmp_path, monkeypatch):
+    """The lock's holder may remove an old order between a worker finding it and mapping it."""
+    expected = batches(directory)._order(0)
+    batches(directory).sharing_orders(tmp_path / "orders")._order(0)
+    real = np.memmap
+    removed = []
+
+    def removed_first(path, *args, mode="r+", **options):
+        if mode == "r" and not removed:
+            removed.append(path)
+            Path(path).unlink()
+        return real(path, *args, mode=mode, **options)
+
+    monkeypatch.setattr(np, "memmap", removed_first)
+
+    order = batches(directory).sharing_orders(tmp_path / "orders")._order(0)
+
+    assert removed, "the race was not set up"
+    assert np.array_equal(order, expected)
+
+
+def test_a_disk_with_no_room_for_an_order_says_so(directory, tmp_path, monkeypatch):
+    """Rather than the writer dying of SIGBUS on the first page there is no block for."""
+
+    def full(descriptor, offset, length):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    # Not raising where os has none, as on macOS: there the fake is what the code then finds.
+    monkeypatch.setattr(os, "posix_fallocate", full, raising=False)
+    source = batches(directory).sharing_orders(tmp_path / "orders")
+
+    with pytest.raises(OSError, match="No space left on device"):
+        source._order(0)
+
+    assert not list((tmp_path / "orders").glob("*.writing")), "nor a half-made file left behind"
+
+
+def test_an_order_is_written_where_space_cannot_be_reserved_up_front(
+    directory, tmp_path, monkeypatch
+):
+    """macOS has no posix_fallocate, and the file is sized without it."""
+    monkeypatch.delattr(os, "posix_fallocate", raising=False)
+
+    order = batches(directory).sharing_orders(tmp_path / "orders")._order(0)
+
+    assert np.array_equal(order, batches(directory)._order(0))
+
+
+def test_what_a_writer_that_died_left_is_written_again(directory, tmp_path):
+    expected = batches(directory)._order(0)
+    orders = tmp_path / "orders"
+    orders.mkdir()
+    (orders / "train-seed0-epoch0.order.writing").write_bytes(b"half")
+    (orders / "train-seed0-epoch0.order").write_bytes(b"not the right size")
+
+    order = batches(directory).sharing_orders(orders)._order(0)
+
+    assert np.array_equal(order, expected)
+    assert not list(orders.glob("*.writing"))
+
+
+def test_sharing_orders_leaves_the_original_alone_and_hands_over_nothing_cached(
+    directory, tmp_path
+):
+    original = batches(directory)
+    expected = moves(original, 2)
+    untouched = len(pickle.dumps(batches(directory)))
+
+    shared = original.sharing_orders(tmp_path / "orders")
+
+    assert len(pickle.dumps(shared)) <= untouched + 200, "only the directory's name is added"
+    assert moves(original, 2) == expected, "the original's reader was not closed under it"
+    assert moves(shared, 2) == expected
+
+
+@pytest.mark.parametrize("method", ["fork", "spawn"])
+def test_workers_sharing_orders_produce_the_same_batches(directory, tmp_path, method):
+    expected = moves(batches(directory, batches=8), 8)
+    source = batches(directory, batches=8).sharing_orders(tmp_path / "orders")
+    loader = batch_loader(source, workers=2, device=torch.device("cpu"))
+    loader.multiprocessing_context = method
+
+    loaded = list(iterate(loader))
+
+    assert [int(move) for batch in loaded for move in batch.move] == expected
+    assert [path.name for path in (tmp_path / "orders").glob("*.order")] == [
+        "train-seed0-epoch0.order"
+    ]
 
 
 def test_a_batch_carries_the_history_its_encoder_asks_for(directory):
