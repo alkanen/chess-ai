@@ -599,16 +599,20 @@ export interface RunInfo {
   config?: { optimizer?: { gradient_clip?: number }; evaluation?: { suites?: string[] } };
 }
 
-/** A sample game the evaluator is playing with a checkpoint, as it stands. */
+/** A game the evaluator is playing with a checkpoint, as it stands: a sample game or a ladder's. */
 export interface LiveGame {
+  /** Which suite is playing it. */
+  suite: 'sample-games' | 'stockfish-ladder';
   run: string;
   /** The checkpoint playing it. */
   step: number;
-  /** Where it will be among the checkpoint's sample games, counting from 0. */
+  /** Where it will be among the checkpoint's games of the suite, counting from 0. */
   index: number;
-  /** How many games the checkpoint plays in all. */
+  /** How many games the checkpoint plays in all, in the suite. */
   games: number;
   opponent: 'self' | 'stockfish';
+  /** The Elo Stockfish plays at, in a ladder; null for a sample game. */
+  level: number | null;
   /** When the evaluator last wrote it. */
   updated: string;
   /** Only the last move has its thoughts, and the position offers no moves. */
@@ -644,6 +648,80 @@ export interface SampleGamesResult {
   games: SampleGame[];
 }
 
+/** How a checkpoint did against one level of the ladder; mirrors chess_ai.ladder.LadderLevel. */
+export interface LadderLevel {
+  /** The strength Stockfish played at, which the results are counted against. */
+  elo: number;
+  /** The level asked for, which is `elo` unless Stockfish could not play at it. */
+  requested_elo: number;
+  /** Seconds Stockfish had for each move. */
+  move_time: number;
+  wins: number;
+  draws: number;
+  losses: number;
+}
+
+/** A checkpoint's Elo from its ladder; mirrors chess_ai.ladder.LadderEstimate. */
+export interface LadderEstimate {
+  /** The most likely rating, or null when the checkpoint is beyond the ladder. */
+  rating: number | null;
+  /** The bottom of the range, or null when the results put no bottom to it. */
+  low: number | null;
+  /** The top of the range, or null when the results put no top to it. */
+  high: number | null;
+  beyond: 'below_floor' | 'above_ceiling' | null;
+  /** The lowest level's rating. */
+  floor: number;
+  /** The highest level's rating. */
+  ceiling: number;
+  /** How likely the range is to hold the true rating, such as 0.95. */
+  confidence: number;
+  games: number;
+  points: number;
+}
+
+/** One of the games of a ladder; mirrors chess_ai.ladder.LadderGame. */
+export interface LadderGame {
+  /** Where the game is among the ladder's games, counting from 0; how it is replayed. */
+  index: number;
+  /** The level it was played at. */
+  elo: number;
+  model_color: Color;
+  /** The name of the line it started from. */
+  opening: string;
+  result: Result;
+  termination: GameOverReason | null;
+  /** How many moves were played, the opening's among them. */
+  plies: number;
+}
+
+/** What a checkpoint's ladder came to; mirrors chess_ai.ladder.LadderResult. */
+export interface LadderResult {
+  model: ModelDescription;
+  started: string;
+  finished: string;
+  /** The opening set the games started from, and its version. */
+  openings: string;
+  games_per_level: number;
+  levels: LadderLevel[];
+  estimate: LadderEstimate;
+  /** In the order they were played; empty from a ladder played before results listed them. */
+  games: LadderGame[];
+}
+
+/** One checkpoint's ladder, to chart Elo over training; mirrors chess_ai.web.runs.LadderPoint. */
+export interface LadderPoint {
+  step: number;
+  estimate: LadderEstimate;
+  /** The Elo of every level it was played against, weakest first. */
+  levels: number[];
+  games_per_level: number;
+  /** Seconds Stockfish had for each move, which the rating is only comparable at. */
+  move_time: number;
+  /** The rating the checkpoint was asked to play like. */
+  rating: number | null;
+}
+
 /**
  * What the run channel sends: what the run is and where it has got to, first and whenever
  * that changes, and the lines of its metrics log. A metrics event with `reset` set replaces
@@ -668,7 +746,7 @@ export type RunEvent =
     }
   | {
       type: 'live_game';
-      /** The sample game being played with one of the run's checkpoints, or null for none. */
+      /** The game being played with one of the run's checkpoints, or null for none. */
       live: LiveGame | null;
     }
   | { type: 'error'; message: string };
@@ -955,6 +1033,29 @@ export async function fetchSampleGames(run: string, step: number): Promise<Sampl
 export async function openSampleGame(run: string, step: number, game = 0): Promise<ReplayFile> {
   const url = new URL(
     apiUrl(`runs/${encodeURIComponent(run)}/evaluations/${step}/sample-games/replay`),
+  );
+  url.searchParams.set('game', String(game));
+  return await replayed(url);
+}
+
+/** Every ladder of the checkpoints of `run`, by step, to chart its Elo over training. */
+export async function fetchLadderPoints(run: string): Promise<LadderPoint[]> {
+  return await fetched<LadderPoint[]>(
+    apiUrl(`runs/${encodeURIComponent(run)}/evaluations/stockfish-ladder`),
+  );
+}
+
+/** How the checkpoint from `step` of `run` did on the Stockfish ladder, and its games. */
+export async function fetchLadder(run: string, step: number): Promise<LadderResult> {
+  return await fetched<LadderResult>(
+    apiUrl(`runs/${encodeURIComponent(run)}/evaluations/${step}/stockfish-ladder`),
+  );
+}
+
+/** Replays one of the ladder games the checkpoint from `step` of `run` played. */
+export async function openLadderGame(run: string, step: number, game = 0): Promise<ReplayFile> {
+  const url = new URL(
+    apiUrl(`runs/${encodeURIComponent(run)}/evaluations/${step}/stockfish-ladder/replay`),
   );
   url.searchParams.set('game', String(game));
   return await replayed(url);

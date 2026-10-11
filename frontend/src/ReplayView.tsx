@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from 'react';
 import {
   openDatasetGame,
+  openLadderGame,
   openPgn,
   openSampleGame,
   openSavedGame,
@@ -18,6 +19,7 @@ import {
   type DatasetGameRef,
 } from './datasetPlaces';
 import { describeResult, GameStatus } from './GameStatus';
+import { ladderGameHash, ladderGameInHash, type LadderGameRef } from './ladder';
 import { MoveList } from './MoveList';
 import { ReplayControls } from './ReplayControls';
 import { formatCount } from './runFormat';
@@ -34,13 +36,15 @@ import './ReplayView.css';
  * moving to another game in the same file sends it up again. A dataset game is one game,
  * named by the address, and is opened from the dataset's page. A sample game is one of the
  * games a run's checkpoint played, named by the address, and is opened from the run's page;
- * the checkpoint's other games are in the same file.
+ * the checkpoint's other games are in the same file. A ladder game is the same, of the games
+ * of the checkpoint's Stockfish ladder.
  */
 type Source =
   | { kind: 'saved'; name: string }
   | { kind: 'file'; name: string; pgn: string }
   | { kind: 'dataset'; game: DatasetGameRef }
-  | { kind: 'sample'; game: SampleGameRef };
+  | { kind: 'sample'; game: SampleGameRef }
+  | { kind: 'ladder'; game: LadderGameRef };
 
 /** Reads one game of a source, as a file of games with that one selected. */
 async function read(source: Source, game: number): Promise<ReplayFile> {
@@ -57,6 +61,8 @@ async function read(source: Source, game: number): Promise<ReplayFile> {
     }
     case 'sample':
       return await openSampleGame(source.game.run, source.game.step, game);
+    case 'ladder':
+      return await openLadderGame(source.game.run, source.game.step, game);
   }
 }
 
@@ -70,6 +76,8 @@ function addressOf(source: Source, game: number): string | null {
       return datasetGameHash(source.game);
     case 'sample':
       return sampleGameHash({ ...source.game, index: game });
+    case 'ladder':
+      return ladderGameHash({ ...source.game, index: game });
     default:
       return null;
   }
@@ -82,7 +90,11 @@ function sourceInAddress(hash: string): Source | null {
     return { kind: 'dataset', game: dataset };
   }
   const sample = sampleGameInHash(hash);
-  return sample === null ? null : { kind: 'sample', game: sample };
+  if (sample !== null) {
+    return { kind: 'sample', game: sample };
+  }
+  const ladder = ladderGameInHash(hash);
+  return ladder === null ? null : { kind: 'ladder', game: ladder };
 }
 
 /** What the arrow keys do, which is what the buttons under the board do. */
@@ -127,9 +139,15 @@ interface ReplayViewProps {
   datasetGame?: DatasetGameRef | null;
   /** A run's sample game the address names, to open as the view is shown; null for none. */
   sampleGame?: SampleGameRef | null;
+  /** A run's ladder game the address names, to open as the view is shown; null for none. */
+  ladderGame?: LadderGameRef | null;
 }
 
-export function ReplayView({ datasetGame = null, sampleGame = null }: ReplayViewProps) {
+export function ReplayView({
+  datasetGame = null,
+  sampleGame = null,
+  ladderGame = null,
+}: ReplayViewProps) {
   const [source, setSource] = useState<Source | null>(null);
   const [file, setFile] = useState<ReplayFile | null>(null);
   /** How many moves of the game are on the board; 0 is the position it started from. */
@@ -162,7 +180,7 @@ export function ReplayView({ datasetGame = null, sampleGame = null }: ReplayView
     return () => window.removeEventListener('keydown', step);
   }, [file, plies]);
 
-  // The dataset game or sample game the address names, opened when the view is shown with one,
+  // The dataset, sample or ladder game the address names, opened when the view is shown with one,
   // and again whenever the address is followed to one. Keyed by the objects themselves, which
   // App makes anew each time the address changes, rather than by the address they spell: the
   // view replaces the address when another game is opened here, which App never hears of, so a
@@ -173,9 +191,11 @@ export function ReplayView({ datasetGame = null, sampleGame = null }: ReplayView
       void openGame({ kind: 'dataset', game: datasetGame }, 0);
     } else if (sampleGame !== null) {
       void openGame({ kind: 'sample', game: sampleGame }, sampleGame.index);
+    } else if (ladderGame !== null) {
+      void openGame({ kind: 'ladder', game: ladderGame }, ladderGame.index);
     }
     // Not on openGame, which is a new function every render: only the address says when to open.
-  }, [datasetGame, sampleGame]);
+  }, [datasetGame, sampleGame, ladderGame]);
 
   /**
    * Take the next request, and say afterwards whether it is still the one being waited
@@ -301,10 +321,11 @@ export function ReplayView({ datasetGame = null, sampleGame = null }: ReplayView
                   <a href={datasetHash(pageOf(source.game))}>
                     {source.game.name}, {source.game.split} game {source.game.index + 1}
                   </a>
-                ) : source.kind === 'sample' ? (
+                ) : source.kind === 'sample' || source.kind === 'ladder' ? (
                   <>
                     <a href={`#runs/${encodeURIComponent(source.game.run)}`}>{source.game.run}</a>
-                    , sample games of step {formatCount(source.game.step)}
+                    , {source.kind === 'sample' ? 'sample games' : 'Stockfish ladder'} of step{' '}
+                    {formatCount(source.game.step)}
                   </>
                 ) : (
                   source.name

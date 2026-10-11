@@ -451,4 +451,25 @@ describe('ReplayView', () => {
       expect(window.location.hash).toBe('#replay');
     });
   });
+
+  describe('a run’s ladder game', () => {
+    afterEach(() => {
+      window.location.hash = '';
+    });
+
+    it('opens the game the address names, and keeps the address on the game chosen', async () => {
+      window.location.hash = '#replay/ladder/tiny/500/2';
+      render(<ReplayView ladderGame={{ run: 'tiny', step: 500, index: 1 }} />);
+
+      await waitFor(() => expect(screen.getByText(/Move 0 of 7/)).toBeInTheDocument());
+      const [url] = fetch.mock.calls.at(-1) as [string];
+      expect(url).toMatch(/\/runs\/tiny\/evaluations\/500\/stockfish-ladder\/replay\?game=1$/);
+      expect(screen.getByText(/Stockfish ladder of step 500/)).toBeInTheDocument();
+
+      fireEvent.change(screen.getByLabelText('Game'), { target: { value: '0' } });
+
+      await waitFor(() => expect(screen.getByText(/Move 0 of 4/)).toBeInTheDocument());
+      expect(window.location.hash).toBe('#replay/ladder/tiny/500/1');
+    });
+  });
 });

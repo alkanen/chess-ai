@@ -35,7 +35,7 @@ from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
 from starlette.websockets import WebSocketClose, WebSocketState
 
-from chess_ai import replay
+from chess_ai import ladder, replay
 from chess_ai.config import Config
 from chess_ai.dataset import DatasetError, ManifestError
 from chess_ai.game_session import (
@@ -125,6 +125,7 @@ from chess_ai.web.games import (
     TooManyGamesError,
 )
 from chess_ai.web.runs import (
+    LadderPoint,
     LatestMetricsCache,
     RunCheckpoints,
     RunEvent,
@@ -133,6 +134,7 @@ from chess_ai.web.runs import (
     ShownProbes,
     describe_checkpoints,
     describe_run,
+    ladder_points,
     show_probes,
 )
 
@@ -738,6 +740,74 @@ def create_app(
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND,
                 f"run {name!r} has no sample games for the checkpoint from step {step}",
+            )
+        return _replayed(pgn, game)
+
+    @api.get(
+        "/runs/{name}/evaluations/stockfish-ladder",
+        responses={404: {"description": "No run of that name is kept here"}},
+    )
+    def run_ladders(name: str, response: Response) -> list[LadderPoint]:
+        """The Elo of every checkpoint of a run that has a ladder, by step, to chart.
+
+        Pruned checkpoints are among them: their results are kept.
+        """
+        response.headers.update(NO_STORE)
+        return ladder_points(_open_run(name))
+
+    @api.get(
+        "/runs/{name}/evaluations/{step}/stockfish-ladder",
+        responses={
+            404: {"description": "No run of that name, or no ladder for that step"},
+            500: {"description": "The result is there and cannot be read"},
+        },
+    )
+    def run_ladder(name: str, step: int, response: Response) -> ladder.LadderResult:
+        """How a checkpoint did at each level of the Stockfish ladder, its Elo, and the games.
+
+        Replaced when the checkpoint is laddered again, so it is kept by nobody.
+        """
+        response.headers.update(NO_STORE)
+        run = _open_run(name)
+        try:
+            result = ladder.read_ladder(run, step)
+        except RunError as unreadable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unreadable)
+            ) from unreadable
+        if result is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"run {name!r} has no ladder for the checkpoint from step {step}",
+            )
+        return result
+
+    @api.get(
+        "/runs/{name}/evaluations/{step}/stockfish-ladder/replay",
+        responses={
+            404: {"description": "No run of that name, no ladder, or no such game"},
+            500: {"description": "The games are there and cannot be read"},
+        },
+    )
+    def run_ladder_game(
+        name: str,
+        step: int,
+        response: Response,
+        game: Annotated[int, Query(ge=0, description=_WHICH_GAME)] = 0,
+    ) -> replay.ReplayFile:
+        """Replay one of the games of a checkpoint's ladder, as the replay viewer opens a file."""
+        response.headers.update(NO_STORE)
+        run = _open_run(name)
+        try:
+            pgn = ladder.read_games(run, step)
+        except RunError as unreadable:
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR, str(unreadable)
+            ) from unreadable
+        if pgn is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"run {name!r} has no ladder games for the checkpoint from step {step}",
             )
         return _replayed(pgn, game)
 

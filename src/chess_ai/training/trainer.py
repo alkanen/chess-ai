@@ -160,8 +160,12 @@ def train(
     config_text: str,
     overwrite: bool = False,
     say: Callable[[str], None] = print,
+    ladder_every: int | None = None,
 ) -> Path:
     """Train what ``config`` describes, and return the run directory it wrote.
+
+    ``ladder_every`` is how often the evaluator ladders a run's checkpoints, ``[ladder] every``:
+    retention keeps the ones due a ladder until it is played. ``None`` keeps nothing for it.
 
     Raises :exc:`TrainingError` for anything the config or the machine is wrong about, which is
     everything a person running this can do something about.
@@ -191,15 +195,23 @@ def train(
         )
     except RunError as e:
         raise TrainingError(e) from e
+    _hold_for_ladders(writer, ladder_every)
     say(f"chess-ai: run {config.name} in {directory}")
     _train_to_end(run, writer, _optimizer(run), _Start(), say=say)
     return directory
 
 
 def resume(
-    name: str, *, data_dir: Path, runs_dir: Path, say: Callable[[str], None] = print
+    name: str,
+    *,
+    data_dir: Path,
+    runs_dir: Path,
+    say: Callable[[str], None] = print,
+    ladder_every: int | None = None,
 ) -> Path:
     """Carry on training the run called ``name`` from its latest checkpoint, to the end.
+
+    ``ladder_every`` is as :func:`train` has it.
 
     Everything comes from the checkpoint — the config, the weights, the optimizer's moments, the
     step, the random state and how long the run had been going — and the dataset is opened by
@@ -222,6 +234,7 @@ def resume(
     try:
         run, optimizer, start = _resumable(RunReader(directory), data_dir=data_dir, say=say)
         writer.policy = run.config.checkpoints.policy()
+        _hold_for_ladders(writer, ladder_every)
         writer.rewind(start.step)
     except RunError as e:
         writer.close()
@@ -232,6 +245,16 @@ def resume(
     say(f"chess-ai: resuming run {name} in {directory}")
     _train_to_end(run, writer, optimizer, start, say=say)
     return directory
+
+
+def _hold_for_ladders(writer: RunWriter, every: int | None) -> None:
+    """Have retention keep the checkpoints due a Stockfish ladder until it is played, for a run
+    that asks for the ladder; ``every`` is ``[ladder] every`` from the global config."""
+    if every is None:
+        return
+    from chess_ai.ladder import awaiting_ladder
+
+    writer.held = awaiting_ladder(RunReader(writer.directory), every)
 
 
 def _resumable(

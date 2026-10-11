@@ -232,6 +232,19 @@ describe('SampleGamesView', () => {
       expect(screen.getByRole('button', { name: 'Flip to White' })).toBeInTheDocument();
     });
 
+    it('leaves a ladder game to the ladder’s section', () => {
+      render(
+        <SampleGamesView
+          run="tiny"
+          evaluations={[]}
+          liveGame={liveGame({ suite: 'stockfish-ladder', level: 1350 })}
+          playing
+        />,
+      );
+
+      expect(screen.queryByRole('heading', { level: 4 })).toBeNull();
+    });
+
     it('goes when the games are over', () => {
       const { rerender } = render(
         <SampleGamesView run="tiny" evaluations={[]} liveGame={liveGame()} playing />,

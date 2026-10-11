@@ -51,11 +51,13 @@ describe('useRunChannel', () => {
     const socket = FakeWebSocket.latest;
     socket.open();
     const live: LiveGame = {
+      suite: 'sample-games',
       run: 'live',
       step: 2000,
       index: 0,
       games: 2,
       opponent: 'self',
+      level: null,
       updated: '2026-10-10T12:00:00Z',
       // Only passed along here: what is in it is the run page's to draw.
       game: { id: 'g', moves: [] } as unknown as LiveGame['game'],

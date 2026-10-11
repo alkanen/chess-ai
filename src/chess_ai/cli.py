@@ -655,7 +655,7 @@ def _temperature(value: str) -> float:
 def _match(config: Config, args: argparse.Namespace) -> int:
     import chess.engine
 
-    from chess_ai.match import append_game, distinct_games, match_filename
+    from chess_ai.match import append_game, distinct_games, game_line, match_filename
     from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.players import Player
     from chess_ai.stockfish import StockfishError
@@ -676,7 +676,7 @@ def _match(config: Config, args: argparse.Namespace) -> int:
         except OSError as e:
             raise _UserError(f"could not save game {game.number} to {path}: {e.strerror}") from e
         played.append(game)
-        _say(_game_line(game, args.games, names))
+        _say(game_line(game, names, number=game.number, games=args.games))
 
     async def play() -> None:
         from chess_ai.match import play_match
@@ -875,20 +875,6 @@ def _side_names(
     ]
 
 
-def _game_line(game: "MatchGame", games: int, names: list[str]) -> str:
-    """One finished game: who had which colour, and how it went."""
-    state = game.game
-    over = state.position.game_over
-    result = over.result if over is not None else "*"
-    how = f"{over.reason.replace('_', ' ')}, " if over is not None else ""
-    moves = (len(state.moves) + 1) // 2
-    white, black = names if game.first_plays_white else reversed(names)
-    return (
-        f"game {game.number}/{games}, {game.opening.name}: {white} – {black} {result} "
-        f"({how}{moves} moves)"
-    )
-
-
 def _match_summary(played: "list[MatchGame]", names: list[str]) -> str:
     """The score from each side's point of view, overall and by colour."""
     import chess
@@ -1020,7 +1006,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         save_ladder,
         start_games_file,
     )
-    from chess_ai.match import append_game, distinct_games
+    from chess_ai.match import append_game, distinct_games, game_line
     from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.stockfish import StockfishError, start_stockfish
     from chess_ai.training.run_store import RunError, code_version
@@ -1036,6 +1022,11 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         raise _UserError(e) from e
     side = dataclasses.replace(args.checkpoint, rating=rating)
     ((run, chosen),) = _choose_checkpoints([side], config).values()
+    try:
+        # Before it is loaded, so that a file replaced meanwhile is not taken for this one.
+        written = run.checkpoint_written(chosen)
+    except RunError as e:
+        raise _UserError(e) from e
     inference = config.inference.model_copy(update={"device": args.device or settings.device})
     model, label = _model_player(
         side, run, chosen, None, config.model_copy(update={"inference": inference}), 0, {}
@@ -1054,7 +1045,9 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         except OSError as e:
             raise _UserError(f"could not save a game to {partial}: {e.strerror}") from e
         played += 1
-        line = _game_line(game, games, [label, f"Stockfish {stockfish.elo}"])
+        line = game_line(
+            game, [label, f"Stockfish {stockfish.elo}"], number=game.number, games=games
+        )
         _say(f"{played}/{total} {line}")
 
     def games_note() -> str:
@@ -1129,6 +1122,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         started=started,
         finished=datetime.now(UTC),
         code_version=code_version(),
+        checkpoint_written=written,
     )
     for level in result.levels:
         fraction = level.points / level.games
@@ -1252,6 +1246,7 @@ def _train(config: Config, args: argparse.Namespace) -> int:
             config_text=config_text,
             overwrite=args.overwrite,
             say=_say,
+            ladder_every=config.ladder.every,
         ),
     )
 
@@ -1261,7 +1256,13 @@ def _resume(config: Config, args: argparse.Namespace) -> int:
 
     return _training(
         args.name,
-        lambda: resume(args.name, data_dir=config.paths.data, runs_dir=config.paths.runs, say=_say),
+        lambda: resume(
+            args.name,
+            data_dir=config.paths.data,
+            runs_dir=config.paths.runs,
+            say=_say,
+            ladder_every=config.ladder.every,
+        ),
     )
 
 
@@ -1643,7 +1644,10 @@ def _add_evaluation_commands(commands: argparse._SubParsersAction) -> None:
         description=(
             "Run evaluation suites on the checkpoints named, whether or not they have results\n"
             "already, and replace those. The suites default to the ones the run's experiment\n"
-            "config names. Settings come from the [evaluator] section of the configuration."
+            "config names. Settings come from the [evaluator] section of the configuration,\n"
+            "and the ladder's from [ladder]. Of all of a run's checkpoints, the ladder plays\n"
+            "only those the evaluator would, every [ladder] every steps; name a checkpoint to\n"
+            "ladder it all the same."
         ),
         epilog=(
             "examples:\n"
@@ -1665,7 +1669,9 @@ def _add_evaluation_commands(commands: argparse._SubParsersAction) -> None:
         action="append",
         type=_suite,
         metavar="NAME",
-        help="a suite to run, given once for each: probe-positions or sample-games",
+        help=(
+            "a suite to run, given once for each: probe-positions, sample-games or stockfish-ladder"
+        ),
     )
     evaluate.set_defaults(handler=_evaluate)
 
@@ -1699,20 +1705,24 @@ def _evaluation_suites(
     the config says. Only those, so that a setting of one suite that is wrong stops nothing
     the others would do.
 
-    ``live`` is the runs directory to show the sample game being played in, which only the
-    evaluator does. Also takes the CPU threads the config allows, since everything that
-    follows is evaluation.
+    ``live`` is the runs directory to show the game being played in, which only the evaluator
+    does. Also takes the CPU threads the config allows, since everything that follows is
+    evaluation.
 
     Raises:
-        _UserError: a suite's settings name a set of positions or openings that cannot be read.
+        _UserError: a suite's settings name a set of positions or openings that cannot be read,
+            or a device there is not.
     """
     import torch
 
     from chess_ai.evaluator import ProbeSuite
+    from chess_ai.inference import load_engine
+    from chess_ai.ladder import LadderSuite
     from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.probes import ProbeSetError, load_probe_set
     from chess_ai.sample_games import SampleGamesSuite
     from chess_ai.stockfish import start_stockfish
+    from chess_ai.training.hardware import HardwareError, resolve_device
 
     settings = config.evaluator
     torch.set_num_threads(settings.threads)
@@ -1735,6 +1745,39 @@ def _evaluation_suites(
         suites[SampleGamesSuite.name] = SampleGamesSuite(
             config.sample_games, openings, stockfish=stockfish, live=live
         )
+    if LadderSuite.name in names:
+        ladder = config.ladder
+        try:
+            ladder_openings = load_opening_set(ladder.openings)
+        except OpeningSetError as e:
+            raise _UserError(f"[ladder] openings: {e}") from e
+        try:
+            resolve_device(ladder.device)
+        except HardwareError as e:
+            raise _UserError(f"[ladder] device: {e}") from e
+
+        async def level(elo: int, move_time: float) -> "Player":
+            return await start_stockfish(config.stockfish.path, elo=elo, move_time=move_time)
+
+        def load(path: "Path") -> Any:
+            # Where the ladder plays, rather than the evaluator's own device: a ladder asks
+            # about thousands of positions one after another.
+            return load_engine(path, device=ladder.device, batch_size=config.inference.batch_size)
+
+        def release() -> None:
+            # What the ladder held of a GPU goes back to the training run beside it.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        suites[LadderSuite.name] = LadderSuite(
+            ladder,
+            ladder_openings,
+            stockfish=level,
+            load=load,
+            release=release,
+            live=live,
+            say=_say,
+        )
     return suites
 
 
@@ -1755,6 +1798,7 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
     import signal
     import threading
 
+    from chess_ai import ladder, sample_games
     from chess_ai.evaluator import (
         Evaluator,
         EvaluatorBusy,
@@ -1764,28 +1808,37 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
         runs_lacking,
     )
     from chess_ai.probes import save_current_set
-    from chess_ai.sample_games import SUITE as SAMPLE_GAMES
     from chess_ai.sample_games import clear_live_game
-    from chess_ai.sample_games import stands as sample_games_stand
 
     runs = config.paths.runs
     # Every suite there is, since which ones runs ask for can change while this goes on. The
     # probes are what the run page compares results with, so without them nothing is done.
     suites = _evaluation_suites(config, [ProbeSuite.name], live=runs)
-    try:
-        suites |= _evaluation_suites(config, [SAMPLE_GAMES], live=runs)
-    except _UserError as e:
-        # A pass that left out games some checkpoint lacks would end as one that left nothing
-        # out, which is what a script running it checks for, and it has no later to be started
-        # again for. A pass that would play no games goes on as the evaluator would.
-        if args.once and runs_lacking(runs, SAMPLE_GAMES, sample_games_stand):
-            raise
-        # Said once, rather than as a failure for every checkpoint, which keep waiting for
-        # their games until an evaluator that can play them is started.
-        _say(
-            f"chess-ai: warning: {e}; no sample games are played until the evaluator is restarted",
-            err=True,
-        )
+    optional = (
+        (sample_games.SUITE, sample_games.stands, lambda run, checkpoint: True, "sample games are"),
+        (
+            ladder.SUITE,
+            ladder.stands,
+            lambda run, checkpoint: ladder.wanted(run, checkpoint, config.ladder.every),
+            "ladders are",
+        ),
+    )
+    for name, stands, wants, what in optional:
+        try:
+            suites |= _evaluation_suites(config, [name], live=runs)
+        except _UserError as e:
+            # A pass that left out a suite some checkpoint lacks would end as one that left
+            # nothing out, which is what a script running it checks for, and it has no later to
+            # be started again for. A pass that would not run the suite goes on as the evaluator
+            # would.
+            if args.once and runs_lacking(runs, name, stands, wants):
+                raise
+            # Said once, rather than as a failure for every checkpoint, which keep waiting for
+            # their results until an evaluator that can run the suite is started.
+            _say(
+                f"chess-ai: warning: {e}; no {what} played until the evaluator is restarted",
+                err=True,
+            )
     evaluator = Evaluator(
         runs,
         suites,
@@ -1857,6 +1910,8 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
 
 
 def _evaluate(config: Config, args: argparse.Namespace) -> int:
+    import chess.engine
+
     from chess_ai.evaluator import configured_suites
     from chess_ai.inference import InferenceError
     from chess_ai.probes import DivergedError
@@ -1889,8 +1944,19 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
     load = _evaluation_loader(config)
     failed: set[str] = set()
     try:
-        for run, checkpoint, suites, one_of_all in chosen:
+        for run, checkpoint, asked, one_of_all in chosen:
             label = f"{run.name}@{checkpoint.step}"
+            suites = list(dict.fromkeys(asked))
+            if one_of_all:
+                # One of all of a run's: a suite that is only run on some, such as the ladder
+                # every so many steps, runs on those alone, as the evaluator's would.
+                for suite in [
+                    each for each in suites if not available[each].wants(run, checkpoint)
+                ]:
+                    suites.remove(suite)
+                    _say(f"{label} {suite}: skipped, as the evaluator would; name it to run it")
+                if not suites:
+                    continue
             try:
                 written = run.checkpoint_written(checkpoint)
                 engine = None if written is None else load(run.checkpoint_path(checkpoint))
@@ -1907,7 +1973,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     f"chess-ai: warning: {label} was pruned before it could be evaluated", err=True
                 )
                 continue
-            for suite in dict.fromkeys(suites):
+            for suite in suites:
                 try:
                     said = available[suite].evaluate(run, checkpoint, written, engine)
                 except CheckpointChanged as e:
@@ -1932,7 +1998,15 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                 except StockfishError as e:
                     # The same for every checkpoint to come: not one to go on past.
                     raise _UserError(f"{label} {suite}: {e}") from e
+                except (TimeoutError, chess.engine.EngineError) as e:
+                    raise _UserError(f"{label} {suite}: {_engine_failure(e)}") from e
                 _say(f"{label} {suite}: {said}")
+            # Done with the checkpoint, as the evaluator is after a job.
+            for suite in suites:
+                try:
+                    available[suite].after(run)
+                except Exception as e:
+                    _say(f"chess-ai: warning: {label} {suite}: {e}", err=True)
     except KeyboardInterrupt:
         _say("chess-ai: interrupted", err=True)
         return 130

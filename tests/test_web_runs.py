@@ -20,6 +20,7 @@ from training_helpers import model_run
 from chess_ai.config import (
     Config,
     EvaluatorConfig,
+    LadderConfig,
     PathsConfig,
     SampleGamesConfig,
     ServerConfig,
@@ -27,7 +28,9 @@ from chess_ai.config import (
 from chess_ai.encoders import create_encoder
 from chess_ai.evaluator import ProbeSuite
 from chess_ai.inference import load_engine
+from chess_ai.ladder import LadderSuite
 from chess_ai.openings import load_opening_set
+from chess_ai.players import GameContext, PlayerMove, StockfishDescription
 from chess_ai.probes import (
     CURRENT_SET_FILE,
     SUITE,
@@ -867,4 +870,100 @@ def test_unreadable_sample_games_are_a_server_error(client, runs):
     (directory / "sample-games.pgn").write_bytes(b"\xff\xfe")
 
     for path in ("sample-games", "sample-games/replay"):
+        assert client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/{path}").status_code == 500
+
+
+# The Stockfish ladder.
+
+
+class LastMoveStockfish:
+    """A ladder level that plays the last legal move in UCI order."""
+
+    def __init__(self, elo: int) -> None:
+        self.name = f"Stockfish {elo}"
+        self.stockfish = StockfishDescription(
+            elo=elo, requested_elo=elo, min_elo=1350, max_elo=2850, move_time=0.1
+        )
+
+    async def choose_move(self, context: GameContext) -> PlayerMove:
+        return PlayerMove(max(context.board.legal_moves, key=lambda move: move.uci()))
+
+    def close(self) -> None:
+        pass
+
+    async def wait_closed(self) -> None:
+        pass
+
+
+def laddered(run: RunReader, step: int, *, levels=(1350, 1500)) -> None:
+    async def start(elo: int, move_time: float) -> LastMoveStockfish:
+        return LastMoveStockfish(elo)
+
+    checkpoint = next(each for each in run.checkpoints() if each.step == step)
+    settings = LadderConfig(levels=levels, games_per_level=1)
+    suite = LadderSuite(settings, load_opening_set("standard"), stockfish=start)
+    engine = load_engine(run.checkpoint_path(checkpoint))
+    suite.evaluate(run, checkpoint, run.checkpoint_written(checkpoint), engine)
+
+
+def test_a_checkpoints_ladder_is_shown_and_its_games_replayed(client, runs):
+    run = RunReader(model_run(runs, "tiny", steps=(2,)))
+    laddered(run, 2)
+
+    shown = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/stockfish-ladder")
+    second = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/stockfish-ladder/replay?game=1")
+    beyond = client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/stockfish-ladder/replay?game=2")
+
+    assert shown.status_code == 200
+    assert shown.headers["cache-control"] == "no-store"
+    result = shown.json()
+    assert [level["elo"] for level in result["levels"]] == [1350, 1500]
+    assert [game["elo"] for game in result["games"]] == [1350, 1500]
+    assert second.status_code == 200
+    replayed_game = second.json()
+    assert len(replayed_game["games"]) == 2
+    assert len(replayed_game["selected"]["moves"]) == result["games"][1]["plies"]
+    assert beyond.status_code == 404
+
+
+def test_a_runs_ladders_are_listed_by_step_to_chart(client, runs):
+    run = RunReader(model_run(runs, "tiny", steps=(2, 4, 6)))
+    laddered(run, 4)
+    laddered(run, 2, levels=(1350,))
+    # One that cannot be read costs the chart that point alone.
+    (run.evaluation_directory(6)).mkdir(parents=True)
+    (run.evaluation_directory(6) / "stockfish-ladder.json").write_text("{")
+
+    response = client.get(f"{PREFIX}/api/runs/tiny/evaluations/stockfish-ladder")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    points = response.json()
+    assert [(point["step"], point["levels"]) for point in points] == [
+        (2, [1350]),
+        (4, [1350, 1500]),
+    ]
+    assert points[1]["games_per_level"] == 1
+    assert points[1]["rating"] == 2000
+    assert points[1]["move_time"] == 0.1
+    assert points[1]["estimate"]["games"] == 2
+    assert client.get(f"{PREFIX}/api/runs/missing/evaluations/stockfish-ladder").status_code == 404
+
+
+@pytest.mark.parametrize("path", ["stockfish-ladder", "stockfish-ladder/replay"])
+def test_a_checkpoint_without_a_ladder_has_none_to_show(client, runs, path):
+    model_run(runs, "tiny", steps=(2,))
+
+    assert client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/{path}").status_code == 404
+    assert client.get(f"{PREFIX}/api/runs/missing/evaluations/2/{path}").status_code == 404
+
+
+def test_an_unreadable_ladder_is_a_server_error(client, runs):
+    run = RunReader(model_run(runs, "tiny", steps=(2,)))
+    directory = run.evaluation_directory(2)
+    directory.mkdir(parents=True)
+    (directory / "stockfish-ladder.json").write_text("{")
+    (directory / "stockfish-ladder.pgn").write_bytes(b"\xff\xfe")
+
+    for path in ("stockfish-ladder", "stockfish-ladder/replay"):
         assert client.get(f"{PREFIX}/api/runs/tiny/evaluations/2/{path}").status_code == 500

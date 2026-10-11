@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { GpuStats } from './api';
+import { LADDER_SUITE } from './ladder';
+import { LadderView } from './LadderView';
 import { MetricChart } from './MetricChart';
 import { PROBE_SUITE } from './probes';
 import { ProbeView } from './ProbeView';
@@ -194,6 +196,13 @@ export function RunView({ name }: RunViewProps) {
             evaluations={run.evaluations}
             liveGame={run.liveGame}
             playing={info?.config?.evaluation?.suites?.includes(SAMPLE_SUITE) ?? true}
+          />
+          <LadderView
+            key={`${name}-ladder`}
+            run={name}
+            evaluations={run.evaluations}
+            liveGame={run.liveGame}
+            laddered={info?.config?.evaluation?.suites?.includes(LADDER_SUITE) ?? false}
           />
           <ProbeView
             key={name}

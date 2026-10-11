@@ -94,7 +94,14 @@ expire_after_days = 7
 # The Stockfish ladder that `chess-ai ladder` measures a checkpoint's Elo on: the
 # checkpoint plays a match against Stockfish at each level, and its Elo, with a
 # 95% range, is worked out from how it scored. The command line can override
-# each of these for one ladder.
+# each of these for one ladder. The evaluator plays it too, for the runs that
+# ask for it in their experiment config (not this file), when the run starts:
+#
+#   [evaluation]
+#   suites = ["probe-positions", "sample-games", "stockfish-ladder"]
+#
+# A run that is already training keeps the suites it started with; use
+# `chess-ai evaluate RUN --suite stockfish-ladder` to ladder its checkpoints.
 
 # Stockfish's Elo levels. A level outside the range Stockfish supports is played
 # at the nearest end of it (1350 to 2850 for Stockfish 14), and a checkpoint that
@@ -104,6 +111,13 @@ levels = [1350, 1500, 1700, 1900, 2100]
 # How many games the checkpoint plays against each level, the colours swapped
 # every game.
 games_per_level = 20
+
+# Which checkpoints the evaluator ladders: those from a step that is a multiple
+# of this, and the last one of a run that has finished. The default ladder takes
+# about ten minutes on a GPU, and runs save a checkpoint far more often than that.
+# Training keeps the checkpoints due a ladder until the evaluator has played it
+# (the newest three at most), on top of the ones its retention keeps.
+every = 10000
 
 # The rating the checkpoint is asked to play like. A model asked for no rating
 # plays far below what it can do, so a ladder always asks for one.

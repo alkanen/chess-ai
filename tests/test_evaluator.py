@@ -550,6 +550,12 @@ class NeverStands:
     def __init__(self) -> None:
         self.evaluated = 0
 
+    def wants(self, run, checkpoint) -> bool:
+        return True
+
+    def after(self, run) -> None:
+        pass
+
     def stands(self, run, checkpoint, written) -> bool:
         return False
 

@@ -26,11 +26,13 @@ export function liveGame(changes: Partial<LiveGame> = {}): LiveGame {
   const [first, second] = foolsMateMoves;
   const step = changes.step ?? 500;
   return {
+    suite: 'sample-games',
     run: 'tiny',
     step,
     index: 0,
     games: 2,
     opponent: 'self',
+    level: null,
     updated: '2026-10-10T12:00:00Z',
     game: {
       ...foolsMateStart.game,
