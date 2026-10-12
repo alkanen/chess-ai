@@ -25,8 +25,9 @@ from pathlib import Path
 from typing import BinaryIO, Final, TextIO
 
 from chess_ai.dataset.files import sha256_of, sync_directory, sync_file
-from chess_ai.dataset.progress import INTERVAL, format_duration
+from chess_ai.dataset.progress import INTERVAL, LOG_INTERVAL, format_duration
 from chess_ai.dataset.store import HELD_BY_ANOTHER, DatasetError
+from chess_ai.output import DETAIL, MILESTONE, shown, stamp
 
 try:
     import fcntl
@@ -273,7 +274,7 @@ def _held(path: Path) -> Iterator[None]:
     try:
         fd = os.open(lock, os.O_CREAT | os.O_RDONLY, 0o644)
     except OSError as e:
-        LOGGER.warning("chess-ai: cannot lock the download of %s: %s", path.name, e.strerror)
+        LOGGER.warning("cannot lock the download of %s: %s", path.name, e.strerror)
         yield
         return
     try:
@@ -285,7 +286,7 @@ def _held(path: Path) -> Iterator[None]:
                     f"{path.name} is already being downloaded into {path.parent}; "
                     "wait for that to finish"
                 ) from e
-            LOGGER.warning("chess-ai: cannot lock the download of %s: %s", path.name, e.strerror)
+            LOGGER.warning("cannot lock the download of %s: %s", path.name, e.strerror)
         yield
     finally:
         os.close(fd)
@@ -303,16 +304,20 @@ def _why(error: BaseException) -> str:
 class DownloadPrinter:
     """Prints a download's progress on one line that rewrites itself, at most every
     :data:`~chess_ai.dataset.progress.INTERVAL`, as :class:`~chess_ai.dataset.ProgressPrinter`
-    does a build's. A line at a time where the stream is not a terminal.
+    does a build's. A line at a time where the stream is not a terminal, every
+    :data:`~chess_ai.dataset.progress.LOG_INTERVAL`; stamped and left out by ``--quiet`` as the
+    build's are, apart from the line saying a file is done.
 
     The rate is of this session's bytes only: a resumed download starts with most of the file
     already there, and counting that in would promise a minute for what takes an hour.
     """
 
-    def __init__(self, stream: TextIO | None = None, interval: float = INTERVAL) -> None:
-        self._stream = stream if stream is not None else sys.stderr
-        self._interval = interval
+    def __init__(self, stream: TextIO | None = None, interval: float | None = None) -> None:
+        self._stream = stream if stream is not None else sys.stdout
         self._rewrite = _is_terminal(self._stream)
+        if interval is None:
+            interval = INTERVAL if self._rewrite else LOG_INTERVAL
+        self._interval = interval
         self._name: str | None = None
         self._started = 0.0
         self._first = 0
@@ -327,8 +332,12 @@ class DownloadPrinter:
         done = total is not None and have >= total
         if not done and now - self._last < self._interval:
             return
+        if not shown(MILESTONE if done else DETAIL):
+            return
         self._last = now
-        line = _download_line(name, have, total, have - self._first, now - self._started)
+        line = stamp(self._stream) + _download_line(
+            name, have, total, have - self._first, now - self._started
+        )
         try:
             if self._rewrite:
                 self._stream.write(f"\r\x1b[K{line}" + ("\n" if done else ""))

@@ -12,8 +12,14 @@ import sys
 from dataclasses import dataclass
 from typing import Final, TextIO
 
+from chess_ai.output import DETAIL, MILESTONE, shown, stamp
+
 INTERVAL: Final = 1.0
 """How often a reporter that throttles will actually report, in seconds."""
+
+LOG_INTERVAL: Final = 30.0
+"""How often it reports where each report is a line of its own, as in a log file: a line a
+second is thousands of lines over an hour, and nobody reads a log that closely."""
 
 
 @dataclass(frozen=True)
@@ -93,27 +99,35 @@ class ProgressPrinter:
 
     Rewriting one line keeps hours of progress out of a terminal's scrollback; the summary
     line at the end is the one that stays. Anywhere that is not a terminal — a log file, a
-    test — gets a line at a time instead, because a carriage return is not readable there.
+    test — gets a line at a time instead, every :data:`LOG_INTERVAL`, because a carriage return
+    is not readable there.
+
+    On stdout by default, as the rest of what a command says is, and like it stamped with the
+    time and left out by ``--quiet``, which keeps only the summary line.
     """
 
     def __init__(
         self,
         stream: TextIO | None = None,
-        interval: float = INTERVAL,
+        interval: float | None = None,
         rewrite: bool | None = None,
     ) -> None:
-        self._stream = stream if stream is not None else sys.stderr
+        self._stream = stream if stream is not None else sys.stdout
+        self._rewrite = rewrite if rewrite is not None else _is_terminal(self._stream)
+        if interval is None:
+            interval = INTERVAL if self._rewrite else LOG_INTERVAL
         self._interval = interval
         self._last = -interval
-        self._rewrite = rewrite if rewrite is not None else _is_terminal(self._stream)
         self._unfinished = False
         """Whether a line has been written that nothing has ended yet."""
 
     def __call__(self, progress: Progress) -> None:
         if not progress.done and progress.seconds - self._last < self._interval:
             return
+        if not shown(MILESTONE if progress.done else DETAIL):
+            return
         self._last = progress.seconds
-        line = format_progress(progress)
+        line = stamp(self._stream) + format_progress(progress)
         if not self._rewrite:
             # Redirected into a log file, where a rewritten line is one unreadable line.
             self._stream.write(f"{line}\n")

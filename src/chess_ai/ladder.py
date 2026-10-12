@@ -42,6 +42,8 @@ from chess_ai.evaluator import until_stopped
 from chess_ai.game_session import GameSession
 from chess_ai.match import MatchGame, append_game, game_line, play_match, score
 from chess_ai.openings import OpeningSet
+from chess_ai.output import DETAIL, Say
+from chess_ai.output import say as said_on_stdout
 from chess_ai.players import (
     ModelDescription,
     Player,
@@ -504,7 +506,7 @@ class LadderSuite:
         load: EngineLoader | None = None,
         release: Callable[[], None] = lambda: None,
         live: Path | None = None,
-        say: Callable[[str], None] = LOGGER.info,
+        say: Say = said_on_stdout,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.settings = settings
@@ -596,7 +598,9 @@ class LadderSuite:
                 level = f"Stockfish {stockfish.elo}"
                 model_white = session.state.white.model is not None
                 white, black = (label, level) if model_white else (level, label)
-                self._say(f"{label} {SUITE}: game {begun}/{total} begins: {white} – {black}")
+                self._say(
+                    f"{label} {SUITE}: game {begun}/{total} begins: {white} – {black}", kind=DETAIL
+                )
                 if self._live is None:
                     return
 
@@ -612,7 +616,7 @@ class LadderSuite:
                 append_game(games_file, game)
                 names = [label, f"Stockfish {stockfish.elo}"]
                 line = game_line(game, names, number=ended, games=total)
-                self._say(f"{label} {SUITE}: {line}")
+                self._say(f"{label} {SUITE}: {line}", kind=DETAIL)
 
             played = await play_ladder(
                 model,

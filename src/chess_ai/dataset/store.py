@@ -179,7 +179,7 @@ def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
     except OSError as e:
         # No lock file, for the same kind of reason as no lock: a directory somebody else owns, or
         # one mounted read-only. Whether the build itself can write is its own question to answer.
-        LOGGER.warning("chess-ai: cannot lock builds in %s: %s", root, e.strerror)
+        LOGGER.warning("cannot lock builds in %s: %s", root, e.strerror)
         yield
         return
     unlocked: OSError | None = None
@@ -200,8 +200,7 @@ def dataset_lock(data_dir: Path, name: str) -> Iterator[None]:
                 ) from e
         if unlocked is not None:
             LOGGER.warning(
-                "chess-ai: %s cannot lock, so two builds of one dataset are not kept apart "
-                "there: %s",
+                "%s cannot lock, so two builds of one dataset are not kept apart there: %s",
                 root,
                 unlocked.strerror,
             )

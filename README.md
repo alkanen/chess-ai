@@ -103,6 +103,18 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[inference] batch_size` | `CHESS_AI_INFERENCE_BATCH_SIZE` | `32` |
 | `[stockfish] path` | `CHESS_AI_STOCKFISH_PATH` | `stockfish`, looked up on `PATH` |
 
+### Output
+
+Every command says what it is doing on stdout, a line per stage, game or progress report, and writes warnings and errors to stderr as `chess-ai: warning: …`. Each line starts with the time it was written, except in the systemd journal (which stamps lines itself) and in the output of `runs list`, `runs annotate` and `dataset stats`. These options go before or after the command:
+
+| Option | Effect |
+|---|---|
+| `-q` | leave out the step-by-step lines: start-up stages, single games, progress reports, checkpoint saves |
+| `-qq` | only the results, and errors |
+| `-v` | also log info records, including the web server's start-up lines and its access log |
+| `-vv` | also log debug records |
+| `--timestamps=always\|never\|auto` | override where lines are stamped (default `auto`) |
+
 ### Serve
 
 ```sh

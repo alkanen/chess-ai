@@ -3,7 +3,6 @@
 import ast
 import errno
 import io
-import logging
 import os
 import shutil
 import subprocess
@@ -31,6 +30,7 @@ from dataset_helpers import (
     shard_bytes,
 )
 
+from chess_ai import output
 from chess_ai.dataset import (
     SPLITS,
     TRAIN,
@@ -818,15 +818,13 @@ def test_a_dataset_an_interrupted_build_set_aside_is_offered_back(tmp_path, capl
 
 @contextmanager
 def on_one_stream():
-    """A terminal: the progress line and the warnings going to the same place, as they do there."""
+    """A terminal: the progress line and the warnings going to the same place, as they do there,
+    the warnings written as every command writes them."""
     stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    logger = logging.getLogger("chess_ai")
-    logger.addHandler(handler)
-    try:
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, "stderr", stream)
+        output.configure()
         yield stream
-    finally:
-        logger.removeHandler(handler)
 
 
 def a_dataset_set_aside(tmp_path):

@@ -9,6 +9,7 @@ import chess.pgn
 import pytest
 import torch
 from game_helpers import PlayerBroke
+from output_helpers import heard, unheard
 from training_helpers import model_run
 
 from chess_ai import replay
@@ -435,7 +436,7 @@ def ladder_suite(
         load=load,
         release=release or (lambda: None),
         live=runs,
-        say=(said.append if said is not None else lambda line: None),
+        say=(heard(said) if said is not None else unheard),
     )
     return suite, made
 

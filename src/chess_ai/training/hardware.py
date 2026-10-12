@@ -143,7 +143,7 @@ def _find_device(index: int) -> Any | None:
             return pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
         return pynvml.nvmlDeviceGetHandleByIndex(index)
     except Exception as e:  # noqa: BLE001 - NVML raises its own errors, and an import may fail
-        LOGGER.info("GPU statistics unavailable: %s", e)
+        LOGGER.warning("GPU statistics unavailable: %s", e)
         return None
 
 
