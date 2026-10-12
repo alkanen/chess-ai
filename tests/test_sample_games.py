@@ -13,6 +13,7 @@ import chess
 import chess.pgn
 import pytest
 import torch
+from output_helpers import heard
 from training_helpers import add_checkpoint, model_run
 
 from chess_ai import replay
@@ -190,7 +191,7 @@ def test_the_evaluator_plays_the_sample_games_of_each_new_checkpoint(tmp_path):
     runs = tmp_path / "runs"
     directory = model_run(runs, steps=(2,))
     said: list[str] = []
-    worker = Evaluator(runs, {SUITE: suite(games=1)}, load=load_engine, say=said.append)
+    worker = Evaluator(runs, {SUITE: suite(games=1)}, load=load_engine, say=heard(said))
 
     worker.run_once()
     add_checkpoint(directory, 4)
@@ -599,7 +600,7 @@ def test_a_stop_after_the_games_were_saved_counts_them_as_done(tmp_path):
         runs,
         {SUITE: suite(games=0, stockfish_games=1, opponent=SlowToClose(stop))},
         load=load_engine,
-        say=said.append,
+        say=heard(said),
         warn=lambda text: pytest.fail(text),
     )
 

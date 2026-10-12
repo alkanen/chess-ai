@@ -30,6 +30,8 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pydantic import ValidationError
 
+from chess_ai.output import RESULT, Say
+from chess_ai.output import say as said_on_stdout
 from chess_ai.players import ModelDescription
 from chess_ai.probes import (
     ProbeResult,
@@ -353,7 +355,7 @@ class Evaluator:
         suites: Mapping[str, Suite],
         *,
         load: Loader,
-        say: Callable[[str], None] = LOGGER.info,
+        say: Say = said_on_stdout,
         warn: Callable[[str], None] = LOGGER.warning,
     ) -> None:
         self.runs_dir = runs_dir
@@ -430,7 +432,7 @@ class Evaluator:
                 # since it is the newest it would be next every time, ahead of everything else.
                 self._fail(job, (name,), f"{name} saved a result that does not read back")
                 continue
-            self._say(f"{job.describe()} {name}: {said}")
+            self._say(f"{job.describe()} {name}: {said}", kind=RESULT)
         self._after(job)
         return True
 

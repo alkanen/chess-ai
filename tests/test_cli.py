@@ -21,8 +21,8 @@ def served(monkeypatch):
     """Capture what ``chess-ai serve`` would run instead of starting a server."""
     calls = {}
 
-    def fake_run(app, host, port):
-        calls.update(app=app, host=host, port=port)
+    def fake_run(app, host, port, **options):
+        calls.update(app=app, host=host, port=port, **options)
 
     monkeypatch.setattr(uvicorn, "run", fake_run)
     return calls
@@ -37,6 +37,7 @@ def test_serve_uses_configured_address_and_prefix(tmp_path, served, capsys):
     assert (served["host"], served["port"]) == ("0.0.0.0", 9000)
     assert TestClient(served["app"]).get("/chess/api/start-position").status_code == 200
     assert "http://0.0.0.0:9000/chess/" in capsys.readouterr().out
+    assert served["log_config"] is None, "uvicorn logs through the handler every command has"
 
 
 def test_invalid_config_exits_with_message(tmp_path, served, capsys):
@@ -135,7 +136,42 @@ def test_dataset_build_refuses_fewer_than_one_worker(tmp_path, capsys):
 def test_dataset_build_reports_progress_while_it_works(tmp_path, capsys):
     assert main(["dataset", "build", "games", str(FIXTURES)]) == 0
 
-    assert "games/s" in capsys.readouterr().err
+    said = capsys.readouterr()
+    assert "games/s" in said.out, "on stdout with the rest of what the build says"
+    assert "games/s" not in said.err
+
+
+def test_a_build_not_on_a_terminal_writes_whole_lines_and_redraws_nothing(tmp_path, capsys):
+    from chess_ai.dataset import builder, progress
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(builder, "REPORT_EVERY", 1)
+        patch.setattr(progress, "LOG_INTERVAL", 0.0)
+        assert main(["dataset", "build", "games", str(FIXTURES)]) == 0
+
+    said = capsys.readouterr()
+    for stream in (said.out, said.err):
+        assert "\r" not in stream and "\x1b" not in stream, "no carriage return, no escape"
+    assert len([line for line in said.out.splitlines() if "games/s" in line]) > 1
+
+
+def test_a_quiet_dataset_build_says_only_that_it_was_built(tmp_path, capsys):
+    from chess_ai.dataset import builder, progress
+
+    def progress_lines(*options):
+        main(["dataset", "build", "games", str(FIXTURES), "--overwrite", *options])
+        out = capsys.readouterr().out
+        assert "chess-ai: dataset games in" in out, "the summary, however quiet"
+        return [line for line in out.splitlines() if "games/s" in line]
+
+    with pytest.MonkeyPatch.context() as patch:
+        # Every game a report and every report a line, so that one missing was left out.
+        patch.setattr(builder, "REPORT_EVERY", 1)
+        patch.setattr(progress, "LOG_INTERVAL", 0.0)
+        assert len(progress_lines()) > 1
+        quiet = progress_lines("-q")
+
+    assert len(quiet) == 1 and quiet[0].startswith("built "), "only the line saying it is done"
 
 
 def test_dataset_build_over_an_existing_dataset_needs_overwrite(tmp_path, capsys):
@@ -702,6 +738,96 @@ def test_train_writes_a_run_in_the_configured_runs_directory(tmp_path, capsys):
     assert "mlp," in out and "parameters" in out, "the parameter count, before it starts"
     assert "positions/s measured" in out, "and how fast a step actually was"
     assert "runs/tiny" in out, "and where the run went"
+
+
+def positions_of(out: str, *beginnings: str) -> list[int]:
+    """Where in ``out`` the first line starting with each of ``beginnings`` is."""
+    lines = out.splitlines()
+    return [
+        next(index for index, line in enumerate(lines) if line.startswith(beginning))
+        for beginning in beginnings
+    ]
+
+
+def test_train_says_each_slow_stage_as_it_starts(tmp_path, capsys):
+    from training_helpers import dataset, experiment
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+
+    assert main(["train", str(config)]) == 0
+
+    out = capsys.readouterr().out
+    stages = (
+        "chess-ai: opening dataset ",
+        "chess-ai: building the mlp model on cpu",
+        "chess-ai: measuring throughput over ",
+        "chess-ai: run tiny, seed",
+        "chess-ai: run tiny in ",
+        "chess-ai: loading batches in this process, starting with epoch 1's order of ",
+        "chess-ai: saved the checkpoint of step ",
+        "chess-ai: finished ",
+    )
+    where = positions_of(out, *stages)
+    assert where == sorted(where), out
+    assert where[0] == 0, "nothing comes before the first stage"
+
+
+def test_resume_says_each_slow_stage_as_it_starts(tmp_path, capsys, monkeypatch):
+    import signal
+
+    from training_helpers import dataset, experiment
+
+    from chess_ai.training import trainer
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+    real = trainer._step
+    calls = {"n": 0}
+
+    def stopped_on_the_run_s_second_step(*args, **kwargs):
+        result = real(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == trainer.PROBE_STEPS + 1 + 2:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return result
+
+    monkeypatch.setattr(trainer, "_step", stopped_on_the_run_s_second_step)
+    assert main(["train", str(config)]) == 128 + signal.SIGTERM
+    monkeypatch.setattr(trainer, "_step", real)
+    capsys.readouterr()
+
+    assert main(["resume", "tiny"]) == 0
+
+    out = capsys.readouterr().out
+    where = positions_of(
+        out,
+        "chess-ai: loading the checkpoint of step ",
+        "chess-ai: opening dataset ",
+        "chess-ai: building the mlp model on cpu",
+        "chess-ai: measuring throughput over ",
+        "chess-ai: run tiny, seed",
+        "chess-ai: resuming run tiny in ",
+        "chess-ai: loading batches in this process, starting with epoch ",
+        "chess-ai: finished ",
+    )
+    assert where == sorted(where), out
+    assert where[0] == 0, "nothing comes before the first stage"
+
+
+def test_quiet_training_leaves_out_the_stages_and_the_saves(tmp_path, capsys):
+    from training_helpers import dataset, experiment
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+
+    assert main(["train", str(config), "-q"]) == 0
+
+    out = capsys.readouterr().out
+    assert "opening dataset" not in out
+    assert "saved the checkpoint" not in out
+    assert "chess-ai: run tiny in " in out, "where the run is still said"
+    assert "chess-ai: finished " in out
 
 
 def test_train_uses_the_configured_runs_directory(tmp_path):

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 import pytest
 import torch
+from output_helpers import heard, unheard
 from training_helpers import add_checkpoint, model_run
 
 from chess_ai.cli import main
@@ -40,7 +41,7 @@ def evaluator(runs_dir, *, probes=None, said=None, warned=None) -> Evaluator:
         runs_dir,
         {suite.name: suite},
         load=load_engine,
-        say=(said.append if said is not None else lambda text: None),
+        say=(heard(said) if said is not None else unheard),
         warn=(warned.append if warned is not None else lambda text: None),
     )
 
@@ -426,7 +427,7 @@ def test_a_checkpoint_saved_during_a_backlog_is_evaluated_before_the_rest_of_it(
     order: list[str] = []
     stop = threading.Event()
 
-    def heard(text: str) -> None:
+    def hear(text: str, kind=None) -> None:
         order.append(text.split()[0])
         if len(order) == 1:
             add_checkpoint(run, 8)
@@ -434,7 +435,7 @@ def test_a_checkpoint_saved_during_a_backlog_is_evaluated_before_the_rest_of_it(
             stop.set()
 
     suite = ProbeSuite(load_probe_set("standard"), rating=1500)
-    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=heard)
+    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=hear)
 
     finishes(lambda: worker.run(poll_seconds=60, stop=stop))
 
@@ -447,14 +448,14 @@ def test_once_evaluates_what_lacked_a_result_when_it_began_and_no_more(tmp_path)
     run = model_run(runs, steps=(2, 4, 6))
     order: list[str] = []
 
-    def heard(text: str) -> None:
+    def hear(text: str, kind=None) -> None:
         order.append(text.split()[0])
         if len(order) == 1:
             add_checkpoint(run, 8, keep=10)
             (run / "checkpoints" / "step-000000004.pt").unlink()  # Pruned before its turn.
 
     suite = ProbeSuite(load_probe_set("standard"), rating=1500)
-    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=heard)
+    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=hear)
 
     jobs = finishes(worker.run_once)
 
@@ -468,7 +469,9 @@ def test_once_stops_between_checkpoints_when_told_to(tmp_path):
     model_run(runs, steps=(2, 4, 6))
     stop = threading.Event()
     suite = ProbeSuite(load_probe_set("standard"), rating=1500)
-    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=lambda text: stop.set())
+    worker = Evaluator(
+        runs, {suite.name: suite}, load=load_engine, say=lambda text, kind=None: stop.set()
+    )
 
     stopped = finishes(lambda: pytest.raises(Stopped, worker.run_once, stop=stop))
 
@@ -481,7 +484,9 @@ def test_once_told_to_stop_after_its_last_checkpoint_has_finished(tmp_path):
     model_run(runs, steps=(2,))
     stop = threading.Event()
     suite = ProbeSuite(load_probe_set("standard"), rating=1500)
-    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=lambda text: stop.set())
+    worker = Evaluator(
+        runs, {suite.name: suite}, load=load_engine, say=lambda text, kind=None: stop.set()
+    )
 
     assert done(finishes(lambda: worker.run_once(stop=stop))) == [("tiny", 2)]
 

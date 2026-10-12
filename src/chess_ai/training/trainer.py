@@ -49,6 +49,8 @@ from chess_ai.dataset import TRAIN, VALIDATION, Dataset, DatasetError, ManifestE
 from chess_ai.encoders import Encoder, EncoderSpec, create_encoder
 from chess_ai.models import ChessModel, create_model
 from chess_ai.move_codec import VOCABULARY_SIZE
+from chess_ai.output import DETAIL, RESULT, Say
+from chess_ai.output import say as said_on_stdout
 from chess_ai.registry import RegistryError
 from chess_ai.training import checkpoint
 from chess_ai.training.batches import (
@@ -161,7 +163,7 @@ def train(
     runs_dir: Path,
     config_text: str,
     overwrite: bool = False,
-    say: Callable[[str], None] = print,
+    say: Say = said_on_stdout,
     ladder_every: int | None = None,
 ) -> Path:
     """Train what ``config`` describes, and return the run directory it wrote.
@@ -180,10 +182,10 @@ def train(
     except RunError as e:
         raise TrainingError(e) from e
 
-    run = _prepare(config, data_dir=data_dir)
+    run = _prepare(config, data_dir=data_dir, say=say)
     # Before the probe, which puts back whatever weights it found: these are the ones to keep.
-    lineage = _initialize(run, runs_dir=runs_dir) if config.initialize_from else None
-    estimate = _probe(run)
+    lineage = _initialize(run, runs_dir=runs_dir, say=say) if config.initialize_from else None
+    estimate = _probe(run, say=say)
     for line in _summary(run, estimate, lineage=lineage):
         say(line)
 
@@ -208,7 +210,7 @@ def resume(
     *,
     data_dir: Path,
     runs_dir: Path,
-    say: Callable[[str], None] = print,
+    say: Say = said_on_stdout,
     ladder_every: int | None = None,
 ) -> Path:
     """Carry on training the run called ``name`` from its latest checkpoint, to the end.
@@ -260,7 +262,7 @@ def _hold_for_ladders(writer: RunWriter, every: int | None) -> None:
 
 
 def _resumable(
-    reader: RunReader, *, data_dir: Path, say: Callable[[str], None]
+    reader: RunReader, *, data_dir: Path, say: Say
 ) -> tuple[_Run, torch.optim.Optimizer, _Start]:
     """The run in ``reader`` put back as its latest checkpoint left it, ready to carry on."""
     name = reader.name
@@ -273,13 +275,14 @@ def _resumable(
             f"run {name!r} saved no checkpoint, so there is nothing to resume it from; "
             "start it again with 'chess-ai train --overwrite'"
         )
+    say(f"chess-ai: loading the checkpoint of step {latest.step:,}", kind=DETAIL)
     payload = _load(reader.checkpoint_path(latest), doing=f"resume run {name!r}")
     config = _pinned_to_its_version(_config_of(payload, name), reader)
-    run = _prepare(config, data_dir=data_dir)
+    run = _prepare(config, data_dir=data_dir, say=say)
     _same_dataset(run, reader)
     doing = f"resume run {name!r} from step {latest.step:,}"
     _check_compatible(run, payload, doing=doing)
-    estimate = _probe(run)
+    estimate = _probe(run, say=say)
     # After the probe, which puts back the weights it found rather than the ones it left.
     _load_weights(run, payload, doing=doing)
     optimizer = _optimizer(run)
@@ -378,7 +381,7 @@ def _elapsed_at(payload: dict[str, Any], reader: RunReader, step: int) -> float:
     return float(max(times, default=0.0))
 
 
-def _initialize(run: _Run, *, runs_dir: Path) -> Lineage:
+def _initialize(run: _Run, *, runs_dir: Path, say: Say = said_on_stdout) -> Lineage:
     """Load the weights ``[initialize_from]`` names into ``run``, and say where they came from."""
     source = run.config.initialize_from
     assert source is not None
@@ -392,6 +395,7 @@ def _initialize(run: _Run, *, runs_dir: Path) -> Lineage:
     except RunError as e:
         raise TrainingError(f"cannot initialize from run {source.run!r}: {e}") from e
     doing = f"initialize from run {source.run!r} at step {chosen.step:,}"
+    say(f"chess-ai: loading the weights of run {source.run} at step {chosen.step:,}", kind=DETAIL)
     payload = _load(reader.checkpoint_path(chosen), doing=doing)
     _check_compatible(run, payload, doing=doing)
     _load_weights(run, payload, doing=doing)
@@ -474,7 +478,7 @@ def _train_to_end(
     optimizer: torch.optim.Optimizer,
     start: _Start,
     *,
-    say: Callable[[str], None],
+    say: Say,
 ) -> None:
     """Run the loop with ``writer``, and have the run say how it ended whichever way it does."""
     progress = _Progress(step=start.step, epoch=_epoch(run, start.step))
@@ -512,9 +516,7 @@ def _train_to_end(
             raise TrainingStopped(writer.directory, progress.step, stopped_by)
 
 
-def _finished_anyway(
-    writer: RunWriter, run: _Run, progress: _Progress, *, say: Callable[[str], None]
-) -> None:
+def _finished_anyway(writer: RunWriter, run: _Run, progress: _Progress, *, say: Say) -> None:
     """Say a run that was interrupted after its last checkpoint finished, unless it already has.
 
     Asked of the heartbeat rather than remembered, for the same reason as :func:`_saved_at`: the
@@ -528,7 +530,7 @@ def _finished_anyway(
     if status is None or status.status != RunStatus.FINISHED:
         steps = run.config.schedule.steps
         writer.finish(RunStatus.FINISHED, step=steps, steps=steps, epoch=round(progress.epoch, 4))
-    say(f"chess-ai: finished {run.config.schedule.steps:,} steps")
+    say(f"chess-ai: finished {run.config.schedule.steps:,} steps", kind=RESULT)
 
 
 def _saved_at(writer: RunWriter, step: int) -> bool:
@@ -600,7 +602,7 @@ def _ended(
     )
 
 
-def _prepare(config: ExperimentConfig, *, data_dir: Path) -> _Run:
+def _prepare(config: ExperimentConfig, *, data_dir: Path, say: Say = said_on_stdout) -> _Run:
     """Resolve the config against this machine and this dataset, or say why it cannot be."""
     try:
         device = resolve_device(config.training.device)
@@ -608,6 +610,7 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path) -> _Run:
         raise TrainingError(e) from e
     dtype = autocast_dtype(device, mixed_precision=config.training.mixed_precision)
 
+    say(f"chess-ai: opening dataset {config.dataset.name}", kind=DETAIL)
     try:
         dataset = open_dataset(
             config.dataset.name, data_dir=data_dir, version=config.dataset.version
@@ -628,6 +631,7 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path) -> _Run:
 
     # Seeded before the model is built, because building it is what draws the initial weights.
     torch.manual_seed(config.seed)
+    say(f"chess-ai: building the {config.model.architecture} model on {device}", kind=DETAIL)
     try:
         encoder = create_encoder(config.encoder.name, **config.encoder.options)
         model = create_model(config.model.architecture, encoder.spec, **config.model.options)
@@ -758,7 +762,7 @@ def _step(run: _Run, batch: Batch, optimizer: torch.optim.Optimizer) -> _StepRes
     return _StepResult(total.detach(), policy_loss, value_loss, norm, clipped)
 
 
-def _probe(run: _Run) -> float | None:
+def _probe(run: _Run, *, say: Say = said_on_stdout) -> float | None:
     """Positions per second over a few real steps, measured before the run starts.
 
     Real steps, with a real optimizer, on a real batch: a forward pass alone would flatter the
@@ -766,6 +770,13 @@ def _probe(run: _Run) -> float | None:
     weights are put back afterwards, so the run still starts from exactly the seeded
     initialization, and the throwaway optimizer never sees the run's own.
     """
+    # The batch it steps on is the run's first, which means shuffling the first epoch's order:
+    # at Lichess scale, most of the time this takes.
+    say(
+        f"chess-ai: measuring throughput over {PROBE_STEPS} steps, once the first epoch's order "
+        f"of {run.batches.positions:,} positions is shuffled",
+        kind=DETAIL,
+    )
     weights = {name: value.detach().clone() for name, value in run.model.state_dict().items()}
     optimizer = _optimizer(run)
     try:
@@ -804,7 +815,7 @@ def _loop(
     start: _Start,
     *,
     stop: _StopRequest,
-    say: Callable[[str], None],
+    say: Say,
 ) -> int | None:
     """Train to the end of the schedule, logging, validating and checkpointing as it goes.
 
@@ -814,7 +825,7 @@ def _loop(
     config = run.config
     steps = config.schedule.steps
     scheduler = _schedule(run, optimizer, completed=start.step)
-    validation = _validation_split(run, say=say)
+    validation = _validation_split(run)
 
     run.model.train()
     session_started = time.perf_counter()
@@ -837,6 +848,7 @@ def _loop(
         # Last, so that nothing between here and the first step draws from it.
         _restore_rng(start.rng_state, run.device)
 
+    say(_loader_line(run, start.step), kind=DETAIL)
     for batch in _stream(run, first=start.step, orders=writer.directory / ORDERS_DIR):
         batch = batch.to(run.device, non_blocking=run.device.type == "cuda")
         # Read before the scheduler moves on: this is the rate the weights just moved by, and
@@ -934,7 +946,7 @@ def _loop(
                 # metrics and can never be the best. A ctrl-c waits the seconds it takes.
                 with holding_stop_signals():
                     path = writer.save_checkpoint(step, save, metrics=metrics)
-            LOGGER.info("saved %s", path)
+            say(f"chess-ai: saved the checkpoint of step {step:,} in {path}", kind=DETAIL)
 
         if stopping:
             return stop.signal
@@ -947,7 +959,10 @@ def _loop(
         epoch=round(_epoch(run, step), 4),
         positions_per_second=step * config.training.batch_size / elapsed if elapsed else None,
     )
-    say(f"chess-ai: finished {steps:,} steps in {_duration(elapsed)}{_best(writer, config)}")
+    say(
+        f"chess-ai: finished {steps:,} steps in {_duration(elapsed)}{_best(writer, config)}",
+        kind=RESULT,
+    )
     return None
 
 
@@ -972,6 +987,20 @@ def _best(writer: RunWriter, config: ExperimentConfig) -> str:
     if value is None:
         return ""
     return f", best {config.checkpoints.metric} {value:.4f} at step {best.step:,}"
+
+
+def _loader_line(run: _Run, first: int) -> str:
+    """What the wait for the first batch is: a worker shuffling the epoch's order, at Lichess
+    scale, unless a trainer that was killed left it behind."""
+    workers = run.config.training.data_workers
+    epoch = first // run.batches.batches_per_epoch + 1
+    order = f"epoch {epoch}'s order of {run.batches.positions:,} positions"
+    if not workers:
+        return f"chess-ai: loading batches in this process, starting with {order}"
+    return (
+        f"chess-ai: starting {workers} data loader worker{'s' if workers != 1 else ''}; "
+        f"the first step waits for {order}"
+    )
 
 
 def _stream(run: _Run, *, first: int = 0, orders: Path) -> Iterator[Batch]:
@@ -1092,13 +1121,13 @@ class _Beat:
         )
 
 
-def _validation_split(run: _Run, *, say: Callable[[str], None]):
+def _validation_split(run: _Run):
     """The validation split to measure on, or ``None`` with a word about why there is none."""
     counts = run.dataset.manifest.splits.get(VALIDATION)
     if counts is None or not counts.trained_on:
-        say(
-            "chess-ai: warning: this dataset has no validation positions, so no validation "
-            "metrics will be logged; rebuild it with a larger --validation-fraction"
+        LOGGER.warning(
+            "this dataset has no validation positions, so no validation metrics will be logged; "
+            "rebuild it with a larger --validation-fraction"
         )
         return None
     return run.dataset[VALIDATION]

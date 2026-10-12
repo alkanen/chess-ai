@@ -36,6 +36,19 @@ The user reviews PRs with inline review comments, then asks for the relevant one
 - Reply on every thread in the same round, through `gh api -X POST repos/alkanen/chess-ai/pulls/N/comments/ID/replies -f body=...`. Describe what changed (no commit hashes, since the commit doesn't exist yet) or give the reasoning for pushing back. Leave the threads unresolved; the user resolves them.
 - Finish by summarizing, per comment, what was changed or pushed back on, and suggest a Conventional Commits title and body for the round's commit.
 
+## Command-line output
+
+Every command sets up its output once, in `chess_ai.output` (called from `cli.main`). New code follows the same patterns:
+
+- **Two channels.** The command's own account of what it is doing (stages, games, progress, results) goes to stdout through a `say` callback (`chess_ai.output.say`, or a `say: Say` parameter that library code takes). Problems go to stderr through `logging`: `LOGGER = logging.getLogger(__name__)`, then `LOGGER.warning(...)`. Never `print`, and never `say(..., err=True)` for a warning. `err=True` is only for the line saying how a command ended ("interrupted", "evaluator stopped").
+- **No prefix in log messages.** Write `LOGGER.warning("cannot lock %s: %s", path, e)`. The handler adds `chess-ai: warning: ` (and the logger name at info and debug). `say` lines start with `chess-ai: ` themselves when they are narration, but not when they are a result or a listing.
+- **Every `say` line has a kind**, which is what `-q`/`-qq` hide: `kind=DETAIL` for one step of many (a stage starting, a game, a progress line, a checkpoint saved), the default `MILESTONE` for where a long job has got to (validation lines, a header naming what is being played), and `kind=RESULT` for what the command was run for (summaries, a suite's result, a listing, how it ended). `-qq` shows only results, so a query command's output must be `RESULT`.
+- **Say when a slow stage starts**, not when it ends: one `DETAIL` line as it begins (`chess-ai: opening dataset NAME`). Every line is timestamped, so the gap to the next line is how long it took. A stage with a known size says how far along it is (`game 31/102`).
+- **Plain lines, no redrawing in place.** The one exception is `ProgressPrinter`/`DownloadPrinter`, which rewrite one line on a terminal and write a line every `LOG_INTERVAL` anywhere else. Stamp anything written straight to a stream with `output.stamp(stream)`.
+- **Timestamps** come from `output.stamp`/`output.say`, not from the message. They are on by default, but off for the journal (`JOURNAL_STREAM`) and for commands marked `query=True` in `set_defaults` (`runs list`, `runs annotate`, `dataset stats`). `--timestamps=always|never` overrides both.
+- **Short names in per-game lines.** A run name can be a hundred characters long. Name the model(s) in a `MILESTONE` header (`RUN@30000 sample games 3–22 of 102: model against Stockfish 1350`), repeated whenever the opponent changes and otherwise every 20 games, and call them `model` (or `model 1`/`model 2`) in the game lines.
+- **Tests** that pass `say=` need a callable that takes `kind=`, e.g. `lambda text, kind=MILESTONE: said.append(text)`. Lines are unstamped in tests (see `tests/conftest.py`). `tests/test_output.py` stamps them on purpose.
+
 ## Checks
 
 Run these before handing over an issue or a review round:

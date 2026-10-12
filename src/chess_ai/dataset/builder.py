@@ -452,7 +452,7 @@ def build_dataset(
                 # end, when the last flush of the shards finds the disk full.
                 _end_progress_line(progress)
                 LOGGER.warning(
-                    "chess-ai: the build of dataset %r stopped part way; what it had read is "
+                    "the build of dataset %r stopped part way; what it had read is "
                     "kept in %s. Carry it on with 'chess-ai dataset build %s --resume', or "
                     "start again with --discard-interrupted.",
                     name,
@@ -598,7 +598,7 @@ def append_dataset(
             if has_checkpoint(directory):
                 _end_progress_line(progress)
                 LOGGER.warning(
-                    "chess-ai: the append to dataset %r stopped part way; what it had read is "
+                    "the append to dataset %r stopped part way; what it had read is "
                     "kept past version %d, where nothing reads it. Carry it on with "
                     "'chess-ai dataset append %s --resume', or cut it off with "
                     "--discard-interrupted on the next append.",
@@ -658,7 +658,7 @@ def _settle_interrupted_builds(
                 f"'chess-ai dataset build {name} --resume'"
             )
     for path in interrupted:
-        LOGGER.warning("chess-ai: discarding the interrupted build of %r in %s", name, path)
+        LOGGER.warning("discarding the interrupted build of %r in %s", name, path)
         # The checkpoint first, so that a delete which stops part way leaves rubble that is
         # reported as such, and never a checkpoint over records that are no longer all there.
         remove_checkpoint(path)
@@ -753,7 +753,7 @@ def _settle_interrupted_append(
                 )
             )
     LOGGER.warning(
-        "chess-ai: discarding the records an interrupted append left past version %d of dataset %r",
+        "discarding the records an interrupted append left past version %d of dataset %r",
         base.version,
         name,
     )
@@ -1055,7 +1055,7 @@ def _report_rubble(data_dir: Path, name: str) -> None:
             # An interrupted build, which resuming or discarding is the answer to, not this.
             continue
         LOGGER.warning(
-            "chess-ai: %s is a working directory of another build of %r — one that was killed, or "
+            "%s is a working directory of another build of %r — one that was killed, or "
             "one running elsewhere. It is not a dataset and nothing will read it; remove it once "
             "no build of %r is running.",
             path,
@@ -1064,7 +1064,7 @@ def _report_rubble(data_dir: Path, name: str) -> None:
         )
     for path in discarded_datasets(data_dir, name):
         LOGGER.warning(
-            "chess-ai: %s is what is left of a dataset an earlier build of %r replaced and could "
+            "%s is what is left of a dataset an earlier build of %r replaced and could "
             "not finish deleting. It is part of a dataset without the rest of it; remove it.",
             path,
             name,
@@ -1086,7 +1086,7 @@ def _report_set_aside(data_dir: Path, name: str) -> None:
             # two renames and followed by a later build. Which it was does not change the advice:
             # what is in place now is newer, and renaming this over it would lose that.
             LOGGER.warning(
-                "chess-ai: %s is a dataset %r that a build set aside and did not remove. What is "
+                "%s is a dataset %r that a build set aside and did not remove. What is "
                 "in %s now is newer than it, so renaming it back would replace the newer one; "
                 "keep it only if you want the older dataset, and remove it otherwise.",
                 path,
@@ -1095,7 +1095,7 @@ def _report_set_aside(data_dir: Path, name: str) -> None:
             )
             continue
         LOGGER.warning(
-            "chess-ai: %s is the dataset %r that an interrupted build set aside and never put "
+            "%s is the dataset %r that an interrupted build set aside and never put "
             "back. Nothing else will mention it: rename it to %s to have it again, or remove it.",
             path,
             name,
@@ -1876,7 +1876,7 @@ class _Build:
                 # the serial path, and gets the same answer: counted, and not the end of a build.
                 found[index].error = str(e)
                 found[index].went_away = True
-                LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
+                LOGGER.warning("%s; its games are not in this dataset", e)
                 continue
             jobs.append(
                 [self._job(piece, passing=past if piece.start == at else 0) for piece in pieces]
@@ -2142,7 +2142,7 @@ class _Build:
         if not state.explained:
             state.explained = True
             LOGGER.warning(
-                "chess-ai: %s has %s bytes with no game boundary in them, which is more than a "
+                "%s has %s bytes with no game boundary in them, which is more than a "
                 "worker should hold at once, so %s is being read in this process, on one core, "
                 "with the others idle until it is done. Its games are most likely not separated "
                 "by a blank line.",
@@ -2219,7 +2219,7 @@ class _Build:
             state.error = str(e)
             state.went_away = True
             state.stopped = True
-            LOGGER.warning("chess-ai: %s; its games are not in this dataset", e)
+            LOGGER.warning("%s; its games are not in this dataset", e)
         else:
             try:
                 self._read_games(reader, index, state)
@@ -2331,7 +2331,7 @@ class _Build:
             return
         self._said_unexpected = True
         LOGGER.warning(
-            "chess-ai: a game could not be read for a reason nothing expected, and is counted "
+            "a game could not be read for a reason nothing expected, and is counted "
             "as %s; further ones are counted silently\n%s",
             SkipReason.UNREADABLE.value,
             self.tally.unexpected,
@@ -2372,7 +2372,7 @@ class _Build:
         except Exception as e:
             self._progress = None
             LOGGER.warning(
-                "chess-ai: progress reporting stopped, and the build carries on: %s",
+                "progress reporting stopped, and the build carries on: %s",
                 _described(e),
             )
 

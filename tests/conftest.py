@@ -2,6 +2,8 @@ import os
 
 import pytest
 
+from chess_ai import output
+
 
 @pytest.fixture(autouse=True)
 def isolated_config(tmp_path, monkeypatch):
@@ -10,6 +12,16 @@ def isolated_config(tmp_path, monkeypatch):
         if name.startswith("CHESS_AI_"):
             monkeypatch.delenv(name)
     monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def unstamped_output(monkeypatch):
+    """Leave lines unstamped, as they are in the journal, so that tests can compare them whole;
+    and leave no command's verbosity behind for the next test. Timestamp tests ask for them."""
+    monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+    monkeypatch.setattr(output, "to_the_journal", lambda stream: True)
+    yield
+    output.reset()
 
 
 @pytest.fixture

@@ -4,6 +4,7 @@ import contextlib
 import copy
 import dataclasses
 import json
+import logging
 import math
 import os
 import pickle
@@ -18,6 +19,7 @@ from types import SimpleNamespace
 import chess
 import pytest
 import torch
+from output_helpers import heard, unheard
 from torch import nn
 from training_helpers import dataset, experiment
 
@@ -62,7 +64,7 @@ def run(tmp_path, data_dir, name: str = "tiny", **sections):
         data_dir=data_dir,
         runs_dir=tmp_path / "runs",
         config_text=(tmp_path / f"{name}.toml").read_text(),
-        say=lambda line: None,
+        say=unheard,
     )
     assert directory == tmp_path / "runs" / name
     return open_run(tmp_path / "runs", name)
@@ -77,7 +79,7 @@ def said_by(tmp_path, data_dir, name: str = "tiny", **sections) -> list[str]:
         data_dir=data_dir,
         runs_dir=tmp_path / "runs",
         config_text="",
-        say=lines.append,
+        say=heard(lines),
     )
     return lines
 
@@ -183,7 +185,7 @@ def test_every_metrics_line_says_how_many_positions_and_seconds_in_it_is(tmp_pat
         ), "placed where the step it measured was done"
 
 
-def test_a_dataset_with_nothing_held_back_trains_without_validating(tmp_path, capsys):
+def test_a_dataset_with_nothing_held_back_trains_without_validating(tmp_path, caplog):
     """An unsplit dataset is still trainable; it just cannot be measured."""
     dataset(tmp_path / "data", name="unsplit", validation_fraction=0.0)
     config = load_experiment(experiment(tmp_path / "tiny.toml", dataset_name="unsplit"))
@@ -198,7 +200,8 @@ def test_a_dataset_with_nothing_held_back_trains_without_validating(tmp_path, ca
     reader = open_run(tmp_path / "runs", "tiny")
     assert all(line["split"] == "train" for line in reader.metrics())
     assert reader.status.status == RunStatus.FINISHED
-    assert "no validation positions" in capsys.readouterr().out
+    warned = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert [record for record in warned if "no validation positions" in record.message]
 
 
 def test_checkpoints_are_saved_on_schedule_and_at_the_end(tmp_path, data_dir):
@@ -228,7 +231,7 @@ def test_retention_keeps_the_checkpoints_a_ladder_is_due_on_until_it_is_played(t
         data_dir=data_dir,
         runs_dir=tmp_path / "runs",
         config_text="",
-        say=lambda line: None,
+        say=unheard,
         ladder_every=2,
     )
 
@@ -620,7 +623,7 @@ def test_a_schedule_that_needs_no_extra_validation_says_nothing(tmp_path, data_d
     assert not [line for line in lines if "extra validation" in line], lines
 
 
-def test_a_dataset_with_no_validation_split_is_not_told_about_extra_passes(tmp_path):
+def test_a_dataset_with_no_validation_split_is_not_told_about_extra_passes(tmp_path, caplog):
     """The note exists to make a real cost visible; a run that never validates pays none.
 
     `_summary` runs before the loop and sees only the two schedules, while whether validation
@@ -639,7 +642,7 @@ def test_a_dataset_with_no_validation_split_is_not_told_about_extra_passes(tmp_p
     )
 
     assert not [line for line in lines if "extra validation" in line], lines
-    assert [line for line in lines if "no validation positions" in line], "and it says why"
+    assert "no validation positions" in caplog.text, "and it says why, as a warning"
 
 
 def test_a_null_best_metric_does_not_traceback_after_the_run_finished(
@@ -906,7 +909,7 @@ def signal_after(monkeypatch, steps: int, number: int = signal.SIGTERM) -> None:
     after_steps(monkeypatch, steps, lambda: os.kill(os.getpid(), number))
 
 
-def resumed(tmp_path, data_dir, name: str, say=lambda line: None):
+def resumed(tmp_path, data_dir, name: str, say=unheard):
     resume(name, data_dir=data_dir, runs_dir=tmp_path / "runs", say=say)
     return open_run(tmp_path / "runs", name)
 
@@ -941,7 +944,7 @@ def test_a_stop_signal_saves_a_checkpoint_and_says_the_run_stopped(
 
     with pytest.raises(TrainingStopped) as stopped:
         train(
-            config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=said.append
+            config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=heard(said)
         )
 
     assert (stopped.value.step, stopped.value.signal) == (5, number)
@@ -1180,7 +1183,7 @@ def test_a_validation_line_says_how_long_the_run_has_been_going_and_has_left(
     said: list[str] = []
     config = load_experiment(experiment(tmp_path / "tiny.toml", **RESUMABLE))
 
-    train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=said.append)
+    train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=heard(said))
 
     # Validated at 4, at 8 and at the end, 1000 seconds a step and nothing else costing any.
     assert timings(said) == [
@@ -1202,7 +1205,7 @@ def test_a_resumed_run_times_itself_from_the_resume(tmp_path, data_dir, monkeypa
     clock["now"] = clock_after_the_break
     said: list[str] = []
 
-    halves = resumed(tmp_path, data_dir, "halves", say=said.append)
+    halves = resumed(tmp_path, data_dir, "halves", say=heard(said))
 
     # From step 1 at 3000 seconds a step: 7 steps by step 8, and one left. Step 4 is too few
     # steps in to estimate from.
@@ -1238,7 +1241,7 @@ def test_a_resume_just_before_a_validation_gives_no_estimate_from_one_step(
     monkeypatch.setattr(trainer, "_validate", slow_validate)
     said: list[str] = []
 
-    resumed(tmp_path, data_dir, "halves", say=said.append)
+    resumed(tmp_path, data_dir, "halves", say=heard(said))
 
     # From step 3: step 4 is one step in. Step 8 is five, two validations among them.
     assert timings(said) == [
@@ -1312,9 +1315,10 @@ def test_a_resumed_run_says_where_it_carries_on_from(tmp_path, data_dir, monkeyp
     monkeypatch.setattr(trainer, "_step", REAL_STEP)
     said: list[str] = []
 
-    resumed(tmp_path, data_dir, "tiny", say=said.append)
+    resumed(tmp_path, data_dir, "tiny", say=heard(said))
 
-    assert said[0] == "chess-ai: run tiny, seed 7, resuming at step 5", said
+    summary = [line for line in said if line.startswith("chess-ai: run tiny,")]
+    assert summary[0] == "chess-ai: run tiny, seed 7, resuming at step 5", said
     assert not [line for line in said if "predates" in line], said
 
 
@@ -1522,7 +1526,7 @@ def test_a_checkpoint_from_before_the_random_state_was_saved_still_resumes(
     checkpoints.save(payload, path)
     said: list[str] = []
 
-    reader = resumed(tmp_path, data_dir, "tiny", say=said.append)
+    reader = resumed(tmp_path, data_dir, "tiny", say=heard(said))
 
     assert reader.status.status == RunStatus.FINISHED
     assert [line for line in said if "predates saving the random state" in line], said
@@ -1565,7 +1569,7 @@ def test_a_fine_tuning_run_records_where_its_weights_came_from(tmp_path, data_di
         experiment(tmp_path / "tuned.toml", initialize_from='run = "pretrained"\ncheckpoint = 3')
     )
 
-    train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=said.append)
+    train(config, data_dir=data_dir, runs_dir=tmp_path / "runs", config_text="", say=heard(said))
 
     tuned = open_run(tmp_path / "runs", "tuned")
     assert tuned.info.initialized_from.model_dump() == {

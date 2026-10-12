@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import atexit
 import dataclasses
+import logging
 import math
 import os
 import secrets
@@ -15,6 +16,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
 from chess_ai.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_FILE, Config, ConfigError, load_config
+from chess_ai.output import (
+    DETAIL,
+    LOUDEST,
+    QUIETEST,
+    RESULT,
+    Timestamps,
+    configure,
+    say,
+)
 
 if TYPE_CHECKING:
     # Only named in annotations: importing them for real would bring in what they import
@@ -23,6 +33,8 @@ if TYPE_CHECKING:
     from chess_ai.players import Player, SelectionStrategy
     from chess_ai.training.run_store import CheckpointChoice, CheckpointInfo, RunReader
 
+LOGGER = logging.getLogger(__name__)
+
 AUTO = "auto"
 """What ``--rating-source`` is when each game's own headers should say."""
 
@@ -30,11 +42,16 @@ AUTO = "auto"
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    configure(
+        verbosity=_verbosity(args),
+        timestamps=args.timestamps,
+        query=getattr(args, "query", False),
+    )
     try:
         config = load_config(args.config)
         return args.handler(config, args)
     except (ConfigError, _UserError) as e:
-        _say(f"{parser.prog}: error: {e}", err=True)
+        LOGGER.error("%s", e)
         parser.exit(2)
         raise  # parser.exit has already left; this is only here to say so.
 
@@ -43,37 +60,24 @@ class _UserError(Exception):
     """Something the person running the command can fix, reported without a traceback."""
 
 
-def _say(text: str, *, err: bool = False) -> None:
-    """Print ``text``, or stop trying to, if there is nobody left to print it to.
-
-    Every stream this command writes to can go away while it is running, and they go together: a
-    closed terminal, a dropped ssh session, a pipe into ``head``. None of that is worth turning a
-    finished build into a traceback, and on the way out of a failed one it must not take the place
-    of the reason it failed. The exit status says what happened whether or not anyone hears it —
-    which takes :func:`_drain_streams` as well, because what a failed write leaves behind is as
-    costly as the write itself.
-    """
-    with suppress(OSError):
-        print(text, file=sys.stderr if err else sys.stdout, flush=True)
-
-
 def _drain_streams() -> None:
     """Leave the standard streams in a state the interpreter can shut down quietly.
 
     What a failed write left in a stream's buffer is flushed once more by the interpreter on its
     way out, where the failure is reported as ``Exception ignored in: <_io.TextIOWrapper ...>``
     and replaces the process's exit status with **120** — see :func:`_silence`. A finished build
-    answering 120 because its reader had gone is the one thing :func:`_say`'s promise cannot
-    afford, and 120 is the one status that tells the cron job reading it nothing at all.
+    answering 120 because its reader had gone is the one thing :func:`~chess_ai.output.say`'s
+    promise cannot afford, and 120 is the one status that tells the cron job reading it nothing
+    at all.
 
     Registered with :mod:`atexit` rather than done on the way out of :func:`main`, for two
     reasons. It has to run after everything that writes, and not everything does so through
-    :func:`_say`: the progress line comes from :class:`~chess_ai.dataset.ProgressPrinter`, the
-    usage from :mod:`argparse`, and the traceback for an exception that escapes ``main`` from the
-    interpreter itself — that last one printed after any ``finally`` here has already had its
-    turn. And :func:`main` is an ordinary function that a test or another program calls in the
-    same process, where :func:`_silence` would outlive the call; at the interpreter's own exit
-    there is nothing left for it to take with it.
+    :func:`~chess_ai.output.say`: the progress line comes from
+    :class:`~chess_ai.dataset.ProgressPrinter`, the usage from :mod:`argparse`, and the traceback
+    for an exception that escapes ``main`` from the interpreter itself — that last one printed
+    after any ``finally`` here has already had its turn. And :func:`main` is an ordinary function
+    that a test or another program calls in the same process, where :func:`_silence` would
+    outlive the call; at the interpreter's own exit there is nothing left for it to take with it.
     """
     for stream in (sys.stdout, sys.stderr):
         if stream is None:
@@ -132,6 +136,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"configuration file (default: ${CONFIG_PATH_ENV}, else ./{DEFAULT_CONFIG_FILE} "
         "if it exists)",
     )
+    _add_output_options(parser)
     commands = parser.add_subparsers(title="commands", required=True, metavar="COMMAND")
 
     serve = commands.add_parser("serve", help="serve the web app")
@@ -143,7 +148,60 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_match_command(commands)
     _add_ladder_command(commands)
     _add_evaluation_commands(commands)
+    for command in _commands(parser):
+        _add_output_options(command, after=True)
     return parser
+
+
+def _add_output_options(parser: argparse.ArgumentParser, *, after: bool = False) -> None:
+    """``-v``, ``-q`` and ``--timestamps``, which go before the command or after it alike.
+
+    Given after it, they land in a namespace of the command's own, which argparse copies over the
+    one before: so they are counted under names of their own and added up by :func:`_verbosity`,
+    and say nothing at all unless given, which is what keeps them from undoing the ones before.
+    """
+    group = parser.add_argument_group("output")
+    group.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        dest="later_verbose" if after else "verbose",
+        default=argparse.SUPPRESS if after else 0,
+        help="also log info records, and debug records given twice",
+    )
+    group.add_argument(
+        "-q",
+        "--quiet",
+        action="count",
+        dest="later_quiet" if after else "quiet",
+        default=argparse.SUPPRESS if after else 0,
+        help="leave out the step-by-step lines; given twice, everything but the results and errors",
+    )
+    group.add_argument(
+        "--timestamps",
+        type=Timestamps,
+        choices=list(Timestamps),
+        default=argparse.SUPPRESS if after else Timestamps.AUTO,
+        help="start each line with the time it was written (default: auto, which is everywhere "
+        "but the systemd journal and the commands that only list or show something)",
+    )
+
+
+def _commands(parser: argparse.ArgumentParser) -> list[argparse.ArgumentParser]:
+    """Every command ``parser`` runs, at the end of however many levels of subcommands."""
+    found = []
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for command in dict.fromkeys(action.choices.values()):
+                found.extend(_commands(command) or [command])
+    return found
+
+
+def _verbosity(args: argparse.Namespace) -> int:
+    """``-v`` counted up and ``-q`` counted down, wherever on the command line they were."""
+    louder = args.verbose + getattr(args, "later_verbose", 0)
+    quieter = args.quiet + getattr(args, "later_quiet", 0)
+    return max(QUIETEST, min(LOUDEST, louder - quieter))
 
 
 def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
@@ -331,7 +389,7 @@ def _add_dataset_commands(commands: argparse._SubParsersAction) -> None:
         metavar="N",
         help="summarise the dataset as it was at version N (default: the latest)",
     )
-    stats.set_defaults(handler=_dataset_stats)
+    stats.set_defaults(handler=_dataset_stats, query=True)
 
     download = actions.add_parser(
         "download",
@@ -406,7 +464,7 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
         help="include the runs tagged archived, which are otherwise left out unless "
         "--tag archived asks for them",
     )
-    listing.set_defaults(handler=_list_runs)
+    listing.set_defaults(handler=_list_runs, query=True)
 
     annotate = actions.add_parser(
         "annotate",
@@ -437,7 +495,7 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
         metavar="PATH",
         help="replace the notes with what this file says; - reads them from standard input",
     )
-    annotate.set_defaults(handler=_annotate_run)
+    annotate.set_defaults(handler=_annotate_run, query=True)
 
 
 _PLAYER_HELP = """\
@@ -676,7 +734,7 @@ def _match(config: Config, args: argparse.Namespace) -> int:
         except OSError as e:
             raise _UserError(f"could not save game {game.number} to {path}: {e.strerror}") from e
         played.append(game)
-        _say(game_line(game, names, number=game.number, games=args.games))
+        say(game_line(game, names, number=game.number, games=args.games), kind=DETAIL)
 
     async def play() -> None:
         from chess_ai.match import play_match
@@ -705,18 +763,17 @@ def _match(config: Config, args: argparse.Namespace) -> int:
                     made[index] = await _stockfish_player(side, config)
             (first, first_label), (second, second_label) = made[0], made[1]
             names.extend(_side_names((first_label, args.first), (second_label, args.second)))
-            _say(
+            say(
                 f"chess-ai: {names[0]} against {names[1]}, {args.games} games from opening set "
                 f"{openings.label}, seed {seed}"
             )
             if args.games > distinct_games(openings):
-                _say(
-                    f"chess-ai: warning: opening set {openings.label} has "
+                LOGGER.warning(
+                    f"opening set {openings.label} has "
                     f"{_count(len(openings.openings), 'line')}, so from game "
                     f"{distinct_games(openings) + 1} "
                     "on the games start as earlier ones did, and players that always play their "
-                    "most likely move will repeat them",
-                    err=True,
+                    "most likely move will repeat them"
                 )
             try:
                 await play_match(
@@ -737,12 +794,16 @@ def _match(config: Config, args: argparse.Namespace) -> int:
     try:
         asyncio.run(play())
     except KeyboardInterrupt:
-        _say(f"chess-ai: interrupted after {len(played)} of {args.games} games", err=True)
+        say(
+            f"chess-ai: interrupted after {len(played)} of {args.games} games",
+            err=True,
+            kind=RESULT,
+        )
         return 130
     finally:
         if played:
-            _say(_match_summary(played, names))
-            _say(f"chess-ai: games saved in {path}")
+            say(_match_summary(played, names), kind=RESULT)
+            say(f"chess-ai: games saved in {path}", kind=RESULT)
     return 0
 
 
@@ -1048,7 +1109,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         line = game_line(
             game, [label, f"Stockfish {stockfish.elo}"], number=game.number, games=games
         )
-        _say(f"{played}/{total} {line}")
+        say(f"{played}/{total} {line}", kind=DETAIL)
 
     def games_note() -> str:
         """Where the games played so far are, for a ladder that stopped before its end.
@@ -1070,26 +1131,24 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         except StockfishError as e:
             raise _LevelNotStarted(level, e) from e
         if stockfish.stockfish.clamped:
-            _say(
-                f"chess-ai: warning: Stockfish plays from {stockfish.stockfish.min_elo} to "
+            LOGGER.warning(
+                f"Stockfish plays from {stockfish.stockfish.min_elo} to "
                 f"{stockfish.stockfish.max_elo}, so level {level} is played at "
-                f"{stockfish.stockfish.elo}",
-                err=True,
+                f"{stockfish.stockfish.elo}"
             )
         return stockfish
 
-    _say(
+    say(
         f"chess-ai: {label} at rating {rating} against Stockfish at "
         f"{', '.join(str(level) for level in levels)}, {_count(games, 'game')} each at "
         f"{move_time:g} s a move, from opening set {openings.label}"
     )
     if games > distinct_games(openings):
-        _say(
-            f"chess-ai: warning: opening set {openings.label} has "
+        LOGGER.warning(
+            f"opening set {openings.label} has "
             f"{_count(len(openings.openings), 'line')}, so from game "
             f"{distinct_games(openings) + 1} of each level on the games start as earlier ones "
-            "did, and the checkpoint, which plays its most likely move, will repeat them",
-            err=True,
+            "did, and the checkpoint, which plays its most likely move, will repeat them"
         )
     started = datetime.now(UTC)
     try:
@@ -1099,10 +1158,11 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
             )
         )
     except KeyboardInterrupt:
-        _say(
+        say(
             f"chess-ai: interrupted after {played} of {total} games, so no result was saved"
             f"{games_note()}",
             err=True,
+            kind=RESULT,
         )
         return 130
     except _LevelNotStarted as e:
@@ -1126,19 +1186,21 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
     )
     for level in result.levels:
         fraction = level.points / level.games
-        _say(
+        say(
             f"Stockfish {level.elo}: {level.points:g}/{level.games} = {100 * fraction:.1f}% "
-            f"(+{level.wins} ={level.draws} -{level.losses})"
+            f"(+{level.wins} ={level.draws} -{level.losses})",
+            kind=RESULT,
         )
-    _say(
+    say(
         f"Elo: {result.estimate.describe()}, a {100 * result.estimate.confidence:g}% range, "
-        f"on Stockfish's scale at {move_time:g} s a move"
+        f"on Stockfish's scale at {move_time:g} s a move",
+        kind=RESULT,
     )
     try:
         save_ladder(run, result, partial)
     except RunError as e:
         raise _UserError(f"{e}, so no result was saved{games_note()}") from e
-    _say(f"chess-ai: result saved in {result_path(run, chosen.step)}")
+    say(f"chess-ai: result saved in {result_path(run, chosen.step)}", kind=RESULT)
     return 0
 
 
@@ -1153,7 +1215,7 @@ def _list_runs(config: Config, args: argparse.Namespace) -> int:
         except RunError as e:
             # Listed all the same, as the web list does: a run is still a run without its
             # notes. Only a filter by tag has to leave it out, since its tags cannot be known.
-            _say(f"chess-ai: warning: {e}", err=True)
+            LOGGER.warning("%s", e)
             notes = RunNotes()
         if not listed(notes.tags, wanted=args.tag, archived=args.archived):
             # Counted, so that a list emptied by archiving does not read as if the runs had gone.
@@ -1167,12 +1229,12 @@ def _list_runs(config: Config, args: argparse.Namespace) -> int:
         state = beat.status.value if beat is not None else "starting"
         tags = f" [{', '.join(notes.tags)}]" if notes.tags else ""
         title = f"  {notes.title}" if notes.title else ""
-        _say(f"{name}  {state}{tags}{title}")
+        say(f"{name}  {state}{tags}{title}", kind=RESULT)
         shown += 1
     if shown == 0:
         wanted = f" tagged {', '.join(args.tag)}" if args.tag else ""
         hidden = f" ({archived} archived; --archived shows them)" if archived else ""
-        _say(f"chess-ai: no runs{wanted} in {config.paths.runs}{hidden}", err=True)
+        say(f"chess-ai: no runs{wanted} in {config.paths.runs}{hidden}", err=True, kind=RESULT)
     return 0
 
 
@@ -1209,10 +1271,10 @@ def _annotate_run(config: Config, args: argparse.Namespace) -> int:
             notes = save_notes(run, edited)
         except RunError as e:
             raise _UserError(e) from e
-    _say(f"run: {run.name}")
-    _say(f"title: {notes.title or '–'}")
-    _say(f"tags: {', '.join(notes.tags) or '–'}")
-    _say("notes:" + (f"\n{notes.notes.rstrip()}" if notes.notes.strip() else " –"))
+    say(f"run: {run.name}", kind=RESULT)
+    say(f"title: {notes.title or '–'}", kind=RESULT)
+    say(f"tags: {', '.join(notes.tags) or '–'}", kind=RESULT)
+    say("notes:" + (f"\n{notes.notes.rstrip()}" if notes.notes.strip() else " –"), kind=RESULT)
     return 0
 
 
@@ -1245,7 +1307,7 @@ def _train(config: Config, args: argparse.Namespace) -> int:
             runs_dir=config.paths.runs,
             config_text=config_text,
             overwrite=args.overwrite,
-            say=_say,
+            say=say,
             ladder_every=config.ladder.every,
         ),
     )
@@ -1260,7 +1322,7 @@ def _resume(config: Config, args: argparse.Namespace) -> int:
             args.name,
             data_dir=config.paths.data,
             runs_dir=config.paths.runs,
-            say=_say,
+            say=say,
             ladder_every=config.ladder.every,
         ),
     )
@@ -1281,16 +1343,17 @@ def _training(name: str, run: Callable[[], object]) -> int:
         # well so that a path it does not cover cannot become a traceback either.
         raise _UserError(e) from e
     except TrainingStopped as e:
-        _say(
+        say(
             f"chess-ai: {e}; 'chess-ai resume {name}' carries on from there",
             err=True,
+            kind=RESULT,
         )
         return 128 + e.signal
     except KeyboardInterrupt:
         # Not an error: ctrl-c twice, or once before the run had started. No hint about
         # resuming, since in the second case there may be no run to resume; a run that had
         # started has already said it stopped.
-        _say("chess-ai: interrupted", err=True)
+        say("chess-ai: interrupted", err=True, kind=RESULT)
         return 130
     except OSError as e:
         raise _UserError(f"could not finish the run: {e.strerror or e}") from e
@@ -1303,8 +1366,11 @@ def _serve(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.web import create_app
 
     server = config.server
-    _say(f"chess-ai: serving on http://{server.host}:{server.port}{server.path_prefix}/")
-    uvicorn.run(create_app(config), host=server.host, port=server.port)
+    say(f"chess-ai: serving on http://{server.host}:{server.port}{server.path_prefix}/")
+    # Uvicorn's records through the one handler every command logs through, rather than its own:
+    # stamped and prefixed as the rest are, and its start-up lines and access log, a line for
+    # every request, only with --verbose.
+    uvicorn.run(create_app(config), host=server.host, port=server.port, log_config=None)
     return 0
 
 
@@ -1533,7 +1599,7 @@ def _report_built(config: Config, manifest) -> int:
         if latest.version > 1
         else f"{manifest.games:,} games, {manifest.positions:,} positions, "
     )
-    _say(
+    say(
         f"chess-ai: dataset {manifest.name} in {dataset_path(config.paths.data, manifest.name)}: "
         + added
         + (
@@ -1546,15 +1612,15 @@ def _report_built(config: Config, manifest) -> int:
         + (" (stopped at --max-games)" if latest.reached_max_games else "")
         # A source that could not be read leaves the dataset short of its games, which is not
         # something to leave to whoever thinks to run "dataset stats" afterwards.
-        + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else "")
+        + (f"; {len(unread)} source(s) not read whole: {', '.join(unread)}" if unread else ""),
+        kind=RESULT,
     )
     if lost:
         # Built, and not the dataset that was asked for. Said on its own line and answered for in
         # the exit status, because a build in a cron job is read by a script before a person.
-        _say(
-            f"chess-ai: warning: dataset {manifest.name} is missing games from "
-            f"{len(lost)} source(s) that could not be read whole: {', '.join(lost)}",
-            err=True,
+        LOGGER.warning(
+            f"dataset {manifest.name} is missing games from "
+            f"{len(lost)} source(s) that could not be read whole: {', '.join(lost)}"
         )
         return 1
     return 0
@@ -1587,7 +1653,7 @@ def _download_dumps(config: Config, args: argparse.Namespace) -> int:
     finally:
         printer.finish()
     for path in paths:
-        _say(f"chess-ai: {path}")
+        say(f"chess-ai: {path}", kind=RESULT)
     return 0
 
 
@@ -1598,7 +1664,7 @@ def _dataset_stats(config: Config, args: argparse.Namespace) -> int:
         dataset = open_dataset(args.name, data_dir=config.paths.data, version=args.version)
     except (DatasetError, ManifestError) as e:
         raise _UserError(_with_available(e, config.paths.data)) from e
-    _say(summarize(dataset.manifest).rstrip("\n"))
+    say(summarize(dataset.manifest).rstrip("\n"), kind=RESULT)
     return 0
 
 
@@ -1776,7 +1842,7 @@ def _evaluation_suites(
             load=load,
             release=release,
             live=live,
-            say=_say,
+            say=say,
         )
     return suites
 
@@ -1835,16 +1901,12 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
                 raise
             # Said once, rather than as a failure for every checkpoint, which keep waiting for
             # their results until an evaluator that can run the suite is started.
-            _say(
-                f"chess-ai: warning: {e}; no {what} played until the evaluator is restarted",
-                err=True,
-            )
+            LOGGER.warning(f"{e}; no {what} played until the evaluator is restarted")
     evaluator = Evaluator(
         runs,
         suites,
         load=_evaluation_loader(config),
-        say=_say,
-        warn=lambda text: _say(f"chess-ai: warning: {text}", err=True),
+        say=say,
     )
     stop = threading.Event()
     stopped_by: list[int] = []
@@ -1879,17 +1941,18 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
                     except Stopped as e:
                         # Not the end of a pass: a script that goes on from here would take
                         # every checkpoint to have its results, so the status says it stopped.
-                        _say(
+                        say(
                             "chess-ai: evaluator stopped before every checkpoint was evaluated: "
                             f"{e.left} {'is' if e.left == 1 else 'are'} left",
                             err=True,
+                            kind=RESULT,
                         )
                         return 128 + stopped_by[0]
                     if not done:
-                        _say("chess-ai: every checkpoint has its results already")
+                        say("chess-ai: every checkpoint has its results already", kind=RESULT)
                     return 0
                 else:
-                    _say(
+                    say(
                         f"chess-ai: evaluating the checkpoints of the runs in {runs} as they are "
                         f"saved, on the {config.evaluator.device} device, looking every "
                         f"{config.evaluator.poll_seconds:g} s; ctrl-c to stop"
@@ -1903,9 +1966,9 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
     except OSError as e:
         raise _UserError(f"cannot lock {runs}: {e.strerror or e}") from e
     except KeyboardInterrupt:
-        _say("chess-ai: interrupted", err=True)
+        say("chess-ai: interrupted", err=True, kind=RESULT)
         return 130
-    _say("chess-ai: evaluator stopped", err=True)
+    say("chess-ai: evaluator stopped", err=True, kind=RESULT)
     return 0
 
 
@@ -1954,7 +2017,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     each for each in suites if not available[each].wants(run, checkpoint)
                 ]:
                     suites.remove(suite)
-                    _say(f"{label} {suite}: skipped, as the evaluator would; name it to run it")
+                    say(f"{label} {suite}: skipped, as the evaluator would; name it to run it")
                 if not suites:
                     continue
             try:
@@ -1969,9 +2032,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                 # deletes its older checkpoints while the newer ones are evaluated.
                 if not one_of_all:
                     raise _UserError(f"{label} was pruned before it could be evaluated")
-                _say(
-                    f"chess-ai: warning: {label} was pruned before it could be evaluated", err=True
-                )
+                LOGGER.warning(f"{label} was pruned before it could be evaluated")
                 continue
             for suite in suites:
                 try:
@@ -1982,7 +2043,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     # result to show for it, and a script has to be able to tell.
                     if not one_of_all:
                         raise _UserError(why) from e
-                    _say(f"chess-ai: warning: {why}", err=True)
+                    LOGGER.warning("%s", why)
                     break
                 except DivergedError as e:
                     why = f"{label} {suite}: {e}"
@@ -1990,7 +2051,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     # evaluated all the same; the exit status still says this one was not.
                     if not one_of_all:
                         raise _UserError(why) from e
-                    _say(f"chess-ai: warning: {why}", err=True)
+                    LOGGER.warning("%s", why)
                     failed.add(label)
                     continue
                 except RunError as e:
@@ -2000,15 +2061,15 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     raise _UserError(f"{label} {suite}: {e}") from e
                 except (TimeoutError, chess.engine.EngineError) as e:
                     raise _UserError(f"{label} {suite}: {_engine_failure(e)}") from e
-                _say(f"{label} {suite}: {said}")
+                say(f"{label} {suite}: {said}", kind=RESULT)
             # Done with the checkpoint, as the evaluator is after a job.
             for suite in suites:
                 try:
                     available[suite].after(run)
                 except Exception as e:
-                    _say(f"chess-ai: warning: {label} {suite}: {e}", err=True)
+                    LOGGER.warning("%s %s: %s", label, suite, e)
     except KeyboardInterrupt:
-        _say("chess-ai: interrupted", err=True)
+        say("chess-ai: interrupted", err=True, kind=RESULT)
         return 130
     if failed:
         raise _UserError(f"{_count(len(failed), 'checkpoint')} could not be evaluated")
