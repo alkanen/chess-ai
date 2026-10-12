@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CheckpointSummary, RunSummary } from './api';
+import type { CheckpointSummary, LadderPoint, RunSummary } from './api';
 import { NewGameForm } from './NewGameForm';
+import { ladderPoint } from './test/ladder';
 
 const HUMAN = { kind: 'human' };
 const RANDOM = { kind: 'random' };
@@ -37,6 +38,11 @@ const CHECKPOINTS: Record<string, CheckpointSummary[]> = {
   ],
 };
 
+/** The ladders of each run's checkpoints: only the best of the baseline has been laddered. */
+const LADDERS: Record<string, LadderPoint[]> = {
+  'mlp-baseline': [ladderPoint(6000)],
+};
+
 /** A server with `runs` on it, answering each request with a body of its own. */
 function serving(runs: RunSummary[] = RUNS) {
   return vi.fn((url: string) => {
@@ -52,6 +58,10 @@ function serving(runs: RunSummary[] = RUNS) {
     if (asked !== null) {
       const run = decodeURIComponent(asked[1]);
       return Promise.resolve(Response.json({ run, checkpoints: CHECKPOINTS[run] ?? [] }));
+    }
+    const laddered = /\/api\/runs\/([^/]+)\/evaluations\/stockfish-ladder$/.exec(url);
+    if (laddered !== null) {
+      return Promise.resolve(Response.json(LADDERS[decodeURIComponent(laddered[1])] ?? []));
     }
     return Promise.resolve(Response.json({}));
   });
@@ -299,6 +309,65 @@ describe('NewGameForm', () => {
       fireEvent.change(checkpoint, { target: { value: '6000' } });
 
       expect(await start(fetch)).toMatchObject({ white: { checkpoint: 6000 } });
+    });
+
+    it('says how strong the chosen checkpoint played on the Stockfish ladder', async () => {
+      render(<NewGameForm />);
+
+      await chooseModel('White');
+
+      // Best is step 6000, which has a ladder of its own.
+      expect(
+        await screen.findByText(
+          /^Step 6000 played about as well as Stockfish set to 1420 \(likely 1360 to 1481\) at 0\.1 s a move on the Stockfish ladder, asked to play like a player rated 2000\. That is Stockfish’s own scale, not a Lichess rating\./,
+        ),
+      ).toBeInTheDocument();
+      expect(screen.getByText(/You have asked for no rating/)).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '2000' } });
+      expect(screen.queryByText(/may play differently/)).not.toBeInTheDocument();
+    });
+
+    it('says a checkpoint has no ladder, and names the nearest one it shows instead', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+      await screen.findByText(/^Step 6000 played/);
+
+      fireEvent.change(screen.getByLabelText('White checkpoint'), { target: { value: 'latest' } });
+
+      expect(
+        screen.getByText(
+          /^Step 12000 has not been on the Stockfish ladder\. The nearest that has, step 6000, played about as well as Stockfish set to 1420/,
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('says plainly when no checkpoint of the run has been on the ladder', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      fireEvent.change(screen.getByLabelText('White run'), { target: { value: 'mlp-wider' } });
+
+      expect(
+        await screen.findByText(
+          'Step 400 has not been on the Stockfish ladder, nor has any other checkpoint of this run.',
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Stockfish set to/)).not.toBeInTheDocument();
+    });
+
+    it('says nothing of strength when the ladders cannot be listed, and plays all the same', async () => {
+      const answering = serving();
+      fetch.mockImplementation((url: string) =>
+        url.endsWith('/evaluations/stockfish-ladder')
+          ? Promise.resolve(new Response('', { status: 500 }))
+          : answering(url),
+      );
+      render(<NewGameForm />);
+      await chooseModel('White');
+      await screen.findByRole('option', { name: 'Step 6000 (best)' });
+
+      expect(screen.queryByText(/Stockfish ladder/)).not.toBeInTheDocument();
+      expect(await start(fetch)).toMatchObject({ white: { run: 'mlp-baseline' } });
     });
 
     it('asks for another run’s checkpoints and goes back to its best one', async () => {

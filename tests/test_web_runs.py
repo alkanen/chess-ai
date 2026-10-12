@@ -927,7 +927,8 @@ def test_a_checkpoints_ladder_is_shown_and_its_games_replayed(client, runs):
 
 
 def test_a_runs_ladders_are_listed_by_step_to_chart(client, runs):
-    run = RunReader(model_run(runs, "tiny", steps=(2, 4, 6)))
+    # Step 8 has never been laddered, so it is not among them: the picker says it has none.
+    run = RunReader(model_run(runs, "tiny", steps=(2, 4, 6, 8)))
     laddered(run, 4)
     laddered(run, 2, levels=(1350,))
     # One that cannot be read costs the chart that point alone.

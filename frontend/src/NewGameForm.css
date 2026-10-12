@@ -26,6 +26,11 @@
   opacity: 0.75;
 }
 
+/* A few sentences rather than a line, which the narrow width above would stack into a column. */
+.new-game .note.strength {
+  max-width: 30rem;
+}
+
 /* A colour's settings sit under the colour they belong to, indented enough to group them. */
 .new-game .player {
   display: flex;
