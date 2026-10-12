@@ -1129,8 +1129,10 @@ def test_match_plays_two_checkpoints_and_prints_the_score_from_both_sides(tmp_pa
     out = capsys.readouterr().out
     assert status == 0
     assert "tiny step 2 against tiny step 4, 2 games from opening set standard v1" in out
-    assert "game 1/2, Ruy Lopez: tiny step 2 – tiny step 4" in out
-    assert "game 2/2, Ruy Lopez: tiny step 4 – tiny step 2" in out
+    header = "chess-ai: games 1–2 of 2: model 1 (tiny step 2) against model 2 (tiny step 4)\n"
+    assert header in out
+    assert "\ngame 1/2 starting, Ruy Lopez: model 1 – model 2\ngame 1/2, Ruy Lopez: model 1" in out
+    assert "game 2/2, Ruy Lopez: model 2 – model 1" in out
     assert "\ntiny step 2: " in out and "\ntiny step 4: " in out
     assert "as white" in out and "as black" in out
     assert f"games saved in {tmp_path / 'games'}" in out
@@ -1649,7 +1651,13 @@ def test_ladder_plays_each_level_and_saves_the_result_and_games_in_the_run(tmp_p
     out = capsys.readouterr().out
     assert status == 0
     assert "tiny step 4 at rating 2000 against Stockfish at 1350, 1500, 2 games each" in out
-    assert "4/4 game 2/2" in out
+    lines = out.splitlines()
+    header = "chess-ai: tiny step 4 ladder games {} of 4: model against Stockfish {}"
+    first = lines.index(header.format("1–2", 1350))
+    second = lines.index(header.format("3–4", 1500))
+    assert lines[first + 1].startswith("game 1/4 starting, ")
+    assert lines[second - 1].startswith("game 2/4, ")
+    assert lines[second + 4].startswith("game 4/4, ") and lines[second + 4].endswith(" moves)")
     assert "\nElo: " in out
     evaluations = tmp_path / "runs/tiny/evaluations/step-000000004"
     assert sorted(path.name for path in evaluations.iterdir()) == [

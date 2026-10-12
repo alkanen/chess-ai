@@ -37,8 +37,10 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from chess_ai.config import SampleGamesConfig
 from chess_ai.evaluator import until_stopped
 from chess_ai.game_session import GameSession, GameState
-from chess_ai.match import MatchGame, append_game, play_match
+from chess_ai.match import GameLines, MatchGame, append_game, play_match
 from chess_ai.openings import OpeningSet
+from chess_ai.output import Say
+from chess_ai.output import say as said_on_stdout
 from chess_ai.players import (
     ModelDescription,
     Player,
@@ -303,7 +305,8 @@ class SampleGamesSuite:
     ``stockfish`` starts the Stockfish opponent; it is only called for a config that asks for
     games against it. ``live`` is the runs directory to show
     the game being played in, or ``None`` to show nothing, as a one-off evaluation does: only
-    the evaluator, of which there is one, may write the one file there is.
+    the evaluator, of which there is one, may write the one file there is. ``say`` is handed a
+    line as each game starts and ends, since a checkpoint's games can take an hour.
     """
 
     name = SUITE
@@ -315,6 +318,7 @@ class SampleGamesSuite:
         *,
         stockfish: StockfishStarter | None = None,
         live: Path | None = None,
+        say: Say = said_on_stdout,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if settings.stockfish_games and stockfish is None:
@@ -323,6 +327,7 @@ class SampleGamesSuite:
         self.openings = openings
         self._stockfish = stockfish
         self._live = live
+        self._say = say
         self._clock = clock
 
     def wants(self, run: RunReader, checkpoint: CheckpointInfo) -> bool:
@@ -367,6 +372,12 @@ class SampleGamesSuite:
             engine, run=run.name, checkpoint=checkpoint.step, rating=settings.rating
         )
         total = settings.games + settings.stockfish_games
+        lines = GameLines(
+            self._say,
+            f"{run.name}@{checkpoint.step} sample games",
+            total=total,
+            openings=self.openings,
+        )
         stockfish: Player | None = None
         partial: Path | None = None
         listed: list[SampleGame] = []
@@ -386,11 +397,13 @@ class SampleGamesSuite:
                 def keep(game: MatchGame) -> None:
                     append_game(games_file, game)
                     listed.append(_listed(len(listed), opponent, game))
+                    lines.ended(game)
 
                 return keep
 
             def watch(opponent: Opponent, before: int) -> Callable[[int, GameSession], None]:
                 def follow(number: int, session: GameSession) -> None:
+                    lines.starting(number)
                     if self._live is None:
                         return
                     index = before + number - 1
@@ -404,6 +417,7 @@ class SampleGamesSuite:
                 return follow
 
             if settings.games:
+                lines.match(["model", "model"], games=settings.games, paired=False)
                 await play_match(
                     model,
                     model,
@@ -415,7 +429,11 @@ class SampleGamesSuite:
                     paired=False,
                     move_delay=settings.move_delay,
                 )
-            if stockfish is not None:
+            if isinstance(stockfish, StockfishBackedPlayer):
+                lines.match(
+                    ["model", f"Stockfish {stockfish.stockfish.elo}"],
+                    games=settings.stockfish_games,
+                )
                 await play_match(
                     model,
                     stockfish,

@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any, TextIO
 
 from chess_ai.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_FILE, Config, ConfigError, load_config
 from chess_ai.output import (
-    DETAIL,
     LOUDEST,
     QUIETEST,
     RESULT,
@@ -29,6 +28,7 @@ from chess_ai.output import (
 if TYPE_CHECKING:
     # Only named in annotations: importing them for real would bring in what they import
     # every time any command runs, torch-adjacent run store and all.
+    from chess_ai.game_session import GameSession
     from chess_ai.match import MatchGame
     from chess_ai.players import Player, SelectionStrategy
     from chess_ai.training.run_store import CheckpointChoice, CheckpointInfo, RunReader
@@ -713,7 +713,7 @@ def _temperature(value: str) -> float:
 def _match(config: Config, args: argparse.Namespace) -> int:
     import chess.engine
 
-    from chess_ai.match import append_game, distinct_games, game_line, match_filename
+    from chess_ai.match import GameLines, append_game, distinct_games, match_filename
     from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.players import Player
     from chess_ai.stockfish import StockfishError
@@ -727,6 +727,7 @@ def _match(config: Config, args: argparse.Namespace) -> int:
     played: list[MatchGame] = []
     names: list[str] = []
     engines: dict[tuple[str, int], Any] = {}
+    lines = GameLines(say, "games", total=args.games, openings=openings)
 
     def on_game(game: "MatchGame") -> None:
         try:
@@ -734,7 +735,7 @@ def _match(config: Config, args: argparse.Namespace) -> int:
         except OSError as e:
             raise _UserError(f"could not save game {game.number} to {path}: {e.strerror}") from e
         played.append(game)
-        say(game_line(game, names, number=game.number, games=args.games), kind=DETAIL)
+        lines.ended(game)
 
     async def play() -> None:
         from chess_ai.match import play_match
@@ -775,9 +776,16 @@ def _match(config: Config, args: argparse.Namespace) -> int:
                     "on the games start as earlier ones did, and players that always play their "
                     "most likely move will repeat them"
                 )
+            short, players = _short_names(names, sides)
+            lines.match(short, games=args.games, players=players)
             try:
                 await play_match(
-                    first, second, games=args.games, openings=openings, on_game=on_game
+                    first,
+                    second,
+                    games=args.games,
+                    openings=openings,
+                    on_game=on_game,
+                    on_session=lambda number, session: lines.starting(number),
                 )
             except (StockfishError, TimeoutError, chess.engine.EngineError) as e:
                 raise _UserError(
@@ -936,6 +944,26 @@ def _side_names(
     ]
 
 
+def _short_names(
+    names: list[str], sides: "Sequence[_ModelSide | _StockfishSide]"
+) -> tuple[list[str], str]:
+    """What a match's game lines call its players, and what its headers say they are.
+
+    A checkpoint is ``model``, or ``model 1`` and ``model 2`` when both players are one, since
+    its name can be as long as a line; the header names it in full. Stockfish is called what
+    it is called already.
+    """
+    models = [index for index, side in enumerate(sides) if isinstance(side, _ModelSide)]
+    short = list(names)
+    for index in models:
+        short[index] = "model" if len(models) == 1 else f"model {index + 1}"
+    described = [
+        f"{brief} ({name})" if brief != name else name
+        for brief, name in zip(short, names, strict=True)
+    ]
+    return short, f"{described[0]} against {described[1]}"
+
+
 def _match_summary(played: "list[MatchGame]", names: list[str]) -> str:
     """The score from each side's point of view, overall and by colour."""
     import chess
@@ -1067,7 +1095,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         save_ladder,
         start_games_file,
     )
-    from chess_ai.match import append_game, distinct_games, game_line
+    from chess_ai.match import GameLines, append_game, distinct_games
     from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.stockfish import StockfishError, start_stockfish
     from chess_ai.training.run_store import RunError, code_version
@@ -1098,6 +1126,12 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         raise _UserError(f"cannot write the ladder's games in {run.directory}: {e}") from e
     played = 0
     total = games * len(levels)
+    lines = GameLines(say, f"{label} ladder games", total=total, openings=openings)
+
+    def on_session(stockfish, number: int, session: "GameSession") -> None:
+        if number == 1:
+            lines.match(["model", f"Stockfish {stockfish.elo}"], games=games)
+        lines.starting(number)
 
     def on_game(stockfish, game: "MatchGame") -> None:
         nonlocal played
@@ -1106,10 +1140,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         except OSError as e:
             raise _UserError(f"could not save a game to {partial}: {e.strerror}") from e
         played += 1
-        line = game_line(
-            game, [label, f"Stockfish {stockfish.elo}"], number=game.number, games=games
-        )
-        say(f"{played}/{total} {line}", kind=DETAIL)
+        lines.ended(game)
 
     def games_note() -> str:
         """Where the games played so far are, for a ladder that stopped before its end.
@@ -1154,7 +1185,13 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
     try:
         levels_played = asyncio.run(
             play_ladder(
-                model, levels, games=games, openings=openings, opponent=opponent, on_game=on_game
+                model,
+                levels,
+                games=games,
+                openings=openings,
+                opponent=opponent,
+                on_game=on_game,
+                on_session=on_session,
             )
         )
     except KeyboardInterrupt:
@@ -1809,7 +1846,7 @@ def _evaluation_suites(
             return await start_stockfish(config.stockfish.path, elo=elo, move_time=move_time)
 
         suites[SampleGamesSuite.name] = SampleGamesSuite(
-            config.sample_games, openings, stockfish=stockfish, live=live
+            config.sample_games, openings, stockfish=stockfish, live=live, say=say
         )
     if LadderSuite.name in names:
         ladder = config.ladder
@@ -2020,6 +2057,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     say(f"{label} {suite}: skipped, as the evaluator would; name it to run it")
                 if not suites:
                     continue
+            say(f"chess-ai: evaluating {label}: {', '.join(suites)}")
             try:
                 written = run.checkpoint_written(checkpoint)
                 engine = None if written is None else load(run.checkpoint_path(checkpoint))

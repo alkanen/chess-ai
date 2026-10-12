@@ -19,12 +19,14 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Final
 from uuid import uuid4
 
 import chess
 
 from chess_ai.game_session import GameSession, GameState
 from chess_ai.openings import Opening, OpeningSet
+from chess_ai.output import DETAIL, Say
 from chess_ai.pgn import game_pgn
 from chess_ai.players import Player
 
@@ -35,6 +37,9 @@ _Z95 = 1.96
 """How many standard errors either side of a mean a 95% range spans, by the normal curve."""
 
 _WHITE_SCORES = {"1-0": 1.0, "1/2-1/2": 0.5, "0-1": 0.0}
+
+HEADER_EVERY: Final = 20
+"""How many games :class:`GameLines` says between two headers naming who is playing."""
 
 
 @dataclass(frozen=True)
@@ -221,6 +226,99 @@ def game_line(game: MatchGame, names: Sequence[str], *, number: int, games: int)
         f"game {number}/{games}, {game.opening.name}: {white} – {black} {result} "
         f"({how}{moves} moves)"
     )
+
+
+def starting_line(
+    opening: Opening, first_plays_white: bool, names: Sequence[str], *, number: int, games: int
+) -> str:
+    """The line :func:`game_line` says of a game, as the game starts: ``game 3/20 starting,
+    Italian Game: Stockfish 1350 – tiny``."""
+    white, black = names if first_plays_white else reversed(names)
+    return f"game {number}/{games} starting, {opening.name}: {white} – {black}"
+
+
+class GameLines:
+    """Says the games of one or more matches as each starts and ends, numbered from the first
+    game of the first match, under a header that says who is playing.
+
+    The game lines call the players by short names, such as ``model`` or ``Stockfish 1350``,
+    since a run's name can be as long as a line of the terminal. The header says what they
+    are, and comes before the first game, before the first game of each match, and otherwise
+    every :data:`HEADER_EVERY` games, so that a log looked at from anywhere says it within a
+    screenful: ``chess-ai: RUN@30000 sample games 3–22 of 102: model against Stockfish 1350``.
+    ``title`` is what comes before the range, such as ``RUN@30000 sample games``, and ``total``
+    is how many games all the matches play.
+
+    The game lines are :data:`~chess_ai.output.DETAIL` lines and the headers milestones.
+    """
+
+    def __init__(
+        self,
+        say: Say,
+        title: str,
+        *,
+        total: int,
+        openings: OpeningSet,
+        every: int = HEADER_EVERY,
+    ) -> None:
+        self._say = say
+        self._title = title
+        self._total = total
+        self._openings = openings
+        self._every = every
+        self._names: tuple[str, str] = ("", "")
+        self._players = ""
+        self._paired = True
+        self._before = 0
+        """How many games the matches before this one play."""
+        self._games = 0
+        self._header_due = 1
+        """The number, in this match, of the next game to say the header before."""
+
+    def match(
+        self,
+        names: Sequence[str],
+        *,
+        games: int,
+        paired: bool = True,
+        players: str | None = None,
+    ) -> None:
+        """Start saying the games of the next match, between the players ``names`` calls
+        the first and the second, as :func:`play_match` plays ``games`` of them, ``paired``
+        or not. ``players`` is what the header says of them, by default ``first against
+        second``, or ``first against itself``."""
+        first, second = names
+        self._before += self._games
+        self._names = (first, second)
+        self._games = games
+        self._paired = paired
+        self._header_due = 1
+        if players is None:
+            players = f"{first} against itself" if first == second else f"{first} against {second}"
+        self._players = players
+
+    def starting(self, number: int) -> None:
+        """Say that game ``number`` of the match, counting from 1, is starting."""
+        if number >= self._header_due:
+            last = min(number + self._every - 1, self._games)
+            first_number, last_number = self._before + number, self._before + last
+            games = f"{first_number}" if last == number else f"{first_number}–{last_number}"
+            self._say(f"chess-ai: {self._title} {games} of {self._total}: {self._players}")
+            self._header_due = number + self._every
+        opening, first_plays_white = pairing(number, self._openings, paired=self._paired)
+        line = starting_line(
+            opening,
+            first_plays_white,
+            self._names,
+            number=self._before + number,
+            games=self._total,
+        )
+        self._say(line, kind=DETAIL)
+
+    def ended(self, game: MatchGame) -> None:
+        """Say how ``game``, of the match, went."""
+        line = game_line(game, self._names, number=self._before + game.number, games=self._total)
+        self._say(line, kind=DETAIL)
 
 
 def match_filename(now: datetime | None = None) -> str:

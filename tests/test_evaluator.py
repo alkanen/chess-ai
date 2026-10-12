@@ -23,6 +23,7 @@ from chess_ai.evaluator import (
     evaluator_lock,
 )
 from chess_ai.inference import load_engine
+from chess_ai.output import RESULT
 from chess_ai.probes import SUITE, ProbeSetVersion, load_probe_set, read_current_set, read_probes
 from chess_ai.sample_games import SUITE as SAMPLE_GAMES
 from chess_ai.training.run_store import (
@@ -112,7 +113,8 @@ def test_results_round_trip_through_the_run_store(tmp_path):
     # What the file says is what reading it back gives, however it was written.
     assert json.loads(run.evaluation(2, SUITE)) == json.loads(result.model_dump_json())
     assert said == [
-        f"tiny@2 {SUITE}: solved {result.solved()[0]} of {result.solved()[1]} probes (standard v1)"
+        f"chess-ai: evaluating tiny@2: {SUITE}",
+        f"tiny@2 {SUITE}: solved {result.solved()[0]} of {result.solved()[1]} probes (standard v1)",
     ]
 
 
@@ -428,6 +430,8 @@ def test_a_checkpoint_saved_during_a_backlog_is_evaluated_before_the_rest_of_it(
     stop = threading.Event()
 
     def hear(text: str, kind=None) -> None:
+        if kind is not RESULT:
+            return
         order.append(text.split()[0])
         if len(order) == 1:
             add_checkpoint(run, 8)
@@ -442,6 +446,37 @@ def test_a_checkpoint_saved_during_a_backlog_is_evaluated_before_the_rest_of_it(
     assert order == ["tiny@6", "tiny@8", "tiny@4", "tiny@2"]
 
 
+def test_the_evaluator_says_each_checkpoint_it_starts_and_once_when_it_goes_idle(tmp_path):
+    runs = tmp_path / "runs"
+    run = model_run(runs, steps=(2,))
+    said: list[str] = []
+
+    class Looks(threading.Event):
+        """Ends the run on the fifth look that finds nothing, a new checkpoint on the second."""
+
+        looks = 0
+
+        def wait(self, timeout=None) -> bool:
+            self.looks += 1
+            if self.looks == 2:
+                add_checkpoint(run, 4)
+            if self.looks == 5:
+                self.set()
+            return self.is_set()
+
+    finishes(lambda: evaluator(runs, said=said).run(poll_seconds=60, stop=Looks()))
+
+    idle = "chess-ai: every checkpoint has its results; waiting for new ones"
+    assert [line.split(" solved")[0] for line in said] == [
+        f"chess-ai: evaluating tiny@2: {SUITE}",
+        f"tiny@2 {SUITE}:",
+        idle,
+        f"chess-ai: evaluating tiny@4: {SUITE}",
+        f"tiny@4 {SUITE}:",
+        idle,
+    ]
+
+
 def test_once_evaluates_what_lacked_a_result_when_it_began_and_no_more(tmp_path):
     """So that it ends, however fast the runs save checkpoints meanwhile."""
     runs = tmp_path / "runs"
@@ -449,6 +484,8 @@ def test_once_evaluates_what_lacked_a_result_when_it_began_and_no_more(tmp_path)
     order: list[str] = []
 
     def hear(text: str, kind=None) -> None:
+        if kind is not RESULT:
+            return
         order.append(text.split()[0])
         if len(order) == 1:
             add_checkpoint(run, 8, keep=10)
@@ -677,3 +714,50 @@ def test_evaluate_fails_on_a_named_checkpoint_that_diverged(tmp_path, monkeypatc
 
     assert exited.value.code == 2
     assert "error: tiny@2 probe-positions: the network's outputs" in capsys.readouterr().err
+
+
+def test_a_checkpoint_pruned_before_it_is_loaded_is_said_to_have_been(tmp_path):
+    """Its "evaluating" line is otherwise followed by nothing, which reads as a lost checkpoint."""
+    runs = tmp_path / "runs"
+    run = RunReader(model_run(runs, steps=(2,)))
+    said: list[str] = []
+    warned: list[str] = []
+
+    def pruned_first(path):
+        path.unlink()
+        return load_engine(path)
+
+    suite = ProbeSuite(load_probe_set("standard"), rating=1500)
+    worker = Evaluator(
+        runs, {suite.name: suite}, load=pruned_first, say=heard(said), warn=warned.append
+    )
+
+    assert done(worker.run_once()) == [("tiny", 2)]
+    assert said == [
+        f"chess-ai: evaluating tiny@2: {SUITE}",
+        "chess-ai: tiny@2 was pruned before it could be evaluated",
+    ]
+    assert warned == []
+    assert read_probes(run, 2) is None
+
+
+def test_a_checkpoint_that_changes_while_it_is_evaluated_is_said_to_have(tmp_path):
+    from chess_ai.training.run_store import CheckpointChanged
+
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2,))
+    said: list[str] = []
+
+    class Changing(ProbeSuite):
+        def evaluate(self, *args, **kwargs) -> str:
+            raise CheckpointChanged("replaced")
+
+    suite = Changing(load_probe_set("standard"), rating=1500)
+    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=heard(said))
+
+    worker.evaluate(worker.pending()[0])
+
+    assert said == [
+        f"chess-ai: evaluating tiny@2: {SUITE}",
+        f"chess-ai: tiny@2 changed while {SUITE} evaluated it, so its result was not saved",
+    ]

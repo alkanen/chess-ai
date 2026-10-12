@@ -400,17 +400,23 @@ class Evaluator:
         """Run the suites ``job`` names on its checkpoint, loading the checkpoint once for all,
         and say whether it got to the end of them.
 
-        A checkpoint pruned before its turn came is passed over without a word: it is no longer
-        one to evaluate. Any other failure is said, and the checkpoint not tried again. A suite
+        A checkpoint pruned before it could be loaded, or replaced or pruned while it was evaluated,
+        is passed over, since it is no longer one to evaluate, but said to have been: its
+        "evaluating" line is otherwise followed by nothing at all in the log, which reads as a
+        checkpoint that was lost. Not as a warning: a run still training prunes its older
+        checkpoints while a backlog is worked through, as it should. Any other failure is
+        warned of, and the checkpoint not tried again. A suite
         stopped by ``stop`` part-way is neither: the rest are not run, and ``False`` is returned.
         """
         run, checkpoint = job.run, job.checkpoint
         path = run.checkpoint_path(checkpoint)
+        # Before it is loaded, which is the slow part of a checkpoint with only the probes.
+        self._say(f"chess-ai: evaluating {job.describe()}: {', '.join(job.suites)}")
         try:
             engine = self._load(path)
         except Exception as e:
             if not path.exists():
-                LOGGER.debug("%s was pruned before it could be evaluated", job.describe())
+                self._say(f"chess-ai: {job.describe()} was pruned before it could be evaluated")
                 return True
             self._fail(job, job.suites, f"cannot be loaded: {e}")
             return True
@@ -422,7 +428,10 @@ class Evaluator:
                 return False
             except CheckpointChanged:
                 # Replaced or pruned meanwhile: the next look finds the new file, if any.
-                LOGGER.debug("%s changed while it was evaluated", job.describe())
+                self._say(
+                    f"chess-ai: {job.describe()} changed while {name} evaluated it, so its "
+                    "result was not saved"
+                )
                 break
             except Exception as e:
                 self._fail(job, (name,), f"{name} failed: {e}")
@@ -483,13 +492,19 @@ class Evaluator:
         """Evaluate checkpoints as they appear, until ``stop`` is set.
 
         ``stop`` is looked at between checkpoints, while waiting for more, and by a suite that
-        takes long as it goes.
+        takes long as it goes. Going from evaluating to waiting is said, once, and not every
+        look that finds nothing.
         """
+        waiting = False
         while not stop.is_set():
             job = self._next()
             if job is None:
+                if not waiting:
+                    self._say("chess-ai: every checkpoint has its results; waiting for new ones")
+                    waiting = True
                 stop.wait(poll_seconds)
             else:
+                waiting = False
                 self.evaluate(job, stop=stop)
 
     def _next(self) -> Job | None:

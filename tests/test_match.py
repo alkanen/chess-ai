@@ -7,6 +7,8 @@ from chess_ai import replay
 from chess_ai.game_session import GameSession
 from chess_ai.match import (
     EVENT,
+    HEADER_EVERY,
+    GameLines,
     MatchGame,
     append_game,
     distinct_games,
@@ -16,6 +18,7 @@ from chess_ai.match import (
     score,
 )
 from chess_ai.openings import Opening, OpeningSet, load_opening_set
+from chess_ai.output import DETAIL, MILESTONE, Kind
 from chess_ai.players import GameContext, PlayerMove
 from chess_ai.position_view import GameOver
 
@@ -276,3 +279,55 @@ async def test_match_files_are_named_to_sort_among_the_saved_games():
     assert names[0] != names[1], "two matches begun in the same second"
     assert all(name.startswith("20261003-1200") and name.endswith(".pgn") for name in names)
     assert [name[:15] for name in names] == sorted(name[:15] for name in names)
+
+
+def lines_of(said: list[tuple[str, Kind]], *, total: int) -> GameLines:
+    def say(text: str, *, kind: Kind = MILESTONE) -> None:
+        said.append((text, kind))
+
+    return GameLines(say, "R@3 sample games", total=total, openings=TWO_LINES)
+
+
+async def test_game_lines_are_numbered_through_every_match_under_a_header_for_each():
+    said: list[tuple[str, Kind]] = []
+    lines = lines_of(said, total=3)
+
+    lines.match(["model", "model"], games=1, paired=False)
+    lines.starting(1)
+    lines.ended(finished(1, True, "1-0"))
+    lines.match(["model", "Stockfish 1350"], games=2)
+    lines.starting(1)
+    lines.ended(finished(1, True, "0-1"))
+    lines.starting(2)
+    lines.ended(finished(2, False, "1/2-1/2"))
+
+    assert said == [
+        ("chess-ai: R@3 sample games 1 of 3: model against itself", MILESTONE),
+        ("game 1/3 starting, King's Pawn: model – model", DETAIL),
+        ("game 1/3, King's Pawn: model – model 1-0 (resignation, 0 moves)", DETAIL),
+        ("chess-ai: R@3 sample games 2–3 of 3: model against Stockfish 1350", MILESTONE),
+        ("game 2/3 starting, King's Pawn: model – Stockfish 1350", DETAIL),
+        ("game 2/3, King's Pawn: model – Stockfish 1350 0-1 (resignation, 0 moves)", DETAIL),
+        ("game 3/3 starting, King's Pawn: Stockfish 1350 – model", DETAIL),
+        ("game 3/3, King's Pawn: Stockfish 1350 – model 1/2-1/2 (abort, 0 moves)", DETAIL),
+    ]
+
+
+async def test_the_header_is_said_again_every_so_many_games():
+    said: list[tuple[str, Kind]] = []
+    games = HEADER_EVERY + 5
+    lines = lines_of(said, total=games)
+
+    lines.match(["model 1", "model 2"], games=games, players="model 1 (a) against model 2 (b)")
+    for number in range(1, games + 1):
+        lines.starting(number)
+
+    headers = [text for text, kind in said if kind == MILESTONE]
+    assert headers == [
+        f"chess-ai: R@3 sample games 1–{HEADER_EVERY} of {games}: model 1 (a) against model 2 (b)",
+        f"chess-ai: R@3 sample games {HEADER_EVERY + 1}–{games} of {games}: "
+        "model 1 (a) against model 2 (b)",
+    ]
+    second = said.index((headers[1], MILESTONE))
+    assert said[second - 1][0].startswith(f"game {HEADER_EVERY}/{games} starting")
+    assert said[second + 1][0].startswith(f"game {HEADER_EVERY + 1}/{games} starting")

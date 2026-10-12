@@ -492,13 +492,17 @@ def test_the_suite_says_when_each_game_begins_and_how_it_ended(tmp_path):
 
     ladder_checkpoint(suite, run, 4)
 
-    assert said[0] == "tiny@4 stockfish-ladder: game 1/4 begins: tiny@4 – Stockfish 1350"
-    assert said[1].startswith("tiny@4 stockfish-ladder: game 1/4, Start: tiny@4 – Stockfish 1350 ")
-    assert said[2] == "tiny@4 stockfish-ladder: game 2/4 begins: Stockfish 1350 – tiny@4"
-    assert said[6] == "tiny@4 stockfish-ladder: game 4/4 begins: Stockfish 1500 – tiny@4"
-    assert said[7].startswith("tiny@4 stockfish-ladder: game 4/4, Start: Stockfish 1500 – tiny@4 ")
-    assert said[7].endswith(" moves)")
-    assert len(said) == 8
+    # A header for each level, then each game as it starts and ends, numbered through the
+    # whole ladder and with the checkpoint called "model".
+    assert said[0] == "chess-ai: tiny@4 ladder games 1–2 of 4: model against Stockfish 1350"
+    assert said[1] == "game 1/4 starting, Start: model – Stockfish 1350"
+    assert said[2].startswith("game 1/4, Start: model – Stockfish 1350 ")
+    assert said[3] == "game 2/4 starting, Start: Stockfish 1350 – model"
+    assert said[5] == "chess-ai: tiny@4 ladder games 3–4 of 4: model against Stockfish 1500"
+    assert said[8] == "game 4/4 starting, Start: Stockfish 1500 – model"
+    assert said[9].startswith("game 4/4, Start: Stockfish 1500 – model ")
+    assert said[9].endswith(" moves)")
+    assert len(said) == 10
 
 
 def test_the_ladder_games_can_be_watched_as_they_are_played(tmp_path):
@@ -660,7 +664,8 @@ def test_evaluate_ladders_the_checkpoints_the_evaluator_would_unless_one_is_name
 
     out = capsys.readouterr().out
     assert f"tiny@2 {SUITE}: skipped" in out
-    assert f"tiny@4 {SUITE}: game 1/1 begins: tiny@4 – Stockfish 1350" in out
+    assert "chess-ai: tiny@4 ladder games 1 of 1: model against Stockfish 1350" in out
+    assert "\ngame 1/1 starting, " in out and ": model – Stockfish 1350\n" in out
     assert f"tiny@4 {SUITE}: Elo " in out
     assert read_ladder(run, 2) is None
     assert read_ladder(run, 4) is not None

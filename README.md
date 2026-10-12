@@ -115,6 +115,16 @@ Every command says what it is doing on stdout, a line per stage, game or progres
 | `-vv` | also log debug records |
 | `--timestamps=always\|never\|auto` | override where lines are stamped (default `auto`) |
 
+Games (a match, a ladder, a checkpoint's sample games) are said as each one starts and ends, with a checkpoint called `model` (`model 1` and `model 2` in a match of two), since a run's name can be as long as the line. A header names what is playing before the first game, whenever the opponent changes, and otherwise every 20 games:
+
+```
+2026-10-12 21:03:11 chess-ai: resnet10x256@30000 sample games 3–22 of 102: model against Stockfish 1350
+2026-10-12 21:03:11 game 3/102 starting, Ruy Lopez: model – Stockfish 1350
+2026-10-12 21:03:48 game 3/102, Ruy Lopez: model – Stockfish 1350 0-1 (checkmate, 54 moves)
+```
+
+The evaluator says which checkpoint it starts on and with which suites, and once, when it runs out of work, that it is waiting for new checkpoints.
+
 ### Serve
 
 ```sh

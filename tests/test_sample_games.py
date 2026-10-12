@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import chess
 import chess.pgn
 import pytest
 import torch
-from output_helpers import heard
+from output_helpers import heard, unheard
 from training_helpers import add_checkpoint, model_run
 
 from chess_ai import replay
@@ -23,6 +24,7 @@ from chess_ai.game_session import GameState
 from chess_ai.inference import load_engine
 from chess_ai.match import distinct_games, pairing
 from chess_ai.openings import load_opening_set
+from chess_ai.output import DETAIL, MILESTONE, Kind
 from chess_ai.players import GameContext, PlayerMove, StockfishDescription
 from chess_ai.probes import DivergedError
 from chess_ai.sample_games import (
@@ -77,7 +79,7 @@ class FakeStockfish:
         pass
 
 
-def suite(*, games=2, stockfish_games=0, opponent=None, live=None) -> SampleGamesSuite:
+def suite(*, games=2, stockfish_games=0, opponent=None, live=None, say=unheard) -> SampleGamesSuite:
     async def start(elo: int, move_time: float):
         return opponent
 
@@ -86,6 +88,7 @@ def suite(*, games=2, stockfish_games=0, opponent=None, live=None) -> SampleGame
         OPENINGS,
         stockfish=start if stockfish_games else None,
         live=live,
+        say=say,
     )
 
 
@@ -97,6 +100,32 @@ def play(chosen: SampleGamesSuite, run: RunReader, step: int, *, engine=None) ->
         run.checkpoint_written(checkpoint),
         engine or load_engine(run.checkpoint_path(checkpoint)),
     )
+
+
+def test_each_game_is_said_as_it_starts_and_ends_under_a_header_for_each_opponent(tmp_path):
+    run = RunReader(model_run(tmp_path / "runs", steps=(2,)))
+    said: list[tuple[str, Kind]] = []
+
+    def hear(text: str, *, kind: Kind = MILESTONE) -> None:
+        said.append((text, kind))
+
+    play(suite(games=1, stockfish_games=2, opponent=FakeStockfish(), say=hear), run, 2)
+
+    # How each game ended, which is the model's to decide, in one word.
+    ended = [
+        (re.sub(r" (1-0|0-1|1/2-1/2) \(.+ moves\)$", " ended", text), kind) for text, kind in said
+    ]
+    first = OPENINGS.openings[0].name
+    assert ended == [
+        ("chess-ai: tiny@2 sample games 1 of 3: model against itself", MILESTONE),
+        (f"game 1/3 starting, {first}: model – model", DETAIL),
+        (f"game 1/3, {first}: model – model ended", DETAIL),
+        ("chess-ai: tiny@2 sample games 2–3 of 3: model against Stockfish 1350", MILESTONE),
+        (f"game 2/3 starting, {first}: model – Stockfish 1350", DETAIL),
+        (f"game 2/3, {first}: model – Stockfish 1350 ended", DETAIL),
+        (f"game 3/3 starting, {first}: Stockfish 1350 – model", DETAIL),
+        (f"game 3/3, {first}: Stockfish 1350 – model ended", DETAIL),
+    ]
 
 
 def test_against_itself_every_game_starts_from_a_line_of_its_own():
@@ -202,7 +231,8 @@ def test_the_evaluator_plays_the_sample_games_of_each_new_checkpoint(tmp_path):
         (2, SUITE),
         (4, SUITE),
     ]
-    assert [line.split(":")[0] for line in said] == [f"tiny@2 {SUITE}", f"tiny@4 {SUITE}"]
+    results = [line.split(":")[0] for line in said if not line.startswith(("chess-ai", "game "))]
+    assert results == [f"tiny@2 {SUITE}", f"tiny@4 {SUITE}"]
     assert worker.run_once() == []
 
 
@@ -609,7 +639,8 @@ def test_a_stop_after_the_games_were_saved_counts_them_as_done(tmp_path):
     assert kind == "returned", outcome
     assert [job.checkpoint.step for job in outcome] == [2]
     assert read_sample_games(run, 2) is not None
-    assert [line.split(":")[0] for line in said] == [f"tiny@2 {SUITE}"]
+    results = [line.split(":")[0] for line in said if not line.startswith(("chess-ai", "game "))]
+    assert results == [f"tiny@2 {SUITE}"]
 
 
 def test_evaluator_once_with_a_bad_opening_set_probes_runs_that_ask_for_no_games(tmp_path, capsys):

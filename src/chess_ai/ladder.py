@@ -40,9 +40,9 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from chess_ai.config import LadderConfig
 from chess_ai.evaluator import until_stopped
 from chess_ai.game_session import GameSession
-from chess_ai.match import MatchGame, append_game, game_line, play_match, score
+from chess_ai.match import GameLines, MatchGame, append_game, play_match, score
 from chess_ai.openings import OpeningSet
-from chess_ai.output import DETAIL, Say
+from chess_ai.output import Say
 from chess_ai.output import say as said_on_stdout
 from chess_ai.players import (
     ModelDescription,
@@ -583,8 +583,10 @@ class LadderSuite:
             )
             partial = start_games_file(run, checkpoint.step)
             games_file = partial
+            lines = GameLines(
+                self._say, f"{label} ladder games", total=total, openings=self.openings
+            )
             begun = 0
-            ended = 0
 
             async def opponent(level: int) -> Player:
                 return await self._stockfish(level, settings.move_time)
@@ -595,12 +597,11 @@ class LadderSuite:
                 nonlocal begun
                 begun += 1
                 index = begun - 1
-                level = f"Stockfish {stockfish.elo}"
-                model_white = session.state.white.model is not None
-                white, black = (label, level) if model_white else (level, label)
-                self._say(
-                    f"{label} {SUITE}: game {begun}/{total} begins: {white} – {black}", kind=DETAIL
-                )
+                if number == 1:
+                    lines.match(
+                        ["model", f"Stockfish {stockfish.elo}"], games=settings.games_per_level
+                    )
+                lines.starting(number)
                 if self._live is None:
                     return
 
@@ -611,12 +612,8 @@ class LadderSuite:
                 session.listen(show)
 
             def on_game(stockfish: StockfishDescription, game: MatchGame) -> None:
-                nonlocal ended
-                ended += 1
                 append_game(games_file, game)
-                names = [label, f"Stockfish {stockfish.elo}"]
-                line = game_line(game, names, number=ended, games=total)
-                self._say(f"{label} {SUITE}: {line}", kind=DETAIL)
+                lines.ended(game)
 
             played = await play_ladder(
                 model,
