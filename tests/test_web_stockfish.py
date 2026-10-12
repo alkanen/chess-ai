@@ -327,8 +327,11 @@ def test_a_stockfish_on_move_when_the_server_restarts_is_started_at_once(tmp_pat
     wait_until_gone(*pids)
 
 
-def test_a_game_whose_stockfish_was_killed_carries_on_after_a_restart(tmp_path, engine):
+def test_a_game_whose_stockfish_was_killed_carries_on_after_a_restart(tmp_path):
     """As when a service manager stops the server and its engines at once, for an update."""
+    # An engine that never answers, so that the kill is all that can end the game however slow
+    # the machine is: one that moves after its move time had played by then on a stalled one.
+    engine = fake_engine(tmp_path / "engine", "--hang-after", "0")
     with serve(tmp_path, engine) as client:
         _, links = start_with_links(client, stockfish(move_time=30), HUMAN)
         [killed] = started(engine)
