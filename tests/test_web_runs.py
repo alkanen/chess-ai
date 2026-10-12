@@ -561,12 +561,17 @@ def test_a_viewer_starts_again_when_the_run_is_started_again(client, runs):
             with new_run(runs, created=NOW + timedelta(hours=1)) as again:
                 again.log(step=1, split="train", loss=5.0)
 
-                restarted = next_of(websocket, "metrics")
-                while not restarted["records"]:
-                    restarted = next_of(websocket, "metrics")
+                # The stream can see the new run before its first line, so the reset may come
+                # on its own, with the record in a later event: keep what follows the last reset.
+                reset, records = False, []
+                while not records:
+                    event = next_of(websocket, "metrics")
+                    if event["reset"]:
+                        reset, records = True, []
+                    records += event["records"]
 
-    assert restarted["reset"] is True
-    assert [record["loss"] for record in restarted["records"]] == [5.0]
+    assert reset is True
+    assert [record["loss"] for record in records] == [5.0]
 
 
 def test_a_run_that_is_not_here_is_answered_with_an_error(client):
