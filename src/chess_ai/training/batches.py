@@ -161,8 +161,21 @@ class PositionBatches(TorchDataset):
     def __getitem__(self, index: int) -> Batch:
         epoch, within = divmod(index, self.batches_per_epoch)
         start = within * self.batch_size
+        return self._batch(self._order(epoch)[start : start + self.batch_size])
+
+    def stored_batch(self) -> Batch:
+        """A batch of the first positions trained on, in the order they are stored.
+
+        A real batch, of the size every batch of the run has, for no epoch's order: at Lichess
+        scale shuffling one takes minutes, and what is in a batch does not change how long a
+        step on it takes. Which is what the throughput probe wants it for.
+        """
+        return self._batch(np.arange(self.positions_per_batch, dtype=self._dtype()))
+
+    def _batch(self, targets: np.ndarray) -> Batch:
+        """The batch of these training targets, numbered as an epoch's order numbers them."""
         reader = self._split_reader()
-        order = reader.target_positions(self._order(epoch)[start : start + self.batch_size])
+        order = reader.target_positions(targets)
         encoder = self._position_encoder()
         frames = reader.position_history(order, encoder.history)
         records = frames[:, 0]

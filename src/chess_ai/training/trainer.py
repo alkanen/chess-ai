@@ -770,17 +770,14 @@ def _probe(run: _Run, *, say: Say = said_on_stdout) -> float | None:
     weights are put back afterwards, so the run still starts from exactly the seeded
     initialization, and the throwaway optimizer never sees the run's own.
     """
-    # The batch it steps on is the run's first, which means shuffling the first epoch's order:
-    # at Lichess scale, most of the time this takes.
-    say(
-        f"chess-ai: measuring throughput over {PROBE_STEPS} steps, once the first epoch's order "
-        f"of {run.batches.positions:,} positions is shuffled",
-        kind=DETAIL,
-    )
+    say(f"chess-ai: measuring throughput over {PROBE_STEPS} steps", kind=DETAIL)
     weights = {name: value.detach().clone() for name, value in run.model.state_dict().items()}
     optimizer = _optimizer(run)
     try:
-        batch = run.batches[0].to(run.device)
+        # Not the run's first batch, which would mean shuffling an epoch's order the loader
+        # then shuffles again: minutes at Lichess scale, for a step that takes as long on any
+        # batch of the same size.
+        batch = run.batches.stored_batch().to(run.device)
         for index in range(PROBE_STEPS + 1):
             if index == 1:
                 # The first step pays for CUDA's lazy setup and cuBLAS picking kernels, which a

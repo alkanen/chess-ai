@@ -622,3 +622,31 @@ def test_an_epoch_of_a_filtered_dataset_visits_its_training_targets_and_nothing_
 
     assert source.positions == len(targets)
     assert visited == sorted(int(move) for move in targets["move"])
+
+
+@pytest.mark.parametrize("filters", [None, Filters(min_rating=1700)])
+def test_the_stored_batch_is_the_first_positions_trained_on_in_stored_order(
+    tmp_path, monkeypatch, filters
+):
+    """What the throughput probe steps on: a real batch, for no epoch's order."""
+    dataset(tmp_path / "data", filters=filters)
+    with open_dataset("test", data_dir=tmp_path / "data") as built:
+        unshuffled = batches(built.directory)
+        monkeypatch.setattr(batches_module, "_shuffle", lambda order, seed, epoch: order)
+        expected = unshuffled[0]
+        source = batches(built.directory)
+        asked = []
+        monkeypatch.setattr(source, "_order", lambda epoch: asked.append(epoch))
+
+        batch = source.stored_batch()
+
+    assert not asked, "no epoch's order was built"
+    assert len(batch) == source.positions_per_batch
+    for got, wanted in zip(batch, expected, strict=True):
+        assert torch.equal(got, wanted)
+
+
+def test_the_stored_batch_of_a_split_smaller_than_a_batch_is_all_of_it(directory):
+    source = batches(directory, batch_size=10_000)
+
+    assert len(source.stored_batch()) == source.positions
