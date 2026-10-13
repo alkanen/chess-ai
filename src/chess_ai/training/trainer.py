@@ -22,6 +22,11 @@ The loop keeps two things honest about speed. It never reads a loss back from th
 it is about to log one, because every read is a stall; and before it starts it measures a few real
 steps and says how fast they were, so a two-day run can be recognised as a two-day run before it
 is two days in.
+
+On a GPU the model is compiled (``[training] compile``), in place, so that what it saves is the
+same checkpoint an uncompiled model would: the engine, the evaluator and ``[initialize_from]`` load
+it uncompiled, and a run can be resumed with the setting changed. See
+:func:`~chess_ai.training.hardware.compile_model`.
 """
 
 import copy
@@ -66,6 +71,7 @@ from chess_ai.training.experiment import ExperimentConfig, OptimizerSection
 from chess_ai.training.hardware import (
     HardwareError,
     autocast_dtype,
+    compile_model,
     describe_device,
     gpu_stats,
     resolve_device,
@@ -154,6 +160,8 @@ class _Run:
     spec: EncoderSpec
     model: ChessModel
     batches: PositionBatches
+    compiled: bool = False
+    """Whether ``model`` is compiled; see :func:`~chess_ai.training.hardware.compile_model`."""
 
 
 def train(
@@ -185,7 +193,7 @@ def train(
     run = _prepare(config, data_dir=data_dir, say=say)
     # Before the probe, which puts back whatever weights it found: these are the ones to keep.
     lineage = _initialize(run, runs_dir=runs_dir, say=say) if config.initialize_from else None
-    estimate = _probe(run, say=say)
+    estimate = _probe(run, say=say, uncompiled="compile = false in [training]")
     for line in _summary(run, estimate, lineage=lineage):
         say(line)
 
@@ -212,10 +220,14 @@ def resume(
     runs_dir: Path,
     say: Say = said_on_stdout,
     ladder_every: int | None = None,
+    compile: bool | None = None,
 ) -> Path:
     """Carry on training the run called ``name`` from its latest checkpoint, to the end.
 
-    ``ladder_every`` is as :func:`train` has it.
+    ``ladder_every`` is as :func:`train` has it. ``compile`` overrides ``[training] compile``
+    from the checkpoint's config, which is the only one there is to edit: a run that cannot be
+    compiled where it is resumed carries on uncompiled with ``False``, and one trained
+    uncompiled can be sped up with ``True``. The checkpoints saved from then on record it.
 
     Everything comes from the checkpoint — the config, the weights, the optimizer's moments, the
     step, the random state and how long the run had been going — and the dataset is opened by
@@ -236,7 +248,9 @@ def resume(
     except RunError as e:
         raise TrainingError(e) from e
     try:
-        run, optimizer, start = _resumable(RunReader(directory), data_dir=data_dir, say=say)
+        run, optimizer, start = _resumable(
+            RunReader(directory), data_dir=data_dir, say=say, compile=compile
+        )
         writer.policy = run.config.checkpoints.policy()
         _hold_for_ladders(writer, ladder_every)
         writer.rewind(start.step)
@@ -262,9 +276,10 @@ def _hold_for_ladders(writer: RunWriter, every: int | None) -> None:
 
 
 def _resumable(
-    reader: RunReader, *, data_dir: Path, say: Say
+    reader: RunReader, *, data_dir: Path, say: Say, compile: bool | None = None
 ) -> tuple[_Run, torch.optim.Optimizer, _Start]:
-    """The run in ``reader`` put back as its latest checkpoint left it, ready to carry on."""
+    """The run in ``reader`` put back as its latest checkpoint left it, ready to carry on,
+    compiled or not as ``compile`` says if it says."""
     name = reader.name
     status = reader.status
     if status is not None and status.status == RunStatus.FINISHED:
@@ -278,11 +293,15 @@ def _resumable(
     say(f"chess-ai: loading the checkpoint of step {latest.step:,}", kind=DETAIL)
     payload = _load(reader.checkpoint_path(latest), doing=f"resume run {name!r}")
     config = _pinned_to_its_version(_config_of(payload, name), reader)
+    if compile is not None:
+        config = config.model_copy(
+            update={"training": config.training.model_copy(update={"compile": compile})}
+        )
     run = _prepare(config, data_dir=data_dir, say=say)
     _same_dataset(run, reader)
     doing = f"resume run {name!r} from step {latest.step:,}"
     _check_compatible(run, payload, doing=doing)
-    estimate = _probe(run, say=say)
+    estimate = _probe(run, say=say, uncompiled=f"'chess-ai resume {name} --no-compile'")
     # After the probe, which puts back the weights it found rather than the ones it left.
     _load_weights(run, payload, doing=doing)
     optimizer = _optimizer(run)
@@ -309,10 +328,16 @@ def _config_of(payload: dict[str, Any], name: str) -> ExperimentConfig:
     optimizer state has the one parameter group to show for it; their config does not say so,
     because the setting did not exist. The new default would build two groups and fail to load
     the state, so a config without the setting gets the behaviour it was trained with.
+
+    So do runs made before the model could be compiled: compiled kernels round differently
+    from the ones they were trained with, and the rest of the run would quietly not be the run
+    it was. ``chess-ai resume --compile`` compiles one anyway.
     """
     data = copy.deepcopy(payload.get("config") or {})
     if isinstance(data.get("optimizer"), dict):
         data["optimizer"].setdefault("decay_biases_and_norms", True)
+    if isinstance(data.get("training"), dict):
+        data["training"].setdefault("compile", False)
     data["name"] = name
     try:
         return ExperimentConfig.model_validate(data)
@@ -650,6 +675,7 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path, say: Say = said_on_std
         )
     except (DatasetError, ValueError) as e:
         raise TrainingError(e) from e
+    model.to(device)
     return _Run(
         config=config,
         device=device,
@@ -657,8 +683,9 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path, say: Say = said_on_std
         dataset=dataset,
         encoder=encoder,
         spec=encoder.spec,
-        model=model.to(device),
+        model=model,
         batches=batches,
+        compiled=compile_model(model, device, enabled=config.training.compile),
     )
 
 
@@ -762,15 +789,24 @@ def _step(run: _Run, batch: Batch, optimizer: torch.optim.Optimizer) -> _StepRes
     return _StepResult(total.detach(), policy_loss, value_loss, norm, clipped)
 
 
-def _probe(run: _Run, *, say: Say = said_on_stdout) -> float | None:
+def _probe(run: _Run, *, say: Say = said_on_stdout, uncompiled: str) -> float | None:
     """Positions per second over a few real steps, measured before the run starts.
 
     Real steps, with a real optimizer, on a real batch: a forward pass alone would flatter the
     estimate by the backward pass and the weight update, which together are most of a step. The
     weights are put back afterwards, so the run still starts from exactly the seeded
     initialization, and the throwaway optimizer never sees the run's own.
+
+    The first step is not timed. It pays for CUDA's lazy setup and cuBLAS picking kernels, and
+    for a compiled model it is where the training step is compiled, which takes longer than
+    the rest of the probe does; either way it is not what a run of thousands of steps should
+    be judged by.
+
+    ``uncompiled`` says how to train the run without compiling it, for when compiling fails:
+    a setting for a new run, an option for a resumed one.
     """
-    say(f"chess-ai: measuring throughput over {PROBE_STEPS} steps", kind=DETAIL)
+    if run.compiled:
+        say("chess-ai: compiling the model", kind=DETAIL)
     weights = {name: value.detach().clone() for name, value in run.model.state_dict().items()}
     optimizer = _optimizer(run)
     try:
@@ -778,12 +814,11 @@ def _probe(run: _Run, *, say: Say = said_on_stdout) -> float | None:
         # then shuffles again: minutes at Lichess scale, for a step that takes as long on any
         # batch of the same size.
         batch = run.batches.stored_batch().to(run.device)
-        for index in range(PROBE_STEPS + 1):
-            if index == 1:
-                # The first step pays for CUDA's lazy setup and cuBLAS picking kernels, which a
-                # run of thousands of steps should not be judged by.
-                _synchronize(run.device)
-                started = time.perf_counter()
+        _step(run, batch, optimizer)
+        _synchronize(run.device)
+        say(f"chess-ai: measuring throughput over {PROBE_STEPS} steps", kind=DETAIL)
+        started = time.perf_counter()
+        for _ in range(PROBE_STEPS):
             _step(run, batch, optimizer)
         _synchronize(run.device)
         elapsed = time.perf_counter() - started
@@ -791,6 +826,13 @@ def _probe(run: _Run, *, say: Say = said_on_stdout) -> float | None:
         raise TrainingError(
             f"the GPU ran out of memory on a batch of {run.config.training.batch_size}: {e}. "
             "Lower batch_size, or train on a smaller model"
+        ) from e
+    except torch._dynamo.exc.TorchDynamoException as e:
+        # The probe is the first thing to call the model, so this is where compiling fails,
+        # and the run would only fail the same way at its first step.
+        raise TrainingError(
+            f"could not compile the model ({_compile_failure(e)}); use {uncompiled} to train "
+            "it uncompiled"
         ) from e
     except Exception as e:  # noqa: BLE001 - the probe is the first thing to run any of this
         LOGGER.warning("could not measure throughput: %s", e)
@@ -802,6 +844,53 @@ def _probe(run: _Run, *, say: Say = said_on_stdout) -> float | None:
         # shard pickles as the whole file, so it has to be handed over unopened.
         run.batches.close()
     return PROBE_STEPS * run.config.training.batch_size / elapsed if elapsed > 0 else None
+
+
+def _compile_failure(error: Exception) -> str:
+    """What went wrong compiling, in one line, with the rest of it logged.
+
+    Dynamo's own message runs to several lines, most of them about how to get a longer one, and
+    what failed beneath it can be a whole compiler's output: a missing compiler or ``Python.h``
+    on a new machine is a ``CppCompileError`` whose message is the command and everything the
+    compiler said. That is the reason, so it is logged as a warning, which comes before the
+    error; the error itself is one line and ends in how to train without compiling.
+
+    On a GPU the kernels are built by Triton in worker processes, and a failure there (no
+    ``cuda.h`` or ``libcuda.so`` for Triton's driver, a broken ``ptxas``) arrives as a
+    ``SubprocException`` holding the worker's traceback as ``details``. Its first line only says
+    a subprocess failed; the reason is the error the worker ended in, named by
+    :func:`_raised_last`.
+    """
+    inner = getattr(error, "inner_exception", None)
+    failed = inner if isinstance(inner, BaseException) else error
+    text = str(failed).strip()
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        LOGGER.warning("compiling the model failed:\n%s", text)
+    details = getattr(failed, "details", None)
+    raised = _raised_last(details) if isinstance(details, str) else ""
+    if raised:
+        return f"{raised}, in a compile worker"
+    first = lines[0].strip() if lines else ""
+    if failed is not inner:
+        return first or type(error).__name__
+    return f"{type(inner).__name__}: {first}" if first else type(inner).__name__
+
+
+def _raised_last(traceback: str) -> str:
+    """The first line of the error a formatted traceback ends in, or ``""`` for no traceback.
+
+    Not the traceback's last line: it ends with the error's whole message, which can run on —
+    ptxas's lists its stderr and then the command to repeat it with — and with any notes added
+    to it. The error starts at the first line after the last frame that is not indented, as a
+    frame's code and the carets under it are.
+    """
+    lines = [line for line in traceback.splitlines() if line.strip()]
+    frames = [index for index, line in enumerate(lines) if line.startswith('  File "')]
+    if not frames:
+        return lines[-1].strip() if lines else ""
+    after = (line for line in lines[frames[-1] + 1 :] if not line[0].isspace())
+    return next(after, "").strip()
 
 
 def _loop(
@@ -1238,6 +1327,8 @@ def _summary(
     first = start.step if start else 0
     epochs = steps * config.training.batch_size / positions
     precision = "bf16" if run.dtype is torch.bfloat16 else "fp32"
+    if run.compiled:
+        precision += ", compiled"
     lines = [
         f"chess-ai: run {config.name}, seed {config.seed}"
         + (f", resuming at step {first:,}" if start else ""),

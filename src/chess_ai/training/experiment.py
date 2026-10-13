@@ -107,6 +107,12 @@ class TrainingSection(_Section):
     the value head is there so the network has some notion of who is winning."""
     mixed_precision: bool = True
     """Run the forward and backward passes in bfloat16 on a GPU that supports it."""
+    compile: bool = True
+    """Compile the model with ``torch.compile`` when training on a GPU, which fuses the small
+    element-wise operations (casts, residual additions, normalization, activations) that limit
+    a ResNet or a transformer more than its matrix multiplies do. It costs some seconds at the
+    start of a run, and compiled kernels round slightly differently from eager ones, so a run
+    is reproducible bit for bit only with the same setting. The CPU never compiles."""
     data_workers: int = Field(default=4, ge=0)
     """Processes that read and encode batches. 0 does it in the training process."""
     log_every_steps: int = Field(default=50, gt=0)

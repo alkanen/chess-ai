@@ -1871,3 +1871,16 @@ def test_a_ladder_whose_result_cannot_be_saved_says_where_its_games_really_are(
     assert "Permission denied" in err
     assert f"the 1 game played is in {games}" in err
     assert len(ladder_games(games)) == 1
+
+
+@pytest.mark.parametrize(
+    ("flags", "compile"), [([], None), (["--compile"], True), (["--no-compile"], False)]
+)
+def test_resume_can_override_whether_the_run_compiles(tmp_path, monkeypatch, flags, compile):
+    import chess_ai.training
+
+    asked = {}
+    monkeypatch.setattr(chess_ai.training, "resume", lambda name, **kwargs: asked.update(kwargs))
+
+    assert main(["resume", "tiny", *flags]) == 0
+    assert asked["compile"] is compile

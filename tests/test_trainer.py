@@ -21,6 +21,7 @@ import pytest
 import torch
 from output_helpers import heard, unheard
 from torch import nn
+from torch._dynamo.utils import counters
 from training_helpers import dataset, experiment
 
 from chess_ai.dataset import open_dataset
@@ -916,6 +917,9 @@ DROPOUT = 'architecture = "mlp"\ndepth = 2\nwidth = 16\ndropout = 0.2'
 REAL_STEP = trainer._step
 """For putting the step back once a test has stopped a run with it, and wants to resume."""
 
+REAL_COMPILE = trainer.compile_model
+"""For putting compiling back as it was, once a test has made a run compile on the CPU."""
+
 RESUMABLE = {
     "model": DROPOUT,
     "schedule": "steps = 9\nwarmup_steps = 2",
@@ -1704,3 +1708,321 @@ def test_a_run_cannot_be_initialized_from_itself(tmp_path, data_dir):
             config_text="",
             overwrite=True,
         )
+
+
+@pytest.fixture
+def dynamo():
+    """torch.compile's counters, from a clean start: what the test compiles, and nothing else."""
+    torch._dynamo.reset()
+    counters.clear()
+    yield counters
+    torch._dynamo.reset()
+
+
+def compiled_on_the_cpu(monkeypatch) -> None:
+    """Have the trainer compile its model on the CPU, with the eager backend.
+
+    The trainer only compiles on a GPU. The eager backend traces the model as compiling does
+    and guards each graph the same way, so what recompiles and what a checkpoint of a compiled
+    model holds can be tested without one; and it runs the traced operations as they are, so a
+    run computes exactly what an uncompiled one does.
+    """
+
+    def compile_model(model, device, *, enabled):
+        if not enabled:
+            return False
+        model.compile(backend="eager")
+        return True
+
+    monkeypatch.setattr(trainer, "compile_model", compile_model)
+
+
+def test_a_cpu_run_is_not_compiled_and_does_not_say_it_is(tmp_path, data_dir, dynamo):
+    lines = said_by(tmp_path, data_dir)
+
+    device = next(line for line in lines if line.startswith("  device"))
+    assert "compiled" not in device
+    assert "chess-ai: compiling the model" not in lines
+    assert not dynamo["stats"]["unique_graphs"]
+    assert open_run(tmp_path / "runs", "tiny").info.config["training"]["compile"] is True
+
+
+def test_a_compiled_run_says_so_and_compiles_before_it_measures(
+    tmp_path, data_dir, monkeypatch, dynamo
+):
+    compiled_on_the_cpu(monkeypatch)
+
+    lines = said_by(tmp_path, data_dir)
+
+    device = next(line for line in lines if line.startswith("  device"))
+    assert device.endswith(", compiled")
+    compiling = lines.index("chess-ai: compiling the model")
+    assert lines[compiling + 1].startswith("chess-ai: measuring throughput")
+
+
+def test_validation_compiles_once_rather_than_at_every_pass(
+    tmp_path, data_dir, monkeypatch, dynamo
+):
+    """One graph to train with, one for validation's pass without gradients, and one for its
+    smaller last batch; four validations later, still three."""
+    compiled_on_the_cpu(monkeypatch)
+
+    reader = run(tmp_path, data_dir, validation="every_steps = 2\npositions = 20")
+
+    assert len(lines_of(reader, "validation")) == 4
+    assert dynamo["stats"]["unique_graphs"] == 3
+
+
+def test_a_compiled_run_saves_checkpoints_an_uncompiled_model_loads(
+    tmp_path, data_dir, monkeypatch, dynamo
+):
+    compiled_on_the_cpu(monkeypatch)
+
+    reader = run(tmp_path, data_dir)
+
+    payload = final_payload(reader)
+    assert not any("_orig_mod" in name for name in payload["model_state"])
+    engine = load_engine(reader.checkpoint_path(reader.latest_checkpoint()))
+    board = chess.Board()
+    assert engine.evaluate(board).best in board.legal_moves
+
+
+@pytest.mark.parametrize(("first", "then"), [(False, True), (True, False)])
+def test_a_run_resumes_with_compiling_turned_on_or_off_in_between(
+    tmp_path, data_dir, monkeypatch, dynamo, first, then
+):
+    whole = run(tmp_path, data_dir, name="whole", **RESUMABLE)
+    if first:
+        compiled_on_the_cpu(monkeypatch)
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="halves", **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    monkeypatch.setattr(trainer, "compile_model", REAL_COMPILE)
+    if then:
+        compiled_on_the_cpu(monkeypatch)
+
+    halves = resumed(tmp_path, data_dir, "halves")
+
+    assert halves.status.status == RunStatus.FINISHED
+    assert_same_state(final_payload(whole), final_payload(halves))
+    assert dynamo["stats"]["unique_graphs"]
+
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+
+
+@needs_cuda
+def test_a_compiled_run_on_the_gpu_trains_checkpoints_and_plays_uncompiled(
+    tmp_path, data_dir, dynamo
+):
+    """The real thing: inductor on the GPU, in bfloat16, as a run on the training machine is."""
+    lines = said_by(
+        tmp_path,
+        data_dir,
+        model='architecture = "resnet"\nblocks = 1\nchannels = 8',
+        training='device = "cuda"\nbatch_size = 8\ndata_workers = 0\nlog_every_steps = 2',
+        validation="every_steps = 2\npositions = 20",
+    )
+
+    assert any(line.startswith("  device") and line.endswith("bf16, compiled") for line in lines)
+    reader = open_run(tmp_path / "runs", "tiny")
+    assert reader.status.status == RunStatus.FINISHED
+    assert len(lines_of(reader, "validation")) == 4
+    assert dynamo["stats"]["unique_graphs"] == 3
+    assert all(math.isfinite(line["loss"]) for line in lines_of(reader, "train"))
+    engine = load_engine(reader.checkpoint_path(reader.latest_checkpoint()))
+    board = chess.Board()
+    board.push_san("e4")
+    assert engine.evaluate(board).best in board.legal_moves
+
+
+def stopped_halfway(tmp_path, data_dir, monkeypatch, *, compiled: bool) -> None:
+    """A run of ``RESUMABLE`` called "halves", stopped after its fifth step, ready to resume."""
+    if compiled:
+        compiled_on_the_cpu(monkeypatch)
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="halves", **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    monkeypatch.setattr(trainer, "compile_model", REAL_COMPILE)
+
+
+def without_the_compile_setting(reader) -> None:
+    """Make the run's checkpoints look as they did before ``[training] compile`` existed."""
+    for entry in reader.checkpoints():
+        path = reader.checkpoint_path(entry)
+        payload = checkpoints.load(path)
+        del payload["config"]["training"]["compile"]
+        checkpoints.save(payload, path)
+
+
+def test_a_run_from_before_compiling_resumes_uncompiled(tmp_path, data_dir, monkeypatch, dynamo):
+    """Compiled kernels round differently, so the rest of it would not be the run it was."""
+    stopped_halfway(tmp_path, data_dir, monkeypatch, compiled=False)
+    without_the_compile_setting(open_run(tmp_path / "runs", "halves"))
+    compiled_on_the_cpu(monkeypatch)
+
+    halves = resumed(tmp_path, data_dir, "halves")
+
+    assert halves.status.status == RunStatus.FINISHED
+    assert not dynamo["stats"]["unique_graphs"]
+    assert final_payload(halves)["config"]["training"]["compile"] is False
+
+
+@pytest.mark.parametrize(("first", "then"), [(False, True), (True, False)])
+def test_resume_can_turn_compiling_on_or_off(tmp_path, data_dir, monkeypatch, dynamo, first, then):
+    stopped_halfway(tmp_path, data_dir, monkeypatch, compiled=first)
+    if not first:
+        without_the_compile_setting(open_run(tmp_path / "runs", "halves"))
+    torch._dynamo.reset()
+    dynamo.clear()
+    compiled_on_the_cpu(monkeypatch)
+    lines: list[str] = []
+
+    resume("halves", data_dir=data_dir, runs_dir=tmp_path / "runs", say=heard(lines), compile=then)
+
+    device = next(line for line in lines if line.startswith("  device"))
+    assert device.endswith(", compiled") is then
+    assert bool(dynamo["stats"]["unique_graphs"]) is then
+    halves = open_run(tmp_path / "runs", "halves")
+    assert halves.status.status == RunStatus.FINISHED
+    # What the rest of the run was trained with, for whoever resumes it next.
+    assert final_payload(halves)["config"]["training"]["compile"] is then
+
+
+def failing_to_compile(monkeypatch, error: Exception | None = None) -> None:
+    """Have compiling fail with ``error``, as it does where inductor cannot find what it needs."""
+
+    def backend(graph, inputs):
+        raise error or RuntimeError("no C compiler")
+
+    def compile_model(model, device, *, enabled):
+        if not enabled:
+            return False
+        model.compile(backend=backend)
+        return True
+
+    monkeypatch.setattr(trainer, "compile_model", compile_model)
+
+
+def test_a_new_run_that_cannot_compile_says_how_to_train_uncompiled(
+    tmp_path, data_dir, monkeypatch, dynamo
+):
+    failing_to_compile(monkeypatch)
+
+    with pytest.raises(TrainingError, match=r"could not compile.*compile = false in \[training\]"):
+        run(tmp_path, data_dir)
+
+
+def test_a_resumed_run_that_cannot_compile_says_how_to_resume_it_uncompiled(
+    tmp_path, data_dir, monkeypatch, dynamo
+):
+    stopped_halfway(tmp_path, data_dir, monkeypatch, compiled=True)
+    failing_to_compile(monkeypatch)
+
+    with pytest.raises(TrainingError) as failed:
+        resumed(tmp_path, data_dir, "halves")
+
+    assert "could not compile the model" in str(failed.value)
+    assert "'chess-ai resume halves --no-compile'" in str(failed.value)
+    assert "[training]" not in str(failed.value)
+    torch._dynamo.reset()
+    monkeypatch.setattr(trainer, "compile_model", REAL_COMPILE)
+
+    halves = resumed(tmp_path, data_dir, "halves")
+
+    assert halves.status.status == RunStatus.FINISHED
+
+
+class CppCompileError(RuntimeError):
+    """Shaped as inductor's is when there is no compiler or no ``Python.h``: a block of lines."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "\nC++ compile error\n\nCommand:\ng++ /tmp/kernel.cpp -shared -fPIC -o kernel.so"
+            "\n\nOutput:\n/tmp/kernel.cpp:1:10: fatal error: Python.h: No such file or directory"
+        )
+
+
+def test_a_compiler_s_output_is_logged_and_the_error_stays_one_line_ending_in_the_fix(
+    tmp_path, data_dir, monkeypatch, dynamo, caplog
+):
+    failing_to_compile(monkeypatch, CppCompileError())
+
+    with pytest.raises(TrainingError) as failed:
+        run(tmp_path, data_dir)
+
+    message = str(failed.value)
+    assert "\n" not in message
+    assert message.startswith("could not compile the model (CppCompileError: C++ compile error)")
+    assert message.endswith("use compile = false in [training] to train it uncompiled")
+    warned = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("fatal error: Python.h" in record.getMessage() for record in warned)
+
+
+def test_a_compile_worker_s_failure_is_named_by_the_error_it_ended_in(
+    tmp_path, data_dir, monkeypatch, dynamo, caplog
+):
+    """Triton's kernels are built in worker processes, whose error arrives wrapped, with the
+    worker's traceback; the reason is its last line."""
+    from torch._inductor.compile_worker.subproc_pool import SubprocException
+
+    details = (
+        "Traceback (most recent call last):\n"
+        '  File "triton/backends/nvidia/driver.py", line 38, in library_dirs\n'
+        "    raise RuntimeError(...)\n"
+        "RuntimeError: Failed to find cuda.h\n"
+    )
+    failing_to_compile(monkeypatch, SubprocException(details, "triton"))
+
+    with pytest.raises(TrainingError) as failed:
+        run(tmp_path, data_dir)
+
+    message = str(failed.value)
+    assert "\n" not in message
+    assert message.startswith(
+        "could not compile the model (RuntimeError: Failed to find cuda.h, in a compile worker)"
+    )
+    warned = [record for record in caplog.records if record.levelno == logging.WARNING]
+    assert any("driver.py" in record.getMessage() for record in warned)
+
+
+def test_a_compile_failure_without_a_message_is_named_by_its_type(
+    tmp_path, data_dir, monkeypatch, dynamo
+):
+    failing_to_compile(monkeypatch, AssertionError())
+
+    with pytest.raises(TrainingError, match=r"could not compile the model \(AssertionError\); use"):
+        run(tmp_path, data_dir)
+
+
+def test_a_compile_worker_s_error_with_more_lines_is_named_by_its_first(
+    tmp_path, data_dir, monkeypatch, dynamo
+):
+    """The traceback ends with the whole of the error's message, as ptxas's runs to its stderr
+    and the command to repeat it with; the error is named by where its message starts."""
+    from torch._inductor.compile_worker.subproc_pool import SubprocException
+
+    details = (
+        "Traceback (most recent call last):\n"
+        '  File "triton/compiler/compiler.py", line 300, in compile\n'
+        "    next_module = compile_ir(module, metadata)\n"
+        "                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+        '  File "triton/backends/nvidia/compiler.py", line 450, in make_cubin\n'
+        "    raise PTXASError(error)\n"
+        "triton.runtime.errors.PTXASError: PTXAS error: Internal Triton PTX codegen error\n"
+        "`ptxas` stderr:\n"
+        "ptxas fatal   : Value 'sm_120' is not defined for option 'gpu-name'\n"
+        "\n"
+        "Repro command: /usr/local/cuda/bin/ptxas -lineinfo -v --gpu-name sm_120 /tmp/k.ptx\n"
+    )
+    failing_to_compile(monkeypatch, SubprocException(details, "triton"))
+
+    with pytest.raises(TrainingError) as failed:
+        run(tmp_path, data_dir)
+
+    assert str(failed.value).startswith(
+        "could not compile the model (triton.runtime.errors.PTXASError: PTXAS error: Internal "
+        "Triton PTX codegen error, in a compile worker); use"
+    )
