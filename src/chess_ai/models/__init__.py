@@ -15,6 +15,7 @@ from chess_ai.models.registry import (
     create_model,
 )
 from chess_ai.models.resnet import ResNet
+from chess_ai.models.transformer import SquareTransformer
 
 __all__ = [
     "MLP",
@@ -23,6 +24,7 @@ __all__ = [
     "ChessModel",
     "ModelOutput",
     "ResNet",
+    "SquareTransformer",
     "architecture_defaults",
     "architecture_names",
     "create_model",

@@ -1,0 +1,184 @@
+# An experiment config: everything one training run depends on, in one file.
+#
+#   chess-ai train experiments/transformer-lichess-2026.toml
+#
+# The file is copied into the run directory as it is, comments and all, so a run can
+# always be traced back to what produced it. Only [dataset] has to be filled in.
+#
+# Every option is listed, with the built-in default noted beside it: a line you delete
+# falls back to that default, and a value that differs from it is this file's own choice.
+# The notes are checked against the code by the test suite, so they cannot drift.
+#
+# The run is named after this file unless `name` says otherwise, and `--name` on the
+# command line overrides both, which is how the same config is run more than once.
+#
+# A square transformer on the same data and encoder as resnet-lichess-2026.toml (a 10x256
+# residual tower), to compare the two on equal terms: every square is a token, attention lets
+# every square see every other one in a single layer, and the global features are tokens of
+# their own. The heads are the residual tower's, so the comparison is about the body.
+#
+# The size is 8x192 at batch 4096 because 8x256 at the tower's batch of 8192 needs about
+# 45 GiB and an RTX 4090 has 24: every position keeps about a dozen activations of 75 tokens
+# per layer for the backward pass. Measured on synthetic batches in bfloat16, 8x192 trains at
+# about 20,000 positions a second against 23,000 for the tower, so the two get about the same
+# time; 8x256 managed 11,000 at any batch up to 3072, the most that fitted. It has 7.9M
+# parameters to the tower's 16.3M.
+#
+# The batch is half the tower's, so the step counts below are twice its: the same positions
+# between warmup, validations and checkpoints, and the same four epochs.
+
+name = "transformer-lichess-2026"
+
+# Draws the initial weights and the order positions are visited in. The same seed on
+# the same data and the same code gives the same run.
+seed = 1234                                # default: 0
+
+[dataset]
+# A dataset built with `chess-ai dataset build`, by name, in the data directory.
+# Its train split is trained on and its validation split is measured on; the dataset
+# decided which games went where, so no positions from one game are in both.
+name = "lichess-2026"
+# Which version of it, counting from 1; see `chess-ai dataset append`. Left out, the run
+# trains on the latest; either way it records the version it resolved to, and a resumed run
+# keeps that one.
+# version = 2                              # default: the latest
+
+[encoder]
+# What the network is shown. "board-planes" gives a plane per piece type and colour
+# on an 8x8 grid, plus a separate vector of what is not on the board: side to move,
+# castling rights, en passant, the halfmove clock, and both players' ratings.
+name = "board-planes"                      # default: "board-planes"
+
+# What a rating is divided by to become a feature. The default leaves room above
+# today's top ratings, so a 3000 is 0.6 and the pools can inflate without the feature
+# leaving the range the model was trained on.
+rating_scale = 5000.0                      # default: 5000.0
+
+# How many earlier positions of the game are shown behind the current one, as 12 more
+# planes each. 0 shows the position alone. Planes for positions before the game began
+# are all zero. Each square's history goes into that square's token, so it costs the
+# transformer one wider input layer and no more tokens. 3 was worth 0.018 nats of policy loss
+# over 1 on a 6x64 residual tower.
+history = 3                                # default: 0
+
+# Which way up the board is shown. "absolute" is always from white's side.
+# "side-to-move" turns it around when black is to move, so the mover's pieces are
+# always on the same planes and always play up the board; the castling features and
+# the moves the model predicts are turned with it, and turned back when it plays.
+orientation = "side-to-move"               # default: "absolute"
+
+[model]
+# Which architecture, by its registered name. Everything below this line is that
+# architecture's own hyperparameters, so a typo is refused rather than ignored.
+architecture = "square-transformer"        # default: "mlp"
+
+# Transformer layers, and how wide each token is through all of them. Each layer is attention
+# across the 64 squares and the global features, then a feed-forward part per token.
+layers = 8                                 # default: 6
+width = 192                                # default: 128
+
+# Attention heads per layer. They split the width between them, so they have to divide it:
+# 6 heads of 32 here.
+heads = 6                                  # default: 4
+
+# How much wider than the tokens each layer's feed-forward part is.
+ffn_multiplier = 4                         # default: 4
+
+# Off, as for the MLP: no run so far has scored better on its training data than on the
+# held-out games, which is what dropout is for.
+dropout = 0.0                              # default: 0.0
+
+[training]
+# "auto" uses the GPU when there is one and the CPU when there is not. Naming "cuda"
+# explicitly fails on a machine without one, rather than quietly training 200x slower.
+device = "auto"                            # default: "auto"
+
+batch_size = 4096                          # default: 1024
+
+# How much the win/draw/loss head counts next to the policy. The policy is the point;
+# the value head is there so the network has some notion of who is winning.
+value_loss_weight = 0.5                    # default: 0.5
+
+# bfloat16 for the forward and backward passes, on an Ampere or newer card. Older
+# cards and the CPU train in float32 instead, and say so.
+mixed_precision = true                     # default: true
+
+# Processes that read and encode batches while the GPU trains. 0 does it inline.
+data_workers = 4                           # default: 4
+
+log_every_steps = 50                       # default: 50
+
+[optimizer]
+# Not swept yet. 1e-3 is where a pre-norm transformer this size usually starts; the 10x256
+# tower's 4e-3 came from a sweep of the tower, and attention tends to want less.
+learning_rate = 1e-3                       # default: 0.001
+weight_decay = 0.01                        # default: 0.01
+
+# Whether weight decay also shrinks biases and the normalization layers' scales and
+# shifts. Usually not: decay is for the weights that multiply an input. Runs made before
+# the trainer told the two apart decayed everything, which true brings back.
+decay_biases_and_norms = false             # default: false
+
+beta1 = 0.9                                # default: 0.9
+beta2 = 0.95                               # default: 0.95
+epsilon = 1e-8                             # default: 1e-08
+
+# Largest gradient norm allowed through. 0 turns clipping off.
+gradient_clip = 1.0                        # default: 1.0
+
+[schedule]
+# How long the run is. One step is one batch, so steps * batch_size / positions is
+# how many times over the data it goes; the run prints that before it starts. Here about
+# four epochs of the 704M training positions at batch 4096.
+steps = 688000                             # default: 10000
+
+# Linear warmup, then cosine decay to min_learning_rate_fraction of the learning rate.
+warmup_steps = 2000                        # default: 500
+min_learning_rate_fraction = 0.1           # default: 0.1
+
+[validation]
+# The same positions every time, from the front of the validation split, so that the
+# curve across steps is measured on one thing. More positions costs time per pass and
+# buys a less noisy curve.
+#
+# every_steps is a floor, not the whole story: a checkpoint step validates too, so that
+# the metrics kept with a checkpoint were measured on that checkpoint. When the two
+# schedules below do not divide each other that means extra passes, and the run says how
+# many before it starts.
+every_steps = 2000                         # default: 500
+positions = 163840                         # default: 16384
+
+[checkpoints]
+# Every this many steps, and at the last step. Each of those steps also validates, which
+# is what lets `metric` below mean something for every checkpoint that is kept.
+every_steps = 2000                         # default: 1000
+
+# The most recent this many are kept, plus the best one wherever it is.
+keep = 3                                   # default: 3
+
+# Which validation metric decides "best": loss, policy_loss, value_loss, top1, top5
+# or illegal_top_move_rate.
+metric = "policy_loss"                     # default: "policy_loss"
+
+[evaluation]
+# What the evaluator (`chess-ai evaluator`, a process of its own beside the trainer) finds
+# out about each checkpoint the run saves, once per suite; `chess-ai evaluate` runs them
+# again on demand. "probe-positions" records the checkpoint's top moves and win/draw/loss
+# estimate on a fixed set of labelled positions, for the run page. "sample-games" plays a few
+# games with the checkpoint (see [sample_games] in chess-ai.toml), which the run page shows
+# live as they are played. "stockfish-ladder" measures the checkpoint's Elo against
+# Stockfish every so many steps (see [ladder] in chess-ai.toml), about ten minutes a
+# checkpoint on a GPU, for the run page's Elo chart. [] evaluates nothing.
+suites = ["probe-positions", "sample-games", "stockfish-ladder"] # default: ["probe-positions", "sample-games"]
+
+# Uncomment to start the weights from another run's checkpoint instead of from the seed:
+# fine-tuning. Weights only — the optimizer, the schedule and the step start afresh, on the
+# dataset above. The architecture, its size and the encoder have to be the ones that run
+# trained, and a run that does not match is refused. run.json records where the weights
+# came from.
+#
+# [initialize_from]
+# run = "a-pretrained-run"
+#
+# Which of its checkpoints: "best" by its own metric, "latest", or a step number.
+# checkpoint = "best"                      # default: "best"
