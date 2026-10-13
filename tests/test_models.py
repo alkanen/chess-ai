@@ -53,26 +53,40 @@ def batch(encoder):
 TINY = {
     "mlp": {"width": 16},
     "resnet": {"blocks": 1, "channels": 8},
+    "square-transformer": {"layers": 1, "width": 8, "heads": 2},
 }
 """Each architecture at a size that builds and runs in milliseconds, by its registered name."""
 
 SMALL = {
     "mlp": {"width": 64},
     "resnet": {"blocks": 2, "channels": 16},
+    "square-transformer": {"layers": 2, "width": 32, "heads": 4},
 }
 """Each architecture at a size that can learn a handful of positions by heart in a second."""
+
+LEARNING_RATE = {
+    "mlp": 0.01,
+    "resnet": 0.01,
+    "square-transformer": 1e-3,
+}
+"""What each architecture learns those positions at.
+
+Attention at 0.01 spikes within a few dozen steps and settles where it can no longer tell two
+positions apart; at a tenth of that it gets there in about fifty.
+"""
 
 VARIANTS = [
     pytest.param("mlp", {}, id="mlp"),
     pytest.param("resnet", {"globals": "planes"}, id="resnet-planes"),
     pytest.param("resnet", {"globals": "film"}, id="resnet-film"),
+    pytest.param("square-transformer", {}, id="square-transformer"),
 ]
 """Every architecture, and every way it has of being wired differently, to check each of them."""
 
 
 def test_every_architecture_has_a_tiny_size_and_is_checked():
     """A newly registered architecture fails here until the contract tests below cover it."""
-    assert sorted(TINY) == sorted(SMALL) == architecture_names()
+    assert sorted(TINY) == sorted(SMALL) == sorted(LEARNING_RATE) == architecture_names()
     assert {variant.values[0] for variant in VARIANTS} == set(architecture_names())
 
 
@@ -80,13 +94,13 @@ def tiny(architecture: str, spec: EncoderSpec, **options) -> ChessModel:
     return create_model(architecture, spec, **{**TINY[architecture], **options})
 
 
-def memorize(model, batch, moves, results, *, steps: int = 200) -> float:
+def memorize(architecture: str, model, batch, moves, results, *, steps: int = 200) -> float:
     """Train ``model`` on ``batch`` alone until it knows it by heart, or ``steps`` run out.
 
     Returns the last loss. Stops early because most models get there in a few dozen steps, and
     the dense heads over the whole vocabulary make every step cost something.
     """
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE[architecture])
     for _ in range(steps):
         out = model(*batch)
         loss = F.cross_entropy(out.policy, moves) + F.cross_entropy(out.value, results)
@@ -215,7 +229,7 @@ def test_every_architecture_can_memorize_a_handful_of_positions(architecture, op
     moves = torch.arange(len(POSITIONS)) * 37  # Distinct, arbitrary, and inside the vocabulary.
     results = torch.tensor([Result.WIN, Result.LOSS, Result.DRAW, Result.WIN])
 
-    loss = memorize(model, batch, moves, results)
+    loss = memorize(architecture, model, batch, moves, results)
 
     out = model(*batch)
     assert loss < 0.05, "a model this size should learn four positions by heart"
@@ -223,12 +237,16 @@ def test_every_architecture_can_memorize_a_handful_of_positions(architecture, op
     assert torch.equal(out.value.argmax(dim=1), results)
 
 
-@pytest.mark.parametrize("globals", ["planes", "film"])
-def test_the_resnet_hears_the_features_that_are_not_on_the_board(globals):
+@pytest.mark.parametrize(
+    ("architecture", "options"),
+    [variant for variant in VARIANTS if variant.values[0] != "mlp"],
+)
+def test_the_features_that_are_not_on_the_board_are_heard(architecture, options):
     """Two copies of one board that differ only in the ratings, asked to play different moves.
 
-    Nothing on the planes tells them apart, so a tower that dropped the global features on the
-    floor could not learn this however long it trained.
+    Nothing on the planes tells them apart, so a model that dropped the global features on the
+    floor could not learn this however long it trained. The MLP is left out: it reads the
+    features as plain inputs, with no wiring of its own to get wrong.
     """
     encoder = create_encoder("board-planes")
     bundle = encoder.encode(
@@ -240,9 +258,9 @@ def test_the_resnet_hears_the_features_that_are_not_on_the_board(globals):
     moves = torch.tensor([3, 300])
     results = torch.tensor([Result.LOSS, Result.WIN])
     torch.manual_seed(0)
-    model = small("resnet", encoder.spec, globals=globals)
+    model = small(architecture, encoder.spec, **options)
 
-    assert memorize(model, batch, moves, results) < 0.05
+    assert memorize(architecture, model, batch, moves, results) < 0.05
     assert torch.equal(model(*batch).policy.argmax(dim=1), moves)
 
 
@@ -293,3 +311,61 @@ def test_a_resnet_needs_a_board_to_convolve():
 
     with pytest.raises(ValueError, match="needs board planes, and moves has none"):
         create_model("resnet", moves_only)
+
+
+def test_the_square_transformer_sizes_itself_from_layers_width_and_feed_forward(spec):
+    narrow = create_model("square-transformer", spec, layers=2, width=16, heads=2)
+    wide = create_model("square-transformer", spec, layers=2, width=32, heads=2)
+    deep = create_model("square-transformer", spec, layers=4, width=16, heads=2)
+    fat = create_model("square-transformer", spec, layers=2, width=16, heads=2, ffn_multiplier=8)
+
+    assert narrow.parameter_count < wide.parameter_count
+    assert narrow.parameter_count < deep.parameter_count
+    assert narrow.parameter_count < fat.parameter_count
+
+
+def test_the_heads_split_the_width_without_changing_the_size(spec):
+    """More heads look at more things at once, each through a narrower slice of the width."""
+    one = create_model("square-transformer", spec, layers=2, width=16, heads=1)
+    four = create_model("square-transformer", spec, layers=2, width=16, heads=4)
+
+    assert one.parameter_count == four.parameter_count
+
+
+def test_a_layerless_square_transformer_is_the_embeddings_and_the_heads(spec, batch):
+    model = create_model("square-transformer", spec, layers=0, width=8, heads=1)
+
+    assert model(*batch).policy.shape == (len(POSITIONS), spec.policy_size)
+
+
+def test_every_global_feature_is_a_token_of_its_own(spec):
+    """One vector to scale by the value and one to say which feature it is, per feature."""
+    model = tiny("square-transformer", spec)
+
+    assert model.feature_value.shape == model.feature_embedding.shape == (spec.global_features, 8)
+    assert model.square_embedding.shape == (64, 8)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"layers": -1}, "layers must not be negative"),
+        ({"width": 0}, "width must be at least 1"),
+        ({"heads": 0}, "heads must be at least 1"),
+        ({"width": 10, "heads": 4}, "heads must divide width, and 4 does not divide 10"),
+        ({"ffn_multiplier": 0}, "ffn_multiplier must be at least 1"),
+        ({"dropout": 1.0}, r"dropout must be in \[0, 1\)"),
+    ],
+)
+def test_a_square_transformer_that_cannot_be_built_says_so(spec, options, message):
+    with pytest.raises(ValueError, match=message):
+        create_model("square-transformer", spec, **options)
+
+
+def test_a_square_transformer_needs_a_board():
+    moves_only = EncoderSpec(
+        encoder="moves", spatial_channels=0, global_features=4, sequence_length=16, policy_size=8
+    )
+
+    with pytest.raises(ValueError, match="needs board planes, and moves has none"):
+        create_model("square-transformer", moves_only)
