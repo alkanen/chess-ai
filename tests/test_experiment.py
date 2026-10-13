@@ -40,6 +40,7 @@ def test_only_the_dataset_has_to_be_named(tmp_path):
     assert loaded.model.architecture == "mlp"
     assert loaded.training.device == "auto"
     assert loaded.training.mixed_precision is True
+    assert loaded.training.compile is True
     assert loaded.optimizer.learning_rate == 1e-3
     assert loaded.checkpoints.metric == "policy_loss"
 

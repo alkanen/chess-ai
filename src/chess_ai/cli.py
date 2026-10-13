@@ -437,6 +437,13 @@ def _add_train_command(commands: argparse._SubParsersAction) -> None:
         "that crashed carries on from the last checkpoint it saved.",
     )
     resume.add_argument("name", help="the run")
+    resume.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="compile the model on the GPU, or not, whatever the run was trained with "
+        "(default: as it was; a run from before [training] compile existed is not compiled)",
+    )
     resume.set_defaults(handler=_resume)
 
 
@@ -1361,6 +1368,7 @@ def _resume(config: Config, args: argparse.Namespace) -> int:
             runs_dir=config.paths.runs,
             say=say,
             ladder_every=config.ladder.every,
+            compile=args.compile,
         ),
     )
 

@@ -1,4 +1,4 @@
-"""Which device to train on, and what the device says about itself while training.
+"""Which device to train on, whether to compile for it, and what the device says while training.
 
 Two things that both have to degrade rather than fail. A run asked to train on ``auto`` should
 use the RTX 4090 when it is there and the CPU when it is not, because the same config has to work
@@ -12,6 +12,7 @@ import logging
 from typing import Any, Final
 
 import torch
+from torch import nn
 
 from chess_ai.training.run_store import GpuStats
 
@@ -66,6 +67,29 @@ def autocast_dtype(device: torch.device, *, mixed_precision: bool) -> torch.dtyp
         LOGGER.warning("this GPU does not support bfloat16; training in float32")
         return None
     return torch.bfloat16
+
+
+def compile_model(model: nn.Module, device: torch.device, *, enabled: bool) -> bool:
+    """Compile ``model`` for training on ``device`` if ``enabled`` and it is a GPU; say whether.
+
+    In place, with :meth:`~torch.nn.Module.compile`, rather than by wrapping it: the wrapper
+    ``torch.compile`` returns names every parameter ``_orig_mod.``-something, and a checkpoint
+    of it would not load into the uncompiled model the engine, the evaluator and
+    ``[initialize_from]`` build. Compiled in place, the model keeps its parameter names, so a
+    checkpoint is the same whether or not it was compiled, and a run can be resumed with the
+    setting changed.
+
+    Nothing is compiled here: that happens on the first call, and again once for each new
+    kind of call, which in training is validation's pass without gradients and its smaller
+    last batch. Each is compiled once and kept.
+
+    Only on CUDA, where it pays: compiling on the CPU needs a C++ compiler, would slow every
+    test down by the compile, and is not where anything is trained.
+    """
+    if not enabled or device.type != CUDA:
+        return False
+    model.compile()
+    return True
 
 
 def gpu_stats(device: torch.device) -> GpuStats | None:

@@ -74,6 +74,12 @@ value_loss_weight = 0.5                    # default: 0.5
 # cards and the CPU train in float32 instead, and say so.
 mixed_precision = true                     # default: true
 
+# Compile the model with torch.compile on a GPU, which fuses the small element-wise
+# operations that limit a ResNet or a transformer (about +30% for a ResNet; an MLP
+# gains nothing). It takes some seconds at the start of a run. Compiled kernels round
+# slightly differently, so a run repeats bit for bit only with the same setting.
+compile = true                             # default: true
+
 # Processes that read and encode batches while the GPU trains. 0 does it inline.
 data_workers = 8                           # default: 4
 

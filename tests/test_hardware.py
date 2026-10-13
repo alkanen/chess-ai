@@ -9,9 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
+from torch._dynamo.utils import counters
 
 from chess_ai.training import hardware
-from chess_ai.training.hardware import gpu_stats
+from chess_ai.training.hardware import compile_model, gpu_stats
 from chess_ai.training.run_store import GpuStats
 
 GIB = 2**30
@@ -115,3 +117,29 @@ def test_a_question_nvml_declines_costs_only_its_own_answer(cuda, monkeypatch):
     assert stats.name == "cuda's name for it"
     assert stats.temperature_celsius == 64
     assert stats.memory_used_bytes == 20 * GIB
+
+
+def tiny_model() -> nn.Module:
+    return nn.Sequential(nn.Linear(4, 4), nn.ReLU(), nn.Linear(4, 2))
+
+
+def test_a_model_is_compiled_for_a_gpu_and_keeps_its_parameter_names():
+    model = tiny_model()
+    names = list(model.state_dict())
+
+    # Nothing is compiled until the model is called, so no GPU is needed to ask for it.
+    assert compile_model(model, CUDA0, enabled=True) is True
+    assert list(model.state_dict()) == names
+
+
+@pytest.mark.parametrize(
+    ("device", "enabled"),
+    [(torch.device("cpu"), True), (CUDA0, False), (torch.device("cpu"), False)],
+)
+def test_a_model_is_left_uncompiled_on_the_cpu_or_when_compiling_is_off(device, enabled):
+    model = tiny_model()
+    graphs = counters["stats"]["unique_graphs"]
+
+    assert compile_model(model, device, enabled=enabled) is False
+    assert model(torch.zeros(1, 4)).shape == (1, 2)
+    assert counters["stats"]["unique_graphs"] == graphs
