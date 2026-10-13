@@ -483,6 +483,41 @@ def test_the_probe_does_not_leave_the_dataset_open_for_the_loader(tmp_path, data
     assert max(sizes) < mapped, f"the loader was handed {max(sizes)} bytes, shards are {mapped}"
 
 
+def orders_before_the_loader(monkeypatch) -> list[int]:
+    """The epochs whose order is asked for before the run's loader is built."""
+    from chess_ai.training import batches as batches_module
+
+    asked: list[int] = []
+    built = {"loader": False}
+    real_order = batches_module.PositionBatches._order
+    real_loader = trainer.batch_loader
+
+    def order(self, epoch):
+        if not built["loader"]:
+            asked.append(epoch)
+        return real_order(self, epoch)
+
+    def loader(batches, **options):
+        built["loader"] = True
+        return real_loader(batches, **options)
+
+    monkeypatch.setattr(batches_module.PositionBatches, "_order", order)
+    monkeypatch.setattr(trainer, "batch_loader", loader)
+    return asked
+
+
+def test_the_probe_shuffles_no_order_for_the_loader_to_shuffle_again(
+    tmp_path, data_dir, monkeypatch
+):
+    """At Lichess scale an epoch's order takes minutes to shuffle, and the probe needs none."""
+    asked = orders_before_the_loader(monkeypatch)
+
+    reader = run(tmp_path, data_dir)
+
+    assert reader.status.status == RunStatus.FINISHED
+    assert not asked, f"the orders of epochs {asked} were built before the loader"
+
+
 def test_the_heartbeat_keeps_up_between_log_lines(tmp_path, data_dir, monkeypatch):
     """Its cadence has to be HEARTBEAT_SECONDS, not log_every_steps.
 
@@ -1306,6 +1341,19 @@ def test_a_crashed_run_resumes_from_its_last_checkpoint_and_forgets_what_came_af
     )
     elapsed = [line["elapsed"] for line in crashed.metrics()]
     assert elapsed == sorted(elapsed), "and the clock carries on rather than starting again"
+
+
+def test_a_resumed_run_probes_without_shuffling_an_order(tmp_path, data_dir, monkeypatch):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    asked = orders_before_the_loader(monkeypatch)
+
+    reader = resumed(tmp_path, data_dir, "tiny")
+
+    assert reader.status.status == RunStatus.FINISHED
+    assert not asked, f"the orders of epochs {asked} were built before the loader"
 
 
 def test_a_resumed_run_says_where_it_carries_on_from(tmp_path, data_dir, monkeypatch):
