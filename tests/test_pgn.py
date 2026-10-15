@@ -287,6 +287,22 @@ async def test_a_side_stockfish_played_says_the_strength_it_played_at_and_its_ti
     assert "WhiteElo" not in headers
 
 
+async def test_stockfish_held_to_a_number_of_nodes_says_so_rather_than_a_time():
+    stockfish = StockfishDescription(
+        elo=1700, requested_elo=1700, min_elo=1320, max_elo=3190, move_time=None, nodes=100_000
+    )
+    session = GameSession(
+        ScriptedPlayer(["e2e4"]), ScriptedStockfishPlayer(["e7e5"], stockfish), id=GAME_ID
+    )
+    async with playing(session):
+        await settled()
+        headers = read_back(game_pgn(session.state)).headers
+
+    assert headers["BlackElo"] == "1700"
+    assert headers["BlackNodes"] == "100000"
+    assert "BlackMoveTime" not in headers
+
+
 async def test_tags_of_the_callers_own_are_added_and_take_the_place_of_its_defaults():
     pgn = game_pgn(
         await fools_mate(),

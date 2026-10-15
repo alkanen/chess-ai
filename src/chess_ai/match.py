@@ -119,32 +119,63 @@ async def play_match(
         raise ValueError(f"a match needs at least one game, not {games}")
     played = []
     for number in range(1, games + 1):
-        opening, first_plays_white = pairing(number, openings, paired=paired)
-        white, black = (first, second) if first_plays_white else (second, first)
-        session = GameSession(white, black, opening=opening.moves, move_delay=move_delay)
-        if on_session is not None:
-            on_session(number, session)
-        await session.play()
-        state = session.state
-        headers = {
-            "Event": event,
-            "Round": str(number),
-            "Opening": opening.name,
-            # A tag of this project's own: which set, and which version of it, the line was
-            # taken from, since two versions of a set can give one line different names.
-            "OpeningSet": openings.label,
-        }
-        game = MatchGame(
-            number=number,
-            opening=opening,
-            first_plays_white=first_plays_white,
-            game=state,
-            pgn=game_pgn(state, headers=headers),
+        game = await play_game(
+            first,
+            second,
+            number,
+            openings=openings,
+            on_session=on_session,
+            event=event,
+            paired=paired,
+            move_delay=move_delay,
         )
         played.append(game)
         if on_game is not None:
             on_game(game)
     return played
+
+
+async def play_game(
+    first: Player,
+    second: Player,
+    number: int,
+    *,
+    openings: OpeningSet,
+    on_session: Callable[[int, GameSession], None] | None = None,
+    event: str = EVENT,
+    paired: bool = True,
+    move_delay: float = 0.0,
+) -> MatchGame:
+    """Play game ``number`` (from 1) of a match between ``first`` and ``second``, from the line
+    and with the colours :func:`pairing` gives it, as :func:`play_match` plays each of its
+    games. ``on_session`` is handed the game's session before a move of it is played.
+
+    Raises:
+        IllegalMoveError: a player chose an illegal move. Whatever a player raises is raised
+            here likewise.
+    """
+    opening, first_plays_white = pairing(number, openings, paired=paired)
+    white, black = (first, second) if first_plays_white else (second, first)
+    session = GameSession(white, black, opening=opening.moves, move_delay=move_delay)
+    if on_session is not None:
+        on_session(number, session)
+    await session.play()
+    state = session.state
+    headers = {
+        "Event": event,
+        "Round": str(number),
+        "Opening": opening.name,
+        # A tag of this project's own: which set, and which version of it, the line was
+        # taken from, since two versions of a set can give one line different names.
+        "OpeningSet": openings.label,
+    }
+    return MatchGame(
+        number=number,
+        opening=opening,
+        first_plays_white=first_plays_white,
+        game=state,
+        pgn=game_pgn(state, headers=headers),
+    )
 
 
 @dataclass(frozen=True)
@@ -237,6 +268,20 @@ def starting_line(
     return f"game {number}/{games} starting, {opening.name}: {white} – {black}"
 
 
+@dataclass
+class LinesMatch:
+    """One match :class:`GameLines` says the games of, as :meth:`GameLines.match` starts it."""
+
+    before: int
+    """How many games the matches before this one play."""
+    names: tuple[str, str]
+    games: int
+    paired: bool
+    players: str
+    header_due: int = 1
+    """The number, in this match, of the next game to say the header before."""
+
+
 class GameLines:
     """Says the games of one or more matches as each starts and ends, numbered from the first
     game of the first match, under a header that says who is playing.
@@ -248,6 +293,9 @@ class GameLines:
     screenful: ``chess-ai: RUN@30000 sample games 3–22 of 102: model against Stockfish 1350``.
     ``title`` is what comes before the range, such as ``RUN@30000 sample games``, and ``total``
     is how many games all the matches play.
+
+    Games are said of the match :meth:`match` started last, unless they are said of one it
+    returned, as the games of matches played at once are.
 
     The game lines are :data:`~chess_ai.output.DETAIL` lines and the headers milestones.
     """
@@ -266,14 +314,7 @@ class GameLines:
         self._total = total
         self._openings = openings
         self._every = every
-        self._names: tuple[str, str] = ("", "")
-        self._players = ""
-        self._paired = True
-        self._before = 0
-        """How many games the matches before this one play."""
-        self._games = 0
-        self._header_due = 1
-        """The number, in this match, of the next game to say the header before."""
+        self._current = LinesMatch(before=0, names=("", ""), games=0, paired=True, players="")
 
     def match(
         self,
@@ -282,42 +323,51 @@ class GameLines:
         games: int,
         paired: bool = True,
         players: str | None = None,
-    ) -> None:
+        before: int | None = None,
+    ) -> LinesMatch:
         """Start saying the games of the next match, between the players ``names`` calls
         the first and the second, as :func:`play_match` plays ``games`` of them, ``paired``
         or not. ``players`` is what the header says of them, by default ``first against
-        second``, or ``first against itself``."""
+        second``, or ``first against itself``. ``before`` is how many games come before the
+        match's first, by default those of every match started before it."""
         first, second = names
-        self._before += self._games
-        self._names = (first, second)
-        self._games = games
-        self._paired = paired
-        self._header_due = 1
         if players is None:
             players = f"{first} against itself" if first == second else f"{first} against {second}"
-        self._players = players
+        self._current = LinesMatch(
+            before=before if before is not None else self._current.before + self._current.games,
+            names=(first, second),
+            games=games,
+            paired=paired,
+            players=players,
+        )
+        return self._current
 
-    def starting(self, number: int) -> None:
-        """Say that game ``number`` of the match, counting from 1, is starting."""
-        if number >= self._header_due:
-            last = min(number + self._every - 1, self._games)
-            first_number, last_number = self._before + number, self._before + last
-            games = f"{first_number}" if last == number else f"{first_number}–{last_number}"
-            self._say(f"chess-ai: {self._title} {games} of {self._total}: {self._players}")
-            self._header_due = number + self._every
-        opening, first_plays_white = pairing(number, self._openings, paired=self._paired)
+    def starting(self, number: int, match: LinesMatch | None = None) -> None:
+        """Say that game ``number`` of ``match``, counting from 1, is starting."""
+        match = match if match is not None else self._current
+        if number >= match.header_due:
+            # From the game it was due before, which is this one unless games played at once
+            # began out of order.
+            first = match.header_due
+            last = min(first + self._every - 1, match.games)
+            first_number, last_number = match.before + first, match.before + last
+            games = f"{first_number}" if last == first else f"{first_number}–{last_number}"
+            self._say(f"chess-ai: {self._title} {games} of {self._total}: {match.players}")
+            match.header_due = first + self._every
+        opening, first_plays_white = pairing(number, self._openings, paired=match.paired)
         line = starting_line(
             opening,
             first_plays_white,
-            self._names,
-            number=self._before + number,
+            match.names,
+            number=match.before + number,
             games=self._total,
         )
         self._say(line, kind=DETAIL)
 
-    def ended(self, game: MatchGame) -> None:
-        """Say how ``game``, of the match, went."""
-        line = game_line(game, self._names, number=self._before + game.number, games=self._total)
+    def ended(self, game: MatchGame, match: LinesMatch | None = None) -> None:
+        """Say how ``game``, of ``match``, went."""
+        match = match if match is not None else self._current
+        line = game_line(game, match.names, number=match.before + game.number, games=self._total)
         self._say(line, kind=DETAIL)
 
 

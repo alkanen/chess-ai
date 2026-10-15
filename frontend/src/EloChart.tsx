@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { LadderPoint } from './api';
-import { describeEstimate, ELO_SERIES, eloChartData, moveTimes } from './ladder';
+import { describeEstimate, ELO_SERIES, eloChartData, ladderLimits } from './ladder';
 import { readPalette, useDarkScheme } from './MetricChart';
 import { formatCount } from './runFormat';
 import './MetricChart.css';
@@ -98,12 +98,12 @@ export function EloChart({ points }: EloChartProps) {
   }, [data]);
 
   const latest = points.length === 0 ? null : points[points.length - 1];
-  const times = moveTimes(points);
+  const limits = ladderLimits(points);
   return (
     <figure className="metric-chart elo-chart" aria-labelledby="elo-chart-title">
       <figcaption id="elo-chart-title">
         <span className="title">
-          Elo on Stockfish’s scale at {times.map((time) => `${time} s`).join(' and ')} a move
+          Elo on Stockfish’s scale at {limits.join(' and ')}
         </span>
         <span className="latest">
           {latest === null
@@ -112,10 +112,10 @@ export function EloChart({ points }: EloChartProps) {
               `a ${Math.round(latest.estimate.confidence * 100)}% range`}
         </span>
       </figcaption>
-      {times.length > 1 && (
+      {limits.length > 1 && (
         <p className="note">
-          These ladders were played at different move times, at which Stockfish plays differently
-          strong: compare ratings measured at one move time only.
+          These ladders were played with Stockfish held to different limits, at which it plays
+          differently strong: compare ratings measured at one limit only.
         </p>
       )}
       {!empty && <div className="plot" ref={container} />}

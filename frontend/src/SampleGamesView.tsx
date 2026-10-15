@@ -15,6 +15,7 @@ import {
 import { LiveGameBoard } from './LiveGameBoard';
 import { formatCount } from './runFormat';
 import { describeEnding, describeOpponent, SAMPLE_SUITE, sampleGameHash } from './sampleGames';
+import { describeLimit } from './stockfishLimit';
 import './SampleGamesView.css';
 
 /** What the live game is, among the games its checkpoint plays. */
@@ -32,7 +33,7 @@ function describeSettings(result: SampleGamesResult): string {
   ];
   const stockfish = result.stockfish;
   if (stockfish !== null) {
-    parts.push(`Stockfish at Elo ${stockfish.elo}, ${stockfish.move_time} s a move`);
+    parts.push(`Stockfish at Elo ${stockfish.elo}, ${describeLimit(stockfish)}`);
   }
   return parts.join('; ');
 }

@@ -25,6 +25,7 @@ import {
 import { LiveGameBoard } from './LiveGameBoard';
 import { formatCount } from './runFormat';
 import { describeEnding } from './sampleGames';
+import { describeLimits } from './stockfishLimit';
 import './SampleGamesView.css';
 import './LadderView.css';
 
@@ -84,11 +85,11 @@ function liveCaption(live: LiveGame): string {
 
 /** How the checkpoint was asked to play, and against what. */
 function describeSettings(result: LadderResult): string {
-  const moveTimes = [...new Set(result.levels.map((level) => level.move_time))];
+  const limits = describeLimits(result.levels);
   return [
     result.model.rating === null ? 'no rating' : `rated ${result.model.rating}`,
     `${result.games_per_level} games a level`,
-    `Stockfish at ${moveTimes.map((time) => `${time} s`).join(' and ')} a move`,
+    `Stockfish at ${limits.join(' and ')}`,
     `openings from ${result.openings}`,
   ].join('; ');
 }

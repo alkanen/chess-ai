@@ -126,8 +126,10 @@ export interface StockfishDescription {
   requested_elo: number;
   min_elo: number;
   max_elo: number;
-  /** Seconds it thinks about each move. */
-  move_time: number;
+  /** Seconds it thinks about each move, or null when it is held to `nodes` instead. */
+  move_time: number | null;
+  /** Positions it searches for each move, or null when it is held to `move_time` instead. */
+  nodes?: number | null;
 }
 
 export interface PlayerInfo {
@@ -654,8 +656,11 @@ export interface LadderLevel {
   elo: number;
   /** The level asked for, which is `elo` unless Stockfish could not play at it. */
   requested_elo: number;
-  /** Seconds Stockfish had for each move. */
-  move_time: number;
+  /** Seconds Stockfish had for each move, or null when it was held to `nodes` instead. */
+  move_time: number | null;
+  /** Positions Stockfish searched for each move, or null (or missing, from before ladders
+   * could be held to nodes) when it was held to `move_time` instead. */
+  nodes?: number | null;
   wins: number;
   draws: number;
   losses: number;
@@ -716,8 +721,11 @@ export interface LadderPoint {
   /** The Elo of every level it was played against, weakest first. */
   levels: number[];
   games_per_level: number;
-  /** Seconds Stockfish had for each move, which the rating is only comparable at. */
-  move_time: number;
+  /** Seconds Stockfish had for each move, or null when it was held to `nodes` instead; the
+   * rating is only comparable with others measured at the same limit. */
+  move_time: number | null;
+  /** Positions Stockfish searched for each move, or null when it was held to `move_time`. */
+  nodes?: number | null;
   /** The rating the checkpoint was asked to play like. */
   rating: number | null;
 }

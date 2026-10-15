@@ -1744,6 +1744,150 @@ def test_a_second_ladder_replaces_the_first(tmp_path, capsys):
     assert len(ladder_games(path)) == 1
 
 
+def test_a_ladder_held_to_nodes_plays_games_at_once_and_saves_them_in_order(tmp_path, capsys):
+    from stockfish_helpers import started, told, wait_until_gone
+
+    from chess_ai.ladder import LadderResult
+
+    config, engine = ladder_config(tmp_path)
+
+    status = main(
+        [
+            "--config",
+            str(config),
+            "ladder",
+            "tiny",
+            "--levels",
+            "1350,1500",
+            "--games",
+            "3",
+            "--nodes",
+            "5000",
+            "--parallel",
+            "3",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert status == 0
+    assert "3 games each at 5,000 nodes a move, 3 games at once, from" in captured.out
+    assert "on Stockfish's scale at 5,000 nodes a move" in captured.out
+    assert "warning" not in captured.err
+    lines = told(engine)
+    assert "go nodes 5000" in lines
+    assert not [line for line in lines if "movetime" in line]
+    evaluations = tmp_path / "runs/tiny/evaluations/step-000000002"
+    result = LadderResult.model_validate_json((evaluations / "stockfish-ladder.json").read_text())
+    assert [(level.elo, level.move_time, level.nodes) for level in result.levels] == [
+        (1350, None, 5000),
+        (1500, None, 5000),
+    ]
+    games = ladder_games(evaluations / "stockfish-ladder.pgn")
+    assert [
+        (game.headers["Round"], game.headers.get("BlackElo", game.headers.get("WhiteElo")))
+        for game in games
+    ] == [
+        ("1", "1350"),
+        ("2", "1350"),
+        ("3", "1350"),
+        ("1", "1500"),
+        ("2", "1500"),
+        ("3", "1500"),
+    ]
+    assert all("Nodes" in "".join(game.headers) for game in games)
+    wait_until_gone(*started(engine))
+
+
+def test_a_ladder_playing_games_at_once_held_to_a_time_warns_that_it_depends_on_the_cpu(
+    tmp_path, capsys
+):
+    config, _ = ladder_config(tmp_path, ladder="parallel_games = 2\n")
+
+    assert (
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "2"]) == 0
+    )
+
+    err = capsys.readouterr().err
+    assert "plays 2 games at once with Stockfish held to a time a move" in err
+    assert "[ladder] nodes" in err
+
+
+def test_a_ladder_whose_games_cannot_be_put_in_order_says_where_they_are(
+    tmp_path, capsys, monkeypatch
+):
+    import errno
+
+    from chess_ai import ladder
+
+    def full_disk(path, played) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(ladder, "write_games", full_disk)
+    config, _ = ladder_config(tmp_path)
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "2"])
+
+    err = capsys.readouterr().err
+    (partial,) = (tmp_path / "runs/tiny/evaluations/step-000000002").glob("*.partial")
+    assert "No space left on device, so no result was saved" in err
+    assert f"the 2 games played are in {partial}" in err
+    assert len(ladder_games(partial)) == 2
+
+
+def test_a_ladder_held_to_nodes_says_how_long_a_hung_stockfish_was_given(
+    tmp_path, capsys, monkeypatch
+):
+    from stockfish_helpers import started, wait_until_gone
+
+    from chess_ai import stockfish
+
+    monkeypatch.setattr(stockfish, "MOVE_GRACE", 0.2)
+    config, engine = ladder_config(tmp_path, "--hang-after", "3")
+
+    with pytest.raises(SystemExit):
+        main(
+            ["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "1"]
+            + ["--nodes", "1000"]
+        )
+
+    err = capsys.readouterr().err
+    assert (
+        "Stockfish took more than 0.25 seconds to search 1,000 nodes for a move, "
+        "and was taken to have hung" in err
+    )
+    assert "move time" not in err
+    wait_until_gone(*started(engine))
+
+
+def test_a_level_stockfish_cannot_play_is_warned_about_once_however_many_games_play_it(
+    tmp_path, capsys
+):
+    config, _ = ladder_config(tmp_path, "--elo-range", "1350", "2850")
+
+    status = main(
+        ["--config", str(config), "ladder", "tiny", "--levels", "1000", "--games", "4"]
+        + ["--nodes", "1000", "--parallel", "3"]
+    )
+
+    assert status == 0
+    assert capsys.readouterr().err.count("level 1000 is played at 1350") == 1
+
+
+def test_a_move_time_on_the_command_line_holds_stockfish_to_it_over_the_configs_nodes(
+    tmp_path, capsys
+):
+    from stockfish_helpers import told
+
+    config, engine = ladder_config(tmp_path, ladder="nodes = 5000\n")
+    command = ["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "1"]
+
+    assert main(command) == 0
+    assert "go nodes 5000" in told(engine)
+    assert main([*command, "--move-time", "0.02"]) == 0
+    assert "go movetime 20" in told(engine)
+
+
 @pytest.mark.parametrize(
     ("arguments", "complaint"),
     [
@@ -1756,6 +1900,12 @@ def test_a_second_ladder_replaces_the_first(tmp_path, capsys):
         (["tiny", "--games", "0"], "a whole number of at least 1, not '0'"),
         (["tiny", "--rating", "-1"], "a rating is a number from 0 to 4000"),
         (["tiny", "--move-time", "0"], "a move time is a number from 0.01 to 60"),
+        (["tiny", "--nodes", "0"], "a number of nodes is a number from 1 to 100000000"),
+        (["tiny", "--parallel", "0"], "a number of games is a number from 1 to 64"),
+        (
+            ["tiny", "--move-time", "0.1", "--nodes", "1000"],
+            "argument --nodes: not allowed with argument --move-time",
+        ),
     ],
 )
 def test_ladder_refuses_what_it_cannot_read(capsys, arguments, complaint):

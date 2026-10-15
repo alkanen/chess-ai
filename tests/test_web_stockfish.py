@@ -79,6 +79,7 @@ def test_stockfish_can_play_white_and_says_how_strong_it_plays(client, engine):
         "min_elo": 1320,
         "max_elo": 3190,
         "move_time": 0.25,
+        "nodes": None,
     }
     assert game["black"]["stockfish"] is None
     assert len(started(engine)) == 1

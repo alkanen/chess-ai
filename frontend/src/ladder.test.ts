@@ -85,6 +85,12 @@ describe('ladder', () => {
     );
   });
 
+  it('describes a strength measured with Stockfish held to a number of nodes', () => {
+    expect(
+      describeStrength(ladderPoint(4000, {}, { move_time: null, nodes: 100_000 }), 2000),
+    ).toMatch(/at 100,000 nodes a move on the Stockfish ladder/);
+  });
+
   it('says a strength may not hold at a rating other than the ladder’s', () => {
     expect(describeStrength(ladderPoint(4000), 1500)).toMatch(
       /rated 2000\. .* You have asked for 1500, so it may play differently\.$/,

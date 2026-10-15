@@ -8,7 +8,13 @@ how it scored against them, by :mod:`chess_ai.rating`.
 The rating is on Stockfish's scale, not Lichess's. Stockfish's levels are anchored to an
 engine rating list at a few seconds a move, and a ladder played at a fraction of that has
 Stockfish playing below its levels, so two ladders are only comparable when they were played
-at the same move time — which is why every result says what it was.
+at the same move time — which is why every result says what it was. Or at the same number of
+nodes a move: what Stockfish searches in a tenth of a second depends on the machine and on how
+busy it is, and what it makes of a number of nodes does not, so a ladder held to nodes compares
+with any other held to as many.
+
+Most of a ladder is Stockfish thinking, on one thread of a CPU that has many, so a ladder can
+play several games at once, each against a Stockfish of its own.
 
 What a ladder finds out is kept in the run directory, beside what any other evaluation finds
 out about the same checkpoint: ``<suite>.json`` with the results and the estimate, and
@@ -26,11 +32,12 @@ games can.
 import asyncio
 import gc
 import logging
+import os
 import threading
 import traceback
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
@@ -40,7 +47,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from chess_ai.config import LadderConfig
 from chess_ai.evaluator import until_stopped
 from chess_ai.game_session import GameSession
-from chess_ai.match import GameLines, MatchGame, append_game, play_match, score
+from chess_ai.match import GameLines, LinesMatch, MatchGame, append_game, play_game, score
 from chess_ai.openings import OpeningSet
 from chess_ai.output import Say
 from chess_ai.output import say as said_on_stdout
@@ -50,6 +57,7 @@ from chess_ai.players import (
     StockfishBackedPlayer,
     StockfishDescription,
     close_players,
+    describe_limit,
     wait_players_closed,
 )
 from chess_ai.position_view import GameOverReason
@@ -101,8 +109,11 @@ class LadderLevel(BaseModel):
     """The strength Stockfish played at, which is the rating the results are counted against."""
     requested_elo: int
     """The level asked for, which is :attr:`elo` unless Stockfish could not play at it."""
-    move_time: float
-    """Seconds Stockfish had for each move."""
+    move_time: float | None
+    """Seconds Stockfish had for each move, or ``None`` when it was held to :attr:`nodes`."""
+    nodes: int | None = None
+    """How many positions Stockfish searched for each move, or ``None`` when it was held to
+    :attr:`move_time`, as every ladder from before ladders could be held to nodes was."""
     wins: int
     draws: int
     losses: int
@@ -114,6 +125,11 @@ class LadderLevel(BaseModel):
     @property
     def points(self) -> float:
         return self.wins + 0.5 * self.draws
+
+    @property
+    def pace(self) -> str:
+        """What Stockfish was held to, such as ``0.1 s a move`` or ``100,000 nodes a move``."""
+        return describe_limit(self.move_time, self.nodes)
 
 
 class LadderEstimate(BaseModel):
@@ -216,53 +232,211 @@ async def play_ladder(
     opponent: Opponent,
     on_game: Callable[[StockfishDescription, MatchGame], None] | None = None,
     on_session: Callable[[StockfishDescription, int, GameSession], None] | None = None,
+    parallel: int = 1,
 ) -> list[PlayedLevel]:
-    """Play ``model`` against Stockfish at each of ``levels`` in turn, ``games`` games each.
+    """Play ``model`` against Stockfish at each of ``levels``, ``games`` games each, as a match
+    at each level would, and return the games by level, weakest first, and by number.
 
-    Each level's opponent is made by ``opponent`` when its turn comes, and closed once its games
-    are over, so that at most one engine runs at a time. ``on_game`` is handed each game as it
-    ends, with the level it was played at, and ``on_session`` each game's session before it is
-    played, with the level and the game's number in it, as
-    :func:`~chess_ai.match.play_match` hands them. ``model`` is the first player of every match.
+    ``parallel`` games are played at once. Each of them is played against an engine of its own,
+    which ``opponent`` makes for the level: whichever game ends first takes the next one, in
+    order of level and number, and keeps its engine while the games it takes are of the same
+    level, so at most ``parallel`` engines run at a time. One at a time, every game of a level is
+    played against one engine, closed once they are over. ``model`` is the first player of every
+    game, and is asked for moves in several games at once when several are played.
+
+    ``on_game`` is handed each game as it ends, with the level it was played at, and
+    ``on_session`` each game's session before it is played, with the level and the game's number
+    in it, as :func:`~chess_ai.match.play_match` hands them. Played at once, games end, and may
+    begin, in an order of their own; the games returned are in order all the same.
 
     Raises:
-        ValueError: there are no levels, or ``games`` is less than one.
+        ValueError: there are no levels, or ``games`` or ``parallel`` is less than one.
         TypeError: ``opponent`` made a player that cannot say how strong it plays.
-        Whatever :func:`~chess_ai.match.play_match` or ``opponent`` raise.
+        Whatever :func:`~chess_ai.match.play_game` or ``opponent`` raise. Every game still being
+            played is stopped, and every engine closed, first.
     """
     if not levels:
         raise ValueError("a ladder needs at least one level")
-    played = []
-    for level in levels:
-        stockfish = await opponent(level)
-        try:
-            if not isinstance(stockfish, StockfishBackedPlayer):
-                raise TypeError(f"{stockfish.name} cannot be a level of a ladder")
+    if games < 1:
+        raise ValueError(f"a match needs at least one game, not {games}")
+    if parallel < 1:
+        raise ValueError(f"a ladder plays at least one game at a time, not {parallel}")
+    ladder = _Ladder(
+        levels=levels,
+        openings=openings,
+        opponent=opponent,
+        on_game=on_game,
+        on_session=on_session,
+        games=iter(
+            [(index, number) for index in range(len(levels)) for number in range(1, games + 1)]
+        ),
+        played=[[] for _ in levels],
+    )
+    at_once = min(parallel, games * len(levels))
+    if at_once == 1:
+        await _play_games(model, ladder)
+    else:
+        await _all_or_none(
+            [asyncio.ensure_future(_play_games(model, ladder)) for _ in range(at_once)]
+        )
+    return [
+        PlayedLevel(
+            stockfish=ladder.described[index],
+            games=sorted(ladder.played[index], key=lambda game: game.number),
+        )
+        for index in range(len(levels))
+    ]
+
+
+@dataclass
+class _Ladder:
+    """What the games of a ladder played at once share: what they are played with, the games
+    still to be played, and those played so far.
+
+    Not the model: whatever plays a ladder's games is handed it, rather than a closure being,
+    so that the frames a failure comes through, which keep their function and its closure
+    whatever clears them, keep no network from being let go of.
+    """
+
+    levels: Sequence[int]
+    openings: OpeningSet
+    opponent: Opponent
+    on_game: Callable[[StockfishDescription, MatchGame], None] | None
+    on_session: Callable[[StockfishDescription, int, GameSession], None] | None
+    games: Iterator[tuple[int, int]]
+    """The games still to be played, each as its level's place among the levels and its number;
+    one iterator for every game played at once, which hands each game out once."""
+    played: list[list[MatchGame]]
+    """The games played so far at each level, in the order they ended."""
+    described: dict[int, StockfishDescription] = field(default_factory=dict)
+    """How strong Stockfish played at each level that has begun."""
+
+
+async def _play_games(model: Player, ladder: _Ladder) -> None:
+    """Play the next game of ``ladder`` there is, and the next, until there are none."""
+    held: int | None = None
+    stockfish: Player | None = None
+    try:
+        for index, number in ladder.games:
+            if index != held:
+                if stockfish is not None:
+                    await _close(stockfish)
+                    stockfish = None
+                stockfish = await ladder.opponent(ladder.levels[index])
+                held = index
+                if not isinstance(stockfish, StockfishBackedPlayer):
+                    raise TypeError(f"{stockfish.name} cannot be a level of a ladder")
+            assert isinstance(stockfish, StockfishBackedPlayer)
             description = stockfish.stockfish
+            ladder.described.setdefault(index, description)
 
-            def handed_over(game: MatchGame, description=description) -> None:
-                if on_game is not None:
-                    on_game(description, game)
-
-            def begun(number: int, session: GameSession, description=description) -> None:
+            def begun(
+                number: int,
+                session: GameSession,
+                description=description,
+                on_session=ladder.on_session,
+            ) -> None:
                 if on_session is not None:
                     on_session(description, number, session)
 
-            level_games = await play_match(
-                model,
-                stockfish,
-                games=games,
-                openings=openings,
-                on_game=handed_over,
-                on_session=begun,
-                event=EVENT,
+            game = await play_game(
+                model, stockfish, number, openings=ladder.openings, on_session=begun, event=EVENT
             )
-        finally:
-            close_players(stockfish)
-            with suppress(TimeoutError):
-                await asyncio.wait_for(wait_players_closed(stockfish), CLOSE_TIMEOUT)
-        played.append(PlayedLevel(stockfish=description, games=level_games))
-    return played
+            ladder.played[index].append(game)
+            if ladder.on_game is not None:
+                ladder.on_game(description, game)
+    finally:
+        if stockfish is not None:
+            await _close(stockfish)
+
+
+async def _close(stockfish: Player) -> None:
+    """Close a level's engine, and give it a moment to be gone."""
+    close_players(stockfish)
+    with suppress(TimeoutError):
+        await asyncio.wait_for(wait_players_closed(stockfish), CLOSE_TIMEOUT)
+
+
+async def _all_or_none(tasks: list["asyncio.Future[None]"]) -> None:
+    """Wait for every one of ``tasks``, and if one fails, stop the rest and raise what it did.
+
+    Every task has stopped by the time this returns or raises, whatever stopped it, so that
+    whatever they hold, such as engines, has been let go of.
+    """
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for task in tasks:
+        if task in done and not task.cancelled() and task.exception() is not None:
+            raise task.exception()  # type: ignore[misc]
+
+
+def game_index(
+    levels: Sequence[int], games: int, stockfish: StockfishDescription, number: int
+) -> int:
+    """Where game ``number`` of the level ``stockfish`` was asked to play at is among the games
+    of a ladder of ``levels``, ``games`` each, counting from 0: the order the result lists them
+    in, and the order :func:`write_games` saves them in."""
+    return levels.index(stockfish.requested_elo) * games + number - 1
+
+
+class LadderLines:
+    """Says the games of a ladder as each starts and ends, as
+    :class:`~chess_ai.match.GameLines` does, each under the header of its own level and
+    numbered through the whole ladder, whichever order they are played in."""
+
+    def __init__(
+        self, say: Say, title: str, *, levels: Sequence[int], games: int, openings: OpeningSet
+    ) -> None:
+        self._levels = levels
+        self._games = games
+        self._lines = GameLines(say, title, total=games * len(levels), openings=openings)
+        self._matches: dict[int, LinesMatch] = {}
+
+    def starting(self, stockfish: StockfishDescription, number: int) -> None:
+        """Say that game ``number`` of the level ``stockfish`` plays is starting."""
+        self._lines.starting(number, self._match(stockfish))
+
+    def ended(self, stockfish: StockfishDescription, game: MatchGame) -> None:
+        """Say how ``game``, of the level ``stockfish`` plays, went."""
+        self._lines.ended(game, self._match(stockfish))
+
+    def _match(self, stockfish: StockfishDescription) -> LinesMatch:
+        position = self._levels.index(stockfish.requested_elo)
+        if position not in self._matches:
+            self._matches[position] = self._lines.match(
+                ["model", f"Stockfish {stockfish.elo}"],
+                games=self._games,
+                before=position * self._games,
+            )
+        return self._matches[position]
+
+
+def write_games(path: Path, played: Sequence[PlayedLevel]) -> None:
+    """Write the games of ``played`` to ``path``, replacing what it held, in the order the result
+    lists them: the games file of a ladder that played games at once has them in the order they
+    ended.
+
+    Written beside it and moved over it once whole, since it is the only copy of the games: a
+    write that fails part way, such as on a disk that has filled up, leaves it as it was.
+
+    Raises:
+        OSError: the games could not be written, and ``path`` is unchanged.
+    """
+    ordered = path.with_name(f"{path.name}.ordered")
+    try:
+        with ordered.open("w", encoding="utf-8") as file:
+            for level in played:
+                for game in level.games:
+                    # PGN separates the games of a file with a blank line.
+                    file.write(f"{game.pgn}\n")
+        os.replace(ordered, path)
+    except BaseException:
+        ordered.unlink(missing_ok=True)
+        raise
 
 
 def ladder_result(
@@ -287,6 +461,7 @@ def ladder_result(
                 elo=level.stockfish.elo,
                 requested_elo=level.stockfish.requested_elo,
                 move_time=level.stockfish.move_time,
+                nodes=level.stockfish.nodes,
                 wins=counted.wins,
                 draws=counted.draws,
                 losses=counted.losses,
@@ -465,16 +640,14 @@ def stands(run: RunReader, checkpoint: CheckpointInfo, written: datetime) -> boo
 
 def summary(result: LadderResult) -> str:
     """One line about ``result``, such as ``Elo 1523 (1460 to 1590), 50/100 at 0.1 s a move``."""
-    move_times = sorted({level.move_time for level in result.levels})
-    at = ", ".join(f"{move_time:g}" for move_time in move_times)
+    at = " and ".join(dict.fromkeys(level.pace for level in result.levels))
     estimate = result.estimate
-    return (
-        f"Elo {estimate.describe()}, {estimate.points:g}/{estimate.games} points at {at} s a move"
-    )
+    return f"Elo {estimate.describe()}, {estimate.points:g}/{estimate.games} points at {at}"
 
 
-StockfishStarter = Callable[[int, float], Awaitable[Player]]
-"""Starts a level's Stockfish, given the Elo and the move time: a player that is
+StockfishStarter = Callable[[int, float, int | None], Awaitable[Player]]
+"""Starts a level's Stockfish, given the Elo, the move time and the number of nodes a move,
+which is ``None`` for one held to the move time: a player that is
 :class:`~chess_ai.players.StockfishBackedPlayer`, so that the result can say how strong it was."""
 
 EngineLoader = Callable[[Path], "InferenceEngine"]
@@ -583,47 +756,62 @@ class LadderSuite:
             )
             partial = start_games_file(run, checkpoint.step)
             games_file = partial
-            lines = GameLines(
-                self._say, f"{label} ladder games", total=total, openings=self.openings
+            levels = settings.levels
+            per_level = settings.games_per_level
+            lines = LadderLines(
+                self._say,
+                f"{label} ladder games",
+                levels=levels,
+                games=per_level,
+                openings=self.openings,
             )
-            begun = 0
+            playing: dict[int, tuple[GameSession, int]] = {}
+            """The games being played, by where they are among the ladder's, and the Elo of each."""
+            # The game the live view follows: the first of those being played, until it ends.
+            followed: int | None = None
 
             async def opponent(level: int) -> Player:
-                return await self._stockfish(level, settings.move_time)
+                return await self._stockfish(level, settings.move_time, settings.nodes)
+
+            def show(index: int) -> None:
+                if self._live is not None and index == followed:
+                    session, elo = playing[index]
+                    self._show(run, checkpoint.step, index, total, elo, session)
 
             def on_session(
                 stockfish: StockfishDescription, number: int, session: GameSession
             ) -> None:
-                nonlocal begun
-                begun += 1
-                index = begun - 1
-                if number == 1:
-                    lines.match(
-                        ["model", f"Stockfish {stockfish.elo}"], games=settings.games_per_level
-                    )
-                lines.starting(number)
-                if self._live is None:
-                    return
-
-                def show(event: object = None) -> None:
-                    self._show(run, checkpoint.step, index, total, stockfish.elo, session)
-
-                show()
-                session.listen(show)
+                nonlocal followed
+                lines.starting(stockfish, number)
+                index = game_index(levels, per_level, stockfish, number)
+                playing[index] = (session, stockfish.elo)
+                if followed is None:
+                    followed = index
+                show(index)
+                session.listen(lambda event=None: show(index))
 
             def on_game(stockfish: StockfishDescription, game: MatchGame) -> None:
+                nonlocal followed
                 append_game(games_file, game)
-                lines.ended(game)
+                lines.ended(stockfish, game)
+                index = game_index(levels, per_level, stockfish, game.number)
+                del playing[index]
+                if index == followed:
+                    followed = min(playing, default=None)
+                    if followed is not None:
+                        show(followed)
 
             played = await play_ladder(
                 model,
-                settings.levels,
-                games=settings.games_per_level,
+                levels,
+                games=per_level,
                 openings=self.openings,
                 opponent=opponent,
                 on_game=on_game,
                 on_session=on_session,
+                parallel=settings.parallel_games,
             )
+            write_games(games_file, played)
             result = ladder_result(
                 model.model,
                 played,
