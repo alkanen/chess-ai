@@ -162,7 +162,8 @@ def _model_tags(color: str, player: PlayerInfo) -> dict[str, str]:
 
 
 def _stockfish_tags(color: str, player: PlayerInfo) -> dict[str, str]:
-    """How strong Stockfish played this side: ``WhiteElo`` and its time a move.
+    """How strong Stockfish played this side: ``WhiteElo``, and its time a move
+    (``WhiteMoveTime``) or the nodes it searched for each (``WhiteNodes``).
 
     ``WhiteElo`` here, unlike for a model, because the number is a strength: the level Stockfish
     is calibrated to play at. The level actually played is written, not the one asked for, which
@@ -171,6 +172,8 @@ def _stockfish_tags(color: str, player: PlayerInfo) -> dict[str, str]:
     stockfish = player.stockfish
     if stockfish is None:
         return {}
+    if stockfish.nodes is not None:
+        return {f"{color}Elo": str(stockfish.elo), f"{color}Nodes": str(stockfish.nodes)}
     return {f"{color}Elo": str(stockfish.elo), f"{color}MoveTime": f"{stockfish.move_time:g}"}
 
 

@@ -71,13 +71,17 @@ export function ladderResult(step: number, changes: Partial<LadderResult> = {}):
   };
 }
 
-export function ladderPoint(step: number, changes: Partial<LadderEstimate> = {}): LadderPoint {
+export function ladderPoint(
+  step: number,
+  changes: Partial<LadderEstimate> = {},
+  limit: Pick<LadderPoint, 'move_time' | 'nodes'> = { move_time: 0.1, nodes: null },
+): LadderPoint {
   return {
     step,
     estimate: estimate(changes),
     levels: [1350, 1500],
     games_per_level: 2,
-    move_time: 0.1,
+    ...limit,
     rating: 2000,
   };
 }

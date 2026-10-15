@@ -362,8 +362,12 @@ class LadderPoint(BaseModel):
     levels: list[int]
     """The Elo of every level it was played against, weakest first."""
     games_per_level: int
-    move_time: float
-    """Seconds Stockfish had for each move, which the rating is only comparable at."""
+    move_time: float | None
+    """Seconds Stockfish had for each move, or ``None`` when it was held to :attr:`nodes`;
+    the rating is only comparable with others played at the same limit."""
+    nodes: int | None = None
+    """How many positions Stockfish searched for each move, or ``None`` when it was held to
+    :attr:`move_time`."""
     rating: int | None
     """The rating the checkpoint was asked to play like."""
 
@@ -391,6 +395,7 @@ def ladder_points(run: RunReader) -> list[LadderPoint]:
                 levels=[level.elo for level in result.levels],
                 games_per_level=result.games_per_level,
                 move_time=result.levels[0].move_time,
+                nodes=result.levels[0].nodes,
                 rating=result.model.rating,
             )
         )

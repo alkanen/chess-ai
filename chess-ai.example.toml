@@ -128,6 +128,24 @@ rating = 2000
 # scale at this move time, and only ladders played at one move time compare.
 move_time = 0.1
 
+# How many positions Stockfish searches for each move, instead of a move time.
+# What it searches in a tenth of a second depends on the machine and on how busy
+# it is (a training run's data loader, other ladders...), so ladders held to a time
+# compare only when played on one machine under one load; held to nodes, Stockfish
+# plays the same anywhere. Stockfish 14.1 searched a median of about 80,000 and a
+# mean of about 110,000 nodes in 0.1 s on one thread of a Ryzen 9 7950X3D beside a
+# training run, so 100000 plays about as a tenth of a second there. It is a scale
+# of its own all the same: ladders at a number of nodes compare only with ladders
+# at the same number. Unset, Stockfish is held to move_time.
+# nodes = 100000
+
+# How many games are played at once, each against a Stockfish process of its own.
+# Most of a ladder is Stockfish thinking on one thread, so 8 at once takes about
+# an eighth of the time. Keep it below the cores a training run and the rest leave
+# free; and hold Stockfish to nodes when playing more than one at once, since held
+# to move_time it plays weaker when its processes share the CPU (a ladder warns).
+parallel_games = 1
+
 # The opening set the games start from: one that comes with chess-ai, or the
 # path of a file of your own.
 openings = "standard"

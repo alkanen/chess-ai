@@ -183,9 +183,20 @@ class LadderConfig(BaseModel):
     """The rating the checkpoint is asked to play like. Always one: asked for none, a model
     plays like a game that claims no rating, which is far below what it can do."""
     move_time: float = Field(default=0.1, ge=0.01, le=60.0)
-    """Seconds Stockfish has for each move. Its levels were calibrated at a few seconds a move,
-    so at this one it plays below them and the ratings are higher than they would be there:
-    compare ladders played at one move time only."""
+    """Seconds Stockfish has for each move, unless :attr:`nodes` is set. Its levels were
+    calibrated at a few seconds a move, so at this one it plays below them and the ratings are
+    higher than they would be there: compare ladders played at one move time only."""
+    nodes: int | None = Field(default=None, ge=1, le=100_000_000)
+    """How many positions Stockfish searches for each move, instead of thinking for
+    :attr:`move_time`. What it searches in a given time depends on the machine and on how busy
+    it is, so a ladder held to a time is only comparable with ladders played on the same
+    machine under the same load; one held to nodes plays the same wherever it is played. Each
+    is a scale of its own: compare ladders played at one limit only."""
+    parallel_games: int = Field(default=1, ge=1, le=64)
+    """How many games are played at once, each against a Stockfish process of its own. Most of
+    a ladder is Stockfish thinking on one thread of a CPU, so playing several at once makes it
+    that much faster. Held to :attr:`move_time` rather than :attr:`nodes`, though, Stockfish
+    plays weaker when its processes have to share the CPU's cores."""
     openings: str = "standard"
     """The opening set the games start from: one that comes with chess-ai, or a file's path."""
     device: Device = "auto"

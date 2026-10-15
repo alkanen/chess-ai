@@ -67,6 +67,40 @@ async def test_stockfish_plays_at_the_elo_asked_for_and_thinks_for_the_time_give
         await stop(player)
 
 
+async def test_stockfish_held_to_a_number_of_nodes_searches_that_many_whatever_the_time(engine):
+    player = await start_stockfish(str(engine), elo=1700, move_time=0.05, nodes=20_000)
+    try:
+        move = (await player.choose_move(GameContext(chess.Board()))).move
+
+        assert chess.Board().is_legal(move)
+        assert (player.stockfish.nodes, player.stockfish.move_time) == (20_000, None)
+        assert player.stockfish.pace == "20,000 nodes a move"
+        lines = told(engine)
+        assert "go nodes 20000" in lines
+        assert not [line for line in lines if "movetime" in line]
+    finally:
+        await stop(player)
+
+
+@pytest.mark.parametrize(
+    ("move_time", "nodes"), [(None, None), (0.1, 1000)], ids=["neither", "both"]
+)
+def test_stockfish_is_described_as_held_to_a_time_or_to_nodes_and_not_both(move_time, nodes):
+    from pydantic import ValidationError
+
+    from chess_ai.players import StockfishDescription
+
+    with pytest.raises(ValidationError, match="a move time or to a number of nodes"):
+        StockfishDescription(
+            elo=1500,
+            requested_elo=1500,
+            min_elo=1320,
+            max_elo=3190,
+            move_time=move_time,
+            nodes=nodes,
+        )
+
+
 @pytest.mark.parametrize(("asked", "played"), [(800, 1320), (3500, 3190)])
 async def test_an_elo_out_of_stockfishs_range_is_played_at_the_nearer_end_and_says_so(
     engine, asked, played
@@ -174,6 +208,21 @@ async def test_stockfish_plays_a_whole_legal_game_against_the_random_mover():
     assert over is not None
     assert over.result in {"1-0", "1/2-1/2"}  # Stockfish does not lose to random moves.
     assert not running(stockfish.pid)
+
+
+@needs_stockfish
+async def test_the_real_engine_plays_a_game_held_to_a_number_of_nodes():
+    assert STOCKFISH is not None
+    stockfish = await start_stockfish(STOCKFISH, elo=1500, nodes=2_000)
+    try:
+        session = GameSession(stockfish, RandomPlayer(seed=7))
+        await session.play()
+    finally:
+        await stop(stockfish)
+
+    over = session.state.position.game_over
+    assert over is not None
+    assert over.result in {"1-0", "1/2-1/2"}
 
 
 @needs_stockfish

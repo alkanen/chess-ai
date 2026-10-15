@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
 import chess
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class MoveRejectedError(Exception):
@@ -156,12 +156,35 @@ class StockfishDescription(BaseModel):
     """The weakest Stockfish will play, which a request below it was raised to."""
     max_elo: int
     """The strongest calibrated level, which a request above it was lowered to."""
-    move_time: float
-    """How many seconds it thinks about each move."""
+    move_time: float | None
+    """How many seconds it thinks about each move, or ``None`` when it is held to
+    :attr:`nodes` instead."""
+    nodes: int | None = None
+    """How many positions it searches for each move, or ``None`` when it is held to
+    :attr:`move_time` instead. What it searches in a given time depends on the machine and on
+    how busy it is; what it makes of a number of positions does not."""
+
+    @model_validator(mode="after")
+    def _one_limit(self) -> "StockfishDescription":
+        if (self.move_time is None) == (self.nodes is None):
+            raise ValueError("Stockfish is held to a move time or to a number of nodes")
+        return self
 
     @property
     def clamped(self) -> bool:
         return self.elo != self.requested_elo
+
+    @property
+    def pace(self) -> str:
+        """How long it thinks, such as ``0.1 s a move`` or ``100,000 nodes a move``."""
+        return describe_limit(self.move_time, self.nodes)
+
+
+def describe_limit(move_time: float | None, nodes: int | None) -> str:
+    """What Stockfish was held to, such as ``0.1 s a move`` or ``100,000 nodes a move``."""
+    if nodes is not None:
+        return f"{nodes:,} nodes a move"
+    return f"{move_time:g} s a move"
 
 
 @runtime_checkable

@@ -696,7 +696,13 @@ def _number[N: (int, float)](
         or number < low
         or (high is not None and number > high)
     ):
-        bounds = f"from {low:g} to {high:g}" if high is not None else f"of at least {low:g}"
+        # Whole numbers in full: a large bound in :g's form would read 1e+08.
+        shown = (lambda bound: str(bound)) if kind is int else (lambda bound: f"{bound:g}")
+        bounds = (
+            f"from {shown(low)} to {shown(high)}"
+            if high is not None
+            else f"of at least {shown(low)}"
+        )
         raise argparse.ArgumentTypeError(f"{text!r}: {what} is a number {bounds}, not {value!r}")
     return number
 
@@ -830,16 +836,22 @@ def _count(number: int, thing: str) -> str:
     return f"{number} {thing}" if number == 1 else f"{number} {thing}s"
 
 
-def _engine_failure(error: Exception) -> str:
+def _engine_failure(error: Exception, *, nodes: int | None = None) -> str:
     """What went wrong with Stockfish in the middle of a game, for the person who ran the match.
 
     The engine hanging and the engine dying are the two that need no mistake by anyone: a
-    machine that is also training can starve it of CPU or run out of memory under it.
+    machine that is also training can starve it of CPU or run out of memory under it. ``nodes``
+    is how many Stockfish was held to a move, if it was held to nodes rather than a move time.
     """
     import chess.engine
 
     from chess_ai import stockfish
 
+    if isinstance(error, TimeoutError) and nodes is not None:
+        return (
+            f"Stockfish took more than {stockfish.move_timeout(None, nodes):g} seconds to search "
+            f"{nodes:,} nodes for a move, and was taken to have hung"
+        )
     if isinstance(error, TimeoutError):
         return (
             f"Stockfish took more than {stockfish.MOVE_GRACE:g} seconds longer than its move time "
@@ -1007,14 +1019,16 @@ def _add_ladder_command(commands: argparse._SubParsersAction) -> None:
             "the highest. The result and the games are saved in the run directory, under\n"
             "evaluations/, replacing any earlier ladder of the same checkpoint.\n"
             "\n"
-            "The levels, games, rating, move time and opening set default to the [ladder]\n"
-            "section of the configuration. The Elo is on Stockfish's scale at the move time\n"
-            "played, not a Lichess rating: compare ladders played at the same move time."
+            "The levels, games, rating, Stockfish's limit, the games played at once and the\n"
+            "opening set default to the [ladder] section of the configuration. The Elo is on\n"
+            "Stockfish's scale at the move time or the nodes a move played, not a Lichess\n"
+            "rating: compare ladders played at the same limit."
         ),
         epilog=(
             "examples:\n"
             "  chess-ai ladder resnet10x256\n"
             "  chess-ai ladder resnet10x256@48000 --levels 1350,1500,1700 --games 10\n"
+            "  chess-ai ladder resnet10x256 --nodes 100000 --parallel 8\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1039,11 +1053,24 @@ def _add_ladder_command(commands: argparse._SubParsersAction) -> None:
         metavar="R",
         help="the rating the checkpoint is asked to play like",
     )
-    ladder.add_argument(
+    limit = ladder.add_mutually_exclusive_group()
+    limit.add_argument(
         "--move-time",
         type=_move_time,
         metavar="SECONDS",
         help="how long Stockfish thinks about each move",
+    )
+    limit.add_argument(
+        "--nodes",
+        type=_nodes,
+        metavar="N",
+        help="how many positions Stockfish searches for each move, instead of a move time",
+    )
+    ladder.add_argument(
+        "--parallel",
+        type=lambda value: _number(int, value, "a number of games", value, 1, 64),
+        metavar="N",
+        help="how many games to play at once, each against a Stockfish of its own",
     )
     ladder.add_argument("--openings", metavar="SET", help="the opening set the games start from")
     ladder.add_argument(
@@ -1081,6 +1108,23 @@ def _move_time(value: str) -> float:
     return _number(float, value, "a move time", value, MIN_MOVE_TIME, MAX_MOVE_TIME)
 
 
+def _nodes(value: str) -> int:
+    from chess_ai.stockfish import MAX_NODES, MIN_NODES
+
+    return _number(int, value, "a number of nodes", value, MIN_NODES, MAX_NODES)
+
+
+def _warn_parallel_by_time(parallel: int, nodes: int | None) -> None:
+    """Warn that Stockfish held to a time a move plays weaker when its games share the CPU."""
+    if parallel > 1 and nodes is None:
+        LOGGER.warning(
+            "the ladder plays %d games at once with Stockfish held to a time a move, so its "
+            "strength depends on how busy the CPU is; [ladder] nodes holds it to a number of "
+            "nodes instead",
+            parallel,
+        )
+
+
 class _LevelNotStarted(Exception):
     """Stockfish could not be started for a level of a ladder, which ``__cause__`` says why."""
 
@@ -1095,15 +1139,18 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
     import chess.engine
 
     from chess_ai.ladder import (
+        LadderLines,
         games_path,
         ladder_result,
         play_ladder,
         result_path,
         save_ladder,
         start_games_file,
+        write_games,
     )
-    from chess_ai.match import GameLines, append_game, distinct_games
+    from chess_ai.match import append_game, distinct_games
     from chess_ai.openings import OpeningSetError, load_opening_set
+    from chess_ai.players import describe_limit
     from chess_ai.stockfish import StockfishError, start_stockfish
     from chess_ai.training.run_store import RunError, code_version
 
@@ -1112,6 +1159,10 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
     games = args.games or settings.games_per_level
     rating = args.rating if args.rating is not None else settings.rating
     move_time = args.move_time if args.move_time is not None else settings.move_time
+    # A move time on the command line holds Stockfish to it, whatever the settings say.
+    nodes = args.nodes if args.nodes is not None or args.move_time is not None else settings.nodes
+    parallel = args.parallel or settings.parallel_games
+    pace = describe_limit(move_time if nodes is None else None, nodes)
     try:
         openings = load_opening_set(args.openings or settings.openings)
     except OpeningSetError as e:
@@ -1133,12 +1184,10 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         raise _UserError(f"cannot write the ladder's games in {run.directory}: {e}") from e
     played = 0
     total = games * len(levels)
-    lines = GameLines(say, f"{label} ladder games", total=total, openings=openings)
+    lines = LadderLines(say, f"{label} ladder games", levels=levels, games=games, openings=openings)
 
     def on_session(stockfish, number: int, session: "GameSession") -> None:
-        if number == 1:
-            lines.match(["model", f"Stockfish {stockfish.elo}"], games=games)
-        lines.starting(number)
+        lines.starting(stockfish, number)
 
     def on_game(stockfish, game: "MatchGame") -> None:
         nonlocal played
@@ -1147,7 +1196,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         except OSError as e:
             raise _UserError(f"could not save a game to {partial}: {e.strerror}") from e
         played += 1
-        lines.ended(game)
+        lines.ended(stockfish, game)
 
     def games_note() -> str:
         """Where the games played so far are, for a ladder that stopped before its end.
@@ -1163,12 +1212,18 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         place = partial if partial.exists() else games_path(run, chosen.step)
         return f"; the {_count(played, 'game')} played {'is' if played == 1 else 'are'} in {place}"
 
+    # Games played at once start an engine for a level each, and a level is warned about once.
+    warned: set[int] = set()
+
     async def opponent(level: int) -> "Player":
         try:
-            stockfish = await start_stockfish(config.stockfish.path, elo=level, move_time=move_time)
+            stockfish = await start_stockfish(
+                config.stockfish.path, elo=level, move_time=move_time, nodes=nodes
+            )
         except StockfishError as e:
             raise _LevelNotStarted(level, e) from e
-        if stockfish.stockfish.clamped:
+        if stockfish.stockfish.clamped and level not in warned:
+            warned.add(level)
             LOGGER.warning(
                 f"Stockfish plays from {stockfish.stockfish.min_elo} to "
                 f"{stockfish.stockfish.max_elo}, so level {level} is played at "
@@ -1179,8 +1234,10 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
     say(
         f"chess-ai: {label} at rating {rating} against Stockfish at "
         f"{', '.join(str(level) for level in levels)}, {_count(games, 'game')} each at "
-        f"{move_time:g} s a move, from opening set {openings.label}"
+        f"{pace}{f', {parallel} games at once' if parallel > 1 else ''}, "
+        f"from opening set {openings.label}"
     )
+    _warn_parallel_by_time(parallel, nodes)
     if games > distinct_games(openings):
         LOGGER.warning(
             f"opening set {openings.label} has "
@@ -1199,6 +1256,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
                 opponent=opponent,
                 on_game=on_game,
                 on_session=on_session,
+                parallel=parallel,
             )
         )
     except KeyboardInterrupt:
@@ -1215,8 +1273,10 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
             f"{e.__cause__}{games_note()}"
         ) from e
     except (StockfishError, TimeoutError, chess.engine.EngineError) as e:
+        # Played at once, the game that failed need not be the one after those that ended.
+        which = f"game {played + 1}" if parallel == 1 else "a game"
         raise _UserError(
-            f"game {played + 1} could not be finished: {_engine_failure(e)}{games_note()}"
+            f"{which} could not be finished: {_engine_failure(e, nodes=nodes)}{games_note()}"
         ) from e
     result = ladder_result(
         model.model,
@@ -1237,9 +1297,17 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         )
     say(
         f"Elo: {result.estimate.describe()}, a {100 * result.estimate.confidence:g}% range, "
-        f"on Stockfish's scale at {move_time:g} s a move",
+        f"on Stockfish's scale at {pace}",
         kind=RESULT,
     )
+    try:
+        # In the order the result lists them, rather than the order games played at once ended.
+        write_games(partial, levels_played)
+    except OSError as e:
+        # The games are still in the file they were played into, which a failed write leaves be.
+        raise _UserError(
+            f"could not put the games in order: {e.strerror}, so no result was saved{games_note()}"
+        ) from e
     try:
         save_ladder(run, result, partial)
     except RunError as e:
@@ -1867,8 +1935,12 @@ def _evaluation_suites(
         except HardwareError as e:
             raise _UserError(f"[ladder] device: {e}") from e
 
-        async def level(elo: int, move_time: float) -> "Player":
-            return await start_stockfish(config.stockfish.path, elo=elo, move_time=move_time)
+        async def level(elo: int, move_time: float, nodes: int | None) -> "Player":
+            return await start_stockfish(
+                config.stockfish.path, elo=elo, move_time=move_time, nodes=nodes
+            )
+
+        _warn_parallel_by_time(ladder.parallel_games, ladder.nodes)
 
         def load(path: "Path") -> Any:
             # Where the ladder plays, rather than the evaluator's own device: a ladder asks
@@ -2022,6 +2094,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
 
     from chess_ai.evaluator import configured_suites
     from chess_ai.inference import InferenceError
+    from chess_ai.ladder import SUITE as LADDER_SUITE
     from chess_ai.probes import DivergedError
     from chess_ai.stockfish import StockfishError
     from chess_ai.training.run_store import (
@@ -2106,7 +2179,9 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     # The same for every checkpoint to come: not one to go on past.
                     raise _UserError(f"{label} {suite}: {e}") from e
                 except (TimeoutError, chess.engine.EngineError) as e:
-                    raise _UserError(f"{label} {suite}: {_engine_failure(e)}") from e
+                    # The ladder may hold Stockfish to nodes; sample games hold it to a time.
+                    nodes = config.ladder.nodes if suite == LADDER_SUITE else None
+                    raise _UserError(f"{label} {suite}: {_engine_failure(e, nodes=nodes)}") from e
                 say(f"{label} {suite}: {said}", kind=RESULT)
             # Done with the checkpoint, as the evaluator is after a job.
             for suite in suites:

@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import io
 import json
 import threading
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from chess_ai.inference import load_engine
 from chess_ai.ladder import (
     EVENT,
     SUITE,
+    LadderLevel,
     LadderResult,
     LadderSuite,
     awaiting_ladder,
@@ -192,6 +194,220 @@ async def test_a_ladder_needs_a_level():
     with pytest.raises(ValueError, match="at least one level"):
         await play_ladder(
             MatingModel("model", "wins"), [], games=1, openings=FROM_THE_START, opponent=Opponents()
+        )
+
+
+class UnwritableGame:
+    """A game whose PGN cannot be written, as one written to a disk that has just filled up."""
+
+    number = 2
+
+    @property
+    def pgn(self) -> str:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+
+async def test_games_that_cannot_be_put_in_order_are_left_as_they_were_played(tmp_path):
+    from chess_ai.ladder import PlayedLevel, write_games
+
+    played = await play_ladder(
+        MatingModel("model", "wins"),
+        [1350, 1500],
+        games=2,
+        openings=FROM_THE_START,
+        opponent=Opponents(),
+    )
+    partial = tmp_path / "stockfish-ladder.1234abcd.pgn.partial"
+    for level in reversed(played):
+        for game in level.games:
+            append_game(partial, game)
+    as_played = partial.read_text()
+    broken = [
+        played[0],
+        PlayedLevel(stockfish=played[1].stockfish, games=[played[1].games[0], UnwritableGame()]),
+    ]
+
+    with pytest.raises(OSError, match="No space left"):
+        write_games(partial, broken)  # type: ignore[list-item]
+
+    assert partial.read_text() == as_played, "every game played is still there"
+    assert list(tmp_path.iterdir()) == [partial], "and nothing else is left behind"
+
+
+class Count:
+    """How many of something there are now, and the most there have been at once."""
+
+    def __init__(self) -> None:
+        self.now = 0
+        self.most = 0
+
+    def up(self) -> None:
+        self.now += 1
+        self.most = max(self.most, self.now)
+
+    def down(self) -> None:
+        self.now -= 1
+
+
+class SlowStockfish(FakeStockfish):
+    """A level that loses every game, taking a while over some of its moves, so that games
+    played at once end in an order of their own, and that counts itself while it is open."""
+
+    def __init__(self, elo: int, engines: Count, delays, *, fails: bool = False) -> None:
+        super().__init__(elo, "loses")
+        self.engines = engines
+        self.delays = delays
+        self.fails = fails
+        engines.up()
+
+    async def choose_move(self, context: GameContext) -> PlayerMove:
+        await asyncio.sleep(next(self.delays))
+        if self.fails:
+            raise PlayerBroke("the engine is gone")
+        return await super().choose_move(context)
+
+    def close(self) -> None:
+        if not self.closed:
+            self.engines.down()
+        super().close()
+
+
+async def slow_ladder(parallel: int, *, failing: int | None = None, levels=(1350, 1500, 1700)):
+    """A ladder of four games a level against :class:`SlowStockfish`, played ``parallel`` at
+    once, with the level ``failing`` failing its games: what it played, the engines, the order
+    the games ended in and how many were played at once."""
+    import itertools
+
+    engines = Count()
+    at_once = Count()
+    made: list[SlowStockfish] = []
+    ended: list[tuple[int, int]] = []
+    delays = itertools.cycle([0.02, 0.0, 0.005, 0.03, 0.0, 0.01])
+
+    async def opponent(elo: int) -> SlowStockfish:
+        made.append(SlowStockfish(elo, engines, delays, fails=elo == failing))
+        return made[-1]
+
+    def on_game(stockfish: StockfishDescription, game) -> None:
+        at_once.down()
+        ended.append((stockfish.elo, game.number))
+
+    played = await play_ladder(
+        MatingModel("model", "wins"),
+        list(levels),
+        games=4,
+        openings=FROM_THE_START,
+        opponent=opponent,
+        on_session=lambda stockfish, number, session: at_once.up(),
+        on_game=on_game,
+        parallel=parallel,
+    )
+    return played, made, engines, ended, at_once
+
+
+async def test_games_played_at_once_each_have_an_engine_of_their_own_and_come_back_in_order():
+    played, made, engines, ended, at_once = await slow_ladder(3)
+
+    assert [(level.stockfish.elo, [game.number for game in level.games]) for level in played] == [
+        (1350, [1, 2, 3, 4]),
+        (1500, [1, 2, 3, 4]),
+        (1700, [1, 2, 3, 4]),
+    ]
+    assert at_once.most == 3
+    assert engines.most == 3, "an engine each, and no more than one each"
+    assert engines.now == 0 and all(stockfish.closed for stockfish in made)
+    assert sorted(ended) == [(elo, number) for elo in (1350, 1500, 1700) for number in range(1, 5)]
+    assert ended != sorted(ended), "the games ended in an order of their own"
+    assert all(game.first_score == 1.0 for level in played for game in level.games)
+
+
+async def test_games_played_at_once_are_the_games_played_one_at_a_time():
+    one, made_one, _, ended_one, at_once = await slow_ladder(1)
+    several, _, _, _, _ = await slow_ladder(4)
+
+    def games(played):
+        return [
+            (
+                level.stockfish.elo,
+                game.number,
+                game.opening,
+                game.first_plays_white,
+                [str(move) for move in game.game.moves],
+            )
+            for level in played
+            for game in level.games
+        ]
+
+    assert games(several) == games(one)
+    assert at_once.most == 1
+    assert ended_one == sorted(ended_one)
+    assert len(made_one) == 3, "one at a time, one engine a level"
+
+
+async def test_a_game_that_fails_stops_the_games_played_with_it_and_closes_every_engine():
+    import itertools
+
+    engines = Count()
+    made: list[SlowStockfish] = []
+    delays = itertools.cycle([0.01, 0.0])
+
+    async def opponent(elo: int) -> SlowStockfish:
+        made.append(SlowStockfish(elo, engines, delays, fails=elo == 1500))
+        return made[-1]
+
+    with pytest.raises(PlayerBroke):
+        await play_ladder(
+            MatingModel("model", "wins"),
+            [1350, 1500],
+            games=4,
+            openings=FROM_THE_START,
+            opponent=opponent,
+            parallel=3,
+        )
+
+    assert made and all(stockfish.closed for stockfish in made)
+    assert engines.now == 0
+
+
+async def test_a_ladder_cancelled_while_games_are_played_at_once_closes_every_engine():
+    import itertools
+
+    engines = Count()
+    made: list[SlowStockfish] = []
+    delays = itertools.repeat(10.0)
+
+    async def opponent(elo: int) -> SlowStockfish:
+        made.append(SlowStockfish(elo, engines, delays))
+        return made[-1]
+
+    ladder = asyncio.ensure_future(
+        play_ladder(
+            MatingModel("model", "wins"),
+            [1350, 1500],
+            games=4,
+            openings=FROM_THE_START,
+            opponent=opponent,
+            parallel=3,
+        )
+    )
+    while len(made) < 3:
+        await asyncio.sleep(0.01)
+    ladder.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await ladder
+
+    assert len(made) == 3 and all(stockfish.closed for stockfish in made)
+
+
+async def test_a_ladder_plays_at_least_one_game_at_a_time():
+    with pytest.raises(ValueError, match="at least one game at a time"):
+        await play_ladder(
+            MatingModel("model", "wins"),
+            [1350],
+            games=1,
+            openings=FROM_THE_START,
+            opponent=Opponents(),
+            parallel=0,
         )
 
 
@@ -389,10 +605,23 @@ class LevelStockfish:
     is, for the evaluator to be stopped in the middle of.
     """
 
-    def __init__(self, elo: int, *, runs=None, stop: threading.Event | None = None) -> None:
+    def __init__(
+        self,
+        elo: int,
+        *,
+        runs=None,
+        stop: threading.Event | None = None,
+        move_time: float | None = 0.1,
+        nodes: int | None = None,
+    ) -> None:
         self.name = f"Stockfish {elo}"
         self.stockfish = StockfishDescription(
-            elo=elo, requested_elo=elo, min_elo=1350, max_elo=2850, move_time=0.1
+            elo=elo,
+            requested_elo=elo,
+            min_elo=1350,
+            max_elo=2850,
+            move_time=move_time if nodes is None else None,
+            nodes=nodes,
         )
         self.runs = runs
         self.stop = stop
@@ -424,9 +653,9 @@ def ladder_suite(
 ) -> tuple[LadderSuite, list[LevelStockfish]]:
     made: list[LevelStockfish] = []
 
-    async def start(elo: int, move_time: float) -> LevelStockfish:
-        assert move_time == settings.move_time
-        made.append(LevelStockfish(elo, runs=runs, stop=stop))
+    async def start(elo: int, move_time: float, nodes: int | None) -> LevelStockfish:
+        assert (move_time, nodes) == (settings.move_time, settings.nodes)
+        made.append(LevelStockfish(elo, runs=runs, stop=stop, move_time=move_time, nodes=nodes))
         return made[-1]
 
     suite = LadderSuite(
@@ -525,6 +754,135 @@ def test_the_ladder_games_can_be_watched_as_they_are_played(tmp_path):
     last = made[1].seen[-1]
     assert (last.index, last.level) == (3, 1500)
     assert not (runs / LIVE_FILE).exists()
+
+
+PARALLEL = LadderConfig(
+    levels=(1350, 1500), games_per_level=3, rating=1500, every=4, parallel_games=4
+)
+
+
+def test_a_suite_playing_games_at_once_saves_them_in_the_order_the_result_lists_them(tmp_path):
+    run = open_run(tmp_path, model_run(tmp_path, steps=(4,)).name)
+    suite, made = ladder_suite(settings=PARALLEL)
+
+    ladder_checkpoint(suite, run, 4)
+
+    result = read_ladder(run, 4)
+    assert result is not None
+    assert [(game.index, game.elo, game.model_color) for game in result.games] == [
+        (0, 1350, "white"),
+        (1, 1350, "black"),
+        (2, 1350, "white"),
+        (3, 1500, "white"),
+        (4, 1500, "black"),
+        (5, 1500, "white"),
+    ]
+    text = read_games(run, 4)
+    assert text is not None
+    games = [replay.read(text, selected=index).selected for index in range(6)]
+    assert [len(game.moves) for game in games] == [game.plies for game in result.games]
+    pgn = io.StringIO(text)
+    headers = [chess.pgn.read_headers(pgn) for _ in range(6)]
+    assert [(header["Round"], header["White"].startswith("tiny")) for header in headers] == [
+        ("1", True),
+        ("2", False),
+        ("3", True),
+        ("1", True),
+        ("2", False),
+        ("3", True),
+    ]
+    assert len(made) > 1 and all(stockfish.closed for stockfish in made)
+
+
+def test_a_ladder_playing_games_at_once_says_each_levels_games_under_its_header(tmp_path):
+    from chess_ai.ladder import LadderLines
+
+    said: list[str] = []
+    lines = LadderLines(
+        heard(said), "tiny@4 ladder games", levels=(1350, 1500), games=3, openings=FROM_THE_START
+    )
+    stockfish = {
+        elo: StockfishDescription(
+            elo=elo, requested_elo=elo, min_elo=1350, max_elo=2850, move_time=0.1
+        )
+        for elo in (1350, 1500)
+    }
+
+    lines.starting(stockfish[1350], 2)
+    lines.starting(stockfish[1500], 1)
+    lines.starting(stockfish[1350], 1)
+
+    assert said == [
+        "chess-ai: tiny@4 ladder games 1–3 of 6: model against Stockfish 1350",
+        "game 2/6 starting, Start: Stockfish 1350 – model",
+        "chess-ai: tiny@4 ladder games 4–6 of 6: model against Stockfish 1500",
+        "game 4/6 starting, Start: model – Stockfish 1500",
+        "game 1/6 starting, Start: model – Stockfish 1350",
+    ]
+
+
+def test_the_live_view_follows_one_game_of_those_played_at_once_until_it_ends(tmp_path):
+    runs = tmp_path / "runs"
+    run = open_run(runs, model_run(runs, steps=(4,)).name)
+    suite, _ = ladder_suite(runs=runs, settings=PARALLEL)
+    shown: list[int] = []
+    show = suite._show
+
+    def recorded(run, step, index, games, elo, session) -> None:
+        shown.append(index)
+        show(run, step, index, games, elo, session)
+
+    suite._show = recorded  # type: ignore[method-assign]
+
+    ladder_checkpoint(suite, run, 4)
+
+    followed = list(dict.fromkeys(shown))
+    assert followed == sorted(followed), "it moves on only when the game it follows ends"
+    assert followed[0] == 0
+    # Each game shown is shown from its first move to its last before the next.
+    assert shown == sorted(shown)
+    assert not (runs / LIVE_FILE).exists()
+
+
+def test_a_ladder_held_to_nodes_says_so_in_its_result(tmp_path):
+    run = open_run(tmp_path, model_run(tmp_path, steps=(4,)).name)
+    settings = SETTINGS.model_copy(update={"nodes": 50_000})
+    suite, _ = ladder_suite(settings=settings)
+
+    summary = ladder_checkpoint(suite, run, 4)
+
+    result = read_ladder(run, 4)
+    assert result is not None
+    assert [(level.move_time, level.nodes) for level in result.levels] == [
+        (None, 50_000),
+        (None, 50_000),
+    ]
+    assert summary.endswith("/4 points at 50,000 nodes a move")
+    text = read_games(run, 4)
+    assert text is not None and '[BlackNodes "50000"]' in text
+
+
+def test_a_result_from_before_ladders_could_be_held_to_nodes_reads_as_held_to_a_time():
+    level = LadderLevel.model_validate(
+        {"elo": 1350, "requested_elo": 1350, "move_time": 0.1, "wins": 1, "draws": 0, "losses": 1}
+    )
+
+    assert (level.move_time, level.nodes, level.pace) == (0.1, None, "0.1 s a move")
+
+
+def test_a_ladder_playing_games_at_once_stopped_part_way_closes_every_engine(tmp_path):
+    runs = tmp_path / "runs"
+    run = open_run(runs, model_run(runs, steps=(4,)).name)
+    stop = threading.Event()
+    suite, made = ladder_suite(runs=runs, stop=stop, settings=PARALLEL)
+
+    with pytest.raises(SuiteStopped):
+        ladder_checkpoint(suite, run, 4, stop=stop)
+
+    assert read_ladder(run, 4) is None
+    assert not list(run.evaluation_directory(4).glob("*.partial"))
+    assert not (runs / LIVE_FILE).exists()
+    assert len(made) > 1 and all(stockfish.closed for stockfish in made)
 
 
 def test_the_suite_plays_a_checkpoint_it_loads_itself_and_lets_go_of_it(tmp_path):
@@ -675,6 +1033,36 @@ def test_evaluate_ladders_the_checkpoints_the_evaluator_would_unless_one_is_name
     assert read_ladder(run, 2) is not None
 
 
+def test_evaluate_says_how_long_a_hung_stockfish_held_to_nodes_was_given(
+    tmp_path, capsys, monkeypatch
+):
+    from stockfish_helpers import fake_engine, started, wait_until_gone
+
+    from chess_ai import stockfish
+    from chess_ai.cli import main
+
+    monkeypatch.setattr(stockfish, "MOVE_GRACE", 0.2)
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(4,))
+    engine = fake_engine(tmp_path / "engine", "--hang-after", "3")
+    (tmp_path / "chess-ai.toml").write_text(
+        f'[paths]\nruns = "{runs}"\n[stockfish]\npath = "{engine}"\n'
+        "[ladder]\nlevels = [1350]\ngames_per_level = 1\nnodes = 1000\nevery = 4\n"
+        'device = "cpu"\n'
+    )
+
+    with pytest.raises(SystemExit):
+        main(["--config", str(tmp_path / "chess-ai.toml"), "evaluate", "tiny@4", "--suite", SUITE])
+
+    err = capsys.readouterr().err
+    assert (
+        f"tiny@4 {SUITE}: Stockfish took more than 0.25 seconds to search 1,000 nodes for a move"
+        in err
+    )
+    assert "move time" not in err
+    wait_until_gone(*started(engine))
+
+
 class PruningStockfish(LevelStockfish):
     """Runs ``on_third_move`` on its third move, as retention pruning the checkpoint or the run
     being started again under its name would happen while a ladder is being played."""
@@ -690,7 +1078,7 @@ class PruningStockfish(LevelStockfish):
 
 
 def pruning_suite(on_third_move, **options) -> LadderSuite:
-    async def start(elo: int, move_time: float) -> LevelStockfish:
+    async def start(elo: int, move_time: float, nodes: int | None) -> LevelStockfish:
         return PruningStockfish(elo, on_third_move)
 
     return LadderSuite(SETTINGS, FROM_THE_START, stockfish=start, **options)
@@ -769,7 +1157,7 @@ def test_the_suite_lets_go_of_what_it_loaded_before_releasing_it(tmp_path, fails
         gc.collect()
         held.append(loaded[0]() is not None)
 
-    async def start(elo: int, move_time: float) -> LevelStockfish:
+    async def start(elo: int, move_time: float, nodes: int | None) -> LevelStockfish:
         if fails:
             raise RuntimeError("no engine")
         return LevelStockfish(elo)

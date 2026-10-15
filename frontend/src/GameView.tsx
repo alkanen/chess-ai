@@ -15,6 +15,7 @@ import { MoveList, type MoveMark } from './MoveList';
 import { forgetGame, goToNewGame, rememberGame } from './myGames';
 import { PausedPanel } from './PausedPanel';
 import { RequestPanel } from './RequestPanel';
+import { describeLimit } from './stockfishLimit';
 import { candidateArrows, shownThoughts, whiteOdds } from './thoughts';
 import { EvalBar, modelPlays, ThoughtsPanel, useShowThoughts } from './ThoughtsPanel';
 import { useGameChannel } from './useGameChannel';
@@ -77,7 +78,7 @@ function describeStockfish(player: PlayerInfo): string | null {
   if (stockfish === null) {
     return null;
   }
-  const pace = `${stockfish.move_time} s a move`;
+  const pace = describeLimit(stockfish);
   if (stockfish.elo === stockfish.requested_elo) {
     return pace;
   }

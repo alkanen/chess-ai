@@ -35,6 +35,13 @@ level a Lichess rating, which is what the ladder estimate will have to keep in m
 MIN_MOVE_TIME: Final = 0.01
 MAX_MOVE_TIME: Final = 60.0
 
+MIN_NODES: Final = 1
+MAX_NODES: Final = 100_000_000
+
+SLOWEST_NODES_PER_SECOND: Final = 20_000
+"""The slowest a Stockfish held to a number of nodes is taken to search, to know when it is
+late: a tenth of what one thread of a busy desktop CPU does."""
+
 START_TIMEOUT: Final = 10.0
 """How long the engine has to say it speaks UCI before it is taken not to."""
 
@@ -49,6 +56,16 @@ _ELO: Final = "UCI_Elo"
 
 Command = str | list[str]
 """How the engine is started: the configured path, or a command line a test runs instead."""
+
+
+def move_timeout(move_time: float | None, nodes: int | None) -> float:
+    """How long Stockfish has for a move before it is taken to have hung: its move time and
+    :data:`MOVE_GRACE`, or as long as ``nodes`` take at :data:`SLOWEST_NODES_PER_SECOND` and
+    :data:`MOVE_GRACE` when it is held to a number of nodes."""
+    if nodes is not None:
+        return nodes / SLOWEST_NODES_PER_SECOND + MOVE_GRACE
+    assert move_time is not None
+    return move_time + MOVE_GRACE
 
 
 class StockfishError(Exception):
@@ -91,12 +108,20 @@ async def describe_stockfish(command: Command) -> StockfishInfo:
 
 
 async def start_stockfish(
-    command: Command, *, elo: int, move_time: float = DEFAULT_MOVE_TIME
+    command: Command,
+    *,
+    elo: int,
+    move_time: float = DEFAULT_MOVE_TIME,
+    nodes: int | None = None,
 ) -> "StockfishPlayer":
     """A Stockfish player at ``elo``, or as near to it as the engine's strength limit goes.
 
     An ``elo`` outside the range the engine's ``UCI_Elo`` option allows is moved to the nearer
     end of it, and the player's :attr:`~StockfishPlayer.stockfish` says so.
+
+    It thinks for ``move_time`` seconds a move, or, if ``nodes`` is given, searches that many
+    positions a move however long that takes. The engine runs on one thread, its default, which
+    is what makes a number of nodes the same search every time.
 
     Raises:
         StockfishError: there is no engine at ``command``, it cannot be run, it does not speak
@@ -115,7 +140,8 @@ async def start_stockfish(
         requested_elo=elo,
         min_elo=low,
         max_elo=high,
-        move_time=move_time,
+        move_time=move_time if nodes is None else None,
+        nodes=nodes,
     )
     try:
         await engine.configure({_LIMIT_STRENGTH: True, _ELO: description.elo})
@@ -177,7 +203,8 @@ def _elo_range(engine: chess.engine.UciProtocol, shown: str) -> tuple[int, int]:
 
 
 class StockfishPlayer:
-    """Stockfish at a fixed strength and a fixed time a move. Made by :func:`start_stockfish`."""
+    """Stockfish at a fixed strength, thinking a fixed time or a fixed number of nodes a move.
+    Made by :func:`start_stockfish`."""
 
     def __init__(
         self,
@@ -188,7 +215,11 @@ class StockfishPlayer:
         self._transport = transport
         self._engine = engine
         self._description = description
-        self._limit = chess.engine.Limit(time=description.move_time)
+        if description.nodes is not None:
+            self._limit = chess.engine.Limit(nodes=description.nodes)
+        else:
+            self._limit = chess.engine.Limit(time=description.move_time)
+        self._timeout = move_timeout(description.move_time, description.nodes)
 
     @property
     def name(self) -> str:
@@ -196,7 +227,7 @@ class StockfishPlayer:
 
     @property
     def stockfish(self) -> StockfishDescription:
-        """How strong it was asked to be and plays, and how long it thinks."""
+        """How strong it was asked to be and plays, and how long or how far it thinks."""
         return self._description
 
     @property
@@ -208,8 +239,7 @@ class StockfishPlayer:
         # The whole game rather than only the position, so that the engine knows which
         # positions have already been repeated and does not walk into a draw unawares.
         result = await asyncio.wait_for(
-            self._engine.play(context.board, self._limit),
-            self._description.move_time + MOVE_GRACE,
+            self._engine.play(context.board, self._limit), self._timeout
         )
         if result.move is None:
             raise StockfishError("Stockfish gave no move")

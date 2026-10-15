@@ -121,6 +121,28 @@ describe('LadderView', () => {
     expect(screen.getByText('1420 (1360 to 1481) at step 2,000, a 95% range')).toBeInTheDocument();
   });
 
+  it('says which limit Stockfish was held to, and that ladders at different ones differ', async () => {
+    const nodes = { move_time: null, nodes: 100_000 };
+    serve(
+      (step) =>
+        ladderResult(step, {
+          levels: ladderResult(step).levels.map((level) => ({ ...level, ...nodes })),
+        }),
+      () => [ladderPoint(1_000), ladderPoint(2_000, {}, nodes)],
+    );
+    render(
+      <LadderView run="tiny" evaluations={[entry(1_000), entry(2_000)]} liveGame={null} laddered />,
+    );
+
+    expect(
+      await screen.findByText(/2 games a level; Stockfish at 100,000 nodes a move/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Elo on Stockfish’s scale at 0.1 s a move and 100,000 nodes a move/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/compare ratings measured at one limit only/)).toBeInTheDocument();
+  });
+
   it('asks for the chart again when a ladder is added, and not for the same ones again', async () => {
     const fetch = serve();
     const { rerender } = render(

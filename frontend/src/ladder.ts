@@ -8,6 +8,7 @@
 import type { LadderEstimate, LadderGame, LadderLevel, LadderPoint } from './api';
 import type { ChartData } from './runCharts';
 import type { SampleGameRef } from './sampleGames';
+import { describeLimit, describeLimits } from './stockfishLimit';
 
 /** What the ladder is called among a run's evaluation suites. */
 export const LADDER_SUITE = 'stockfish-ladder';
@@ -62,11 +63,11 @@ export function describeLadderOpponent(game: Pick<LadderGame, 'elo' | 'model_col
 }
 
 /**
- * The move times the ladders were played at, fastest first: ratings measured at one are not
- * comparable with those measured at another.
+ * The limits the ladders were played at, such as "0.1 s a move" or "100,000 nodes a move", each
+ * once: ratings measured at one are not comparable with those measured at another.
  */
-export function moveTimes(points: LadderPoint[]): number[] {
-  return [...new Set(points.map((point) => point.move_time))].sort((one, other) => one - other);
+export function ladderLimits(points: LadderPoint[]): string[] {
+  return describeLimits(points);
 }
 
 /** The series of the Elo chart, in the order `eloChartData` gives them. */
@@ -137,7 +138,7 @@ export function describeStrength(point: LadderPoint, asked: number | null): stri
       ? 'asked to claim no rating'
       : `asked to play like a player rated ${point.rating}`;
   const sentences = [
-    `played ${strength} at ${point.move_time} s a move on the Stockfish ladder, ${rating}.`,
+    `played ${strength} at ${describeLimit(point)} on the Stockfish ladder, ${rating}.`,
     'That is Stockfish’s own scale, not a Lichess rating.',
   ];
   if (asked !== point.rating) {

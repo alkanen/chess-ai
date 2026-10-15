@@ -901,7 +901,7 @@ class LastMoveStockfish:
 
 
 def laddered(run: RunReader, step: int, *, levels=(1350, 1500)) -> None:
-    async def start(elo: int, move_time: float) -> LastMoveStockfish:
+    async def start(elo: int, move_time: float, nodes: int | None) -> LastMoveStockfish:
         return LastMoveStockfish(elo)
 
     checkpoint = next(each for each in run.checkpoints() if each.step == step)
@@ -951,7 +951,7 @@ def test_a_runs_ladders_are_listed_by_step_to_chart(client, runs):
     ]
     assert points[1]["games_per_level"] == 1
     assert points[1]["rating"] == 2000
-    assert points[1]["move_time"] == 0.1
+    assert (points[1]["move_time"], points[1]["nodes"]) == (0.1, None)
     assert points[1]["estimate"]["games"] == 2
     assert client.get(f"{PREFIX}/api/runs/missing/evaluations/stockfish-ladder").status_code == 404
 
