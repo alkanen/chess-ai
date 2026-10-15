@@ -370,7 +370,7 @@ describe('RunView', () => {
     socket.open();
     socket.deliver(runEvent());
     socket.deliver({ type: 'metrics', reset: true, records: [{ step: 1, split: 'train', loss: 9 }] });
-    FakeUPlot.withSeries('validation').select();
+    FakeUPlot.withSeries('validation').drag();
     // The run is started again under the same name: the log empties, and the chart with it.
     socket.deliver({ type: 'metrics', reset: true, records: [] });
     socket.deliver({ type: 'metrics', reset: false, records: [{ step: 1, split: 'train', loss: 5 }] });
@@ -389,11 +389,47 @@ describe('RunView', () => {
     socket.deliver(runEvent());
     socket.deliver({ type: 'metrics', reset: true, records: [{ step: 1, split: 'train', loss: 9 }] });
     const chart = FakeUPlot.withSeries('validation');
-    chart.select();
+    chart.drag();
 
     socket.deliver({ type: 'metrics', reset: false, records: [{ step: 2, split: 'train', loss: 8 }] });
 
     expect(chart.rescaled).toBe(false);
+  });
+
+  it('offers to reset a zoomed chart, which then follows the run again', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent());
+    socket.deliver({ type: 'metrics', reset: true, records: [{ step: 1, split: 'train', loss: 9 }] });
+    const chart = FakeUPlot.withSeries('validation');
+    expect(screen.queryByRole('button', { name: 'Reset zoom' })).not.toBeInTheDocument();
+    act(() => chart.drag());
+    const figure = chart.target.closest('figure')!;
+
+    fireEvent.click(within(figure).getByRole('button', { name: 'Reset zoom' }));
+
+    expect(chart.rescaled).toBe(true);
+    expect(chart.data[0]).toEqual([1]);
+    expect(within(figure).queryByRole('button', { name: 'Reset zoom' })).not.toBeInTheDocument();
+    socket.deliver({ type: 'metrics', reset: false, records: [{ step: 2, split: 'train', loss: 8 }] });
+    expect(chart.rescaled).toBe(true);
+  });
+
+  it('follows the run again after a double click on a zoomed chart', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent());
+    socket.deliver({ type: 'metrics', reset: true, records: [{ step: 1, split: 'train', loss: 9 }] });
+    const chart = FakeUPlot.withSeries('validation');
+    act(() => chart.drag());
+
+    fireEvent.doubleClick(chart.over);
+
+    expect(screen.queryByRole('button', { name: 'Reset zoom' })).not.toBeInTheDocument();
+    socket.deliver({ type: 'metrics', reset: false, records: [{ step: 2, split: 'train', loss: 8 }] });
+    expect(chart.rescaled).toBe(true);
   });
 
   it('starts the charts again when the log is replaced', () => {

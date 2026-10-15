@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import { logRange, logTicks } from './chartScale';
+import { touchToZoom, useZoomed } from './chartZoom';
 import { latestValues, type ChartData, type ChartLook, type XAxis } from './runCharts';
 import './MetricChart.css';
 
@@ -106,13 +107,14 @@ interface MetricChartProps {
  * One chart of metrics against `x`, drawn by uPlot: one run's, or several runs' side by side.
  *
  * The chart is made once and handed new data as the run logs it. Dragging across it zooms
- * in, and a zoomed chart stays where it was put while new lines arrive, until a double
- * click lets it follow the run again.
+ * in (with a finger, after holding it still for a moment), and a zoomed chart stays where it
+ * was put while new lines arrive, until its reset button or a double click lets it follow
+ * the run again.
  */
 export function MetricChart({ chart: spec, labels, x, data, levels = 0 }: MetricChartProps) {
   const container = useRef<HTMLDivElement>(null);
   const chart = useRef<uPlot | null>(null);
-  const zoomed = useRef(false);
+  const [zoomed, zoomedNow, setZoomed] = useZoomed();
   const dark = useDarkScheme();
   const latest = useMemo(() => latestValues(data), [data]);
   const empty = data[0].length === 0;
@@ -200,14 +202,15 @@ export function MetricChart({ chart: spec, labels, x, data, levels = 0 }: Metric
           value: (_: uPlot, value: number | null) => (value == null ? '–' : spec.format(value)),
         })),
       ],
-      hooks: { setSelect: [() => (zoomed.current = true)] },
+      hooks: { setSelect: [() => setZoomed(true)] },
     };
     // A new chart fits whatever it is made with, so a zoom on the chart it replaces is gone.
-    zoomed.current = false;
+    setZoomed(false);
     const made = new uPlot(options, current.current as uPlot.AlignedData, element);
     chart.current = made;
-    const unzoom = () => (zoomed.current = false);
-    made.over?.addEventListener('dblclick', unzoom);
+    const unzoom = () => setZoomed(false);
+    made.over.addEventListener('dblclick', unzoom);
+    const untouch = touchToZoom(made);
 
     const resized =
       typeof ResizeObserver === 'undefined'
@@ -216,15 +219,21 @@ export function MetricChart({ chart: spec, labels, x, data, levels = 0 }: Metric
     resized?.observe(element);
     return () => {
       resized?.disconnect();
-      made.over?.removeEventListener('dblclick', unzoom);
+      untouch();
+      made.over.removeEventListener('dblclick', unzoom);
       made.destroy();
       chart.current = null;
     };
-  }, [spec, x, named, dark, empty, levels]);
+  }, [spec, x, named, dark, empty, levels, setZoomed]);
 
   useEffect(() => {
-    chart.current?.setData(data as uPlot.AlignedData, !zoomed.current);
-  }, [data]);
+    chart.current?.setData(data as uPlot.AlignedData, !zoomedNow.current);
+  }, [data, zoomedNow]);
+
+  const resetZoom = () => {
+    chart.current?.setData(current.current as uPlot.AlignedData, true);
+    setZoomed(false);
+  };
 
   const caption = labels
     .map((label, index) => {
@@ -241,7 +250,21 @@ export function MetricChart({ chart: spec, labels, x, data, levels = 0 }: Metric
         <span className="title">{spec.title}</span>
         <span className="latest">{empty ? 'Nothing logged yet' : caption}</span>
       </figcaption>
-      {!empty && <div className="plot" ref={container} />}
+      {!empty && (
+        <div className="plot-area">
+          <div className="plot" ref={container} />
+          {zoomed && <ResetZoom onClick={resetZoom} />}
+        </div>
+      )}
     </figure>
+  );
+}
+
+/** Lets a zoomed chart follow its data again, and says that it is zoomed. */
+export function ResetZoom({ onClick }: { onClick: () => void }) {
+  return (
+    <button type="button" className="reset-zoom" onClick={onClick}>
+      Reset zoom
+    </button>
   );
 }

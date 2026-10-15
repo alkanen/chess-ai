@@ -3,7 +3,8 @@ import uPlot from 'uplot';
 import 'uplot/dist/uPlot.min.css';
 import type { LadderPoint } from './api';
 import { describeEstimate, ELO_SERIES, eloChartData, ladderLimits } from './ladder';
-import { readPalette, useDarkScheme } from './MetricChart';
+import { touchToZoom, useZoomed } from './chartZoom';
+import { readPalette, ResetZoom, useDarkScheme } from './MetricChart';
 import { formatCount } from './runFormat';
 import './MetricChart.css';
 
@@ -28,12 +29,14 @@ interface EloChartProps {
  * beyond the ladder marked at the end of it they are past.
  *
  * Kept apart from the metric charts, which have several x-axes to choose from and log-scaled
- * series: a ladder is about a checkpoint, which is a step.
+ * series: a ladder is about a checkpoint, which is a step. It zooms as they do, and a zoomed
+ * chart stays where it was put as new checkpoints are laddered.
  */
 export function EloChart({ points }: EloChartProps) {
   const container = useRef<HTMLDivElement>(null);
   const chart = useRef<uPlot | null>(null);
   const dark = useDarkScheme();
+  const [zoomed, zoomedNow, setZoomed] = useZoomed();
   const data = useMemo(() => eloChartData(points), [points]);
   const empty = points.length === 0;
   const current = useRef(data);
@@ -78,9 +81,14 @@ export function EloChart({ points }: EloChartProps) {
         })),
       ],
       bands: [{ series: [3, 2], fill: translucent(elo, 0.15) }],
+      hooks: { setSelect: [() => setZoomed(true)] },
     };
+    setZoomed(false);
     const made = new uPlot(options, current.current as uPlot.AlignedData, element);
     chart.current = made;
+    const unzoom = () => setZoomed(false);
+    made.over.addEventListener('dblclick', unzoom);
+    const untouch = touchToZoom(made);
     const resized =
       typeof ResizeObserver === 'undefined'
         ? null
@@ -88,14 +96,21 @@ export function EloChart({ points }: EloChartProps) {
     resized?.observe(element);
     return () => {
       resized?.disconnect();
+      untouch();
+      made.over.removeEventListener('dblclick', unzoom);
       made.destroy();
       chart.current = null;
     };
-  }, [empty, dark]);
+  }, [empty, dark, setZoomed]);
 
   useEffect(() => {
-    chart.current?.setData(data as uPlot.AlignedData);
-  }, [data]);
+    chart.current?.setData(data as uPlot.AlignedData, !zoomedNow.current);
+  }, [data, zoomedNow]);
+
+  const resetZoom = () => {
+    chart.current?.setData(current.current as uPlot.AlignedData, true);
+    setZoomed(false);
+  };
 
   const latest = points.length === 0 ? null : points[points.length - 1];
   const limits = ladderLimits(points);
@@ -118,7 +133,12 @@ export function EloChart({ points }: EloChartProps) {
           differently strong: compare ratings measured at one limit only.
         </p>
       )}
-      {!empty && <div className="plot" ref={container} />}
+      {!empty && (
+        <div className="plot-area">
+          <div className="plot" ref={container} />
+          {zoomed && <ResetZoom onClick={resetZoom} />}
+        </div>
+      )}
     </figure>
   );
 }

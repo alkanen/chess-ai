@@ -12,6 +12,11 @@ export class FakeUPlot {
   rescaled = true;
   destroyed = false;
   readonly over = document.createElement('div');
+  /** The selection drawn on the chart, as uPlot keeps it. */
+  select = { left: 0, top: 0, width: 0, height: 0 };
+  /** The x-range the chart was zoomed to last, by a mouse or a finger. */
+  xScale: { min: number; max: number } | null = null;
+  cursor = { left: -10, top: -10 };
 
   /** The series as uPlot keeps them, which a range function looks at for what is shown. */
   get series(): uPlot.Series[] {
@@ -57,10 +62,36 @@ export class FakeUPlot {
     this.rescaled = resetScales;
   }
 
-  /** The viewer drags across the chart to zoom in, as uPlot reports it. */
-  select() {
-    const hooks = this.options.hooks?.setSelect;
-    (Array.isArray(hooks) ? hooks : [hooks]).forEach((hook) => hook?.(this as unknown as uPlot));
+  /** The viewer drags across the chart with a mouse to zoom in, as uPlot reports it. */
+  drag() {
+    this.fire('setSelect');
+  }
+
+  setSelect(select: FakeUPlot['select'], fireHook = true) {
+    this.select = { ...select };
+    if (fireHook) {
+      this.fire('setSelect');
+    }
+  }
+
+  setScale(key: string, limits: { min: number; max: number }) {
+    if (key === 'x') {
+      this.xScale = limits;
+    }
+  }
+
+  setCursor(cursor: FakeUPlot['cursor']) {
+    this.cursor = cursor;
+  }
+
+  /** The x value at `left` CSS pixels into the plot: here, ten for each pixel. */
+  posToVal(left: number): number {
+    return left * 10;
+  }
+
+  private fire(hook: 'setSelect') {
+    const hooks = this.options.hooks?.[hook];
+    (Array.isArray(hooks) ? hooks : [hooks]).forEach((fn) => fn?.(this as unknown as uPlot));
   }
 
   setSize() {}
