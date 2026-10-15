@@ -805,6 +805,26 @@ def test_a_resnet_trains_validates_and_plays_with_nothing_else_changed(tmp_path,
     assert engine.evaluate(board).best in board.legal_moves
 
 
+def test_a_square_transformer_trains_validates_and_plays_with_nothing_else_changed(
+    tmp_path, data_dir
+):
+    """The trainer, the checkpoints and the engine take it as they take the others."""
+    reader = run(
+        tmp_path,
+        data_dir,
+        model='architecture = "square-transformer"\nlayers = 1\nwidth = 4\nheads = 2',
+    )
+
+    assert reader.info.model.architecture == "square-transformer"
+    assert reader.info.model.options == {"layers": 1, "width": 4, "heads": 2}
+    validation = [row for row in reader.metrics() if row["split"] == "validation"]
+    assert validation and all(0.0 <= row["top1"] <= 1.0 for row in validation)
+    engine = load_engine(reader.checkpoint_path(reader.latest_checkpoint()))
+    board = chess.Board()
+    board.push_san("e4")
+    assert engine.evaluate(board).best in board.legal_moves
+
+
 def train_lines(reader) -> list[dict]:
     return [line for line in reader.metrics() if line["split"] == "train"]
 
@@ -855,6 +875,9 @@ DECAY_VARIANTS = [
     pytest.param("mlp", {"depth": 2, "width": 8}, id="mlp"),
     pytest.param("resnet", {"blocks": 1, "channels": 4, "globals": "planes"}, id="resnet-planes"),
     pytest.param("resnet", {"blocks": 1, "channels": 4, "globals": "film"}, id="resnet-film"),
+    pytest.param(
+        "square-transformer", {"layers": 1, "width": 4, "heads": 2}, id="square-transformer"
+    ),
 ]
 
 

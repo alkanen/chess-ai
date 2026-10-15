@@ -548,6 +548,16 @@ size settings:
   `"planes"` paints each one over a whole 8×8 plane next to the board's, and `"film"`
   (feature-wise linear modulation) has them scale and shift every channel of every block, so
   that a rating can steer the whole tower rather than only its first layer.
+- `"square-transformer"` makes each of the 64 squares a token: all of a square's planes (its
+  history too) go through one shared linear layer to `width`, plus a learned embedding for the
+  square. Each global feature is a token of its own, its value times a learned vector plus an
+  embedding saying which feature it is. `layers` pre-norm transformer layers with `heads`
+  attention heads (which must divide `width`), a feed-forward part `ffn_multiplier` times as
+  wide, and `dropout`, attend across all of them, and the residual tower's heads read the
+  squares. [experiments/transformer-lichess-2026.toml](experiments/transformer-lichess-2026.toml)
+  trains one on the same data and encoder as the 10×256 residual tower, for the same four epochs
+  in about 36 hours to the tower's 31. It is 6×256 at half the tower's batch: activations of 75
+  tokens per layer make 8×256 at batch 8192 need about 45 GiB.
 
 Weight decay shrinks the weights that multiply an input, and leaves biases and the
 normalization layers' scales and shifts alone, as is usual. Runs made before the trainer told
