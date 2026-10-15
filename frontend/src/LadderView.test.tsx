@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EvaluationEntry, LadderPoint, LadderResult } from './api';
 import { LadderView } from './LadderView';
@@ -157,6 +157,28 @@ describe('LadderView', () => {
     );
 
     await waitFor(() => expect(calls(fetch, POINTS)).toBe(2));
+  });
+
+  it('keeps a zoomed Elo chart where it was put as checkpoints are laddered, until reset', async () => {
+    let points = [ladderPoint(1_000)];
+    serve(undefined, () => points);
+    const { rerender } = render(
+      <LadderView run="tiny" evaluations={[entry(1_000)]} liveGame={null} laddered />,
+    );
+    await waitFor(() => expect(FakeUPlot.live()).toHaveLength(1));
+    const chart = FakeUPlot.withSeries('Elo');
+    act(() => chart.drag());
+
+    points = [ladderPoint(1_000), ladderPoint(2_000)];
+    rerender(
+      <LadderView run="tiny" evaluations={[entry(1_000), entry(2_000)]} liveGame={null} laddered />,
+    );
+    await waitFor(() => expect(chart.data[0]).toEqual([1000, 2000]));
+    expect(chart.rescaled).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reset zoom' }));
+    expect(chart.rescaled).toBe(true);
+    expect(screen.queryByRole('button', { name: 'Reset zoom' })).not.toBeInTheDocument();
   });
 
   it('steps back to an earlier checkpoint’s ladder', async () => {

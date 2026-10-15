@@ -71,3 +71,38 @@
   font-variant-numeric: tabular-nums;
   color: inherit;
 }
+
+/* The reset button sits over the top right of the chart, where it moves nothing as it comes and goes. */
+.metric-chart .plot-area {
+  position: relative;
+}
+
+.metric-chart .reset-zoom {
+  position: absolute;
+  top: 0.25rem;
+  right: 0.25rem;
+  padding: 0.2rem 0.6rem;
+  font: inherit;
+  font-size: 0.8rem;
+  color: inherit;
+  background: Canvas;
+  border: 1px solid rgb(128 128 128 / 50%);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+/*
+ * A long press on a chart starts a selection, so the browser's own reactions to one (selecting
+ * text, a callout) are kept off it.
+ */
+.metric-chart .u-over {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* A held finger shows as a line under it until it drags a selection out. */
+.metric-chart .u-over.touch-selecting .u-select {
+  min-width: 2px;
+  background: rgb(128 128 128 / 25%);
+}
