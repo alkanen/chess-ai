@@ -81,6 +81,7 @@ export function LiveGameBoard({ live, caption }: LiveGameBoardProps) {
             shown={shown}
             show={showThoughts}
             onShow={setShowThoughts}
+            keepRoom
           />
           <MoveList moves={game.moves} startFen={game.start_fen} />
         </aside>

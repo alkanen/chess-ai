@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { GameState, Thoughts } from './api';
-import { EvalBar, ThoughtsPanel, useShowThoughts } from './ThoughtsPanel';
+import { EvalBar, MOST_CANDIDATES, ThoughtsPanel, useShowThoughts } from './ThoughtsPanel';
 
 const THOUGHTS: Thoughts = {
   candidates: [
@@ -64,6 +64,34 @@ describe('ThoughtsPanel', () => {
 
     expect(screen.getByText('Black is considering…')).toBeInTheDocument();
     expect(screen.queryByText(/played/)).not.toBeInTheDocument();
+  });
+
+  it('keeps room for the most candidates there can be, hidden, when asked to', () => {
+    const { container } = render(
+      <ThoughtsPanel
+        game={GAME}
+        shown={{ thoughts: THOUGHTS, side: 'black', played: 'e7e5' }}
+        show
+        onShow={() => {}}
+        keepRoom
+      />,
+    );
+
+    const kept = container.querySelector('.thoughts-kept');
+    expect(kept).toHaveAttribute('aria-hidden', 'true');
+    expect(kept?.querySelectorAll('li')).toHaveLength(MOST_CANDIDATES);
+    // Only what the model thought is there to be read.
+    expect(screen.getAllByRole('listitem')).toHaveLength(THOUGHTS.candidates.length);
+  });
+
+  it('keeps the room while switched off, and none unless asked to', () => {
+    const { container, rerender } = render(
+      <ThoughtsPanel game={GAME} shown={null} show={false} onShow={() => {}} keepRoom />,
+    );
+    expect(container.querySelector('.thoughts-kept')).not.toBeNull();
+
+    rerender(<ThoughtsPanel game={GAME} shown={null} show onShow={() => {}} />);
+    expect(container.querySelector('.thoughts-kept')).toBeNull();
   });
 
   it('shows nothing but the switch until asked, and remembers being asked', () => {

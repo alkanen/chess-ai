@@ -1,5 +1,16 @@
 .live-game {
   margin-bottom: 1rem;
+  /* Whether the panel fits beside the board is a matter of the room the section has. */
+  container-type: inline-size;
+}
+
+/* The game says how it ended in the place where it said whose turn it was, and no taller. */
+.live-game > .game-status,
+.live-game > .turn-indicator {
+  height: 1.75rem;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .live-badge {
@@ -31,4 +42,115 @@
 
 .live-game .flip {
   margin: 0;
+}
+
+/* A player's name on one line, so that a run's name of a hundred characters leaves the
+   thoughts their room: cut short, and whole when hovered. */
+.live-game .players dd {
+  min-width: 0;
+}
+
+.live-game .player-name {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/*
+ * The section is as tall as the board, whatever the panel shows from one move to the next and
+ * from one game to the next, so that the page under it stays where it is. The panel beside the
+ * board takes the board's height rather than setting it (`contain: size` leaves it out of the
+ * row's height, and the row stretches it to the board's): the players and the thoughts in one
+ * column, and the moves in another as tall as the board, scrolling in it. The board gives up
+ * width before the panel does, but not below what the thoughts need of its height.
+ */
+.live-game .game-view {
+  flex-wrap: nowrap;
+  align-items: stretch;
+}
+
+.live-game .board-frame {
+  min-width: 24rem;
+}
+
+.live-game .board-row {
+  min-width: calc(24rem + 1.75rem);
+}
+
+.live-game .side-panel {
+  display: grid;
+  flex: 0 0 32.5rem;
+  grid-template-areas:
+    'players moves'
+    'flip moves'
+    'thoughts moves';
+  grid-template-columns: minmax(0, 1fr) 13rem;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 0.75rem 1.5rem;
+  contain: size;
+  overflow: hidden;
+}
+
+.live-game .players {
+  grid-area: players;
+  align-self: start;
+}
+
+.live-game .flip {
+  grid-area: flip;
+}
+
+.live-game .thoughts {
+  grid-area: thoughts;
+}
+
+.live-game .move-list {
+  display: flex;
+  flex-direction: column;
+  grid-area: moves;
+  min-height: 0;
+}
+
+.live-game .moves-scroller {
+  flex: 1 1 0;
+  min-height: 0;
+  max-height: none;
+}
+
+/*
+ * Too narrow for the panel beside the board: under it, with the thoughts and the moves side by
+ * side rather than one over the other. Their row is as tall as the room the thoughts keep, and
+ * the move list scrolls in it.
+ */
+@container (width < 60rem) {
+  .live-game .game-view {
+    flex-wrap: wrap;
+  }
+
+  .live-game .board-frame {
+    min-width: 240px;
+  }
+
+  .live-game .board-row {
+    min-width: calc(240px + 1.75rem);
+  }
+
+  .live-game .side-panel {
+    flex-basis: 100%;
+    grid-template-areas:
+      'players flip'
+      'thoughts moves';
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    contain: none;
+  }
+
+  .live-game .flip {
+    justify-self: end;
+  }
+
+  .live-game .move-list {
+    contain: size;
+  }
 }

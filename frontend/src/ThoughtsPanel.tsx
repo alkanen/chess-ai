@@ -6,6 +6,9 @@ import './ThoughtsPanel.css';
 
 const STORAGE_KEY = 'chess-ai.show-thoughts';
 
+/** The most candidate moves a model's thoughts list; mirrors chess_ai.inference.TOP_CANDIDATES. */
+export const MOST_CANDIDATES = 5;
+
 function storedChoice(): boolean {
   try {
     return window.localStorage.getItem(STORAGE_KEY) === 'yes';
@@ -125,6 +128,11 @@ interface ThoughtsPanelProps {
   shown: ShownThoughts | null;
   show: boolean;
   onShow: (show: boolean) => void;
+  /**
+   * Whether to keep room under the switch for the most the panel shows, whatever it shows
+   * now, so that it is as tall from one move to the next.
+   */
+  keepRoom?: boolean;
 }
 
 /**
@@ -144,15 +152,17 @@ function heading(game: GameState, shown: ShownThoughts): string {
  * The switch for the overlay, and what the model is thinking as a list: its candidate moves
  * with how likely it thought each, and its chances of each result from White's side.
  */
-export function ThoughtsPanel({ game, shown, show, onShow }: ThoughtsPanelProps) {
+export function ThoughtsPanel({
+  game,
+  shown,
+  show,
+  onShow,
+  keepRoom = false,
+}: ThoughtsPanelProps) {
   const id = useId();
   const sideOf = (side: Color) => (side === 'white' ? 'White' : 'Black');
-  return (
-    <section className="thoughts" aria-labelledby={`${id}-toggle`}>
-      <label id={`${id}-toggle`} className="thoughts-toggle">
-        <input type="checkbox" checked={show} onChange={(event) => onShow(event.target.checked)} />
-        Show what the model is thinking
-      </label>
+  const thoughts = (
+    <>
       {show && shown === null && (
         <p className="note">
           Shown when the model has just moved, and while it waits out the move delay.
@@ -174,6 +184,48 @@ export function ThoughtsPanel({ game, shown, show, onShow }: ThoughtsPanelProps)
           )}
         </>
       )}
+    </>
+  );
+  return (
+    <section className="thoughts" aria-labelledby={`${id}-toggle`}>
+      <label id={`${id}-toggle`} className="thoughts-toggle">
+        <input type="checkbox" checked={show} onChange={(event) => onShow(event.target.checked)} />
+        Show what the model is thinking
+      </label>
+      {keepRoom ? (
+        <div className="thoughts-room">
+          <RoomKept />
+          <div className="thoughts-shown">{thoughts}</div>
+        </div>
+      ) : (
+        thoughts
+      )}
     </section>
+  );
+}
+
+/** As many candidates as there can be, each as long as one can be put, for the room kept. */
+const WIDEST_CANDIDATES: CandidateMove[] = Array.from({ length: MOST_CANDIDATES }, (_, index) => ({
+  uci: `kept-${index}`,
+  san: 'axb8=Q+',
+  probability: 1,
+}));
+
+/**
+ * The most the panel shows, laid out as it is but never seen, which keeps the room for it: a
+ * heading, every candidate, and the longest the chances can be put.
+ */
+function RoomKept() {
+  return (
+    <div className="thoughts-kept" aria-hidden="true">
+      <p className="thoughts-heading">Black before playing axb8=Q+</p>
+      <CandidateList
+        label=""
+        candidates={WIDEST_CANDIDATES}
+        marked={() => false}
+        markedAs=""
+      />
+      <p className="thoughts-odds">{described({ white: 1, draw: 1, black: 1 })}</p>
+    </div>
   );
 }
