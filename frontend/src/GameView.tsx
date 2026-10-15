@@ -94,7 +94,9 @@ export function Player({ player }: { player: PlayerInfo }) {
   const note = describeModel(player) ?? describeStockfish(player);
   return (
     <dd>
-      {player.name}
+      <span className="player-name" title={player.name}>
+        {player.name}
+      </span>
       {note !== null && <span className="model-note">{note}</span>}
     </dd>
   );

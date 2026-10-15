@@ -100,3 +100,21 @@
 .eval-segment.black {
   background: #1e1e1e;
 }
+
+/* What is shown, and the room kept for the most there can be to show, in the same place: as
+   tall as the taller of the two, which is the room kept. */
+.thoughts-room {
+  display: grid;
+}
+
+.thoughts-room > * {
+  display: flex;
+  flex-direction: column;
+  grid-area: 1 / 1;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.thoughts-kept {
+  visibility: hidden;
+}
