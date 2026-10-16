@@ -2036,6 +2036,17 @@ def test_resume_can_override_whether_the_run_compiles(tmp_path, monkeypatch, fla
     assert asked["compile"] is compile
 
 
+@pytest.mark.parametrize(("flags", "stop_at"), [([], None), (["--stop-at", "6000"], 6000)])
+def test_resume_can_stop_at_a_step(tmp_path, monkeypatch, flags, stop_at):
+    import chess_ai.training
+
+    asked = {}
+    monkeypatch.setattr(chess_ai.training, "resume", lambda name, **kwargs: asked.update(kwargs))
+
+    assert main(["resume", "tiny", *flags]) == 0
+    assert asked["stop_at"] == stop_at
+
+
 def test_runs_rename_renames_a_stopped_run_that_then_resumes_under_its_new_name(
     tmp_path, capsys, monkeypatch
 ):
