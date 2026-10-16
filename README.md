@@ -159,7 +159,7 @@ Games survive a restart of the server. Each game is written as it changes to a J
 
 Tick two or more runs in the list (up to eight) and choose **Compare** to overlay them on the same charts, one line per run: training and validation loss, top-1 and top-5 accuracy, illegal-move rate and learning rate, all followed live.
 
-A run can be given a title, tags and notes, from its page in the browser or from the command line. They are kept in `notes.json` in the run directory, and the run list can be filtered by tag. The run's name never changes, since it is the directory; the title is what it is shown as instead.
+A run can be given a title, tags and notes, from its page in the browser or from the command line. They are kept in `notes.json` in the run directory, and the run list can be filtered by tag. The title is what the run is shown as instead of its name; to change the name itself, see [Rename a run](#rename-a-run).
 
 ```sh
 uv run chess-ai runs annotate mlp-baseline --title "MLP baseline" --tag mlp --tag baseline --notes "First run on the 2024 games."
@@ -169,6 +169,24 @@ uv run chess-ai runs list --tag mlp
 ```
 
 To set a run aside without deleting it, tag it `archived`: `uv run chess-ai runs annotate NAME --tag archived`, and `--untag archived` to bring it back. An archived run is left out of `chess-ai runs list` (unless `--archived` or `--tag archived` asks for it), hidden on the dashboard behind a **Show archived runs** box, and never offered to play against; it can still be opened and compared. That is the place for a sweep's runs, whose curves are worth keeping and whose checkpoints nobody will play.
+
+#### Rename a run
+
+A run's name is its directory, and it is written in many places besides: in every checkpoint, in every evaluation result and its games, in the runs fine-tuned from it, and in the games played against it, in the browser or in a match. `chess-ai runs rename` changes all of them:
+
+```sh
+uv run chess-ai runs rename OLD NEW --dry-run   # lists what would change, and changes nothing
+uv run chess-ai runs rename OLD NEW
+```
+
+It rewrites the run's `run.json`, its `config.toml` if the run took its name from there, its checkpoints (each written beside the old one and moved over it, keeping the time it was written, so that the evaluator's results still stand), and the results and games in `evaluations/`. Then it moves the directory. Then it renames the run in other runs' `[initialize_from]` and lineage, in `live-game.json`, in the games the web server holds (`ongoing-games/`) and in the PGN files in the games directory. The title, tags and notes stay as they are. It names each file it rewrites as it goes (`-q` leaves those lines out) and ends with how many of each kind it rewrote; a run with a few checkpoints, 160 evaluated steps and 300 saved games takes about ten seconds.
+
+It is refused while the run is being trained or resumed, while one of its checkpoints is being evaluated (by the evaluator, `chess-ai evaluate` or `chess-ai ladder`), and when `NEW` is taken or is not a valid run name. A rename that stops part way says so: before the directory has moved the run works as it did under its old name, and after, under its new one. Running the same command again finishes the job; `rename.json` in the run directory remembers what it was renamed from.
+
+What else is running at the time:
+
+- **The evaluator** carries on. An evaluation of the run that would begin while it is being renamed waits for the rename, then finds the run gone and passes it over; the evaluator finds it again under the new name, where every result it had still stands. An evaluator started before this rename existed does not take part in that, so restart it once.
+- **The web server** lists the run under its new name. A page open on the old name shows the run as empty, and links or bookmarks to it (and comparisons that include it) need the new name. The server keeps the games being played in memory and writes them back as they go on, so a game against the run that has not ended yet keeps the old name: stop `chess-ai serve` first, or stop it after, run the rename again, and start it. The rename warns when there are such games. Games that have ended only need their files rewritten, which the rename does either way.
 
 The web server never talks to a trainer: it reads the run directory, so it can be restarted at any time without affecting a run. A trainer that dies without saying so — killed, out of memory, or the machine gone — leaves a heartbeat that claims it is still running. Once that heartbeat is older than `[server] stale_after_seconds` (two minutes by default), the run is flagged **stale**. A trainer rewrites its heartbeat every couple of seconds, but not while it starts up, validates or saves a checkpoint, so keep the threshold well above those.
 

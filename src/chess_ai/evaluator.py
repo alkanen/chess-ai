@@ -22,7 +22,7 @@ import logging
 import os
 import threading
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pydantic import ValidationError
 
-from chess_ai.output import RESULT, Say
+from chess_ai.output import DETAIL, RESULT, Say
 from chess_ai.output import say as said_on_stdout
 from chess_ai.players import ModelDescription
 from chess_ai.probes import (
@@ -50,6 +50,7 @@ from chess_ai.training.run_store import (
     RunError,
     RunReader,
     code_version,
+    evaluating,
     list_runs,
 )
 
@@ -407,7 +408,33 @@ class Evaluator:
         checkpoints while a backlog is worked through, as it should. Any other failure is
         warned of, and the checkpoint not tried again. A suite
         stopped by ``stop`` part-way is neither: the rest are not run, and ``False`` is returned.
+
+        The run is held as being evaluated throughout, so that it cannot be renamed meanwhile; a
+        run renamed or deleted since it was looked at is passed over, and said to have been.
         """
+        with ExitStack() as held:
+            try:
+                held.enter_context(
+                    evaluating(
+                        job.run.directory,
+                        waiting=lambda: self._say(
+                            f"chess-ai: waiting for run {job.run.name} to finish being renamed",
+                            kind=DETAIL,
+                        ),
+                    )
+                )
+            except CheckpointChanged:
+                self._say(
+                    f"chess-ai: {job.describe()} was passed over: its run was renamed or deleted "
+                    "before it could be evaluated"
+                )
+                return True
+            except RunError as e:
+                self._fail(job, job.suites, f"cannot be evaluated: {e}")
+                return True
+            return self._evaluate(job, stop=stop)
+
+    def _evaluate(self, job: Job, *, stop: threading.Event | None) -> bool:
         run, checkpoint = job.run, job.checkpoint
         path = run.checkpoint_path(checkpoint)
         # Before it is loaded, which is the slow part of a checkpoint with only the probes.

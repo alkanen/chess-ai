@@ -385,8 +385,13 @@ def append_game(path: Path, game: MatchGame) -> None:
 
     One file for the whole match, which the replay view opens as a list of its games. Each game
     is written whole as it ends, so the file holds every game a stopped match finished.
+
+    The directory has to be there: one that has gone, such as the evaluation directory of a run
+    renamed while its games were played, is not made again under the old name.
+
+    Raises:
+        OSError: the file cannot be written, or its directory is not there.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         # PGN separates the games of a file with a blank line.
         file.write(f"{game.pgn}\n")

@@ -16,9 +16,13 @@ kills a run nor loses track of one, and a run from six months ago is still brows
     <runs>/<name>/evaluations/      step-<step>/, one per checkpoint evaluated, holding what each
                                     evaluation suite wrote about it: <suite>.json and its games
     <runs>/<name>/writer.lock       locked by the one process writing the run, while it does
+    <runs>/<name>/evaluating.lock   locked, shared, by every evaluation of one of the run's
+                                    checkpoints while it goes on; see evaluating()
     <runs>/<name>/orders/           the order the training loader's workers visit the current
                                     epoch in, shared between them: there while the loader runs,
                                     removed after it, and left behind only by a killed trainer
+    <runs>/<name>/rename.json       what the run was last renamed from, and whether that rename
+                                    finished; see chess_ai.run_rename
 
 Two write disciplines, because two kinds of reader:
 
@@ -75,7 +79,9 @@ LOCK_FILE: Final = "writer.lock"
 CHECKPOINTS_DIR: Final = "checkpoints"
 EVALUATIONS_DIR: Final = "evaluations"
 EVALUATION_LOCK: Final = "evaluation.lock"
+EVALUATING_LOCK: Final = "evaluating.lock"
 ORDERS_DIR: Final = "orders"
+RENAME_FILE: Final = "rename.json"
 CHECKPOINT_INDEX: Final = "index.json"
 CHECKPOINT_SUFFIX: Final = ".pt"
 CHECKPOINT_STEP_DIGITS: Final = 9
@@ -310,9 +316,10 @@ _TAG = re.compile(r"[^\s,]+")
 class RunNotes(BaseModel):
     """What people have said about a run: a title to know it by, tags to find it by, and notes.
 
-    The run's name is its directory, which a trainer may be writing into at this moment and a
-    checkpoint loaded elsewhere names it by, so it never changes. The title is the name it is
-    shown under instead, and can be changed as often as an experiment's meaning becomes clear.
+    The run's name is its directory, which a trainer may be writing into at this moment, and
+    checkpoints, results and games name it by it, so changing it is a job of its own (see
+    :mod:`chess_ai.run_rename`). The title is the name it is shown under instead, and can be
+    changed as often as an experiment's meaning becomes clear.
 
     Tags are single words, so that a command line can take them one at a time and a list of
     them can be written with commas or spaces between: no whitespace and no commas inside one.
@@ -588,7 +595,8 @@ class RunWriter:
         it is another."""
         # The notes too: they were written about the run being replaced, and a title or a
         # "best so far" tag carried over would describe a run that no longer exists.
-        for path in (METRICS_FILE, STATUS_FILE, NOTES_FILE):
+        # And how it was renamed, which a rename of this one would otherwise take for its own.
+        for path in (METRICS_FILE, STATUS_FILE, NOTES_FILE, RENAME_FILE):
             (directory / path).unlink(missing_ok=True)
 
     @staticmethod
@@ -1365,9 +1373,15 @@ def evaluation_lock(directory: Path) -> Iterator[None]:
     two saves that finish together cannot interleave their files: the evaluator and a one-off
     evaluation from the command line can both be finishing one suite about one checkpoint. The
     lock goes with the process that holds it, however that process ends.
+
+    Raises:
+        CheckpointChanged: the run directory is not there any more: renamed or deleted since
+            the evaluation began. It is not made again, which would leave a directory of the
+            old name behind with nothing in it but the lock.
+        RunError: the directory cannot be made or locked.
     """
     try:
-        directory.mkdir(parents=True, exist_ok=True)
+        _make_evaluation_directory(directory)
         descriptor = os.open(directory / EVALUATION_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as e:
         raise RunError(f"cannot lock {directory}: {e.strerror or e}") from e
@@ -1376,6 +1390,60 @@ def evaluation_lock(directory: Path) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
+
+
+@contextmanager
+def evaluating(directory: Path, *, waiting: Callable[[], None] | None = None) -> Iterator[None]:
+    """Say, for as long as this lasts, that one of the checkpoints of the run in ``directory`` is
+    being evaluated: a shared lock, which any number of evaluations can hold at once, and which
+    a rename of the run takes for itself, so that the two never overlap.
+
+    Waits while the run is being renamed, calling ``waiting`` first, so that whoever is
+    watching hears why nothing is happening.
+
+    Raises:
+        CheckpointChanged: the run directory is not there any more, or was renamed while this
+            waited: renamed or deleted.
+        RunError: the lock cannot be opened.
+    """
+    path = directory / EVALUATING_LOCK
+    gone = CheckpointChanged(
+        f"run {directory.name!r} is not in {directory.parent} any more: renamed or deleted"
+    )
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except FileNotFoundError:
+        raise gone from None
+    except OSError as e:
+        raise RunError(f"cannot open {path}: {e.strerror or e}") from e
+    try:
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if waiting is not None:
+                    waiting()
+                fcntl.flock(descriptor, fcntl.LOCK_SH)
+        except OSError as e:
+            # A file system that cannot lock: evaluated all the same, as it is written.
+            LOGGER.debug("cannot lock %s: %s", path, e)
+        # The lock is the file's, wherever it is now: a rename waited for moved it, and the run
+        # with it, and what is at the old name, if anything, is another run.
+        if not _same_file(descriptor, path):
+            raise gone
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _same_file(descriptor: int, path: Path) -> bool:
+    """Whether ``path`` is still the file open as ``descriptor``."""
+    try:
+        there = os.stat(path)
+    except FileNotFoundError:
+        return False
+    held = os.fstat(descriptor)
+    return (there.st_dev, there.st_ino) == (held.st_dev, held.st_ino)
 
 
 def created_with(run: RunReader, checkpoint: CheckpointInfo, written: datetime) -> datetime:
@@ -1435,13 +1503,29 @@ def start_partial_file(directory: Path, name: str) -> Path:
     ``sample-games.1a2b3c4d.pgn.partial``.
 
     Raises:
+        CheckpointChanged: the run directory is not there any more; see :func:`evaluation_lock`.
         OSError: the directory or the file cannot be made.
     """
-    directory.mkdir(parents=True, exist_ok=True)
+    _make_evaluation_directory(directory)
     stem, dot, suffix = name.partition(".")
     path = directory / f"{stem}.{uuid.uuid4().hex[:8]}{dot}{suffix}{PARTIAL_SUFFIX}"
     path.touch(exist_ok=False)
     return path
+
+
+def _make_evaluation_directory(directory: Path) -> None:
+    """Make the evaluation directory ``directory``, in a run directory that has to be there.
+
+    Raises:
+        CheckpointChanged: the run directory is not there.
+        OSError: the directory cannot be made.
+    """
+    try:
+        directory.parent.mkdir(exist_ok=True)
+    except FileNotFoundError:
+        run = directory.parent.parent
+        raise CheckpointChanged(f"run {run.name!r} is not in {run.parent} any more") from None
+    directory.mkdir(exist_ok=True)
 
 
 def save_evaluation(

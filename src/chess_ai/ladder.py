@@ -526,13 +526,21 @@ def start_games_file(run: RunReader, step: int) -> Path:
     return start_partial_file(run.evaluation_directory(step), f"{SUITE}.pgn")
 
 
-def save_ladder(run: RunReader, result: LadderResult, partial: Path) -> None:
+def save_ladder(
+    run: RunReader,
+    result: LadderResult,
+    partial: Path,
+    *,
+    current: Callable[[], bool] | None = None,
+) -> None:
     """Keep ``result`` and its games, from ``partial``, for the checkpoint it is about.
 
     Saved as one set by :func:`~chess_ai.training.run_store.save_evaluation`, so that a result
     has its own games beside it, whichever other ladder of the checkpoint finishes alongside.
+    ``current`` says whether the checkpoint is still the one played, as it does there.
 
     Raises:
+        CheckpointChanged: ``current`` said no. Nothing was saved.
         RunError: the run directory cannot be written. The games are still in ``partial``,
             unless the failure came after they had been moved to :func:`games_path`.
     """
@@ -541,6 +549,7 @@ def save_ladder(run: RunReader, result: LadderResult, partial: Path) -> None:
         run.evaluation_directory(step),
         {f"{SUITE}.json": result.model_dump_json(indent=2) + "\n"},
         {f"{SUITE}.pgn": partial},
+        current=current,
     )
 
 

@@ -78,10 +78,14 @@ def save(payload: dict[str, Any], path: Path) -> None:
     torch.save(payload, path)
 
 
-def load(path: Path, *, map_location: Any = "cpu") -> dict[str, Any]:
-    """Read a checkpoint, or raise :exc:`CheckpointError` saying why it cannot be read."""
+def load(path: Path, *, map_location: Any = "cpu", mmap: bool = False) -> dict[str, Any]:
+    """Read a checkpoint, or raise :exc:`CheckpointError` saying why it cannot be read.
+
+    ``mmap`` maps the tensors from the file rather than reading them, for a reader that wants
+    what the checkpoint says about itself and not its weights.
+    """
     try:
-        payload = torch.load(path, map_location=map_location, weights_only=True)
+        payload = torch.load(path, map_location=map_location, weights_only=True, mmap=mmap)
     except FileNotFoundError as e:
         raise CheckpointError(f"no checkpoint at {path}") from e
     except OSError as e:
