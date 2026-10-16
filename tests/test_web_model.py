@@ -5,6 +5,7 @@ the web server ever sees of a run anyway: a directory of files it only reads.
 """
 
 import asyncio
+import json
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -595,6 +596,62 @@ def test_a_checkpoint_deleted_while_the_server_was_down_pauses_the_game(tmp_path
         paused = pause(after, links, runs)
 
     assert paused["type"] == "paused"
+
+
+def renamed(config: Config, old: str, new: str) -> None:
+    from chess_ai.run_rename import rename_run
+
+    rename_run(
+        config.paths.runs,
+        old,
+        new,
+        games_dir=config.paths.games,
+        ongoing_dir=config.paths.ongoing_games,
+        stale_after=config.server.stale_after_seconds,
+        say=lambda text, kind=None: None,
+    )
+
+
+def test_a_game_against_a_run_renamed_while_the_server_was_down_plays_on_under_its_new_name(
+    tmp_path, runs
+):
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as before:
+        links = start(before, {"kind": "human"}, model(rating=1500)).json()["links"]
+
+    renamed(config, "tiny", "renamed")
+
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as after:
+        seen = after.get(f"{PREFIX}/api/games/{links['white']}").json()
+        with after.websocket_connect(f"{PREFIX}/api/games/{links['white']}/ws") as websocket:
+            websocket.receive_json()
+            websocket.send_json({"type": "move", "uci": "e2e4"})
+            assert websocket.receive_json()["type"] == "move"
+            answered = websocket.receive_json()
+
+    assert seen["game"]["black"]["model"]["run"] == "renamed"
+    assert answered["type"] == "move", "the checkpoint rewritten by the rename is still its own"
+
+
+def test_a_saved_game_of_a_renamed_run_opens_and_replays_under_its_new_name(client, tmp_path):
+    started = start(client, model(checkpoint="best"), model(checkpoint="latest"))
+    with watching(client, started) as websocket:
+        moves, _ = play_out(websocket)
+
+    renamed(
+        Config(paths=PathsConfig(games=tmp_path / "games", runs=tmp_path / "runs")),
+        "tiny",
+        "renamed",
+    )
+
+    (saved,) = client.get(f"{PREFIX}/api/replay/saved").json()
+    replayed = client.get(f"{PREFIX}/api/replay/saved/{saved['name']}").json()
+    assert "renamed step 2" in json.dumps(replayed) and "tiny" not in json.dumps(replayed)
+    assert len(replayed["selected"]["moves"]) == len(moves)
+    assert saved["white"] == "renamed step 2"
 
 
 def test_a_checkpoint_waiting_out_the_move_delay_shows_watchers_what_it_is_considering(

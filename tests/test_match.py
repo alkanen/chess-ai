@@ -151,6 +151,7 @@ async def test_saved_games_replay_to_the_positions_they_ended_in(tmp_path):
         FirstLegalPlayer("First"), FirstLegalPlayer("Second"), games=3, openings=TWO_LINES
     )
     path = tmp_path / "games" / match_filename()
+    path.parent.mkdir()
     for game in games:
         append_game(path, game)
 

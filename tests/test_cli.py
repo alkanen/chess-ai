@@ -2034,3 +2034,159 @@ def test_resume_can_override_whether_the_run_compiles(tmp_path, monkeypatch, fla
 
     assert main(["resume", "tiny", *flags]) == 0
     assert asked["compile"] is compile
+
+
+def test_runs_rename_renames_a_stopped_run_that_then_resumes_under_its_new_name(
+    tmp_path, capsys, monkeypatch
+):
+    import signal
+
+    from training_helpers import dataset, experiment
+
+    from chess_ai.training import RunStatus, checkpoint, open_run, trainer
+
+    dataset(tmp_path / "data")
+    config = experiment(tmp_path / "tiny.toml")
+    real = trainer._step
+    calls = {"n": 0}
+
+    def stop_on_the_run_s_fourth_step(*args, **kwargs):
+        result = real(*args, **kwargs)
+        calls["n"] += 1
+        if calls["n"] == trainer.PROBE_STEPS + 1 + 4:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return result
+
+    monkeypatch.setattr(trainer, "_step", stop_on_the_run_s_fourth_step)
+    assert main(["train", str(config)]) == 128 + signal.SIGTERM
+    monkeypatch.setattr(trainer, "_step", real)
+    capsys.readouterr()
+
+    assert main(["runs", "rename", "tiny", "renamed"]) == 0
+
+    out = capsys.readouterr().out
+    assert "run files rewritten: config.toml and run.json" in out
+    assert "checkpoints rewritten: 2" in out
+    assert "renamed run tiny to renamed" in out
+    assert main(["resume", "renamed"]) == 0
+    run = open_run(tmp_path / "runs", "renamed")
+    assert run.status.status == RunStatus.FINISHED
+    assert run.latest_checkpoint().step == 6
+    assert all(
+        checkpoint.load(run.checkpoint_path(info))["run"] == "renamed" for info in run.checkpoints()
+    )
+    assert 'name = "renamed"' in run.config_text
+
+
+def test_runs_rename_dry_run_lists_what_would_change_and_changes_nothing(tmp_path, capsys):
+    from training_helpers import model_run
+
+    directory = model_run(tmp_path / "runs", "tiny")
+
+    assert main(["runs", "rename", "tiny", "renamed", "--dry-run"]) == 0
+
+    out = capsys.readouterr().out
+    assert "would rewrite runs/tiny/checkpoints/step-000000004.pt" in out
+    assert "checkpoints to rewrite: 2" in out and "nothing was changed" in out
+    assert directory.is_dir() and not (tmp_path / "runs" / "renamed").exists()
+
+
+def test_runs_rename_refuses_a_name_that_is_taken(tmp_path, capsys):
+    from training_helpers import model_run
+
+    model_run(tmp_path / "runs", "tiny")
+    model_run(tmp_path / "runs", "taken")
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["runs", "rename", "tiny", "taken"])
+
+    assert exit_info.value.code == 2
+    assert "is there already" in capsys.readouterr().err
+
+
+def test_a_ladder_from_the_command_line_keeps_its_run_from_being_renamed(tmp_path, monkeypatch):
+    from chess_ai import match
+    from chess_ai.run_rename import rename_run
+    from chess_ai.training.run_store import RunError
+
+    config, _ = ladder_config(tmp_path)
+    refused: list[str] = []
+    real = match.append_game
+
+    def append_and_rename(path, game):
+        try:
+            rename_run(
+                tmp_path / "runs",
+                "tiny",
+                "renamed",
+                games_dir=tmp_path / "games",
+                ongoing_dir=tmp_path / "ongoing-games",
+                stale_after=120.0,
+                say=lambda text, kind=None: None,
+            )
+        except RunError as e:
+            refused.append(str(e))
+        real(path, game)
+
+    monkeypatch.setattr(match, "append_game", append_and_rename)
+
+    status = main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "2"])
+
+    assert status == 0
+    assert len(refused) == 2 and all("is being evaluated" in why for why in refused)
+    assert (tmp_path / "runs/tiny/evaluations/step-000000002/stockfish-ladder.json").is_file()
+
+
+def test_a_ladder_whose_run_moves_away_part_way_saves_nothing_under_its_old_name(
+    tmp_path, monkeypatch, capsys
+):
+    """As a run renamed by hand, or by a rename that could not see the ladder, would."""
+    from chess_ai import match
+
+    config, _ = ladder_config(tmp_path)
+    real = match.append_game
+
+    def move_then_append(path, game):
+        if (tmp_path / "runs/tiny").exists():
+            (tmp_path / "runs/tiny").rename(tmp_path / "runs/moved")
+        real(path, game)
+
+    monkeypatch.setattr(match, "append_game", move_then_append)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "2"])
+
+    assert exit_info.value.code == 2
+    assert "could not save a game" in capsys.readouterr().err
+    assert not (tmp_path / "runs/tiny").exists(), "the old name is not made again"
+
+
+def test_a_ladder_whose_run_is_started_again_part_way_does_not_give_it_its_result(
+    tmp_path, monkeypatch, capsys
+):
+    import shutil
+
+    from training_helpers import model_run
+
+    from chess_ai import ladder
+
+    config, _ = ladder_config(tmp_path)
+    real = ladder.write_games
+
+    def replace_then_write(path, played):
+        # The games kept, as a run started again leaves a ladder's file be until it is saved.
+        games = path.read_bytes()
+        shutil.rmtree(tmp_path / "runs/tiny")
+        model_run(tmp_path / "runs")
+        path.parent.mkdir(parents=True)
+        path.write_bytes(games)
+        real(path, played)
+
+    monkeypatch.setattr(ladder, "write_games", replace_then_write)
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--config", str(config), "ladder", "tiny", "--levels", "1350", "--games", "2"])
+
+    assert exit_info.value.code == 2
+    assert "no result was saved" in capsys.readouterr().err
+    assert not (tmp_path / "runs/tiny/evaluations/step-000000002/stockfish-ladder.json").exists()

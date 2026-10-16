@@ -10,13 +10,14 @@ import os
 import secrets
 import sys
 from collections.abc import Callable, Collection, Sequence
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
 from chess_ai.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_FILE, Config, ConfigError, load_config
 from chess_ai.output import (
+    DETAIL,
     LOUDEST,
     QUIETEST,
     RESULT,
@@ -477,8 +478,8 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
         "annotate",
         help="give a run a title, tags and notes",
         description="Change a run's title, tags and notes, which are kept in its run directory "
-        "and shown on the runs dashboard. With no options, show what it has. The run's name "
-        "never changes; the title is what it is shown as instead.",
+        "and shown on the runs dashboard. With no options, show what it has. The title is what "
+        "the run is shown as instead of its name, which 'chess-ai runs rename' changes.",
     )
     annotate.add_argument("name", help="the run")
     annotate.add_argument(
@@ -503,6 +504,24 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
         help="replace the notes with what this file says; - reads them from standard input",
     )
     annotate.set_defaults(handler=_annotate_run, query=True)
+
+    rename = actions.add_parser(
+        "rename",
+        help="rename a run, and everything that names it",
+        description="Rename a run: its directory, and its name wherever it is written: in its "
+        "checkpoints and evaluations, in the runs fine-tuned from it, and in the games played "
+        "against it. Refused while the run is being trained or evaluated. A rename that stops "
+        "part way leaves the run working under its old name, or under the new one once the "
+        "directory has been moved, and running it again finishes it. The title, tags and notes "
+        "stay as they are. Stop chess-ai serve while renaming a run a game is still being "
+        "played against, since the server would write the old name back.",
+    )
+    rename.add_argument("old", metavar="OLD", help="the run's name")
+    rename.add_argument("new", metavar="NEW", help="the name to give it")
+    rename.add_argument(
+        "--dry-run", action="store_true", help="list what would change, and change nothing"
+    )
+    rename.set_defaults(handler=_rename_run)
 
 
 _PLAYER_HELP = """\
@@ -744,6 +763,7 @@ def _match(config: Config, args: argparse.Namespace) -> int:
 
     def on_game(game: "MatchGame") -> None:
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             append_game(path, game)
         except OSError as e:
             raise _UserError(f"could not save game {game.number} to {path}: {e.strerror}") from e
@@ -1152,7 +1172,13 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.players import describe_limit
     from chess_ai.stockfish import StockfishError, start_stockfish
-    from chess_ai.training.run_store import RunError, code_version
+    from chess_ai.training.run_store import (
+        RunError,
+        code_version,
+        created_with,
+        evaluating,
+        still_evaluated,
+    )
 
     settings = config.ladder
     levels = args.levels or settings.levels
@@ -1169,151 +1195,173 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         raise _UserError(e) from e
     side = dataclasses.replace(args.checkpoint, rating=rating)
     ((run, chosen),) = _choose_checkpoints([side], config).values()
-    try:
-        # Before it is loaded, so that a file replaced meanwhile is not taken for this one.
-        written = run.checkpoint_written(chosen)
-    except RunError as e:
-        raise _UserError(e) from e
-    inference = config.inference.model_copy(update={"device": args.device or settings.device})
-    model, label = _model_player(
-        side, run, chosen, None, config.model_copy(update={"inference": inference}), 0, {}
-    )
-    try:
-        partial = start_games_file(run, chosen.step)
-    except OSError as e:
-        raise _UserError(f"cannot write the ladder's games in {run.directory}: {e}") from e
-    played = 0
-    total = games * len(levels)
-    lines = LadderLines(say, f"{label} ladder games", levels=levels, games=games, openings=openings)
-
-    def on_session(stockfish, number: int, session: "GameSession") -> None:
-        lines.starting(stockfish, number)
-
-    def on_game(stockfish, game: "MatchGame") -> None:
-        nonlocal played
+    # Held until the result is saved, so that the run is not renamed under the games.
+    with ExitStack() as held:
         try:
-            append_game(partial, game)
-        except OSError as e:
-            raise _UserError(f"could not save a game to {partial}: {e.strerror}") from e
-        played += 1
-        lines.ended(stockfish, game)
-
-    def games_note() -> str:
-        """Where the games played so far are, for a ladder that stopped before its end.
-
-        A ladder that played none deletes its empty games file and has nothing to tell. The
-        directory it was in stays, empty or not: another ladder or save of the same checkpoint
-        may have just made sure it is there, and be about to write into it.
-        """
-        if played == 0:
-            partial.unlink(missing_ok=True)
-            return ""
-        # A save that failed may have done so after the games were moved into place.
-        place = partial if partial.exists() else games_path(run, chosen.step)
-        return f"; the {_count(played, 'game')} played {'is' if played == 1 else 'are'} in {place}"
-
-    # Games played at once start an engine for a level each, and a level is warned about once.
-    warned: set[int] = set()
-
-    async def opponent(level: int) -> "Player":
+            held.enter_context(evaluating(run.directory, waiting=_waiting_for(run.name)))
+        except RunError as e:
+            raise _UserError(e) from e
         try:
-            stockfish = await start_stockfish(
-                config.stockfish.path, elo=level, move_time=move_time, nodes=nodes
+            # Before it is loaded, so that a file replaced meanwhile is not taken for this one.
+            written = run.checkpoint_written(chosen)
+            created = created_with(run, chosen, written)
+        except RunError as e:
+            raise _UserError(e) from e
+        inference = config.inference.model_copy(update={"device": args.device or settings.device})
+        model, label = _model_player(
+            side, run, chosen, None, config.model_copy(update={"inference": inference}), 0, {}
+        )
+        try:
+            partial = start_games_file(run, chosen.step)
+        except (OSError, RunError) as e:
+            raise _UserError(f"cannot write the ladder's games in {run.directory}: {e}") from e
+        played = 0
+        total = games * len(levels)
+        lines = LadderLines(
+            say, f"{label} ladder games", levels=levels, games=games, openings=openings
+        )
+
+        def on_session(stockfish, number: int, session: "GameSession") -> None:
+            lines.starting(stockfish, number)
+
+        def on_game(stockfish, game: "MatchGame") -> None:
+            nonlocal played
+            try:
+                append_game(partial, game)
+            except OSError as e:
+                raise _UserError(f"could not save a game to {partial}: {e.strerror}") from e
+            played += 1
+            lines.ended(stockfish, game)
+
+        def games_note() -> str:
+            """Where the games played so far are, for a ladder that stopped before its end.
+
+            A ladder that played none deletes its empty games file and has nothing to tell. The
+            directory it was in stays, empty or not: another ladder or save of the same checkpoint
+            may have just made sure it is there, and be about to write into it.
+            """
+            if played == 0:
+                partial.unlink(missing_ok=True)
+                return ""
+            # A save that failed may have done so after the games were moved into place.
+            place = partial if partial.exists() else games_path(run, chosen.step)
+            return (
+                f"; the {_count(played, 'game')} played {'is' if played == 1 else 'are'} in {place}"
             )
-        except StockfishError as e:
-            raise _LevelNotStarted(level, e) from e
-        if stockfish.stockfish.clamped and level not in warned:
-            warned.add(level)
+
+        # Games played at once start an engine for a level each, and a level is warned about once.
+        warned: set[int] = set()
+
+        async def opponent(level: int) -> "Player":
+            try:
+                stockfish = await start_stockfish(
+                    config.stockfish.path, elo=level, move_time=move_time, nodes=nodes
+                )
+            except StockfishError as e:
+                raise _LevelNotStarted(level, e) from e
+            if stockfish.stockfish.clamped and level not in warned:
+                warned.add(level)
+                LOGGER.warning(
+                    f"Stockfish plays from {stockfish.stockfish.min_elo} to "
+                    f"{stockfish.stockfish.max_elo}, so level {level} is played at "
+                    f"{stockfish.stockfish.elo}"
+                )
+            return stockfish
+
+        say(
+            f"chess-ai: {label} at rating {rating} against Stockfish at "
+            f"{', '.join(str(level) for level in levels)}, {_count(games, 'game')} each at "
+            f"{pace}{f', {parallel} games at once' if parallel > 1 else ''}, "
+            f"from opening set {openings.label}"
+        )
+        _warn_parallel_by_time(parallel, nodes)
+        if games > distinct_games(openings):
             LOGGER.warning(
-                f"Stockfish plays from {stockfish.stockfish.min_elo} to "
-                f"{stockfish.stockfish.max_elo}, so level {level} is played at "
-                f"{stockfish.stockfish.elo}"
+                f"opening set {openings.label} has "
+                f"{_count(len(openings.openings), 'line')}, so from game "
+                f"{distinct_games(openings) + 1} of each level on the games start as earlier ones "
+                "did, and the checkpoint, which plays its most likely move, will repeat them"
             )
-        return stockfish
+        started = datetime.now(UTC)
+        try:
+            levels_played = asyncio.run(
+                play_ladder(
+                    model,
+                    levels,
+                    games=games,
+                    openings=openings,
+                    opponent=opponent,
+                    on_game=on_game,
+                    on_session=on_session,
+                    parallel=parallel,
+                )
+            )
+        except KeyboardInterrupt:
+            say(
+                f"chess-ai: interrupted after {played} of {total} games, so no result was saved"
+                f"{games_note()}",
+                err=True,
+                kind=RESULT,
+            )
+            return 130
+        except _LevelNotStarted as e:
+            raise _UserError(
+                f"Stockfish could not be started for level {e.level}, so no result was saved: "
+                f"{e.__cause__}{games_note()}"
+            ) from e
+        except (StockfishError, TimeoutError, chess.engine.EngineError) as e:
+            # Played at once, the game that failed need not be the one after those that ended.
+            which = f"game {played + 1}" if parallel == 1 else "a game"
+            raise _UserError(
+                f"{which} could not be finished: {_engine_failure(e, nodes=nodes)}{games_note()}"
+            ) from e
+        result = ladder_result(
+            model.model,
+            levels_played,
+            openings=openings,
+            games_per_level=games,
+            started=started,
+            finished=datetime.now(UTC),
+            code_version=code_version(),
+            checkpoint_written=written,
+        )
+        for level in result.levels:
+            fraction = level.points / level.games
+            say(
+                f"Stockfish {level.elo}: {level.points:g}/{level.games} = {100 * fraction:.1f}% "
+                f"(+{level.wins} ={level.draws} -{level.losses})",
+                kind=RESULT,
+            )
+        say(
+            f"Elo: {result.estimate.describe()}, a {100 * result.estimate.confidence:g}% range, "
+            f"on Stockfish's scale at {pace}",
+            kind=RESULT,
+        )
+        try:
+            # In the order the result lists them, rather than the order games played at once ended.
+            write_games(partial, levels_played)
+        except OSError as e:
+            # The games are still in the file they were played into, which a failed write leaves be.
+            raise _UserError(
+                f"could not put the games in order: {e.strerror}, so no result was saved"
+                f"{games_note()}"
+            ) from e
+        try:
+            save_ladder(
+                run,
+                result,
+                partial,
+                current=lambda: still_evaluated(run, chosen, written, created),
+            )
+        except RunError as e:
+            raise _UserError(f"{e}, so no result was saved{games_note()}") from e
+        say(f"chess-ai: result saved in {result_path(run, chosen.step)}", kind=RESULT)
+        return 0
 
-    say(
-        f"chess-ai: {label} at rating {rating} against Stockfish at "
-        f"{', '.join(str(level) for level in levels)}, {_count(games, 'game')} each at "
-        f"{pace}{f', {parallel} games at once' if parallel > 1 else ''}, "
-        f"from opening set {openings.label}"
-    )
-    _warn_parallel_by_time(parallel, nodes)
-    if games > distinct_games(openings):
-        LOGGER.warning(
-            f"opening set {openings.label} has "
-            f"{_count(len(openings.openings), 'line')}, so from game "
-            f"{distinct_games(openings) + 1} of each level on the games start as earlier ones "
-            "did, and the checkpoint, which plays its most likely move, will repeat them"
-        )
-    started = datetime.now(UTC)
-    try:
-        levels_played = asyncio.run(
-            play_ladder(
-                model,
-                levels,
-                games=games,
-                openings=openings,
-                opponent=opponent,
-                on_game=on_game,
-                on_session=on_session,
-                parallel=parallel,
-            )
-        )
-    except KeyboardInterrupt:
-        say(
-            f"chess-ai: interrupted after {played} of {total} games, so no result was saved"
-            f"{games_note()}",
-            err=True,
-            kind=RESULT,
-        )
-        return 130
-    except _LevelNotStarted as e:
-        raise _UserError(
-            f"Stockfish could not be started for level {e.level}, so no result was saved: "
-            f"{e.__cause__}{games_note()}"
-        ) from e
-    except (StockfishError, TimeoutError, chess.engine.EngineError) as e:
-        # Played at once, the game that failed need not be the one after those that ended.
-        which = f"game {played + 1}" if parallel == 1 else "a game"
-        raise _UserError(
-            f"{which} could not be finished: {_engine_failure(e, nodes=nodes)}{games_note()}"
-        ) from e
-    result = ladder_result(
-        model.model,
-        levels_played,
-        openings=openings,
-        games_per_level=games,
-        started=started,
-        finished=datetime.now(UTC),
-        code_version=code_version(),
-        checkpoint_written=written,
-    )
-    for level in result.levels:
-        fraction = level.points / level.games
-        say(
-            f"Stockfish {level.elo}: {level.points:g}/{level.games} = {100 * fraction:.1f}% "
-            f"(+{level.wins} ={level.draws} -{level.losses})",
-            kind=RESULT,
-        )
-    say(
-        f"Elo: {result.estimate.describe()}, a {100 * result.estimate.confidence:g}% range, "
-        f"on Stockfish's scale at {pace}",
-        kind=RESULT,
-    )
-    try:
-        # In the order the result lists them, rather than the order games played at once ended.
-        write_games(partial, levels_played)
-    except OSError as e:
-        # The games are still in the file they were played into, which a failed write leaves be.
-        raise _UserError(
-            f"could not put the games in order: {e.strerror}, so no result was saved{games_note()}"
-        ) from e
-    try:
-        save_ladder(run, result, partial)
-    except RunError as e:
-        raise _UserError(f"{e}, so no result was saved{games_note()}") from e
-    say(f"chess-ai: result saved in {result_path(run, chosen.step)}", kind=RESULT)
-    return 0
+
+def _waiting_for(name: str) -> Callable[[], None]:
+    """What to say when an evaluation has to wait for its run to be renamed."""
+    return lambda: say(f"chess-ai: waiting for run {name} to finish being renamed", kind=DETAIL)
 
 
 def _list_runs(config: Config, args: argparse.Namespace) -> int:
@@ -1387,6 +1435,54 @@ def _annotate_run(config: Config, args: argparse.Namespace) -> int:
     say(f"title: {notes.title or '–'}", kind=RESULT)
     say(f"tags: {', '.join(notes.tags) or '–'}", kind=RESULT)
     say("notes:" + (f"\n{notes.notes.rstrip()}" if notes.notes.strip() else " –"), kind=RESULT)
+    return 0
+
+
+def _rename_run(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.run_rename import rename_run
+    from chess_ai.sample_games import LIVE_FILE
+    from chess_ai.training.run_store import RunError
+
+    try:
+        renamed = rename_run(
+            config.paths.runs,
+            args.old,
+            args.new,
+            games_dir=config.paths.games,
+            ongoing_dir=config.paths.ongoing_games,
+            stale_after=config.server.stale_after_seconds,
+            dry_run=args.dry_run,
+            say=say,
+        )
+    except RunError as e:
+        raise _UserError(e) from e
+    done = "to rewrite" if args.dry_run else "rewritten"
+    files = " and ".join(str(path) for path in renamed.run_files)
+    say(f"run files {done}: {files or 'none'}", kind=RESULT)
+    say(f"checkpoints {done}: {len(renamed.checkpoints)}", kind=RESULT)
+    say(f"evaluation files {done}: {len(renamed.evaluations)}", kind=RESULT)
+    runs = f" ({', '.join(renamed.runs)})" if renamed.runs else ""
+    say(f"other runs {done}: {len(renamed.runs)}{runs}", kind=RESULT)
+    say(
+        f"saved games {done}: {len(renamed.games)} in {config.paths.games}, "
+        f"{len(renamed.ongoing)} in {config.paths.ongoing_games}",
+        kind=RESULT,
+    )
+    if renamed.live:
+        say(f"live game {done}: {LIVE_FILE}", kind=RESULT)
+    if renamed.playing and not args.dry_run:
+        LOGGER.warning(
+            "%d of the games in %s are still going on: a chess-ai serve running now plays them "
+            "as %s, and writes that back as they go on. If one is, stop it, run this rename "
+            "again, and start it again",
+            renamed.playing,
+            config.paths.ongoing_games,
+            args.old,
+        )
+    if args.dry_run:
+        say("nothing was changed", kind=RESULT)
+    else:
+        say(f"renamed run {args.old} to {args.new}", kind=RESULT)
     return 0
 
 
@@ -2101,6 +2197,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
         CheckpointChanged,
         RunError,
         choose_checkpoint,
+        evaluating,
         open_run,
     )
 
@@ -2139,56 +2236,63 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                 if not suites:
                     continue
             say(f"chess-ai: evaluating {label}: {', '.join(suites)}")
-            try:
-                written = run.checkpoint_written(checkpoint)
-                engine = None if written is None else load(run.checkpoint_path(checkpoint))
-            except (InferenceError, RunError) as e:
-                if run.checkpoint_path(checkpoint).exists():
-                    raise _UserError(f"{label}: {e}") from e
-                engine = None
-            if engine is None:
-                # Pruned by its run since the checkpoints were listed: a run still training
-                # deletes its older checkpoints while the newer ones are evaluated.
-                if not one_of_all:
-                    raise _UserError(f"{label} was pruned before it could be evaluated")
-                LOGGER.warning(f"{label} was pruned before it could be evaluated")
-                continue
-            for suite in suites:
+            with ExitStack() as held:
                 try:
-                    said = available[suite].evaluate(run, checkpoint, written, engine)
-                except CheckpointChanged as e:
-                    why = f"{label} changed while it was evaluated, so its result was not saved"
-                    # As for a checkpoint pruned before its turn: one asked for by name has no
-                    # result to show for it, and a script has to be able to tell.
-                    if not one_of_all:
-                        raise _UserError(why) from e
-                    LOGGER.warning("%s", why)
-                    break
-                except DivergedError as e:
-                    why = f"{label} {suite}: {e}"
-                    # One diverged checkpoint of a run says nothing about the others, which are
-                    # evaluated all the same; the exit status still says this one was not.
-                    if not one_of_all:
-                        raise _UserError(why) from e
-                    LOGGER.warning("%s", why)
-                    failed.add(label)
-                    continue
+                    held.enter_context(evaluating(run.directory, waiting=_waiting_for(run.name)))
                 except RunError as e:
-                    raise _UserError(e) from e
-                except StockfishError as e:
-                    # The same for every checkpoint to come: not one to go on past.
-                    raise _UserError(f"{label} {suite}: {e}") from e
-                except (TimeoutError, chess.engine.EngineError) as e:
-                    # The ladder may hold Stockfish to nodes; sample games hold it to a time.
-                    nodes = config.ladder.nodes if suite == LADDER_SUITE else None
-                    raise _UserError(f"{label} {suite}: {_engine_failure(e, nodes=nodes)}") from e
-                say(f"{label} {suite}: {said}", kind=RESULT)
-            # Done with the checkpoint, as the evaluator is after a job.
-            for suite in suites:
+                    raise _UserError(f"{label}: {e}") from e
                 try:
-                    available[suite].after(run)
-                except Exception as e:
-                    LOGGER.warning("%s %s: %s", label, suite, e)
+                    written = run.checkpoint_written(checkpoint)
+                    engine = None if written is None else load(run.checkpoint_path(checkpoint))
+                except (InferenceError, RunError) as e:
+                    if run.checkpoint_path(checkpoint).exists():
+                        raise _UserError(f"{label}: {e}") from e
+                    engine = None
+                if engine is None:
+                    # Pruned by its run since the checkpoints were listed: a run still training
+                    # deletes its older checkpoints while the newer ones are evaluated.
+                    if not one_of_all:
+                        raise _UserError(f"{label} was pruned before it could be evaluated")
+                    LOGGER.warning(f"{label} was pruned before it could be evaluated")
+                    continue
+                for suite in suites:
+                    try:
+                        said = available[suite].evaluate(run, checkpoint, written, engine)
+                    except CheckpointChanged as e:
+                        why = f"{label} changed while it was evaluated, so its result was not saved"
+                        # As for a checkpoint pruned before its turn: one asked for by name has no
+                        # result to show for it, and a script has to be able to tell.
+                        if not one_of_all:
+                            raise _UserError(why) from e
+                        LOGGER.warning("%s", why)
+                        break
+                    except DivergedError as e:
+                        why = f"{label} {suite}: {e}"
+                        # One diverged checkpoint of a run says nothing about the others, which are
+                        # evaluated all the same; the exit status still says this one was not.
+                        if not one_of_all:
+                            raise _UserError(why) from e
+                        LOGGER.warning("%s", why)
+                        failed.add(label)
+                        continue
+                    except RunError as e:
+                        raise _UserError(e) from e
+                    except StockfishError as e:
+                        # The same for every checkpoint to come: not one to go on past.
+                        raise _UserError(f"{label} {suite}: {e}") from e
+                    except (TimeoutError, chess.engine.EngineError) as e:
+                        # The ladder may hold Stockfish to nodes; sample games hold it to a time.
+                        nodes = config.ladder.nodes if suite == LADDER_SUITE else None
+                        raise _UserError(
+                            f"{label} {suite}: {_engine_failure(e, nodes=nodes)}"
+                        ) from e
+                    say(f"{label} {suite}: {said}", kind=RESULT)
+                # Done with the checkpoint, as the evaluator is after a job.
+                for suite in suites:
+                    try:
+                        available[suite].after(run)
+                    except Exception as e:
+                        LOGGER.warning("%s %s: %s", label, suite, e)
     except KeyboardInterrupt:
         say("chess-ai: interrupted", err=True, kind=RESULT)
         return 130
