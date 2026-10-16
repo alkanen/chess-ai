@@ -96,6 +96,14 @@ weight_decay = 0.01                        # default: 0.01
 # the trainer told the two apart decayed everything, which true brings back.
 decay_biases_and_norms = false             # default: false
 
+# How weight decay follows the learning rate schedule. AdamW shrinks the weights by
+# learning rate x weight_decay at every step, so the decay falls with the learning rate
+# either way. "learning-rate" also scales weight_decay by the schedule, so the shrinking
+# goes as the square of the learning rate. With "constant", a weight matrix that feeds a
+# normalization layer keeps shrinking as the rate falls, which keeps its steps as large
+# relative to it as they were, and the end of a long schedule stops paying off.
+weight_decay_schedule = "constant"         # default: "constant"
+
 beta1 = 0.9                                # default: 0.9
 beta2 = 0.95                               # default: 0.95
 epsilon = 1e-8                             # default: 1e-08

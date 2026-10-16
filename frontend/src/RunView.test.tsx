@@ -261,6 +261,32 @@ describe('RunView', () => {
     ]);
   });
 
+  it('charts the parameter norms and how far a step moves the weights', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ info: INFO }));
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      records: [
+        { step: 50, split: 'train', loss: 3.0, weight_norm: 120, scale_bias_norm: 30, update_ratio: 0.002 },
+        { step: 100, split: 'train', loss: 2.5, weight_norm: 110, scale_bias_norm: 32, update_ratio: 0.0015 },
+      ],
+    });
+
+    expect(screen.getByText('Parameter norm')).toBeInTheDocument();
+    expect(FakeUPlot.withSeries('weights').data).toEqual([
+      [50, 100],
+      [120, 110],
+      [30, 32],
+    ]);
+    expect(FakeUPlot.withSeries('update / weights').data).toEqual([
+      [50, 100],
+      [0.002, 0.0015],
+    ]);
+  });
+
   it('fits the y-axis of every chart to its data rather than to the clip threshold', () => {
     render(<RunView name="mlp-big" />);
     const socket = FakeWebSocket.latest;
@@ -344,6 +370,8 @@ describe('RunView', () => {
     expect(() => FakeUPlot.withSeries('gradient norm')).toThrow();
     expect(screen.queryByText('Gradient norm, before clipping')).toBeNull();
     expect(screen.queryByText('Steps clipped')).toBeNull();
+    expect(screen.queryByText('Parameter norm')).toBeNull();
+    expect(screen.queryByText('Step size relative to the weights')).toBeNull();
   });
 
   it('works out no chart again when a heartbeat brings the same run in a new object', () => {
