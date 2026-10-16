@@ -261,6 +261,49 @@ describe('RunView', () => {
     ]);
   });
 
+  it('charts the norms and step sizes of each part of the model, as the latest line names them', () => {
+    render(<RunView name="mlp-big" />);
+    const socket = FakeWebSocket.latest;
+    socket.open();
+    socket.deliver(runEvent({ info: INFO }));
+    const parts = (step: number, scale: number) => ({
+      step,
+      split: 'train',
+      loss: 3.0,
+      'weight_norm/body': 120 * scale,
+      'weight_norm/policy_head': 10000 * scale,
+      'scale_bias_norm/body': 30 * scale,
+      'scale_bias_norm/final_norm': 1 * scale,
+      'update_ratio/body': 0.002 * scale,
+      'update_ratio/policy_head': 0.0001 * scale,
+    });
+    socket.deliver({
+      type: 'metrics',
+      reset: true,
+      // From before the run logged its parts, as a run resumed on newer code has.
+      records: [{ step: 25, split: 'train', loss: 3.5 }, parts(50, 1), parts(100, 2)],
+    });
+    const chartTitled = (title: string) => {
+      const figure = screen.getByText(title).closest('figure')!;
+      return FakeUPlot.live().find((candidate) => figure.contains(candidate.target))!;
+    };
+
+    const weights = chartTitled('Weight norm, by part');
+    expect(weights.options.series.slice(1).map((series) => series.label)).toEqual(['body', 'policy head']);
+    expect(weights.data).toEqual([
+      [50, 100],
+      [120, 240],
+      [10000, 20000],
+    ]);
+    const scales = chartTitled('Norm scales and biases, by part');
+    expect(scales.options.series.slice(1).map((series) => series.label)).toEqual(['body', 'final norm']);
+    expect(chartTitled('Step size relative to the weights, by part').data).toEqual([
+      [50, 100],
+      [0.002, 0.004],
+      [0.0001, 0.0002],
+    ]);
+  });
+
   it('fits the y-axis of every chart to its data rather than to the clip threshold', () => {
     render(<RunView name="mlp-big" />);
     const socket = FakeWebSocket.latest;
@@ -344,6 +387,8 @@ describe('RunView', () => {
     expect(() => FakeUPlot.withSeries('gradient norm')).toThrow();
     expect(screen.queryByText('Gradient norm, before clipping')).toBeNull();
     expect(screen.queryByText('Steps clipped')).toBeNull();
+    expect(screen.queryByText('Weight norm, by part')).toBeNull();
+    expect(screen.queryByText('Step size relative to the weights, by part')).toBeNull();
   });
 
   it('works out no chart again when a heartbeat brings the same run in a new object', () => {

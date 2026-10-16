@@ -46,6 +46,12 @@ export interface Reference {
 
 export interface ChartSpec extends ChartLook {
   series: SeriesSpec[];
+  /**
+   * A metric logged for each part of the model as `PREFIX/PART`, such as `weight_norm/body`,
+   * which makes the chart a line for each part instead of `series`: which parts there are is
+   * the model's to say.
+   */
+  parts?: string;
   reference?: Reference;
 }
 
@@ -121,6 +127,34 @@ export const CHARTS: ChartSpec[] = [
     title: 'Steps clipped',
     series: [{ label: 'clipped', split: 'train', metric: 'clipped_fraction' }],
     ...PERCENTAGES,
+    optional: true,
+  },
+  {
+    // Weight decay shrinks the weights, and the norm layers' scales grow to make up for it.
+    id: 'weight-norm',
+    title: 'Weight norm, by part',
+    series: [],
+    parts: 'weight_norm',
+    ...numbers(4),
+    logarithmic: true,
+    optional: true,
+  },
+  {
+    id: 'scale-bias-norm',
+    title: 'Norm scales and biases, by part',
+    series: [],
+    parts: 'scale_bias_norm',
+    ...numbers(4),
+    logarithmic: true,
+    optional: true,
+  },
+  {
+    id: 'update-ratio',
+    title: 'Step size relative to the weights, by part',
+    series: [],
+    parts: 'update_ratio',
+    ...numbers(3),
+    logarithmic: true,
     optional: true,
   },
 ];
@@ -265,6 +299,45 @@ function line(records: MetricsRecord[], xs: (number | null)[], series: Metric): 
   return found;
 }
 
+/**
+ * The lines of `spec` for a run that logged `records`: its own, or one for each part of the
+ * model, in the order the latest training line that has any lists them, and no more than a
+ * chart has colours for. The parts are taken from that one line rather than gathered from
+ * all of them.
+ *
+ * A log can also have the metric for the whole model at once, under `PREFIX` alone, which is
+ * what the trainer logged before it split it by part: that is a line of its own, so that a
+ * run trained, or begun, then still shows that history. Finding it reads the log up to the
+ * first line that has it, which in a log without it is the whole log, each time the chart
+ * is worked out again as a line arrives; drawing the chart reads the whole log anyway.
+ */
+export function seriesOf(spec: ChartSpec, records: MetricsRecord[]): SeriesSpec[] {
+  const prefix = spec.parts;
+  if (prefix === undefined) {
+    return spec.series;
+  }
+  const whole = logs(records, { split: 'train', metric: prefix })
+    ? [{ label: 'all parts', split: 'train' as const, metric: prefix }]
+    : [];
+  const marker = `${prefix}/`;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record.split !== 'train') {
+      continue;
+    }
+    const parts = Object.keys(record).filter((key) => key.startsWith(marker));
+    if (parts.length > 0) {
+      const each = parts.slice(0, MAX_SERIES - whole.length).map((metric) => ({
+        label: metric.slice(marker.length).replaceAll('_', ' '),
+        split: 'train' as const,
+        metric,
+      }));
+      return [...each, ...whole];
+    }
+  }
+  return whole;
+}
+
 /** Whether any line of `records` has `metric`, which an optional chart is shown for. */
 export function logs(records: MetricsRecord[], metric: Metric): boolean {
   return records.some((record) => record.split === metric.split && metric.metric in record);
@@ -283,7 +356,7 @@ export function chartData(
   reference: number | null = null,
 ): ChartData {
   const xs = placeRecords(records, axis, batchSize);
-  const lines = spec.series.map((series) => line(records, xs, series));
+  const lines = seriesOf(spec, records).map((series) => line(records, xs, series));
   if (reference !== null) {
     lines.push(lines[0].map(([x]): [number, number] => [x, reference]));
   }

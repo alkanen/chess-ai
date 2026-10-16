@@ -155,7 +155,7 @@ Games survive a restart of the server. Each game is written as it changes to a J
 
 ### Follow training
 
-**Runs** lists every training run with its state, architecture, dataset, progress and latest losses, top-1 accuracy and illegal-move rate, refreshed every few seconds. Opening a run shows its step, epoch, throughput and the device it trains on, and while it is running, the time left and how busy, full and hot the GPU is: the memory the run holds and what the whole card has in use, both as CUDA sees them, with utilization and temperature from NVML when it can be asked (without it, those two show as a dash). It also charts its loss (on a log scale), validation accuracy, learning rate and illegal-move rate against the step, and the gradient norm before clipping, with the threshold it is clipped at, and how many steps were clipped. Runs logged before the trainer measured gradients have no gradient charts. The charts follow the run over a WebSocket (`…/api/runs/<name>/ws`) as the trainer logs, so they update without reloading; a finished run shows the same charts for its whole history. Drag across a chart to zoom in, and double-click to let it follow the run again. Every chart can be drawn against the step, the positions seen (which lines up runs with different batch sizes) or the wall time; the choice is remembered in the browser.
+**Runs** lists every training run with its state, architecture, dataset, progress and latest losses, top-1 accuracy and illegal-move rate, refreshed every few seconds. Opening a run shows its step, epoch, throughput and the device it trains on, and while it is running, the time left and how busy, full and hot the GPU is: the memory the run holds and what the whole card has in use, both as CUDA sees them, with utilization and temperature from NVML when it can be asked (without it, those two show as a dash). It also charts its loss (on a log scale), validation accuracy, learning rate and illegal-move rate against the step, and the gradient norm before clipping, with the threshold it is clipped at, and how many steps were clipped; then, for each part of the model (such as the body, the policy head and the value head), the norm of its weights, the norm of its normalization layers' scales and its biases, and how far a step moves its weights relative to their norm, averaged over each logging interval. Each part has a line of its own because a large part such as a policy head would otherwise be all a single number showed; a run logged before they were split by part shows the whole model as one line, "all parts". Runs logged before the trainer measured these have none of these charts. The charts follow the run over a WebSocket (`…/api/runs/<name>/ws`) as the trainer logs, so they update without reloading; a finished run shows the same charts for its whole history. Drag across a chart to zoom in, and double-click to let it follow the run again. Every chart can be drawn against the step, the positions seen (which lines up runs with different batch sizes) or the wall time; the choice is remembered in the browser.
 
 Tick two or more runs in the list (up to eight) and choose **Compare** to overlay them on the same charts, one line per run: training and validation loss, top-1 and top-5 accuracy, illegal-move rate and learning rate, all followed live.
 
@@ -640,9 +640,40 @@ or was killed resumes the same way, from the last checkpoint it saved; whatever 
 that checkpoint is dropped from its metrics, since those steps are trained again. The schedule
 is the one the run started with, so resuming finishes a run but cannot make it longer.
 
+`--stop-at STEP` stops a resumed run at that step instead, with a checkpoint, validated, and
+leaves it **stopped**; the schedule is still the whole run's, and resuming it again carries it
+on. That is what trying a change on part of a run needs (see below).
+
 A run is resumed on the dataset of the same name, and is refused if that dataset has been
 rebuilt since, because its positions would come in a different order. It is also refused while
 another process is still writing it.
+
+#### Weight decay late in a long run
+
+`[optimizer] weight_decay_schedule` says how weight decay follows the learning rate schedule.
+AdamW shrinks the weights by the learning rate times `weight_decay` at every step, so the decay
+falls with the learning rate in any case; `"constant"`, the default, leaves it at that.
+`"learning-rate"` also scales `weight_decay` by the schedule, so the shrinking per step goes as
+the square of the learning rate, and the weights stop shrinking late in a run. A weight matrix
+that feeds a normalization layer computes the same at any scale, and under a constant decay it
+settles at a norm that falls with the learning rate, which could keep its steps from getting
+smaller at the end of a schedule. On the 6x256 square transformer it made no difference: copies
+of the run with the decay scaled, or with none at all, from step 524000 on played no better on
+the Stockfish ladder (no decay: +4 ± 5 Elo over the last 120,000 steps), and their training loss
+was no lower. The run page's per-part charts show how each part's weights and step size move.
+
+To try a change like this on the end of a run without training it again from the start, copy
+the run at one of its checkpoints with the change made, and resume the copy:
+
+```sh
+uv run scripts/branch-run.py RUN 524000 RUN-wd-scheduled --set optimizer.weight_decay_schedule=learning-rate
+uv run chess-ai resume RUN-wd-scheduled --stop-at 564000
+```
+
+The copy has the run's metrics, checkpoints and evaluations up to that step, so its charts and
+ladder go back to the start. Only `weight_decay`, `weight_decay_schedule` and `gradient_clip`
+can be changed this way: a resumed run takes the rest of its optimizer's settings from its
+optimizer state.
 
 #### Fine-tune from another run
 

@@ -94,6 +94,14 @@ weight_decay = 0.01                        # default: 0.01
 # the trainer told the two apart decayed everything, which true brings back.
 decay_biases_and_norms = false             # default: false
 
+# How weight decay follows the learning rate schedule. AdamW shrinks the weights by
+# learning rate x weight_decay at every step, so the decay falls with the learning rate
+# either way. "learning-rate" also scales weight_decay by the schedule, so the shrinking
+# goes as the square of the learning rate, and the weights stop shrinking late in a run.
+# On the 6x256 transformer, neither that nor no decay at all from 524k steps on played
+# better than this by the Stockfish ladder (+4 +/- 5 Elo over the last 120k steps; #127).
+weight_decay_schedule = "constant"         # default: "constant"
+
 beta1 = 0.9                                # default: 0.9
 beta2 = 0.95                               # default: 0.95
 epsilon = 1e-8                             # default: 1e-08
