@@ -123,6 +123,26 @@ export const CHARTS: ChartSpec[] = [
     ...PERCENTAGES,
     optional: true,
   },
+  {
+    // Weight decay shrinks the weights, and the norm layers' scales grow to make up for it.
+    id: 'parameter-norm',
+    title: 'Parameter norm',
+    series: [
+      { label: 'weights', split: 'train', metric: 'weight_norm' },
+      { label: 'norms and biases', split: 'train', metric: 'scale_bias_norm' },
+    ],
+    ...numbers(4),
+    logarithmic: true,
+    optional: true,
+  },
+  {
+    id: 'update-ratio',
+    title: 'Step size relative to the weights',
+    series: [{ label: 'update / weights', split: 'train', metric: 'update_ratio' }],
+    ...numbers(3),
+    logarithmic: true,
+    optional: true,
+  },
 ];
 
 /**
@@ -348,6 +368,22 @@ export const COMPARISON_CHARTS: ComparisonChart[] = [
     title: 'Steps clipped',
     metric: { split: 'train', metric: 'clipped_fraction' },
     ...PERCENTAGES,
+    optional: true,
+  },
+  {
+    id: 'weight-norm',
+    title: 'Weight norm',
+    metric: { split: 'train', metric: 'weight_norm' },
+    ...numbers(4),
+    logarithmic: true,
+    optional: true,
+  },
+  {
+    id: 'update-ratio',
+    title: 'Step size relative to the weights',
+    metric: { split: 'train', metric: 'update_ratio' },
+    ...numbers(3),
+    logarithmic: true,
     optional: true,
   },
 ];

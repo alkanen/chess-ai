@@ -128,6 +128,18 @@ class OptimizerSection(_Section):
 
     Off by default, as is usual: decay is for the weights that multiply an input. Runs made
     before the trainer told the two apart decayed everything, and this brings that back."""
+    weight_decay_schedule: Literal["constant", "learning-rate"] = "constant"
+    """How weight decay follows the learning rate schedule.
+
+    AdamW shrinks the weights by ``learning rate × weight_decay`` each step, so the decay falls
+    with the learning rate in either case. ``"constant"`` leaves ``weight_decay`` as it is set.
+    ``"learning-rate"`` scales it by the schedule as well, so that the shrinking per step goes
+    as the square of the learning rate. A weight matrix feeding a normalization layer computes
+    the same whatever its scale, and with a constant decay it settles at a norm that falls with
+    the learning rate, which keeps its steps as large relative to it as they were: the low
+    learning rate at the end of a schedule then does not slow those layers down. Scaling the
+    decay keeps that norm where it was (Defazio et al., 2025, "Why Gradients Rapidly Increase
+    Near the End of Training")."""
     beta1: float = Field(default=0.9, ge=0.0, lt=1.0)
     beta2: float = Field(default=0.95, ge=0.0, lt=1.0)
     epsilon: float = Field(default=1e-8, gt=0.0)

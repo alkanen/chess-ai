@@ -445,6 +445,13 @@ def _add_train_command(commands: argparse._SubParsersAction) -> None:
         help="compile the model on the GPU, or not, whatever the run was trained with "
         "(default: as it was; a run from before [training] compile existed is not compiled)",
     )
+    resume.add_argument(
+        "--stop-at",
+        type=_positive,
+        metavar="STEP",
+        help="save a checkpoint at this step and stop there, with the schedule still the whole "
+        "run's; resume it again to carry on",
+    )
     resume.set_defaults(handler=_resume)
 
 
@@ -1533,6 +1540,7 @@ def _resume(config: Config, args: argparse.Namespace) -> int:
             say=say,
             ladder_every=config.ladder.every,
             compile=args.compile,
+            stop_at=args.stop_at,
         ),
     )
 
