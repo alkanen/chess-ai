@@ -873,51 +873,72 @@ def test_a_step_measures_and_clips_the_gradient_as_clip_grad_norm_does(tmp_path,
         torch.testing.assert_close(value, twin.model.state_dict()[name])
 
 
-def test_training_lines_say_how_large_the_parameters_are_and_how_far_a_step_moved_them(
-    tmp_path, data_dir
-):
+def test_training_lines_say_how_large_each_part_is_and_how_far_a_step_moved_it(tmp_path, data_dir):
     lines = train_lines(run(tmp_path, data_dir))
 
     assert lines
     for line in lines:
-        assert line["weight_norm"] > 0 and line["scale_bias_norm"] > 0
-        assert 0 < line["update_ratio"] < 1
+        for part in ("trunk", "policy_head", "value_head"):
+            assert line[f"weight_norm/{part}"] > 0
+            assert line[f"scale_bias_norm/{part}"] > 0
+            assert 0 < line[f"update_ratio/{part}"] < 1
+        assert not any(key in line for key in ("weight_norm", "scale_bias_norm", "update_ratio"))
 
 
-def test_the_parameter_norms_are_of_the_weights_and_of_everything_else(tmp_path, data_dir):
-    config = load_experiment(experiment(tmp_path / "tiny.toml"))
+def norm(tensors) -> float:
+    return math.sqrt(sum(t.detach().double().square().sum().item() for t in tensors))
+
+
+def parts_of(model, *, weights: bool) -> dict[str, list]:
+    found: dict[str, list] = {}
+    for name, p in model.named_parameters():
+        if (p.ndim > 1) == weights:
+            found.setdefault(name.split(".")[0], []).append(p)
+    return found
+
+
+SQUARE_TRANSFORMER = 'architecture = "square-transformer"\nlayers = 1\nwidth = 8\nheads = 2'
+
+
+def test_the_parameter_norms_are_of_each_part_s_weights_and_of_the_rest(tmp_path, data_dir):
+    config = load_experiment(experiment(tmp_path / "tiny.toml", model=SQUARE_TRANSFORMER))
     model = trainer._prepare(config, data_dir=data_dir).model
-    weights, rest = trainer._parameter_groups(model, config.optimizer)
 
     norms = trainer._parameter_norms(model)
 
-    assert norms["weight_norm"] == pytest.approx(
-        math.sqrt(sum(p.detach().square().sum().item() for p in weights["params"]))
-    )
-    assert norms["scale_bias_norm"] == pytest.approx(
-        math.sqrt(sum(p.detach().square().sum().item() for p in rest["params"]))
+    weights, rest = parts_of(model, weights=True), parts_of(model, weights=False)
+    assert "final_norm" in rest and "final_norm" not in weights
+    # Summed in single precision, which over a policy head's millions of weights is a few in
+    # 100,000 off: plenty for a chart.
+    assert norms == pytest.approx(
+        {f"weight_norm/{part}": norm(ps) for part, ps in weights.items()}
+        | {f"scale_bias_norm/{part}": norm(ps) for part, ps in rest.items()},
+        rel=1e-3,
     )
 
 
-def test_the_update_ratio_is_how_far_a_step_moved_the_weights_against_their_norm(
-    tmp_path, data_dir
-):
-    config = load_experiment(experiment(tmp_path / "tiny.toml"))
+def test_the_update_ratio_is_how_far_a_step_moved_each_part_against_its_norm(tmp_path, data_dir):
+    config = load_experiment(experiment(tmp_path / "tiny.toml", model=SQUARE_TRANSFORMER))
     prepared = trainer._prepare(config, data_dir=data_dir)
     batch = prepared.batches[0].to(prepared.device)
-    weights = [p for p in prepared.model.parameters() if p.ndim > 1]
-    before = [p.detach().clone() for p in weights]
+    weights = parts_of(prepared.model, weights=True)
+    before = {part: [p.detach().clone() for p in ps] for part, ps in weights.items()}
+    movement = trainer._Movement(prepared.model)
 
-    measured = trainer._step(
-        prepared, batch, trainer._optimizer(prepared), trainer._Movement(prepared.model)
-    )
+    measured = trainer._step(prepared, batch, trainer._optimizer(prepared), movement)
 
-    moved = math.sqrt(
-        sum((p.detach() - b).square().sum().item() for p, b in zip(weights, before, strict=True))
-    )
-    size = math.sqrt(sum(p.detach().square().sum().item() for p in weights))
-    assert moved > 0
-    assert measured.update_ratio.item() == pytest.approx(moved / size, rel=1e-4)
+    assert movement.parts == list(weights)
+    expected = [
+        norm(p - b for p, b in zip(weights[part], before[part], strict=True)) / norm(weights[part])
+        for part in movement.parts
+    ]
+    assert all(value > 0 for value in expected)
+    assert measured.update_ratio.tolist() == pytest.approx(expected, rel=1e-3)
+
+
+def test_a_compiled_model_s_parts_are_named_as_the_model_s_are():
+    assert trainer._part("_orig_mod.body.0.linear1.weight") == "body"
+    assert trainer._part("policy_head.0.weight") == "policy_head"
 
 
 def scheduled(tmp_path, data_dir, optimizer: str, *, completed: int = 0):

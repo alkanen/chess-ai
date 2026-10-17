@@ -9,7 +9,9 @@ import {
   gradientClip,
   latestValues,
   logs,
+  MAX_SERIES,
   placeRecords,
+  seriesOf,
 } from './runCharts';
 import {
   decimalsOf,
@@ -74,6 +76,21 @@ describe('chartData', () => {
       [50, 100],
       [2.5, 0.8],
     ]);
+  });
+
+  it('makes a line of each part a log names, and no more than a chart has colours for', () => {
+    const weights = CHARTS.find((chart) => chart.id === 'weight-norm')!;
+    const record: MetricsRecord = { step: 50, split: 'train', loss: 3.0 };
+    for (let part = 0; part < MAX_SERIES + 2; part += 1) {
+      record[`weight_norm/part_${part}`] = part;
+    }
+
+    const series = seriesOf(weights, [record, { step: 50, split: 'validation', loss: 2.0 }]);
+
+    expect(series).toHaveLength(MAX_SERIES);
+    expect(series[0]).toEqual({ label: 'part 0', split: 'train', metric: 'weight_norm/part_0' });
+    expect(seriesOf(weights, [{ step: 1, split: 'train', loss: 3.0 }])).toEqual([]);
+    expect(seriesOf(LOSS, [])).toBe(LOSS.series);
   });
 
   it('says whether a log has a metric at all, which an optional chart is shown for', () => {

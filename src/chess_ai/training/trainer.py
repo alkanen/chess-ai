@@ -36,7 +36,7 @@ import shutil
 import signal
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -813,24 +813,64 @@ class _StepResult(NamedTuple):
     clipped: torch.Tensor
     """1 if clipping scaled this step's gradient down, else 0."""
     update_ratio: torch.Tensor
-    """How far the step moved the weights, as a fraction of their norm; see :class:`_Movement`."""
+    """How far the step moved each part's weights, as a fraction of their norm; see
+    :class:`_Movement`. Last, since it has a value for each part."""
+
+
+def _part(name: str) -> str:
+    """The part of the model a parameter belongs to: its top-level module, such as ``body``,
+    ``tower`` or ``policy_head``, whatever compiling wrapped it in."""
+    return name.removeprefix("_orig_mod.").split(".")[0]
+
+
+def _by_part(
+    model: nn.Module, *, weights: bool
+) -> tuple[list[str], list[nn.Parameter], torch.Tensor]:
+    """The weights (matrices and kernels, the parameters weight decay is for; see
+    :func:`_parameter_groups`) or the rest (normalization layers' scales and shifts, and
+    biases), the parts of the model they are in, in the model's order, and which part each is in
+    as an index into those."""
+    parts: list[str] = []
+    found: list[nn.Parameter] = []
+    index: list[int] = []
+    for name, parameter in model.named_parameters():
+        if (parameter.ndim > 1) != weights:
+            continue
+        part = _part(name)
+        if part not in parts:
+            parts.append(part)
+        found.append(parameter)
+        index.append(parts.index(part))
+    device = found[0].device if found else None
+    return parts, found, torch.tensor(index, dtype=torch.long, device=device)
+
+
+def _part_norms(tensors: list[torch.Tensor], index: torch.Tensor, parts: int) -> torch.Tensor:
+    """The norm of ``tensors`` taken together within each part, by ``index``."""
+    squares = torch.stack(torch._foreach_norm(tensors)).double().square()
+    return (
+        torch.zeros(parts, dtype=torch.float64, device=squares.device)
+        .index_add_(0, index, squares)
+        .sqrt()
+    )
 
 
 class _Movement:
-    """How far each step moves the weights, as a fraction of how large they are.
+    """How far each step moves the weights of each part of the model, as a fraction of how
+    large they are.
 
-    The weights are the matrices and kernels, the parameters weight decay is for (see
-    :func:`_parameter_groups`). One followed by a normalization layer computes the same at any
-    scale, so what a step does to it is how far it moves it relative to its norm: its effective
-    learning rate, which is what a learning rate schedule is meant to bring down at the end of a
-    run, and what weight decay can keep up instead. Measured over all of them together, so the
-    largest matrices count the most.
+    A weight matrix followed by a normalization layer computes the same at any scale, so what a
+    step does to it is how far it moves it relative to its norm: its effective learning rate,
+    which is what a learning rate schedule is meant to bring down at the end of a run, and what
+    weight decay can keep up instead. Each part separately, because a part without a
+    normalization layer after it, such as a policy head, can be far larger than the rest and
+    would otherwise be all that a single number showed.
 
     Costs a copy of the weights, kept on the device, and three passes over them a step.
     """
 
     def __init__(self, model: nn.Module) -> None:
-        self.weights = [p for p in model.parameters() if p.ndim > 1]
+        self.parts, self.weights, self._index = _by_part(model, weights=True)
         self._before = [torch.empty_like(p) for p in self.weights]
 
     @torch.no_grad()
@@ -840,9 +880,11 @@ class _Movement:
 
     @torch.no_grad()
     def ratio(self) -> torch.Tensor:
-        """How far they moved since :meth:`start`, as a fraction of their norm now."""
+        """How far each part's weights moved since :meth:`start`, as a fraction of their norm
+        now, in the order of :attr:`parts`."""
         torch._foreach_sub_(self._before, self.weights)
-        return nn.utils.get_total_norm(self._before) / nn.utils.get_total_norm(self.weights)
+        moved = _part_norms(self._before, self._index, len(self.parts))
+        return moved / _part_norms(self.weights, self._index, len(self.parts))
 
 
 def _step(
@@ -871,20 +913,23 @@ def _step(
 
 
 @torch.no_grad()
+@torch.no_grad()
 def _parameter_norms(model: nn.Module) -> dict[str, float]:
-    """The norm of the weights, and of the rest: the normalization layers' scales and shifts and
-    the biases, the parameters weight decay leaves alone (see :func:`_parameter_groups`).
+    """The norm of each part's weights, and of the rest of its parameters: the normalization
+    layers' scales and shifts and the biases, which weight decay leaves alone (see
+    :func:`_parameter_groups`), as ``weight_norm/PART`` and ``scale_bias_norm/PART``.
 
-    Weight decay shrinks the weights, and a normalization layer after one makes up for it by
+    Weight decay shrinks the weights, and a normalization layer after them makes up for it by
     growing its scale, so the two together say whether the decay is what is setting their size.
     """
     norms = {}
-    for name, parameters in (
-        ("weight_norm", [p for p in model.parameters() if p.ndim > 1]),
-        ("scale_bias_norm", [p for p in model.parameters() if p.ndim <= 1]),
-    ):
+    for prefix, weights in (("weight_norm", True), ("scale_bias_norm", False)):
+        parts, parameters, index = _by_part(model, weights=weights)
         if parameters:
-            norms[name] = nn.utils.get_total_norm(parameters).item()
+            values = _part_norms(parameters, index, len(parts)).tolist()
+            norms.update(
+                {f"{prefix}/{part}": value for part, value in zip(parts, values, strict=True)}
+            )
     return norms
 
 
@@ -1018,8 +1063,8 @@ def _loop(
     """When this process started stepping, which the console's running time and estimate count
     from: a resumed run may be on another machine, or sharing it differently, than before."""
     started = session_started - start.elapsed
-    window = _Window(run.device)
     movement = _Movement(run.model)
+    window = _Window(run.device, parts=movement.parts)
     latest: dict[str, float] = {}
     measured_at: int | None = None
     """The step ``latest`` was measured at, so a checkpoint is never indexed with another's."""
@@ -1243,12 +1288,18 @@ class _Window:
     measurable share of the run.
     """
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, *, parts: Sequence[str] = ()) -> None:
         self._device = device
+        self._parts = list(parts)
+        """The parts of the model a step's ``update_ratio`` has a value for, in its order."""
         self._reset()
 
     def _reset(self) -> None:
-        self._sums = torch.zeros(len(_StepResult._fields), dtype=torch.float64, device=self._device)
+        self._sums = torch.zeros(
+            len(_StepResult._fields) - 1 + len(self._parts),
+            dtype=torch.float64,
+            device=self._device,
+        )
         self._steps = 0
         self._positions = 0
         self._since = time.perf_counter()
@@ -1269,14 +1320,14 @@ class _Window:
             self._paused += time.perf_counter() - started
 
     def add(self, measured: _StepResult, *, positions: int) -> None:
-        self._sums += torch.stack([value.double() for value in measured])
+        self._sums += torch.cat([value.double().reshape(-1) for value in measured])
         self._steps += 1
         self._positions += positions
 
     def take(self) -> dict[str, float]:
         """The means since the last call, and how fast training produced them."""
         elapsed = time.perf_counter() - self._since - self._paused
-        loss, policy_loss, value_loss, gradient_norm, clipped, update_ratio = (
+        loss, policy_loss, value_loss, gradient_norm, clipped, *update_ratios = (
             self._sums / max(1, self._steps)
         ).tolist()
         means = {
@@ -1285,7 +1336,10 @@ class _Window:
             "value_loss": value_loss,
             "gradient_norm": gradient_norm,
             "clipped_fraction": clipped,
-            "update_ratio": update_ratio,
+            **{
+                f"update_ratio/{part}": ratio
+                for part, ratio in zip(self._parts, update_ratios, strict=True)
+            },
             "positions_per_second": self._positions / elapsed if elapsed > 0 else 0.0,
         }
         self._reset()

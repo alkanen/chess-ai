@@ -46,6 +46,12 @@ export interface Reference {
 
 export interface ChartSpec extends ChartLook {
   series: SeriesSpec[];
+  /**
+   * A metric logged for each part of the model as `PREFIX/PART`, such as `weight_norm/body`,
+   * which makes the chart a line for each part instead of `series`: which parts there are is
+   * the model's to say.
+   */
+  parts?: string;
   reference?: Reference;
 }
 
@@ -125,20 +131,28 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     // Weight decay shrinks the weights, and the norm layers' scales grow to make up for it.
-    id: 'parameter-norm',
-    title: 'Parameter norm',
-    series: [
-      { label: 'weights', split: 'train', metric: 'weight_norm' },
-      { label: 'norms and biases', split: 'train', metric: 'scale_bias_norm' },
-    ],
+    id: 'weight-norm',
+    title: 'Weight norm, by part',
+    series: [],
+    parts: 'weight_norm',
+    ...numbers(4),
+    logarithmic: true,
+    optional: true,
+  },
+  {
+    id: 'scale-bias-norm',
+    title: 'Norm scales and biases, by part',
+    series: [],
+    parts: 'scale_bias_norm',
     ...numbers(4),
     logarithmic: true,
     optional: true,
   },
   {
     id: 'update-ratio',
-    title: 'Step size relative to the weights',
-    series: [{ label: 'update / weights', split: 'train', metric: 'update_ratio' }],
+    title: 'Step size relative to the weights, by part',
+    series: [],
+    parts: 'update_ratio',
     ...numbers(3),
     logarithmic: true,
     optional: true,
@@ -285,6 +299,35 @@ function line(records: MetricsRecord[], xs: (number | null)[], series: Metric): 
   return found;
 }
 
+/**
+ * The lines of `spec` for a run that logged `records`: its own, or one for each part of the
+ * model, in the order the latest training line that has any lists them, and no more than a
+ * chart has colours for. Read from one line rather than all of them, since a chart is worked
+ * out again as each line arrives.
+ */
+export function seriesOf(spec: ChartSpec, records: MetricsRecord[]): SeriesSpec[] {
+  const prefix = spec.parts;
+  if (prefix === undefined) {
+    return spec.series;
+  }
+  const marker = `${prefix}/`;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record.split !== 'train') {
+      continue;
+    }
+    const parts = Object.keys(record).filter((key) => key.startsWith(marker));
+    if (parts.length > 0) {
+      return parts.slice(0, MAX_SERIES).map((metric) => ({
+        label: metric.slice(marker.length).replaceAll('_', ' '),
+        split: 'train',
+        metric,
+      }));
+    }
+  }
+  return [];
+}
+
 /** Whether any line of `records` has `metric`, which an optional chart is shown for. */
 export function logs(records: MetricsRecord[], metric: Metric): boolean {
   return records.some((record) => record.split === metric.split && metric.metric in record);
@@ -303,7 +346,7 @@ export function chartData(
   reference: number | null = null,
 ): ChartData {
   const xs = placeRecords(records, axis, batchSize);
-  const lines = spec.series.map((series) => line(records, xs, series));
+  const lines = seriesOf(spec, records).map((series) => line(records, xs, series));
   if (reference !== null) {
     lines.push(lines[0].map(([x]): [number, number] => [x, reference]));
   }
@@ -368,22 +411,6 @@ export const COMPARISON_CHARTS: ComparisonChart[] = [
     title: 'Steps clipped',
     metric: { split: 'train', metric: 'clipped_fraction' },
     ...PERCENTAGES,
-    optional: true,
-  },
-  {
-    id: 'weight-norm',
-    title: 'Weight norm',
-    metric: { split: 'train', metric: 'weight_norm' },
-    ...numbers(4),
-    logarithmic: true,
-    optional: true,
-  },
-  {
-    id: 'update-ratio',
-    title: 'Step size relative to the weights',
-    metric: { split: 'train', metric: 'update_ratio' },
-    ...numbers(3),
-    logarithmic: true,
     optional: true,
   },
 ];
