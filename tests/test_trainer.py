@@ -862,13 +862,173 @@ def test_a_step_measures_and_clips_the_gradient_as_clip_grad_norm_does(tmp_path,
     expected = nn.utils.clip_grad_norm_(twin.model.parameters(), 0.05)
     twin_optimizer.step()
 
-    measured = trainer._step(prepared, batch, trainer._optimizer(prepared))
+    measured = trainer._step(
+        prepared, batch, trainer._optimizer(prepared), trainer._Movement(prepared.model)
+    )
 
     assert expected > 0.05, "the test needs a gradient the threshold clips"
     torch.testing.assert_close(measured.gradient_norm, expected)
     assert measured.clipped.item() == 1
     for name, value in prepared.model.state_dict().items():
         torch.testing.assert_close(value, twin.model.state_dict()[name])
+
+
+def test_training_lines_say_how_large_each_part_is_and_how_far_a_step_moved_it(tmp_path, data_dir):
+    lines = train_lines(run(tmp_path, data_dir))
+
+    assert lines
+    for line in lines:
+        for part in ("trunk", "policy_head", "value_head"):
+            assert line[f"weight_norm/{part}"] > 0
+            assert line[f"scale_bias_norm/{part}"] > 0
+            assert 0 < line[f"update_ratio/{part}"] < 1
+        assert not any(key in line for key in ("weight_norm", "scale_bias_norm", "update_ratio"))
+
+
+def norm(tensors) -> float:
+    return math.sqrt(sum(t.detach().double().square().sum().item() for t in tensors))
+
+
+def parts_of(model, *, weights: bool) -> dict[str, list]:
+    found: dict[str, list] = {}
+    for name, p in model.named_parameters():
+        if (p.ndim > 1) == weights:
+            found.setdefault(name.split(".")[0], []).append(p)
+    return found
+
+
+SQUARE_TRANSFORMER = 'architecture = "square-transformer"\nlayers = 1\nwidth = 8\nheads = 2'
+
+
+def test_the_parameter_norms_are_of_each_part_s_weights_and_of_the_rest(tmp_path, data_dir):
+    config = load_experiment(experiment(tmp_path / "tiny.toml", model=SQUARE_TRANSFORMER))
+    model = trainer._prepare(config, data_dir=data_dir).model
+
+    norms = trainer._parameter_norms(model)
+
+    weights, rest = parts_of(model, weights=True), parts_of(model, weights=False)
+    assert "final_norm" in rest and "final_norm" not in weights
+    # Summed in single precision, which over a policy head's millions of weights is a few in
+    # 100,000 off: plenty for a chart.
+    assert norms == pytest.approx(
+        {f"weight_norm/{part}": norm(ps) for part, ps in weights.items()}
+        | {f"scale_bias_norm/{part}": norm(ps) for part, ps in rest.items()},
+        rel=1e-3,
+    )
+
+
+def test_the_update_ratio_is_how_far_a_step_moved_each_part_against_its_norm(tmp_path, data_dir):
+    config = load_experiment(experiment(tmp_path / "tiny.toml", model=SQUARE_TRANSFORMER))
+    prepared = trainer._prepare(config, data_dir=data_dir)
+    batch = prepared.batches[0].to(prepared.device)
+    weights = parts_of(prepared.model, weights=True)
+    before = {part: [p.detach().clone() for p in ps] for part, ps in weights.items()}
+    movement = trainer._Movement(prepared.model)
+
+    measured = trainer._step(prepared, batch, trainer._optimizer(prepared), movement)
+
+    assert movement.parts == list(weights)
+    expected = [
+        norm(p - b for p, b in zip(weights[part], before[part], strict=True)) / norm(weights[part])
+        for part in movement.parts
+    ]
+    assert all(value > 0 for value in expected)
+    assert measured.update_ratio.tolist() == pytest.approx(expected, rel=1e-3)
+
+
+def test_a_compiled_model_s_parts_are_named_as_the_model_s_are():
+    assert trainer._part("_orig_mod.body.0.linear1.weight") == "body"
+    assert trainer._part("policy_head.0.weight") == "policy_head"
+
+
+def scheduled(tmp_path, data_dir, optimizer: str, *, completed: int = 0):
+    """An optimizer and the schedule that drives it, ``completed`` steps into a 20-step run."""
+    config = load_experiment(
+        experiment(
+            tmp_path / "tiny.toml",
+            optimizer=f"learning_rate = 0.01\nweight_decay = 0.1\n{optimizer}",
+            schedule="steps = 20\nwarmup_steps = 4",
+        )
+    )
+    prepared = trainer._prepare(config, data_dir=data_dir)
+    optimizer = trainer._optimizer(prepared)
+    for group in optimizer.param_groups:
+        # As the optimizer state a resumed run loads has it.
+        group.setdefault("initial_lr", group["lr"])
+    return optimizer, trainer._schedule(prepared, optimizer, completed=completed)
+
+
+def stepped(optimizer, schedule) -> None:
+    """One step of the schedule, after the optimizer's, as the loop takes them (with no
+    gradients, so that nothing moves)."""
+    optimizer.step()
+    schedule.step()
+
+
+def decays(optimizer) -> list[float]:
+    return [group["weight_decay"] for group in optimizer.param_groups]
+
+
+def test_weight_decay_stays_as_set_while_the_learning_rate_follows_its_schedule(tmp_path, data_dir):
+    optimizer, schedule = scheduled(tmp_path, data_dir, "")
+
+    for _ in range(20):
+        assert decays(optimizer) == [0.1, 0.0]
+        stepped(optimizer, schedule)
+
+
+def test_weight_decay_can_follow_the_learning_rate_schedule(tmp_path, data_dir):
+    optimizer, schedule = scheduled(tmp_path, data_dir, 'weight_decay_schedule = "learning-rate"')
+
+    seen = []
+    for _ in range(20):
+        (rate,) = {group["lr"] for group in optimizer.param_groups}
+        assert decays(optimizer) == [pytest.approx(0.1 * rate / 0.01), 0.0]
+        seen.append(decays(optimizer)[0])
+        stepped(optimizer, schedule)
+    assert max(seen) == pytest.approx(0.1), "the whole decay at the peak of the schedule"
+    assert seen[-1] < 0.02, "and a tenth of it, or nearly, at the end"
+
+
+def test_a_scheduled_decay_resumed_part_way_is_what_it_would_have_been(tmp_path, data_dir):
+    setting = 'weight_decay_schedule = "learning-rate"'
+    whole, schedule = scheduled(tmp_path, data_dir, setting)
+    for _ in range(13):
+        stepped(whole, schedule)
+
+    resumed_at, _ = scheduled(tmp_path, data_dir, setting, completed=13)
+
+    assert decays(resumed_at) == decays(whole)
+    assert [g["lr"] for g in resumed_at.param_groups] == [g["lr"] for g in whole.param_groups]
+
+
+def test_the_decay_comes_from_the_config_rather_than_the_optimizer_state(tmp_path, data_dir):
+    """So that a run resumed with its decay changed in its config goes on with the change."""
+    saved, _ = scheduled(tmp_path, data_dir, "")
+    state = saved.state_dict()
+    config = load_experiment(
+        experiment(tmp_path / "edited.toml", optimizer="weight_decay = 0", schedule="steps = 20")
+    )
+    prepared = trainer._prepare(config, data_dir=data_dir)
+    optimizer = trainer._optimizer(prepared)
+    optimizer.load_state_dict(state)
+    assert decays(optimizer) == [0.1, 0.0], "the state says what it was trained with"
+
+    trainer._schedule(prepared, optimizer, completed=5)
+
+    assert decays(optimizer) == [0.0, 0.0]
+
+
+def test_decaying_everything_follows_the_schedule_too(tmp_path, data_dir):
+    optimizer, schedule = scheduled(
+        tmp_path,
+        data_dir,
+        'decay_biases_and_norms = true\nweight_decay_schedule = "learning-rate"',
+        completed=12,
+    )
+
+    (decay,) = decays(optimizer)
+    assert decay == pytest.approx(0.1 * optimizer.param_groups[0]["lr"] / 0.01)
 
 
 DECAY_VARIANTS = [
@@ -923,6 +1083,20 @@ def test_the_summary_says_what_weight_decay_reaches(tmp_path, data_dir):
     assert line == (
         "  optimizer  AdamW, weight decay 0.01 on 22,000 parameters, "
         "none on 1,979 biases and norms, clip 1"
+    )
+
+
+def test_the_summary_says_when_weight_decay_follows_the_schedule(tmp_path, data_dir):
+    lines = said_by(
+        tmp_path,
+        data_dir,
+        model='architecture = "mlp"\ndepth = 1\nwidth = 8',
+        optimizer='weight_decay_schedule = "learning-rate"',
+    )
+
+    (line,) = [line for line in lines if line.startswith("  optimizer")]
+    assert line.startswith(
+        "  optimizer  AdamW, weight decay 0.01 following the learning rate schedule on 22,000 "
     )
 
 
@@ -1340,6 +1514,74 @@ def test_a_run_stopped_and_resumed_learns_what_it_would_have_in_one_go(
         assert ours["learning_rate"] == theirs["learning_rate"]
         if ours["step"] > 6:
             assert ours["loss"] == theirs["loss"], ours["step"]
+
+
+def test_a_run_with_a_scheduled_decay_resumes_as_it_would_have_gone_on(
+    tmp_path, data_dir, monkeypatch
+):
+    sections = {
+        **RESUMABLE,
+        "optimizer": 'weight_decay = 0.5\nweight_decay_schedule = "learning-rate"',
+    }
+    whole = run(tmp_path, data_dir, name="whole", **sections)
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="halves", **sections)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+
+    halves = resumed(tmp_path, data_dir, "halves")
+
+    assert final_payload(halves)["config"]["optimizer"]["weight_decay_schedule"] == "learning-rate"
+    assert_same_state(final_payload(whole), final_payload(halves))
+    constant = run(
+        tmp_path, data_dir, name="constant", **{**sections, "optimizer": "weight_decay = 0.5"}
+    )
+    assert (
+        final_payload(constant)["model_state"].keys() == final_payload(whole)["model_state"].keys()
+    )
+    assert any(
+        not torch.equal(value, final_payload(whole)["model_state"][name])
+        for name, value in final_payload(constant)["model_state"].items()
+    ), "the schedule makes a difference to what is learned"
+
+
+def test_a_resumed_run_can_stop_at_a_step_and_carry_on_from_there(tmp_path, data_dir, monkeypatch):
+    whole = run(tmp_path, data_dir, name="whole", **RESUMABLE)
+    signal_after(monkeypatch, 3)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, name="parts", **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+    said: list[str] = []
+
+    resume("parts", data_dir=data_dir, runs_dir=tmp_path / "runs", say=heard(said), stop_at=6)
+
+    parts = open_run(tmp_path / "runs", "parts")
+    assert parts.status.status == RunStatus.STOPPED
+    assert (parts.status.step, parts.status.message) == (6, "stopped at step 6, as asked")
+    assert parts.latest_checkpoint().step == 6
+    assert parts.latest_checkpoint().metrics["policy_loss"] > 0, "validated where it stopped"
+    assert (
+        "chess-ai: stopped at step 6, as asked; 'chess-ai resume parts' carries on from there"
+        in said
+    )
+
+    parts = resumed(tmp_path, data_dir, "parts")
+
+    assert parts.status.status == RunStatus.FINISHED
+    assert_same_state(final_payload(whole), final_payload(parts))
+
+
+@pytest.mark.parametrize("stop_at", [5, 10])
+def test_a_resume_cannot_stop_where_it_cannot_get_to(tmp_path, data_dir, monkeypatch, stop_at):
+    signal_after(monkeypatch, 5)
+    with pytest.raises(TrainingStopped):
+        run(tmp_path, data_dir, **RESUMABLE)
+    monkeypatch.setattr(trainer, "_step", REAL_STEP)
+
+    with pytest.raises(TrainingError, match=f"cannot stop run 'tiny' at step {stop_at}"):
+        resume("tiny", data_dir=data_dir, runs_dir=tmp_path / "runs", say=unheard, stop_at=stop_at)
+
+    assert open_run(tmp_path / "runs", "tiny").latest_checkpoint().step == 5
 
 
 def test_a_crashed_run_resumes_from_its_last_checkpoint_and_forgets_what_came_after(

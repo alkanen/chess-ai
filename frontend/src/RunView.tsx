@@ -5,7 +5,7 @@ import { LadderView } from './LadderView';
 import { MetricChart } from './MetricChart';
 import { PROBE_SUITE } from './probes';
 import { ProbeView } from './ProbeView';
-import { CHARTS, chartData, logs, xAxis } from './runCharts';
+import { CHARTS, chartData, logs, seriesOf, xAxis } from './runCharts';
 import { RunStateBadge } from './RunState';
 import { SAMPLE_SUITE } from './sampleGames';
 import { SampleGamesView } from './SampleGamesView';
@@ -88,11 +88,12 @@ export function RunView({ name }: RunViewProps) {
     const references = JSON.parse(referenceKey) as (number | null)[];
     const records = metrics ?? [];
     return CHARTS.flatMap((spec, index) => {
-      if (spec.optional && !logs(records, spec.series[0])) {
+      const series = seriesOf(spec, records);
+      if (spec.optional && (series.length === 0 || !logs(records, series[0]))) {
         return [];
       }
       const reference = references[index];
-      const labels = spec.series.map((series) => series.label);
+      const labels = series.map((each) => each.label);
       const level = reference !== null ? spec.reference : undefined;
       if (level) {
         labels.push(level.label);

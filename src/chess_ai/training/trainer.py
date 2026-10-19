@@ -36,7 +36,7 @@ import shutil
 import signal
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -221,8 +221,15 @@ def resume(
     say: Say = said_on_stdout,
     ladder_every: int | None = None,
     compile: bool | None = None,
+    stop_at: int | None = None,
 ) -> Path:
-    """Carry on training the run called ``name`` from its latest checkpoint, to the end.
+    """Carry on training the run called ``name`` from its latest checkpoint, to the end, or
+    to step ``stop_at`` if that comes first.
+
+    A run stopped at ``stop_at`` saves a checkpoint of that step, validated, and is left
+    stopped, for a resume to carry on from: the schedule is still the whole run's, so a part of
+    a run is trained exactly as it would have been, which is what comparing changes made
+    part way through a run needs.
 
     ``ladder_every`` is as :func:`train` has it. ``compile`` overrides ``[training] compile``
     from the checkpoint's config, which is the only one there is to edit: a run that cannot be
@@ -249,7 +256,7 @@ def resume(
         raise TrainingError(e) from e
     try:
         run, optimizer, start = _resumable(
-            RunReader(directory), data_dir=data_dir, say=say, compile=compile
+            RunReader(directory), data_dir=data_dir, say=say, compile=compile, stop_at=stop_at
         )
         writer.policy = run.config.checkpoints.policy()
         _hold_for_ladders(writer, ladder_every)
@@ -261,7 +268,7 @@ def resume(
         writer.close()
         raise
     say(f"chess-ai: resuming run {name} in {directory}")
-    _train_to_end(run, writer, optimizer, start, say=say)
+    _train_to_end(run, writer, optimizer, start, say=say, stop_at=stop_at)
     return directory
 
 
@@ -276,10 +283,15 @@ def _hold_for_ladders(writer: RunWriter, every: int | None) -> None:
 
 
 def _resumable(
-    reader: RunReader, *, data_dir: Path, say: Say, compile: bool | None = None
+    reader: RunReader,
+    *,
+    data_dir: Path,
+    say: Say,
+    compile: bool | None = None,
+    stop_at: int | None = None,
 ) -> tuple[_Run, torch.optim.Optimizer, _Start]:
     """The run in ``reader`` put back as its latest checkpoint left it, ready to carry on,
-    compiled or not as ``compile`` says if it says."""
+    compiled or not as ``compile`` says if it says, and checked to get to ``stop_at``."""
     name = reader.name
     status = reader.status
     if status is not None and status.status == RunStatus.FINISHED:
@@ -293,6 +305,11 @@ def _resumable(
     say(f"chess-ai: loading the checkpoint of step {latest.step:,}", kind=DETAIL)
     payload = _load(reader.checkpoint_path(latest), doing=f"resume run {name!r}")
     config = _pinned_to_its_version(_config_of(payload, name), reader)
+    if stop_at is not None and not latest.step < stop_at <= config.schedule.steps:
+        raise TrainingError(
+            f"cannot stop run {name!r} at step {stop_at:,}: it carries on from step "
+            f"{latest.step:,}, and its schedule ends at step {config.schedule.steps:,}"
+        )
     if compile is not None:
         config = config.model_copy(
             update={"training": config.training.model_copy(update={"compile": compile})}
@@ -333,11 +350,7 @@ def _config_of(payload: dict[str, Any], name: str) -> ExperimentConfig:
     from the ones they were trained with, and the rest of the run would quietly not be the run
     it was. ``chess-ai resume --compile`` compiles one anyway.
     """
-    data = copy.deepcopy(payload.get("config") or {})
-    if isinstance(data.get("optimizer"), dict):
-        data["optimizer"].setdefault("decay_biases_and_norms", True)
-    if isinstance(data.get("training"), dict):
-        data["training"].setdefault("compile", False)
+    data = _as_trained(payload.get("config") or {})
     data["name"] = name
     try:
         return ExperimentConfig.model_validate(data)
@@ -349,6 +362,17 @@ def _config_of(payload: dict[str, Any], name: str) -> ExperimentConfig:
         raise TrainingError(
             f"run {name!r} was trained with a config this code no longer accepts: {problems}"
         ) from e
+
+
+def _as_trained(config: dict[str, Any]) -> dict[str, Any]:
+    """A copy of a checkpoint's ``config`` with the settings it predates set as it was trained
+    without them, rather than left to today's defaults; see :func:`_config_of`."""
+    data = copy.deepcopy(config)
+    if isinstance(data.get("optimizer"), dict):
+        data["optimizer"].setdefault("decay_biases_and_norms", True)
+    if isinstance(data.get("training"), dict):
+        data["training"].setdefault("compile", False)
+    return data
 
 
 def _pinned_to_its_version(config: ExperimentConfig, reader: RunReader) -> ExperimentConfig:
@@ -504,10 +528,12 @@ def _train_to_end(
     start: _Start,
     *,
     say: Say,
+    stop_at: int | None = None,
 ) -> None:
     """Run the loop with ``writer``, and have the run say how it ended whichever way it does."""
     progress = _Progress(step=start.step, epoch=_epoch(run, start.step))
     with writer, _stop_signals() as stop:
+        stop.at = stop_at
         try:
             stopped_by = _loop(run, writer, progress, optimizer, start, stop=stop, say=say)
         except KeyboardInterrupt:
@@ -572,10 +598,11 @@ def _saved_at(writer: RunWriter, step: int) -> bool:
 
 
 class _StopRequest:
-    """Which signal asked the run to stop, once one has."""
+    """Which signal asked the run to stop, once one has, and the step it is to stop at anyway."""
 
     def __init__(self) -> None:
         self.signal: int | None = None
+        self.at: int | None = None
 
 
 @contextmanager
@@ -721,15 +748,13 @@ def _parameter_groups(model: nn.Module, settings: OptimizerSection) -> list[dict
     ]
 
 
-def _schedule(
-    run: _Run, optimizer: torch.optim.Optimizer, *, completed: int = 0
-) -> torch.optim.lr_scheduler.LambdaLR:
+def _schedule(run: _Run, optimizer: torch.optim.Optimizer, *, completed: int = 0) -> "_Schedule":
     """Linear warmup, then cosine decay to a fraction of the learning rate.
 
     ``completed`` is how many steps have already been taken, for a resumed run. The schedule is
     a function of the step and nothing else, so starting it there is restoring it exactly; it
     reads each group's starting rate from ``initial_lr``, which the optimizer state it was
-    loaded from carries.
+    loaded from carries. It sets the weight decay too, as ``weight_decay_schedule`` says.
     """
     schedule = run.config.schedule
     warmup = schedule.warmup_steps
@@ -742,7 +767,36 @@ def _schedule(
         progress = min(1.0, (completed - warmup) / decaying)
         return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor, last_epoch=completed - 1)
+    return _Schedule(optimizer, factor, completed=completed, settings=run.config.optimizer)
+
+
+class _Schedule(torch.optim.lr_scheduler.LambdaLR):
+    """The learning rate schedule, which sets each step's weight decay as it sets its rate.
+
+    The decay is set from the config at every step, rather than left as the optimizer state it
+    was loaded from has it, so that it is a function of the step alone, as the rate is, and so
+    that a run resumed with its decay changed in its config goes on with the change. The first
+    parameter group is the one weight decay is for; see :func:`_parameter_groups`.
+    """
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        factor: Callable[[int], float],
+        *,
+        completed: int,
+        settings: OptimizerSection,
+    ) -> None:
+        # Before the base class's constructor, which takes the first step.
+        self._decays = [settings.weight_decay] + [0.0] * (len(optimizer.param_groups) - 1)
+        self._scaled = settings.weight_decay_schedule == "learning-rate"
+        super().__init__(optimizer, factor, last_epoch=completed - 1)
+
+    def step(self, epoch: int | None = None) -> None:
+        super().step(epoch)
+        factor = self.lr_lambdas[0](self.last_epoch) if self._scaled else 1.0
+        for group, decay in zip(self.optimizer.param_groups, self._decays, strict=True):
+            group["weight_decay"] = decay * factor
 
 
 def _losses(run: _Run, batch: Batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -765,9 +819,84 @@ class _StepResult(NamedTuple):
     """The total norm of the gradient before any clipping."""
     clipped: torch.Tensor
     """1 if clipping scaled this step's gradient down, else 0."""
+    update_ratio: torch.Tensor
+    """How far the step moved each part's weights, as a fraction of their norm; see
+    :class:`_Movement`. Last, since it has a value for each part."""
 
 
-def _step(run: _Run, batch: Batch, optimizer: torch.optim.Optimizer) -> _StepResult:
+def _part(name: str) -> str:
+    """The part of the model a parameter belongs to: its top-level module, such as ``body``,
+    ``tower`` or ``policy_head``, whatever compiling wrapped it in."""
+    return name.removeprefix("_orig_mod.").split(".")[0]
+
+
+def _by_part(
+    model: nn.Module, *, weights: bool
+) -> tuple[list[str], list[nn.Parameter], torch.Tensor]:
+    """The weights (matrices and kernels, the parameters weight decay is for; see
+    :func:`_parameter_groups`) or the rest (normalization layers' scales and shifts, and
+    biases), the parts of the model they are in, in the model's order, and which part each is in
+    as an index into those."""
+    parts: list[str] = []
+    found: list[nn.Parameter] = []
+    index: list[int] = []
+    for name, parameter in model.named_parameters():
+        if (parameter.ndim > 1) != weights:
+            continue
+        part = _part(name)
+        if part not in parts:
+            parts.append(part)
+        found.append(parameter)
+        index.append(parts.index(part))
+    device = found[0].device if found else None
+    return parts, found, torch.tensor(index, dtype=torch.long, device=device)
+
+
+def _part_norms(tensors: list[torch.Tensor], index: torch.Tensor, parts: int) -> torch.Tensor:
+    """The norm of ``tensors`` taken together within each part, by ``index``."""
+    squares = torch.stack(torch._foreach_norm(tensors)).double().square()
+    return (
+        torch.zeros(parts, dtype=torch.float64, device=squares.device)
+        .index_add_(0, index, squares)
+        .sqrt()
+    )
+
+
+class _Movement:
+    """How far each step moves the weights of each part of the model, as a fraction of how
+    large they are.
+
+    A weight matrix followed by a normalization layer computes the same at any scale, so what a
+    step does to it is how far it moves it relative to its norm: its effective learning rate,
+    which is what a learning rate schedule is meant to bring down at the end of a run, and what
+    weight decay can keep up instead. Each part separately, because a part without a
+    normalization layer after it, such as a policy head, can be far larger than the rest and
+    would otherwise be all that a single number showed.
+
+    Costs a copy of the weights, kept on the device, and three passes over them a step.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        self.parts, self.weights, self._index = _by_part(model, weights=True)
+        self._before = [torch.empty_like(p) for p in self.weights]
+
+    @torch.no_grad()
+    def start(self) -> None:
+        """Note where the weights are before a step."""
+        torch._foreach_copy_(self._before, self.weights)
+
+    @torch.no_grad()
+    def ratio(self) -> torch.Tensor:
+        """How far each part's weights moved since :meth:`start`, as a fraction of their norm
+        now, in the order of :attr:`parts`."""
+        torch._foreach_sub_(self._before, self.weights)
+        moved = _part_norms(self._before, self._index, len(self.parts))
+        return moved / _part_norms(self.weights, self._index, len(self.parts))
+
+
+def _step(
+    run: _Run, batch: Batch, optimizer: torch.optim.Optimizer, movement: _Movement
+) -> _StepResult:
     """One optimizer step. Returns what it measured as tensors, unread, so as not to stall."""
     total, policy_loss, value_loss = _losses(run, batch)
     optimizer.zero_grad(set_to_none=True)
@@ -785,8 +914,30 @@ def _step(run: _Run, batch: Batch, optimizer: torch.optim.Optimizer) -> _StepRes
         clipped = norm > clip
     else:
         clipped = torch.zeros((), device=norm.device)
+    movement.start()
     optimizer.step()
-    return _StepResult(total.detach(), policy_loss, value_loss, norm, clipped)
+    return _StepResult(total.detach(), policy_loss, value_loss, norm, clipped, movement.ratio())
+
+
+@torch.no_grad()
+@torch.no_grad()
+def _parameter_norms(model: nn.Module) -> dict[str, float]:
+    """The norm of each part's weights, and of the rest of its parameters: the normalization
+    layers' scales and shifts and the biases, which weight decay leaves alone (see
+    :func:`_parameter_groups`), as ``weight_norm/PART`` and ``scale_bias_norm/PART``.
+
+    Weight decay shrinks the weights, and a normalization layer after them makes up for it by
+    growing its scale, so the two together say whether the decay is what is setting their size.
+    """
+    norms = {}
+    for prefix, weights in (("weight_norm", True), ("scale_bias_norm", False)):
+        parts, parameters, index = _by_part(model, weights=weights)
+        if parameters:
+            values = _part_norms(parameters, index, len(parts)).tolist()
+            norms.update(
+                {f"{prefix}/{part}": value for part, value in zip(parts, values, strict=True)}
+            )
+    return norms
 
 
 def _probe(run: _Run, *, say: Say = said_on_stdout, uncompiled: str) -> float | None:
@@ -809,17 +960,18 @@ def _probe(run: _Run, *, say: Say = said_on_stdout, uncompiled: str) -> float | 
         say("chess-ai: compiling the model", kind=DETAIL)
     weights = {name: value.detach().clone() for name, value in run.model.state_dict().items()}
     optimizer = _optimizer(run)
+    movement = _Movement(run.model)
     try:
         # Not the run's first batch, which would mean shuffling an epoch's order the loader
         # then shuffles again: minutes at Lichess scale, for a step that takes as long on any
         # batch of the same size.
         batch = run.batches.stored_batch().to(run.device)
-        _step(run, batch, optimizer)
+        _step(run, batch, optimizer, movement)
         _synchronize(run.device)
         say(f"chess-ai: measuring throughput over {PROBE_STEPS} steps", kind=DETAIL)
         started = time.perf_counter()
         for _ in range(PROBE_STEPS):
-            _step(run, batch, optimizer)
+            _step(run, batch, optimizer, movement)
         _synchronize(run.device)
         elapsed = time.perf_counter() - started
     except torch.cuda.OutOfMemoryError as e:
@@ -905,8 +1057,8 @@ def _loop(
 ) -> int | None:
     """Train to the end of the schedule, logging, validating and checkpointing as it goes.
 
-    Returns ``None`` at the end of the schedule, or the signal that stopped it before then,
-    once the checkpoint of the step it stopped at is saved.
+    Returns ``None`` at the end of the schedule or at ``stop.at``, or the signal that stopped
+    it before then, once the checkpoint of the step it stopped at is saved.
     """
     config = run.config
     steps = config.schedule.steps
@@ -918,7 +1070,8 @@ def _loop(
     """When this process started stepping, which the console's running time and estimate count
     from: a resumed run may be on another machine, or sharing it differently, than before."""
     started = session_started - start.elapsed
-    window = _Window(run.device)
+    movement = _Movement(run.model)
+    window = _Window(run.device, parts=movement.parts)
     latest: dict[str, float] = {}
     measured_at: int | None = None
     """The step ``latest`` was measured at, so a checkpoint is never indexed with another's."""
@@ -940,7 +1093,7 @@ def _loop(
         # Read before the scheduler moves on: this is the rate the weights just moved by, and
         # get_last_lr() after scheduler.step() is already the next step's.
         learning_rate = scheduler.get_last_lr()[0]
-        window.add(_step(run, batch, optimizer), positions=len(batch))
+        window.add(_step(run, batch, optimizer, movement), positions=len(batch))
         scheduler.step()
         step += 1
         positions_seen += len(batch)
@@ -958,6 +1111,7 @@ def _loop(
                 elapsed=round(elapsed, 3),
                 positions_seen=positions_seen,
                 **speed,
+                **_parameter_norms(run.model),
             )
 
         # Outside the logging branch, so that the heartbeat's cadence is HEARTBEAT_SECONDS
@@ -972,7 +1126,9 @@ def _loop(
             eta_seconds=_eta(step, steps, elapsed),
         )
 
-        saving = step % config.checkpoints.every_steps == 0 or step == steps
+        # Before the validation, so that the step it stops at is validated as it is saved.
+        arrived = step == stop.at and step < steps
+        saving = step % config.checkpoints.every_steps == 0 or step == steps or arrived
         # Validated whenever a checkpoint is about to be saved, as well as on its own schedule,
         # so that the metrics indexed with a checkpoint are measured on that checkpoint. The two
         # schedules need not divide each other, and metrics from an earlier step would make
@@ -1036,6 +1192,20 @@ def _loop(
 
         if stopping:
             return stop.signal
+        if arrived:
+            writer.heartbeat(
+                RunStatus.STOPPED,
+                step=step,
+                steps=steps,
+                epoch=round(progress.epoch, 4),
+                message=f"stopped at step {step:,}, as asked",
+            )
+            say(
+                f"chess-ai: stopped at step {step:,}, as asked; 'chess-ai resume {config.name}' "
+                "carries on from there",
+                kind=RESULT,
+            )
+            return None
 
     elapsed = time.perf_counter() - started
     writer.finish(
@@ -1125,12 +1295,18 @@ class _Window:
     measurable share of the run.
     """
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, *, parts: Sequence[str] = ()) -> None:
         self._device = device
+        self._parts = list(parts)
+        """The parts of the model a step's ``update_ratio`` has a value for, in its order."""
         self._reset()
 
     def _reset(self) -> None:
-        self._sums = torch.zeros(len(_StepResult._fields), dtype=torch.float64, device=self._device)
+        self._sums = torch.zeros(
+            len(_StepResult._fields) - 1 + len(self._parts),
+            dtype=torch.float64,
+            device=self._device,
+        )
         self._steps = 0
         self._positions = 0
         self._since = time.perf_counter()
@@ -1151,14 +1327,14 @@ class _Window:
             self._paused += time.perf_counter() - started
 
     def add(self, measured: _StepResult, *, positions: int) -> None:
-        self._sums += torch.stack([value.double() for value in measured])
+        self._sums += torch.cat([value.double().reshape(-1) for value in measured])
         self._steps += 1
         self._positions += positions
 
     def take(self) -> dict[str, float]:
         """The means since the last call, and how fast training produced them."""
         elapsed = time.perf_counter() - self._since - self._paused
-        loss, policy_loss, value_loss, gradient_norm, clipped = (
+        loss, policy_loss, value_loss, gradient_norm, clipped, *update_ratios = (
             self._sums / max(1, self._steps)
         ).tolist()
         means = {
@@ -1167,6 +1343,10 @@ class _Window:
             "value_loss": value_loss,
             "gradient_norm": gradient_norm,
             "clipped_fraction": clipped,
+            **{
+                f"update_ratio/{part}": ratio
+                for part, ratio in zip(self._parts, update_ratios, strict=True)
+            },
             "positions_per_second": self._positions / elapsed if elapsed > 0 else 0.0,
         }
         self._reset()
@@ -1388,7 +1568,10 @@ def _describe_optimizer(run: _Run) -> str:
     decayed, *undecayed = (
         sum(p.numel() for p in group["params"]) for group in _parameter_groups(run.model, settings)
     )
-    decay = f"weight decay {settings.weight_decay:g} on {decayed:,} parameters"
+    decay = f"weight decay {settings.weight_decay:g}"
+    if settings.weight_decay_schedule == "learning-rate":
+        decay += " following the learning rate schedule"
+    decay += f" on {decayed:,} parameters"
     if undecayed:
         decay += f", none on {undecayed[0]:,} biases and norms"
     return f"AdamW, {decay}, {clip}"
