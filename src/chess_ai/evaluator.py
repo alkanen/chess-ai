@@ -21,6 +21,7 @@ import fcntl
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
@@ -30,7 +31,8 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from pydantic import ValidationError
 
-from chess_ai.output import DETAIL, RESULT, Say
+from chess_ai.match import passing
+from chess_ai.output import DETAIL, RESULT, Say, failure
 from chess_ai.output import say as said_on_stdout
 from chess_ai.players import ModelDescription
 from chess_ai.probes import (
@@ -64,6 +66,13 @@ LOCK_FILE: Final = "evaluator.lock"
 
 STOP_POLL_SECONDS: Final = 0.1
 """How often a suite that plays games looks at whether the evaluator has been told to stop."""
+
+RETRY_SECONDS: Final = 600.0
+"""How long a checkpoint a suite failed on for a reason that can pass waits to be tried again."""
+
+TRIES: Final = 3
+"""How many times a suite is tried on a checkpoint that keeps failing for a reason that can
+pass, before it is not tried again until the evaluator is restarted."""
 
 
 class Stopped(Exception):
@@ -347,7 +356,12 @@ class Evaluator:
 
     ``suites`` are the suites it can run, by name. A run asking for one that is not among them
     gets the rest. A checkpoint a suite fails on is not tried again until the evaluator is
-    started again, so that a broken file is reported once rather than every few seconds.
+    started again, so that a broken file is reported once rather than every few seconds;
+    unless it failed for a reason that can pass (:func:`~chess_ai.match.passing`), such as a
+    Stockfish move that timed out while the machine was stalled, when it is tried again
+    :data:`RETRY_SECONDS` later, up to :data:`TRIES` times in all. Meanwhile it lacks its result
+    still, which is what keeps a checkpoint due a ladder from its run's retention. An evaluator
+    that is ``once``, making one pass and exiting, says instead that the next pass tries it.
     """
 
     def __init__(
@@ -358,19 +372,31 @@ class Evaluator:
         load: Loader,
         say: Say = said_on_stdout,
         warn: Callable[[str], None] = LOGGER.warning,
+        clock: Callable[[], float] = time.monotonic,
+        once: bool = False,
     ) -> None:
         self.runs_dir = runs_dir
         self.suites = dict(suites)
         self._load = load
         self._say = say
         self._warn = warn
-        self._failed: set[tuple[str, int, datetime, str]] = set()
+        self._clock = clock
+        self._once = once
+        """Whether it makes one pass and exits, as ``chess-ai evaluator --once`` does, and so
+        tries nothing again itself: the next pass is another evaluator, which knows nothing of
+        this one's tries."""
+        self._failed: dict[tuple[str, int, datetime, str], _Failed] = {}
         """The checkpoints a suite failed on, by run, step, when the file was written, and suite."""
+        self._lacking: set[tuple[str, int, datetime, str]] = set()
+        """The checkpoints, by the same key, the last look found lacking a suite's result, those
+        waiting to be tried again among them."""
 
     def pending(self) -> list[Job]:
         """Every checkpoint on disk that lacks a result a suite of its run's would give, newest
         checkpoint first. Archived runs are left alone."""
         jobs: list[Job] = []
+        lacking: set[tuple[str, int, datetime, str]] = set()
+        now = self._clock()
         for run, configured in evaluated_runs(self.runs_dir):
             name = run.name
             wanted = [suite for suite in configured if suite in self.suites]
@@ -384,17 +410,28 @@ class Evaluator:
                     continue
                 if written is None:
                     continue  # Pruned since the listing.
-                missing = tuple(
-                    suite
-                    for suite in wanted
-                    if (name, checkpoint.step, written, suite) not in self._failed
-                    and self.suites[suite].wants(run, checkpoint)
-                    and not self.suites[suite].stands(run, checkpoint, written)
-                )
+                missing = []
+                for suite in wanted:
+                    key = (name, checkpoint.step, written, suite)
+                    if not self.suites[suite].wants(run, checkpoint):
+                        continue
+                    failed = self._failed.get(key)
+                    if failed is not None and failed.given_up:
+                        continue  # Not tried again, and not looked at again either.
+                    if failed is not None and failed.waiting(now):
+                        # Lacking still, without reading what it lacks: nothing but this
+                        # evaluator saves its result, and a look comes every few seconds.
+                        lacking.add(key)
+                        continue
+                    if self.suites[suite].stands(run, checkpoint, written):
+                        continue
+                    lacking.add(key)
+                    missing.append(suite)
                 if missing:
                     jobs.append(
-                        Job(run=run, checkpoint=checkpoint, written=written, suites=missing)
+                        Job(run=run, checkpoint=checkpoint, written=written, suites=tuple(missing))
                     )
+        self._lacking = lacking
         return sorted(jobs, key=lambda job: job.written, reverse=True)
 
     def evaluate(self, job: Job, *, stop: threading.Event | None = None) -> bool:
@@ -406,7 +443,8 @@ class Evaluator:
         "evaluating" line is otherwise followed by nothing at all in the log, which reads as a
         checkpoint that was lost. Not as a warning: a run still training prunes its older
         checkpoints while a backlog is worked through, as it should. Any other failure is
-        warned of, and the checkpoint not tried again. A suite
+        warned of, and the checkpoint not tried again, or only later for a failure that can
+        pass (see :class:`Evaluator`). A suite
         stopped by ``stop`` part-way is neither: the rest are not run, and ``False`` is returned.
 
         The run is held as being evaluated throughout, so that it cannot be renamed meanwhile; a
@@ -445,7 +483,7 @@ class Evaluator:
             if not path.exists():
                 self._say(f"chess-ai: {job.describe()} was pruned before it could be evaluated")
                 return True
-            self._fail(job, job.suites, f"cannot be loaded: {e}")
+            self._fail(job, job.suites, f"cannot be loaded: {failure(e)}")
             return True
         for name in job.suites:
             try:
@@ -461,7 +499,7 @@ class Evaluator:
                 )
                 break
             except Exception as e:
-                self._fail(job, (name,), f"{name} failed: {e}")
+                self._fail(job, (name,), f"{name} failed: {failure(e)}", passing=passing(e))
                 continue
             if not self.suites[name].stands(run, checkpoint, job.written):
                 # Saved, and yet still lacking: evaluating it again would save the same, and
@@ -527,7 +565,7 @@ class Evaluator:
             job = self._next()
             if job is None:
                 if not waiting:
-                    self._say("chess-ai: every checkpoint has its results; waiting for new ones")
+                    self._say(self._idle())
                     waiting = True
                 stop.wait(poll_seconds)
             else:
@@ -546,9 +584,68 @@ class Evaluator:
         jobs = self.pending()
         return jobs[0] if jobs else None
 
-    def _fail(self, job: Job, suites: Sequence[str], why: str) -> None:
+    def _idle(self) -> str:
+        """What the evaluator says as it goes from evaluating to waiting: not that every
+        checkpoint has its results while some lack them still, to be tried again."""
+        now = self._clock()
+        retrying = len(
+            {
+                key[:3]
+                for key, failed in self._failed.items()
+                # Not one whose time has come, which has been tried again since, nor one the last
+                # look did not find lacking, such as one replaced or archived meanwhile.
+                if failed.waiting(now) and key in self._lacking
+            }
+        )
+        if not retrying:
+            return "chess-ai: every checkpoint has its results; waiting for new ones"
+        return (
+            "chess-ai: every other checkpoint has its results; waiting for new ones, and to "
+            f"try {retrying} that failed again"
+        )
+
+    def _fail(self, job: Job, suites: Sequence[str], why: str, *, passing: bool = False) -> None:
+        """Warn that ``suites`` failed on ``job``'s checkpoint, and say when they are tried again:
+        never, unless the failure is ``passing``, and then not before :data:`RETRY_SECONDS`
+        have gone by, nor once it has failed :data:`TRIES` times."""
+        tries = 0
         for suite in suites:
-            self._failed.add((job.run.name, job.checkpoint.step, job.written, suite))
+            key = (job.run.name, job.checkpoint.step, job.written, suite)
+            failed = self._failed.get(key)
+            tries = (failed.tries if failed is not None else 0) + 1
+            again = passing and tries < TRIES
+            self._failed[key] = _Failed(
+                tries=tries, retry_at=self._clock() + RETRY_SECONDS if again else None
+            )
+        if passing and self._once:
+            self._warn(f"{job.describe()} {why}; the next pass of the evaluator tries it again")
+            return
+        if passing and tries < TRIES:
+            minutes = f"{RETRY_SECONDS / 60:g} minutes"
+            self._warn(
+                f"{job.describe()} {why}; it is tried again in {minutes} "
+                f"(try {tries + 1} of {TRIES})"
+            )
+            return
         self._warn(
             f"{job.describe()} {why}; it is not tried again until the evaluator is restarted"
         )
+
+
+@dataclass
+class _Failed:
+    """A suite that failed on a checkpoint, and when it is tried again."""
+
+    tries: int
+    """How many times it has failed."""
+    retry_at: float | None
+    """When it is tried again, by the evaluator's clock, or ``None`` for not at all."""
+
+    @property
+    def given_up(self) -> bool:
+        """Whether it is not tried again until the evaluator is restarted."""
+        return self.retry_at is None
+
+    def waiting(self, now: float) -> bool:
+        """Whether it is to be tried again, and not yet at ``now``."""
+        return self.retry_at is not None and now < self.retry_at

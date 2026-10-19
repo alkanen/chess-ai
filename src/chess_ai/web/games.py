@@ -27,15 +27,12 @@ from typing import Literal
 from pydantic import BaseModel
 
 from chess_ai.game_session import ActionRejectedError, GameEvent, GameSession, GameState
-from chess_ai.players import Player, close_players, wait_players_closed
+from chess_ai.players import CLOSE_TIMEOUT, Player, close_players, wait_players_closed
 from chess_ai.position_view import Color
 from chess_ai.web.game_store import GameLinks, GameStore, PlayerRecord, StoredGame
 
 logger = logging.getLogger(__name__)
 
-
-CLOSE_TIMEOUT = 5.0
-"""How long a game that has stopped waits for its players' engines to exit."""
 
 LINK_BYTES = 16
 """How much randomness a link has: 128 bits, which nobody guesses or tries their way to."""

@@ -13,7 +13,7 @@ from collections.abc import Callable, Collection, Sequence
 from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TextIO
+from typing import TYPE_CHECKING, Any, Final, TextIO
 
 from chess_ai.config import CONFIG_PATH_ENV, DEFAULT_CONFIG_FILE, Config, ConfigError, load_config
 from chess_ai.output import (
@@ -779,7 +779,7 @@ def _match(config: Config, args: argparse.Namespace) -> int:
 
     async def play() -> None:
         from chess_ai.match import play_match
-        from chess_ai.players import close_players, wait_players_closed
+        from chess_ai.players import close_and_wait
 
         sides = (args.first, args.second)
         made: dict[int, tuple[Player, str]] = {}
@@ -834,10 +834,7 @@ def _match(config: Config, args: argparse.Namespace) -> int:
         finally:
             # Waited for as well as closed, however the match ended, so that an engine's process
             # has been reaped before the event loop that would reap it is gone.
-            players = [player for player, _ in made.values()]
-            close_players(*players)
-            with suppress(TimeoutError):
-                await asyncio.wait_for(wait_players_closed(*players), _CLOSE_TIMEOUT)
+            await close_and_wait(*(player for player, _ in made.values()))
 
     try:
         asyncio.run(play())
@@ -855,8 +852,12 @@ def _match(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
-_CLOSE_TIMEOUT = 5.0
-"""How long a finished match waits for its Stockfish processes to exit."""
+FAILURES_IN_A_ROW: Final = 3
+"""At how many checkpoints in a row a suite has to fail for a reason that can pass, counting
+those it ran on, before ``chess-ai evaluate`` takes it for one that fails every time: one stall
+can catch it at two, as at the checkpoint where the stall began and at the next; an engine that
+fails every time is stopped at its third. Counted rather than timed: the time between two
+failures is mostly the games that went well before the second, and a stall's own time with it."""
 
 
 def _count(number: int, thing: str) -> str:
@@ -873,7 +874,12 @@ def _engine_failure(error: Exception, *, nodes: int | None = None) -> str:
     import chess.engine
 
     from chess_ai import stockfish
+    from chess_ai.match import GameFailed
+    from chess_ai.output import failure
 
+    if isinstance(error, (stockfish.StockfishTimeout, GameFailed)):
+        # Each says which engine it was, and how long it was waited for.
+        return str(error)
     if isinstance(error, TimeoutError) and nodes is not None:
         return (
             f"Stockfish took more than {stockfish.move_timeout(None, nodes):g} seconds to search "
@@ -887,8 +893,8 @@ def _engine_failure(error: Exception, *, nodes: int | None = None) -> str:
     if isinstance(error, chess.engine.EngineTerminatedError):
         return f"Stockfish stopped: {error}"
     if isinstance(error, chess.engine.EngineError):
-        return f"Stockfish failed: {error}"
-    return str(error)
+        return f"Stockfish failed: {failure(error)}"
+    return failure(error)
 
 
 def _choose_checkpoints(
@@ -1156,7 +1162,8 @@ class _LevelNotStarted(Exception):
     """Stockfish could not be started for a level of a ladder, which ``__cause__`` says why."""
 
     def __init__(self, level: int, error: Exception) -> None:
-        super().__init__(level, error)
+        # Said as the last failure of a game given up on, when it was a restart that failed.
+        super().__init__(f"Stockfish could not be started for level {level}: {error}")
         self.level = level
 
 
@@ -1175,7 +1182,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         start_games_file,
         write_games,
     )
-    from chess_ai.match import append_game, distinct_games
+    from chess_ai.match import GameFailed, append_game, distinct_games
     from chess_ai.openings import OpeningSetError, load_opening_set
     from chess_ai.players import describe_limit
     from chess_ai.stockfish import StockfishError, start_stockfish
@@ -1316,6 +1323,9 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
                 f"Stockfish could not be started for level {e.level}, so no result was saved: "
                 f"{e.__cause__}{games_note()}"
             ) from e
+        except GameFailed as e:
+            # It says which game, and what went wrong with it the last time it was played.
+            raise _UserError(f"{e}, so no result was saved{games_note()}") from e
         except (StockfishError, TimeoutError, chess.engine.EngineError) as e:
             # Played at once, the game that failed need not be the one after those that ended.
             which = f"game {played + 1}" if parallel == 1 else "a game"
@@ -2128,6 +2138,7 @@ def _evaluator(config: Config, args: argparse.Namespace) -> int:
         suites,
         load=_evaluation_loader(config),
         say=say,
+        once=args.once,
     )
     stop = threading.Event()
     stopped_by: list[int] = []
@@ -2199,6 +2210,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
     from chess_ai.evaluator import configured_suites
     from chess_ai.inference import InferenceError
     from chess_ai.ladder import SUITE as LADDER_SUITE
+    from chess_ai.match import GameFailed, passing
     from chess_ai.probes import DivergedError
     from chess_ai.stockfish import StockfishError
     from chess_ai.training.run_store import (
@@ -2229,6 +2241,10 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
     available = _evaluation_suites(config, {suite for *_, suites, _ in chosen for suite in suites})
     load = _evaluation_loader(config)
     failed: set[str] = set()
+    # How many checkpoints in a row each suite, by run, has failed at for a reason that can pass,
+    # counting those it ran on (see FAILURES_IN_A_ROW). A checkpoint it skipped, or one that changed
+    # while it ran, is neither a failure nor a success, and leaves the count as it was.
+    in_a_row: dict[tuple[str, str], int] = {}
     try:
         for run, checkpoint, asked, one_of_all in chosen:
             label = f"{run.name}@{checkpoint.step}"
@@ -2264,6 +2280,7 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                     LOGGER.warning(f"{label} was pruned before it could be evaluated")
                     continue
                 for suite in suites:
+                    key = (run.name, suite)
                     try:
                         said = available[suite].evaluate(run, checkpoint, written, engine)
                     except CheckpointChanged as e:
@@ -2285,15 +2302,32 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
                         continue
                     except RunError as e:
                         raise _UserError(e) from e
-                    except StockfishError as e:
-                        # The same for every checkpoint to come: not one to go on past.
-                        raise _UserError(f"{label} {suite}: {e}") from e
-                    except (TimeoutError, chess.engine.EngineError) as e:
+                    except (
+                        StockfishError,
+                        TimeoutError,
+                        chess.engine.EngineError,
+                        GameFailed,
+                    ) as e:
                         # The ladder may hold Stockfish to nodes; sample games hold it to a time.
                         nodes = config.ladder.nodes if suite == LADDER_SUITE else None
-                        raise _UserError(
-                            f"{label} {suite}: {_engine_failure(e, nodes=nodes)}"
-                        ) from e
+                        why = f"{label} {suite}: {_engine_failure(e, nodes=nodes)}"
+                        # One that would be the same for every checkpoint to come, such as no
+                        # Stockfish to start, is not one to go on past; one that can pass, such
+                        # as a machine stalled for memory, is, as a diverged checkpoint is. Not
+                        # tried again here: the evaluator does that, later.
+                        if not one_of_all or not passing(e):
+                            raise _UserError(why) from e
+                        in_a_row[key] = in_a_row.get(key, 0) + 1
+                        if in_a_row[key] >= FAILURES_IN_A_ROW:
+                            raise _UserError(
+                                f"{why}; it has failed so at {in_a_row[key]} checkpoints in a "
+                                "row, more than a stall would, so it is taken not to pass, and the "
+                                "rest are not evaluated"
+                            ) from e
+                        LOGGER.warning("%s", why)
+                        failed.add(label)
+                        continue
+                    in_a_row.pop(key, None)
                     say(f"{label} {suite}: {said}", kind=RESULT)
                 # Done with the checkpoint, as the evaluator is after a job.
                 for suite in suites:

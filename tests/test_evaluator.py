@@ -15,6 +15,7 @@ from training_helpers import add_checkpoint, model_run
 
 from chess_ai.cli import main
 from chess_ai.evaluator import (
+    RETRY_SECONDS,
     Evaluator,
     EvaluatorBusy,
     ProbeSuite,
@@ -198,7 +199,406 @@ def test_a_checkpoint_that_cannot_be_loaded_is_reported_once_and_not_tried_again
     assert done(first) == [("tiny", 4), ("tiny", 2)]
     assert second == []
     assert len(warned) == 1 and warned[0].startswith("tiny@4 cannot be loaded")
+    assert warned[0].endswith("it is not tried again until the evaluator is restarted")
     assert read_probes(RunReader(run), 4) is None
+
+
+class TimingOut:
+    """A suite that fails as a game whose engine is late fails, with a ``TimeoutError`` that
+    says nothing, the first ``failures`` times it is run."""
+
+    name = SUITE
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.evaluated = 0
+
+    def wants(self, run, checkpoint) -> bool:
+        return True
+
+    def stands(self, run, checkpoint, written) -> bool:
+        return checkpoint.step <= 2 or self.evaluated > self.failures
+
+    def evaluate(self, run, checkpoint, written, engine, *, stop=None) -> str:
+        self.evaluated += 1
+        if self.evaluated <= self.failures:
+            raise TimeoutError
+        return "done"
+
+    def after(self, run) -> None:
+        pass
+
+
+@pytest.mark.parametrize("failures", [2, 3])
+def test_a_failure_that_can_pass_is_tried_again_later_and_given_up_on_after_three(
+    tmp_path, failures
+):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2, 4))
+    suite = TimingOut(failures)
+    warned: list[str] = []
+    now = [0.0]
+    worker = Evaluator(
+        runs, {suite.name: suite}, load=load_engine, warn=warned.append, clock=lambda: now[0]
+    )
+
+    for _ in range(4):
+        worker.run_once()
+        assert worker.pending() == [], "not until it is time"
+        now[0] += RETRY_SECONDS
+
+    assert suite.evaluated == min(failures + 1, 3)
+    assert warned[:2] == [
+        f"tiny@4 {SUITE} failed: TimeoutError; it is tried again in 10 minutes (try 2 of 3)",
+        f"tiny@4 {SUITE} failed: TimeoutError; it is tried again in 10 minutes (try 3 of 3)",
+    ]
+    if failures == 3:
+        assert warned[2:] == [
+            f"tiny@4 {SUITE} failed: TimeoutError; it is not tried again until the evaluator "
+            "is restarted"
+        ]
+    else:
+        assert len(warned) == 2
+
+
+def test_a_single_pass_does_not_promise_to_try_a_checkpoint_again_itself(tmp_path):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2, 4))
+    suite = TimingOut(1)
+    warned: list[str] = []
+    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, warn=warned.append, once=True)
+
+    worker.run_once()
+
+    # It exits once the pass is done, and the next pass knows nothing of this one's tries.
+    assert warned == [
+        f"tiny@4 {SUITE} failed: TimeoutError; the next pass of the evaluator tries it again"
+    ]
+
+
+def test_evaluator_once_says_the_next_pass_tries_a_checkpoint_again(tmp_path, monkeypatch, capsys):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(4,))
+    (tmp_path / "chess-ai.toml").write_text(f'[paths]\nruns = "{runs}"\n')
+    suite = TimingOut(1)
+    suite.probes = load_probe_set("standard")  # Which the evaluator records it probes with.
+    monkeypatch.setattr(
+        "chess_ai.cli._evaluation_suites", lambda config, names, **options: {suite.name: suite}
+    )
+
+    assert main(["evaluator", "--once"]) == 0
+
+    err = capsys.readouterr().err
+    assert "the next pass of the evaluator tries it again" in err
+    assert "10 minutes" not in err
+
+
+def test_an_evaluator_waiting_to_try_a_checkpoint_again_says_so_when_it_goes_idle(tmp_path):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2, 4))
+    suite = TimingOut(1)
+    said: list[str] = []
+
+    class Once(threading.Event):
+        def wait(self, timeout=None) -> bool:
+            self.set()
+            return True
+
+    now = [0.0]
+    worker = Evaluator(
+        runs,
+        {suite.name: suite},
+        load=load_engine,
+        say=heard(said),
+        warn=unheard,
+        clock=lambda: now[0],
+    )
+
+    worker.run(poll_seconds=60, stop=Once())
+
+    assert said[-1] == (
+        "chess-ai: every other checkpoint has its results; waiting for new ones, and to try "
+        "1 that failed again"
+    )
+
+    now[0] += RETRY_SECONDS
+    worker.run(poll_seconds=60, stop=Once())
+
+    assert said[-3].startswith(f"chess-ai: evaluating tiny@4: {SUITE}")
+    assert said[-1] == "chess-ai: every checkpoint has its results; waiting for new ones"
+
+
+def test_a_checkpoint_waiting_to_be_tried_again_that_is_no_longer_looked_at_is_not_counted(
+    tmp_path,
+):
+    runs = tmp_path / "runs"
+    run = model_run(runs, steps=(2, 4))
+    suite = TimingOut(1)
+    said: list[str] = []
+    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=heard(said), warn=unheard)
+    worker.run_once()
+    # Archived meanwhile, so that nothing will be tried again.
+    save_notes(RunReader(run), RunNotes(tags=[ARCHIVED_TAG]))
+
+    class Once(threading.Event):
+        def wait(self, timeout=None) -> bool:
+            self.set()
+            return True
+
+    worker.run(poll_seconds=60, stop=Once())
+
+    assert said[-1] == "chess-ai: every checkpoint has its results; waiting for new ones"
+
+
+@pytest.mark.parametrize("hangs", [False, True], ids=["dies", "hangs"])
+def test_evaluate_goes_on_past_a_stockfish_that_fails_until_its_third_checkpoint_in_a_row(
+    tmp_path, monkeypatch, capsys, hangs
+):
+    from stockfish_helpers import fake_engine, started, wait_until_gone
+
+    from chess_ai import stockfish
+
+    monkeypatch.setattr(stockfish, "MOVE_GRACE", 0.2)
+    runs = tmp_path / "runs"
+    run = model_run(runs, steps=(2, 4, 6))
+    engine = fake_engine(tmp_path / "engine", "--hang-after" if hangs else "--exit-after", "0")
+    (tmp_path / "chess-ai.toml").write_text(
+        f'[paths]\nruns = "{runs}"\n[stockfish]\npath = "{engine}"\n'
+        "[sample_games]\ngames = 1\nstockfish_games = 1\nstockfish_move_time = 0.01\n"
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        main(["evaluate", "tiny"])
+
+    assert exited.value.code == 2
+    assert probed_steps(RunReader(run)) == [2, 4, 6], "past the first two, as a stall would pass"
+    err = capsys.readouterr().err
+    assert f"warning: tiny@2 {SAMPLE_GAMES}: sample game 2/2 against Stockfish" in err
+    assert f"warning: tiny@4 {SAMPLE_GAMES}: sample game 2/2 against Stockfish" in err
+    assert f"error: tiny@6 {SAMPLE_GAMES}: sample game 2/2 against Stockfish" in err
+    assert "at 3 checkpoints in a row" in err
+    wait_until_gone(*started(engine))
+
+
+class FailingOn:
+    """A suite called ``name`` that times out wherever ``fails(run, step, attempt)`` says, the
+    attempt counting from 1 for each checkpoint, on the checkpoints ``wants(step)`` says; and
+    raises ``CheckpointChanged`` on the steps of ``changed``, or the ``(step, attempt)`` pairs, and
+    ``DivergedError`` on the pairs of ``diverged``."""
+
+    def __init__(self, name, fails, *, wants=lambda step: True, changed=(), diverged=()) -> None:
+        self.name = name
+        self.fails = fails
+        self.wanted = wants
+        self.changed = set(changed)
+        self.diverged = set(diverged)
+        self.attempts: dict[tuple[str, int], int] = {}
+        self.events: list[str] = []
+        """What it was asked to do, in order: ``evaluate STEP`` and ``after``."""
+
+    def wants(self, run, checkpoint) -> bool:
+        return self.wanted(checkpoint.step)
+
+    def stands(self, run, checkpoint, written) -> bool:
+        return False
+
+    def evaluate(self, run, checkpoint, written, engine, *, stop=None) -> str:
+        from chess_ai.training.run_store import CheckpointChanged
+
+        key = (run.name, checkpoint.step)
+        self.attempts[key] = self.attempts.get(key, 0) + 1
+        self.events.append(f"evaluate {checkpoint.step}")
+        if checkpoint.step in self.changed or (checkpoint.step, self.attempts[key]) in self.changed:
+            raise CheckpointChanged("replaced meanwhile")
+        if (checkpoint.step, self.attempts[key]) in self.diverged:
+            from chess_ai.probes import DivergedError
+
+            raise DivergedError("the network's outputs are not numbers")
+        if self.fails(run.name, checkpoint.step, self.attempts[key]):
+            raise TimeoutError
+        return "done"
+
+    def after(self, run) -> None:
+        self.events.append("after")
+
+
+def evaluate_with(tmp_path, monkeypatch, *suites: FailingOn, runs=("tiny",), steps=(2, 4, 6, 8)):
+    """``chess-ai evaluate`` of every checkpoint of ``runs`` with ``suites`` alone, and its exit
+    status."""
+    root = tmp_path / "runs"
+    for name in runs:
+        model_run(root, name, steps=steps)
+    (tmp_path / "chess-ai.toml").write_text(f'[paths]\nruns = "{root}"\n')
+    monkeypatch.setattr(
+        "chess_ai.cli._evaluation_suites",
+        lambda config, names, **options: {suite.name: suite for suite in suites},
+    )
+    arguments = ["evaluate", *runs]
+    for suite in suites:
+        arguments += ["--suite", suite.name]
+    try:
+        return main(arguments)
+    except SystemExit as exited:
+        return exited.code
+
+
+def test_evaluate_goes_on_past_failures_that_can_pass_while_others_succeed_between_them(
+    tmp_path, monkeypatch, capsys
+):
+    # Two stalls of their own, at 6 and 8, however long the games between them took.
+    suite = FailingOn(SUITE, lambda run, step, attempt: step in {2, 6, 8})
+
+    assert evaluate_with(tmp_path, monkeypatch, suite) == 2
+
+    captured = capsys.readouterr()
+    assert f"tiny@4 {SUITE}: done" in captured.out
+    assert f"warning: tiny@8 {SUITE}: " in captured.err, "two in a row, not three"
+    assert "error: 3 checkpoints could not be evaluated" in captured.err
+    assert "at 3 checkpoints in a row" not in captured.err
+
+
+def test_evaluate_counts_failures_in_a_row_by_suite_not_by_checkpoint(
+    tmp_path, monkeypatch, capsys
+):
+    # The ladder every 4 steps, failing every time; the sample games between it succeed, and the
+    # checkpoints it skips do not count, either way.
+    ladder = FailingOn(
+        SAMPLE_GAMES, lambda run, step, attempt: True, wants=lambda step: step % 4 == 0
+    )
+    probes = FailingOn(SUITE, lambda run, step, attempt: False)
+
+    assert evaluate_with(tmp_path, monkeypatch, probes, ladder, steps=(2, 4, 6, 8, 10, 12)) == 2
+
+    err = capsys.readouterr().err
+    assert f"warning: tiny@4 {SAMPLE_GAMES}: " in err
+    assert f"warning: tiny@8 {SAMPLE_GAMES}: " in err, "its second, the probes of 6 between"
+    assert f"error: tiny@12 {SAMPLE_GAMES}: " in err
+    assert "at 3 checkpoints in a row" in err
+
+
+def test_evaluate_does_not_take_two_suites_failing_once_each_for_one_that_always_fails(
+    tmp_path, monkeypatch, capsys
+):
+    games = FailingOn(SAMPLE_GAMES, lambda run, step, attempt: step == 4)
+    probes = FailingOn(SUITE, lambda run, step, attempt: step == 6)
+
+    assert evaluate_with(tmp_path, monkeypatch, probes, games) == 2
+
+    captured = capsys.readouterr()
+    assert "error: 2 checkpoints could not be evaluated" in captured.err
+    assert f"tiny@8 {SUITE}: done" in captured.out
+
+
+def test_evaluate_goes_on_past_a_stall_that_fails_a_suite_at_two_checkpoints_in_a_row(
+    tmp_path, monkeypatch, capsys
+):
+    # As one stall long enough to catch the next checkpoint too.
+    suite = FailingOn(SUITE, lambda run, step, attempt: step in {4, 6})
+
+    assert evaluate_with(tmp_path, monkeypatch, suite) == 2
+
+    captured = capsys.readouterr()
+    assert f"tiny@8 {SUITE}: done" in captured.out
+    assert "error: 2 checkpoints could not be evaluated" in captured.err
+    assert suite.attempts[("tiny", 4)] == suite.attempts[("tiny", 6)] == 1, "not tried again"
+
+
+def test_evaluate_stops_at_a_suite_that_has_failed_at_three_checkpoints_in_a_row(
+    tmp_path, monkeypatch, capsys
+):
+    # As an engine that fails every time.
+    suite = FailingOn(SUITE, lambda run, step, attempt: True)
+
+    assert evaluate_with(tmp_path, monkeypatch, suite) == 2
+
+    err = capsys.readouterr().err
+    assert f"warning: tiny@2 {SUITE}: " in err
+    assert f"warning: tiny@4 {SUITE}: " in err
+    assert f"error: tiny@6 {SUITE}: " in err
+    assert "at 3 checkpoints in a row" in err
+    assert ("tiny", 8) not in suite.attempts
+
+
+def test_evaluate_does_not_count_a_failure_in_another_run_against_this_one(
+    tmp_path, monkeypatch, capsys
+):
+    # The last of tiny's and the first of other's.
+    suite = FailingOn(SUITE, lambda run, step, attempt: (run, step) in {("tiny", 4), ("other", 2)})
+
+    assert evaluate_with(tmp_path, monkeypatch, suite, runs=("tiny", "other"), steps=(2, 4)) == 2
+
+    captured = capsys.readouterr()
+    assert f"other@4 {SUITE}: done" in captured.out
+    assert "error: 2 checkpoints could not be evaluated" in captured.err
+
+
+def test_evaluate_counts_failures_in_a_row_past_a_checkpoint_that_changed_between_them(
+    tmp_path, monkeypatch, capsys
+):
+    suite = FailingOn(SUITE, lambda run, step, attempt: step in {2, 6, 8}, changed={4})
+
+    assert evaluate_with(tmp_path, monkeypatch, suite) == 2
+
+    err = capsys.readouterr().err
+    assert "tiny@4 changed while it was evaluated" in err
+    assert f"error: tiny@8 {SUITE}: " in err, "the change at 4 neither a failure nor a success"
+    assert "at 3 checkpoints in a row" in err
+
+
+def test_a_checkpoint_waiting_to_be_tried_again_has_its_result_not_looked_for(tmp_path):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2, 4))
+    suite = TimingOut(1)
+    looked: list[int] = []
+    stands = suite.stands
+    suite.stands = lambda run, checkpoint, written: (
+        looked.append(checkpoint.step) or stands(run, checkpoint, written)
+    )
+    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, warn=unheard)
+    worker.run_once()
+    looked.clear()
+
+    assert worker.pending() == []
+
+    assert looked == [2], "only the checkpoint that is not waiting"
+
+
+def test_a_checkpoint_waiting_to_be_tried_again_that_its_suite_no_longer_wants_is_not_counted(
+    tmp_path,
+):
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2, 4))
+    suite = TimingOut(1)
+    said: list[str] = []
+    worker = Evaluator(runs, {suite.name: suite}, load=load_engine, say=heard(said), warn=unheard)
+    worker.run_once()
+    # As the last checkpoint of a run that finished, and was then resumed.
+    suite.wants = lambda run, checkpoint: False
+
+    class Once(threading.Event):
+        def wait(self, timeout=None) -> bool:
+            self.set()
+            return True
+
+    worker.run(poll_seconds=60, stop=Once())
+
+    assert said[-1] == "chess-ai: every checkpoint has its results; waiting for new ones"
+
+
+def test_a_checkpoint_that_cannot_be_loaded_is_not_tried_again_however_long_it_waits(tmp_path):
+    runs = tmp_path / "runs"
+    run = model_run(runs, steps=(4,))
+    (run / "checkpoints" / "step-000000004.pt").write_bytes(b"not a checkpoint")
+    now = [0.0]
+    suite = ProbeSuite(load_probe_set("standard"), rating=1500)
+    worker = Evaluator(
+        runs, {suite.name: suite}, load=load_engine, warn=unheard, clock=lambda: now[0]
+    )
+    worker.run_once()
+
+    now[0] += 100 * RETRY_SECONDS
+
+    assert worker.pending() == []
 
 
 def test_a_checkpoint_pruned_before_its_turn_is_passed_over_without_a_word(tmp_path):

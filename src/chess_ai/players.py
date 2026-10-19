@@ -12,8 +12,9 @@ which the web server imports to start any game at all, has to know what a networ
 
 import asyncio
 import random
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Literal, Protocol, runtime_checkable
+from typing import Final, Literal, Protocol, runtime_checkable
 
 import chess
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -233,6 +234,25 @@ async def wait_players_closed(*players: Player) -> None:
     for player in players:
         if isinstance(player, ClosablePlayer):
             await player.wait_closed()
+
+
+CLOSE_TIMEOUT: Final = 5.0
+"""How long :func:`close_and_wait` gives what a player let go of to be gone."""
+
+
+async def close_and_wait(*players: Player) -> None:
+    """:func:`close_players`, then :func:`wait_players_closed` for up to :data:`CLOSE_TIMEOUT`:
+    long enough for an engine's process to have exited and been reaped, where one that takes
+    longer is left to finish on its own rather than hold up whatever comes next."""
+    close_players(*players)
+    with suppress(TimeoutError):
+        await asyncio.wait_for(wait_players_closed(*players), CLOSE_TIMEOUT)
+
+
+class CanPass(Exception):
+    """A failure that is no fault of what failed and may not come again, such as an engine the
+    machine was too short of memory to start: marked so where that is known, rather than
+    guessed at from what it was raised from; see :func:`chess_ai.match.passing`."""
 
 
 @runtime_checkable

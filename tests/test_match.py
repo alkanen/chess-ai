@@ -1,3 +1,5 @@
+import errno
+
 import chess
 import pytest
 from pgn_helpers import read_back
@@ -332,3 +334,133 @@ async def test_the_header_is_said_again_every_so_many_games():
     second = said.index((headers[1], MILESTONE))
     assert said[second - 1][0].startswith(f"game {HEADER_EVERY}/{games} starting")
     assert said[second + 1][0].startswith(f"game {HEADER_EVERY + 1}/{games} starting")
+
+
+class Waits:
+    """Stands in for the pauses :func:`~chess_ai.match.replaying` makes: records each, and moves
+    a clock of its own on by it instead of waiting."""
+
+    def __init__(self, happened: list) -> None:
+        self.happened = happened
+        self.now = 0.0
+        self.asked: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.happened.append("pause")
+        self.asked.append(seconds)
+        self.now += seconds
+
+
+async def test_the_failed_engine_is_let_go_of_before_each_pause_and_a_new_one_started_after(
+    monkeypatch, caplog
+):
+    from chess_ai import match
+    from chess_ai.match import GameFailed, replaying
+
+    happened: list[str] = []
+    waits = Waits(happened)
+    monkeypatch.setattr(match, "_sleep", waits)
+
+    async def play() -> None:
+        happened.append("play")
+        raise TimeoutError
+
+    async def close() -> None:
+        happened.append("close")
+
+    async def start() -> None:
+        happened.append("start")
+
+    with pytest.raises(GameFailed):
+        await replaying(play, close, start=start, game=lambda: "game 3/10", pauses=(5.0, 20.0))
+
+    assert happened == [
+        *["play", "close", "pause", "start"],
+        *["play", "close", "pause", "start"],
+        *["play", "close"],
+    ], "no engine that failed is left running through a pause"
+    first, second = waits.asked
+    assert 5.0 * 0.75 <= first <= 5.0 * 1.25
+    assert 20.0 * 0.75 <= second <= 20.0 * 1.25, "longer, so that the tries spread over a stall"
+    assert f"game 3/10: TimeoutError; its engine is started again in {first:.0f} seconds" in (
+        caplog.text
+    )
+
+
+async def test_the_pauses_of_games_played_at_once_are_not_all_the_same(monkeypatch):
+    from chess_ai import match
+    from chess_ai.match import replaying
+
+    waits = Waits([])
+    monkeypatch.setattr(match, "_sleep", waits)
+
+    async def nothing() -> None:
+        pass
+
+    for _ in range(8):
+        failed = [True]
+
+        async def play(failed=failed) -> str:
+            if failed.pop() if failed else False:
+                raise TimeoutError
+            return "played"
+
+        await replaying(play, nothing, start=nothing, game=lambda: "game", pauses=(5.0,))
+
+    assert len(waits.asked) == 8
+    assert len(set(waits.asked)) > 1, "so that their engines are not all started at once"
+
+
+async def test_a_stall_shorter_than_the_pauses_between_tries_costs_the_game_nothing(monkeypatch):
+    from chess_ai import match
+    from chess_ai.match import replaying
+
+    waits = Waits([])
+    monkeypatch.setattr(match, "_sleep", waits)
+    tries = 0
+
+    def stalled() -> bool:
+        return waits.now < 10.0
+
+    async def play() -> str:
+        nonlocal tries
+        tries += 1
+        if stalled():
+            raise TimeoutError
+        return "played"
+
+    async def nothing() -> None:
+        pass
+
+    async def start() -> None:
+        if stalled():
+            raise TimeoutError  # A start that took too long, the machine still stalled.
+
+    assert (
+        await replaying(play, nothing, start=start, game=lambda: "game 1/1", pauses=(5.0, 20.0))
+        == "played"
+    )
+    assert tries == 2, "the second try's start failed, and the third went through"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),
+        OSError(errno.ENOMEM, "Cannot allocate memory"),
+        MemoryError(),
+    ],
+    ids=["a lock held elsewhere", "memory, not from an engine start", "this process's memory"],
+)
+def test_running_short_is_not_a_failure_that_can_pass_unless_an_engine_start_says_so(error):
+    from chess_ai.match import passing
+
+    def failed_from(error: BaseException) -> Exception:
+        try:
+            raise RuntimeError("the suite failed") from error
+        except RuntimeError as e:
+            return e
+
+    # Only where an engine is started is it known what a short machine means: see test_stockfish.
+    assert not passing(error)
+    assert not passing(failed_from(error))
