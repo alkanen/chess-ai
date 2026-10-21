@@ -47,7 +47,15 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from chess_ai.config import LadderConfig
 from chess_ai.evaluator import until_stopped
 from chess_ai.game_session import GameSession
-from chess_ai.match import GameLines, LinesMatch, MatchGame, append_game, play_game, score
+from chess_ai.match import (
+    GameLines,
+    LinesMatch,
+    MatchGame,
+    append_game,
+    play_game,
+    replaying,
+    score,
+)
 from chess_ai.openings import OpeningSet
 from chess_ai.output import Say
 from chess_ai.output import say as said_on_stdout
@@ -56,9 +64,8 @@ from chess_ai.players import (
     Player,
     StockfishBackedPlayer,
     StockfishDescription,
-    close_players,
+    close_and_wait,
     describe_limit,
-    wait_players_closed,
 )
 from chess_ai.position_view import GameOverReason
 from chess_ai.rating import DEFAULT_CONFIDENCE, Beyond, Estimate, Result, estimate_rating
@@ -95,9 +102,6 @@ EVENT: Final = "chess-ai ladder"
 """The ``Event`` of every ladder game's PGN, telling them from the games of a plain match."""
 
 FORMAT_VERSION: Final = 1
-
-CLOSE_TIMEOUT: Final = 5.0
-"""How long a level waits for its Stockfish process to exit before going on to the next."""
 
 
 class LadderLevel(BaseModel):
@@ -249,11 +253,17 @@ async def play_ladder(
     in it, as :func:`~chess_ai.match.play_match` hands them. Played at once, games end, and may
     begin, in an order of their own; the games returned are in order all the same.
 
+    A game in which Stockfish hangs or dies is played again from its start against an engine
+    ``opponent`` makes in its place, as :func:`~chess_ai.match.replaying` has it, so that one
+    late move does not throw away every other game of the ladder. ``on_session`` is then handed
+    the game's session again.
+
     Raises:
         ValueError: there are no levels, or ``games`` or ``parallel`` is less than one.
         TypeError: ``opponent`` made a player that cannot say how strong it plays.
-        Whatever :func:`~chess_ai.match.play_game` or ``opponent`` raise. Every game still being
-            played is stopped, and every engine closed, first.
+        GameFailed: a game's engine hung or died every time the game was played.
+        Whatever else :func:`~chess_ai.match.play_game` or ``opponent`` raise. Every game still
+            being played is stopped, and every engine closed, first.
     """
     if not levels:
         raise ValueError("a ladder needs at least one level")
@@ -267,6 +277,7 @@ async def play_ladder(
         opponent=opponent,
         on_game=on_game,
         on_session=on_session,
+        per_level=games,
         games=iter(
             [(index, number) for index in range(len(levels)) for number in range(1, games + 1)]
         ),
@@ -303,6 +314,8 @@ class _Ladder:
     opponent: Opponent
     on_game: Callable[[StockfishDescription, MatchGame], None] | None
     on_session: Callable[[StockfishDescription, int, GameSession], None] | None
+    per_level: int
+    """How many games each level plays."""
     games: Iterator[tuple[int, int]]
     """The games still to be played, each as its level's place among the levels and its number;
     one iterator for every game played at once, which hands each game out once."""
@@ -314,47 +327,86 @@ class _Ladder:
 
 async def _play_games(model: Player, ladder: _Ladder) -> None:
     """Play the next game of ``ladder`` there is, and the next, until there are none."""
-    held: int | None = None
-    stockfish: Player | None = None
+    engine = _LevelEngine(ladder)
+    total = ladder.per_level * len(ladder.levels)
     try:
         for index, number in ladder.games:
-            if index != held:
-                if stockfish is not None:
-                    await _close(stockfish)
-                    stockfish = None
-                stockfish = await ladder.opponent(ladder.levels[index])
-                held = index
-                if not isinstance(stockfish, StockfishBackedPlayer):
-                    raise TypeError(f"{stockfish.name} cannot be a level of a ladder")
-            assert isinstance(stockfish, StockfishBackedPlayer)
-            description = stockfish.stockfish
-            ladder.described.setdefault(index, description)
-
-            def begun(
-                number: int,
-                session: GameSession,
-                description=description,
-                on_session=ladder.on_session,
-            ) -> None:
-                if on_session is not None:
-                    on_session(description, number, session)
-
-            game = await play_game(
-                model, stockfish, number, openings=ladder.openings, on_session=begun, event=EVENT
+            # The engine is started as part of the game, so that one that does not start in
+            # time, on a machine still stalled, is a try of the game like a move too late.
+            description, game = await replaying(
+                lambda index=index, number=number: _play_one(model, ladder, engine, index, number),
+                engine.close,
+                game=lambda index=index, number=number: (
+                    f"game {index * ladder.per_level + number}/{total} against "
+                    f"Stockfish {_playing_at(ladder, index)}"
+                ),
             )
             ladder.played[index].append(game)
             if ladder.on_game is not None:
                 ladder.on_game(description, game)
     finally:
-        if stockfish is not None:
-            await _close(stockfish)
+        await engine.close()
 
 
-async def _close(stockfish: Player) -> None:
-    """Close a level's engine, and give it a moment to be gone."""
-    close_players(stockfish)
-    with suppress(TimeoutError):
-        await asyncio.wait_for(wait_players_closed(stockfish), CLOSE_TIMEOUT)
+def _playing_at(ladder: _Ladder, index: int) -> int:
+    """The Elo Stockfish plays the level at ``index`` at, as the game lines name it, or the level
+    asked for if no engine has started for it yet."""
+    described = ladder.described.get(index)
+    return described.elo if described is not None else ladder.levels[index]
+
+
+async def _play_one(
+    model: Player, ladder: _Ladder, engine: "_LevelEngine", index: int, number: int
+) -> tuple[StockfishDescription, MatchGame]:
+    """Play game ``number`` of the level at ``index`` against ``engine``'s Stockfish for it, and
+    say how strong that played."""
+    stockfish = await engine.at(index)
+    description = stockfish.stockfish
+    on_session = ladder.on_session
+
+    def begun(number: int, session: GameSession) -> None:
+        if on_session is not None:
+            on_session(description, number, session)
+
+    game = await play_game(
+        model, stockfish, number, openings=ladder.openings, on_session=begun, event=EVENT
+    )
+    return description, game
+
+
+class _LevelEngine:
+    """The Stockfish one of the games of a ladder played at once plays against: one level's,
+    kept while its games are of that level, and started again once closed."""
+
+    def __init__(self, ladder: _Ladder) -> None:
+        self._ladder = ladder
+        self._index: int | None = None
+        self._player: Player | None = None
+
+    async def at(self, index: int) -> StockfishBackedPlayer:
+        """The engine for the level at ``index``, started if it is not running.
+
+        Raises:
+            TypeError: the ladder's ``opponent`` made a player that cannot say how strong it
+                plays.
+            Whatever ``opponent`` raises.
+        """
+        if index != self._index:
+            await self.close()
+            self._index = index
+        if self._player is None:
+            self._player = await self._ladder.opponent(self._ladder.levels[index])
+            if not isinstance(self._player, StockfishBackedPlayer):
+                raise TypeError(f"{self._player.name} cannot be a level of a ladder")
+            self._ladder.described.setdefault(index, self._player.stockfish)
+        assert isinstance(self._player, StockfishBackedPlayer)
+        return self._player
+
+    async def close(self) -> None:
+        """Close the engine, if one is running."""
+        player, self._player = self._player, None
+        if player is not None:
+            await close_and_wait(player)
 
 
 async def _all_or_none(tasks: list["asyncio.Future[None]"]) -> None:
@@ -372,6 +424,24 @@ async def _all_or_none(tasks: list["asyncio.Future[None]"]) -> None:
     for task in tasks:
         if task in done and not task.cancelled() and task.exception() is not None:
             raise task.exception()  # type: ignore[misc]
+
+
+def clear_failure_frames(failure: BaseException) -> None:
+    """Clear the frames of ``failure``'s traceback, and of every failure it was raised from or
+    while handling, so that none of them keeps alive what its frames held.
+
+    Both links, and each failure once: Python breaks a cycle of contexts, but not one made with
+    ``raise ... from``, and walking one for ever would hang whoever is handling the failure.
+    """
+    seen: set[int] = set()
+    left: list[BaseException] = [failure]
+    while left:
+        each = left.pop()
+        if id(each) in seen:
+            continue
+        seen.add(id(each))
+        traceback.clear_frames(each.__traceback__)
+        left.extend(link for link in (each.__cause__, each.__context__) if link is not None)
 
 
 def game_index(
@@ -722,7 +792,7 @@ class LadderSuite:
         except BaseException as e:
             # The frames a failure came through still hold the network the ladder loaded,
             # for as long as whoever catches it keeps it, which would keep it from release.
-            traceback.clear_frames(e.__traceback__)
+            clear_failure_frames(e)
             raise
         finally:
             if self._load is not None:

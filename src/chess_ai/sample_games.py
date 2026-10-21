@@ -37,7 +37,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from chess_ai.config import SampleGamesConfig
 from chess_ai.evaluator import until_stopped
 from chess_ai.game_session import GameSession, GameState
-from chess_ai.match import GameLines, MatchGame, append_game, play_match
+from chess_ai.match import GameLines, MatchGame, append_game, play_game, play_match, replaying
 from chess_ai.openings import OpeningSet
 from chess_ai.output import Say
 from chess_ai.output import say as said_on_stdout
@@ -46,8 +46,7 @@ from chess_ai.players import (
     Player,
     StockfishBackedPlayer,
     StockfishDescription,
-    close_players,
-    wait_players_closed,
+    close_and_wait,
 )
 from chess_ai.position_view import GameOverReason
 from chess_ai.probes import check_finite
@@ -78,9 +77,6 @@ FORMAT_VERSION: Final = 1
 
 LIVE_FILE: Final = "live-game.json"
 """In the runs directory: the sample game the evaluator is playing now, as it stands."""
-
-CLOSE_TIMEOUT: Final = 5.0
-"""How long the games wait for their Stockfish process to exit once they are over."""
 
 Opponent = Literal["self", "stockfish"]
 
@@ -381,12 +377,30 @@ class SampleGamesSuite:
         stockfish: Player | None = None
         partial: Path | None = None
         listed: list[SampleGame] = []
+
+        async def start() -> None:
+            nonlocal stockfish
+            assert self._stockfish is not None
+            stockfish = await self._stockfish(settings.stockfish_elo, settings.stockfish_move_time)
+
+        async def close() -> None:
+            nonlocal stockfish
+            player, stockfish = stockfish, None
+            if player is not None:
+                await close_and_wait(player)
+
         try:
             if settings.stockfish_games:
-                assert self._stockfish is not None
-                # Before any game, so that an engine that will not start costs no games.
-                stockfish = await self._stockfish(
-                    settings.stockfish_elo, settings.stockfish_move_time
+                # Before any game, so that an engine that will not start costs no games; and
+                # tried again as a game's engine is, so that one that is only slow to start on a
+                # stalled machine does not fail them all either.
+                await replaying(
+                    start,
+                    close,
+                    game=lambda: (
+                        f"starting Stockfish {settings.stockfish_elo} for the sample games"
+                    ),
+                    again="it is started again in {seconds} seconds",
                 )
                 if not isinstance(stockfish, StockfishBackedPlayer):
                     raise TypeError(f"{stockfish.name} cannot say how strong it plays")
@@ -430,20 +444,30 @@ class SampleGamesSuite:
                     move_delay=settings.move_delay,
                 )
             if isinstance(stockfish, StockfishBackedPlayer):
-                lines.match(
-                    ["model", f"Stockfish {stockfish.stockfish.elo}"],
-                    games=settings.stockfish_games,
-                )
-                await play_match(
-                    model,
-                    stockfish,
-                    games=settings.stockfish_games,
-                    openings=self.openings,
-                    on_game=kept("stockfish"),
-                    on_session=watch("stockfish", settings.games),
-                    event=EVENT,
-                    move_delay=settings.move_delay,
-                )
+                elo = stockfish.stockfish.elo
+                lines.match(["model", f"Stockfish {elo}"], games=settings.stockfish_games)
+                keep, follow = kept("stockfish"), watch("stockfish", settings.games)
+
+                # Game by game rather than as a match, so that a game whose engine hangs is
+                # played again against a new one, as a ladder's is.
+                for number in range(1, settings.stockfish_games + 1):
+                    game = await replaying(
+                        lambda number=number: play_game(
+                            model,
+                            stockfish,
+                            number,
+                            openings=self.openings,
+                            on_session=follow,
+                            event=EVENT,
+                            move_delay=settings.move_delay,
+                        ),
+                        close,
+                        start=start,
+                        game=lambda number=number: (
+                            f"sample game {settings.games + number}/{total} against Stockfish {elo}"
+                        ),
+                    )
+                    keep(game)
             result = SampleGamesResult(
                 model=model.model,
                 checkpoint_written=written,
@@ -472,10 +496,7 @@ class SampleGamesSuite:
             if self._live is not None:
                 with suppress(OSError):
                     clear_live_game(self._live)
-            if stockfish is not None:
-                close_players(stockfish)
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(wait_players_closed(stockfish), CLOSE_TIMEOUT)
+            await close()
 
     def _show(
         self,

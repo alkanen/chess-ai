@@ -14,8 +14,11 @@ makes a match with sampling players reproducible: each player draws from its own
 the same order every time.
 """
 
+import asyncio
+import logging
 import math
-from collections.abc import Callable, Iterable, Sequence
+import random
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -23,12 +26,15 @@ from typing import Final
 from uuid import uuid4
 
 import chess
+import chess.engine
 
 from chess_ai.game_session import GameSession, GameState
 from chess_ai.openings import Opening, OpeningSet
-from chess_ai.output import DETAIL, Say
+from chess_ai.output import DETAIL, Say, failure
 from chess_ai.pgn import game_pgn
-from chess_ai.players import Player
+from chess_ai.players import CanPass, Player
+
+LOGGER = logging.getLogger(__name__)
 
 EVENT = "chess-ai match"
 """The ``Event`` every game of a match is recorded under, telling them from single games."""
@@ -40,6 +46,38 @@ _WHITE_SCORES = {"1-0": 1.0, "1/2-1/2": 0.5, "0-1": 0.0}
 
 HEADER_EVERY: Final = 20
 """How many games :class:`GameLines` says between two headers naming who is playing."""
+
+GAME_ATTEMPTS: Final = 3
+"""How many times :func:`replaying` plays a game whose engine hangs or dies before it gives up."""
+
+REPLAY_PAUSES: tuple[float, ...] = (5.0, 20.0)
+"""Seconds :func:`replaying` waits before each try of a game after the first, the last of them
+for any further tries: so that the tries are spread over a machine stalled for memory, rather
+than all falling inside it, as starts that each take their whole time to fail would. A plain
+hung engine costs no more than the first of them."""
+
+REPLAYED: Final = (TimeoutError, chess.engine.EngineTerminatedError, CanPass)
+"""What an engine does to a game that a new engine need not do again: give no move in time, as
+one starved of CPU or memory by a machine that is also training does, or die, as one the kernel
+kills for its memory does. Or fail to start for the machine's sake, which only where it is
+started can be told from a start that fails every time, and is marked :class:`CanPass` there."""
+
+
+def passing(error: BaseException) -> bool:
+    """Whether ``error`` is a failure that can pass (:data:`REPLAYED`), rather than one that
+    would come again every time, such as an engine that is not installed.
+
+    By what it is or what it was raised from, as a game given up on is a :class:`GameFailed`
+    raised from its last failure. Not by an ``OSError`` such as ``ENOMEM`` in what it was raised
+    from: a lock held elsewhere is an ``EAGAIN`` too, and only an engine's start can say that it
+    was the machine that was short (:class:`~chess_ai.players.CanPass`).
+    """
+    seen: BaseException | None = error
+    while seen is not None:
+        if isinstance(seen, REPLAYED):
+            return True
+        seen = seen.__cause__
+    return False
 
 
 @dataclass(frozen=True)
@@ -176,6 +214,85 @@ async def play_game(
         game=state,
         pgn=game_pgn(state, headers=headers),
     )
+
+
+class GameFailed(Exception):
+    """What :func:`replaying` played or started failed every time, for a reason that can pass:
+    a game whose engine hung or died every time it was played, or an engine that could not be
+    started before any game, as the sample games' is.
+
+    Raised from the last failure, which its message names as well.
+    """
+
+
+REPLAY_JITTER: Final = 0.25
+"""How far either way of its length :func:`replaying` moves each pause, at random: games played
+at once that a stall failed together would otherwise all start their new engines together, on a
+machine that may still be short of memory, and fail their tries together too."""
+
+_sleep = asyncio.sleep
+"""How :func:`replaying` pauses, which tests replace to see the pauses without waiting them."""
+
+
+async def replaying[T](
+    play: Callable[[], Awaitable[T]],
+    close: Callable[[], Awaitable[None]],
+    *,
+    start: Callable[[], Awaitable[None]] | None = None,
+    game: Callable[[], str],
+    again: str = "its engine is started again in {seconds} seconds and the game played from the "
+    "start",
+    attempts: int = GAME_ATTEMPTS,
+    pauses: Sequence[float] | None = None,
+) -> T:
+    """``play()``, and if it fails for a reason that can pass (:func:`passing`), such as an
+    engine in it hanging, ``close()`` the engine that failed, pause, ``start()`` a new one, and
+    ``play()`` again, up to ``attempts`` times in all.
+
+    For a set of games whose result is the games all together, such as a ladder: one late
+    move would otherwise throw all the rest away. Or for starting the engine they are played
+    against, before any of them. ``play`` plays the same game every time, from
+    the same opening with the same colours, so that the games are the ones they would have
+    been, and may start its engine itself, as a ladder's does, which then needs no ``start``.
+    An engine that does not start in time, as the machine that stalled the last may still be
+    stalled, is a try of the game like any other.
+
+    The engine that failed is closed at once, rather than after the pause: one that hung is
+    still running, and would hold on through the pause to what the pause is to give back. The
+    pauses are ``pauses``, by default :data:`REPLAY_PAUSES`, each moved by up to
+    :data:`REPLAY_JITTER` of itself. ``game`` names what is played, such as ``game 31/900``, for
+    the warning each try is said with, ``again`` says what is done about it with ``{seconds}``
+    for the pause, and both are asked for once there is something to say.
+
+    Raises:
+        GameFailed: it failed every time, the last time for a reason that can pass.
+        Whatever else ``play``, ``close`` and ``start`` raise.
+    """
+    waits = tuple(pauses if pauses is not None else REPLAY_PAUSES) or (0.0,)
+    for attempt in range(1, attempts + 1):
+        try:
+            if attempt > 1 and start is not None:
+                await start()
+            return await play()
+        except Exception as e:
+            if not passing(e):
+                raise
+            await close()
+            what = failure(e)
+            if attempt == attempts:
+                raise GameFailed(f"{game()} failed {attempts} times; the last time: {what}") from e
+            pause = waits[min(attempt - 1, len(waits) - 1)]
+            pause *= random.uniform(1 - REPLAY_JITTER, 1 + REPLAY_JITTER)
+            LOGGER.warning(
+                "%s: %s; %s (try %d of %d)",
+                game(),
+                what,
+                again.format(seconds=f"{pause:.0f}"),
+                attempt + 1,
+                attempts,
+            )
+            await _sleep(pause)
+    raise AssertionError("unreachable")
 
 
 @dataclass(frozen=True)

@@ -1371,7 +1371,7 @@ def test_a_stockfish_that_could_not_be_partnered_is_waited_for(tmp_path, capsys,
     ("failure", "complaint"),
     [
         ("--exit-after", "Stockfish stopped"),
-        ("--hang-after", "Stockfish took more than"),
+        ("--hang-after", "Stockfish 1500 gave no move in 0.2"),
     ],
 )
 def test_a_stockfish_that_fails_mid_match_is_reported_without_a_traceback(
@@ -1727,7 +1727,10 @@ def test_a_ladder_that_fails_before_finishing_a_game_leaves_nothing_behind(tmp_p
 
     assert exited.value.code == 2
     err = capsys.readouterr().err
-    assert "game 1 could not be finished: Stockfish stopped" in err
+    assert (
+        "chess-ai: error: game 1/2 against Stockfish 1350 failed 3 times; the last time: engine "
+        "process died unexpectedly (exit code: 1), so no result was saved\n"
+    ) in err
     assert "games played" not in err
     assert list((tmp_path / "runs/tiny/evaluations/step-000000002").iterdir()) == []
     wait_until_gone(*started(engine))
@@ -1852,10 +1855,8 @@ def test_a_ladder_held_to_nodes_says_how_long_a_hung_stockfish_was_given(
         )
 
     err = capsys.readouterr().err
-    assert (
-        "Stockfish took more than 0.25 seconds to search 1,000 nodes for a move, "
-        "and was taken to have hung" in err
-    )
+    assert "game 1/1 against Stockfish 1350 failed 3 times; the last time: Stockfish 1350" in err
+    assert "with 0.25 allowed for 1,000 nodes, and was taken to have hung" in err
     assert "move time" not in err
     wait_until_gone(*started(engine))
 
@@ -2201,3 +2202,15 @@ def test_a_ladder_whose_run_is_started_again_part_way_does_not_give_it_its_resul
     assert exit_info.value.code == 2
     assert "no result was saved" in capsys.readouterr().err
     assert not (tmp_path / "runs/tiny/evaluations/step-000000002/stockfish-ladder.json").exists()
+
+
+def test_a_level_that_cannot_be_started_says_so_as_the_last_failure_of_a_game():
+    from chess_ai.cli import _LevelNotStarted
+    from chess_ai.stockfish import StockfishError
+
+    error = _LevelNotStarted(1350, StockfishError("'stockfish' did not answer within 10 seconds"))
+
+    assert str(error) == (
+        "Stockfish could not be started for level 1350: 'stockfish' did not answer within "
+        "10 seconds"
+    )

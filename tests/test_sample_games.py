@@ -181,6 +181,96 @@ def test_against_stockfish_the_colours_alternate_and_each_line_is_played_both_wa
     assert "4 games against Stockfish 1350 (scored " in said
 
 
+class HangingStockfish(FakeStockfish):
+    """Times out on its move ``hangs_on``, if it is given one, as an engine that is late does."""
+
+    def __init__(self, hangs_on: int | None) -> None:
+        super().__init__()
+        self.hangs_on = hangs_on
+        self.asked = 0
+
+    async def choose_move(self, context: GameContext) -> PlayerMove:
+        self.asked += 1
+        if self.asked == self.hangs_on:
+            raise TimeoutError
+        return await super().choose_move(context)
+
+
+def unclocked(pgn: str) -> str:
+    """``pgn`` without the dates and times it was played at."""
+    return "".join(line for line in pgn.splitlines(True) if not line.startswith(("[Date", "[Time")))
+
+
+def hanging_games(
+    made: list[HangingStockfish], *, hanging: int, failing: frozenset[int] = frozenset()
+) -> SampleGamesSuite:
+    """A game against itself and two against Stockfish, whose first ``hanging`` engines
+    each time out on their third move, which is in the second game, and whose starts number
+    ``failing`` (from 1) time out."""
+    starts = [0]
+
+    async def start(elo: int, move_time: float) -> HangingStockfish:
+        starts[0] += 1
+        if starts[0] in failing:
+            raise TimeoutError
+        made.append(HangingStockfish(3 if len(made) < hanging else None))
+        return made[-1]
+
+    return SampleGamesSuite(
+        SampleGamesConfig(games=1, stockfish_games=2, rating=1500),
+        OPENINGS,
+        stockfish=start,
+        say=unheard,
+    )
+
+
+def test_a_game_whose_stockfish_hangs_is_played_again_against_a_new_engine(tmp_path, caplog):
+    run = RunReader(model_run(tmp_path / "runs", steps=(2,)))
+    play(hanging_games([], hanging=0), run, 2)
+    clean = read_games(run, 2)
+    made: list[HangingStockfish] = []
+
+    play(hanging_games(made, hanging=1), run, 2)
+
+    assert unclocked(read_games(run, 2)) == unclocked(clean), "the game played again as it was"
+    assert len(read_sample_games(run, 2).games) == 3
+    assert len(made) == 2 and all(stockfish.closed for stockfish in made)
+    assert (
+        "sample game 2/3 against Stockfish 1350: TimeoutError; its engine is started again in "
+        "0 seconds and the game played from the start (try 2 of 3)"
+    ) in caplog.text
+
+
+def test_an_engine_that_does_not_start_in_time_in_place_of_one_that_hung_is_tried_again(
+    tmp_path,
+):
+    run = RunReader(model_run(tmp_path / "runs", steps=(2,)))
+    play(hanging_games([], hanging=0), run, 2)
+    clean = read_games(run, 2)
+    made: list[HangingStockfish] = []
+
+    play(hanging_games(made, hanging=1, failing=frozenset({2})), run, 2)
+
+    assert unclocked(read_games(run, 2)) == unclocked(clean)
+    assert len(made) == 2 and all(stockfish.closed for stockfish in made)
+
+
+def test_a_game_whose_stockfish_hangs_every_time_fails_the_games_naming_the_failure(tmp_path):
+    from chess_ai.match import GameFailed
+
+    run = RunReader(model_run(tmp_path / "runs", steps=(2,)))
+    made: list[HangingStockfish] = []
+
+    with pytest.raises(GameFailed) as failed:
+        play(hanging_games(made, hanging=100), run, 2)
+
+    assert str(failed.value) == (
+        "sample game 2/3 against Stockfish 1350 failed 3 times; the last time: TimeoutError"
+    )
+    assert read_sample_games(run, 2) is None
+    assert len(made) == 3 and all(stockfish.closed for stockfish in made)
+
+
 def test_the_saved_games_replay_to_the_positions_they_ended_in(tmp_path):
     run = RunReader(model_run(tmp_path / "runs", steps=(2,)))
 
@@ -249,6 +339,31 @@ def test_a_diverged_checkpoint_plays_no_games(tmp_path):
     assert read_sample_games(run, 2) is None
     # Found out before anything was written.
     assert not run.evaluation_directory(2).exists()
+
+
+def test_stockfish_that_does_not_start_in_time_before_the_games_is_started_again(tmp_path):
+    run = RunReader(model_run(tmp_path / "runs", steps=(2,)))
+    starts = 0
+
+    async def slow_at_first(elo: int, move_time: float) -> FakeStockfish:
+        nonlocal starts
+        starts += 1
+        if starts == 1:
+            raise TimeoutError
+        return FakeStockfish()
+
+    chosen = SampleGamesSuite(
+        SampleGamesConfig(games=1, stockfish_games=2), OPENINGS, stockfish=slow_at_first
+    )
+
+    play(chosen, run, 2)
+
+    assert starts == 2
+    assert [game.opponent for game in read_sample_games(run, 2).games] == [
+        "self",
+        "stockfish",
+        "stockfish",
+    ]
 
 
 def test_stockfish_that_will_not_start_costs_no_games_and_leaves_nothing_behind(tmp_path):

@@ -6,6 +6,7 @@ is what the adapter asks of an engine and what it makes of the answers. The ones
 """
 
 import asyncio
+import time
 
 import chess
 import chess.engine
@@ -26,6 +27,7 @@ from chess_ai.players import GameContext, RandomPlayer
 from chess_ai.stockfish import (
     StockfishError,
     StockfishPlayer,
+    StockfishTimeout,
     describe_stockfish,
     start_stockfish,
 )
@@ -156,10 +158,295 @@ async def test_a_program_that_does_not_speak_uci_is_given_up_on_and_not_left_run
     monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
     engine = fake_engine(tmp_path / "engine", "--mute")
 
-    with pytest.raises(StockfishError, match="did not answer as a UCI engine"):
+    with pytest.raises(StockfishError) as silent:
         await start_stockfish(str(engine), elo=1500)
 
+    # Never having answered, it is taken not to be a UCI engine at all, rather than one that is
+    # slow to start, and is not tried again.
+    assert str(silent.value) == (
+        f"{str(engine)!r} did not answer as a UCI engine within 0.5 seconds; is it Stockfish?"
+    )
+    assert silent.value.__cause__ is None
     wait_until_gone(*started(engine))
+
+
+async def test_a_start_that_times_out_is_one_that_can_pass_only_if_it_has_answered_before(
+    tmp_path, monkeypatch
+):
+    from chess_ai.match import passing
+
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    silenced = tmp_path / "silenced"
+    engine = fake_engine(tmp_path / "engine", "--mute-if", str(silenced))
+    other = fake_engine(tmp_path / "other", "--mute")
+
+    with pytest.raises(StockfishError) as never:
+        await start_stockfish(str(other), elo=1500)
+    await stop(await start_stockfish(str(engine), elo=1500))
+    silenced.touch()
+    with pytest.raises(StockfishError) as stalled:
+        await start_stockfish(str(engine), elo=1500)
+
+    # A command that has never answered is a wrong path, and would not answer next time either.
+    assert not passing(never.value)
+    assert str(never.value).endswith("is it Stockfish?")
+    # One that has is a machine too busy for it to start, which passes.
+    assert passing(stalled.value)
+    assert "has answered before" in str(stalled.value)
+    wait_until_gone(*started(engine), *started(other))
+
+
+async def test_an_engine_that_does_not_start_in_time_has_exited_and_been_reaped_by_then(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    engine = fake_engine(tmp_path / "engine", "--mute")
+
+    with pytest.raises(StockfishError):
+        await start_stockfish(str(engine), elo=1500)
+
+    [pid] = started(engine)
+    assert not Path(f"/proc/{pid}").exists(), "not left for nobody to reap"
+
+
+async def test_a_command_that_dies_before_it_has_ever_answered_cannot_pass(tmp_path):
+    from chess_ai.match import passing
+
+    crashing = tmp_path / "crashing"
+    crashing.write_text("#!/bin/sh\necho 'Illegal instruction' >&2\nexit 132\n")
+    crashing.chmod(0o755)
+
+    with pytest.raises(StockfishError) as died:
+        await start_stockfish(str(crashing), elo=1500)
+
+    assert "could not be started as a UCI engine" in str(died.value)
+    assert not passing(died.value), "a wrong [stockfish] path, as a silent one is"
+
+
+async def test_a_start_this_process_was_stopped_through_most_of_can_pass(tmp_path, monkeypatch):
+    from chess_ai.match import passing
+
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    monkeypatch.setattr(stockfish_module, "STALL_TICK", 0.05)
+    # Never answers, and has never answered: only the stall tells it from a wrong path.
+    engine = fake_engine(tmp_path / "engine", "--mute")
+
+    starting = asyncio.create_task(start_stockfish(str(engine), elo=1500))
+    await asyncio.sleep(0.05)
+    time.sleep(1.5)  # As the whole machine stopped, waiting for memory.
+    with pytest.raises(StockfishError) as stalled:
+        await starting
+
+    assert passing(stalled.value)
+    assert "with this process stopped" in str(stalled.value)
+    wait_until_gone(*started(engine))
+
+
+async def test_a_stop_that_comes_while_a_late_move_is_given_up_on_is_not_lost():
+    from chess_ai.players import StockfishDescription
+
+    player = object.__new__(StockfishPlayer)
+    player._timeout = 0.05
+    player._description = StockfishDescription(
+        elo=1500, requested_elo=1500, min_elo=1350, max_elo=2850, move_time=0.01
+    )
+    letting_go = asyncio.Event()
+
+    async def slow_to_let_go():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            # As python-chess telling the engine to stop: a moment before it is gone.
+            letting_go.set()
+            await asyncio.shield(asyncio.sleep(0.2))
+            raise
+
+    asking = asyncio.create_task(player._answer(slow_to_let_go()))
+    await letting_go.wait()
+    asking.cancel()  # The evaluator told to stop, as the move was being given up on.
+
+    with pytest.raises(asyncio.CancelledError):
+        await asking
+
+
+async def test_a_first_start_that_says_what_it_is_and_then_crashes_cannot_pass(tmp_path):
+    from chess_ai.match import passing
+
+    # As a Stockfish built for another CPU: its banner comes first, then the instruction it
+    # cannot run.
+    crashing = tmp_path / "crashing"
+    crashing.write_text(
+        "#!/bin/sh\necho 'Stockfish 17 by the Stockfish developers'\nkill -ILL $$\n"
+    )
+    crashing.chmod(0o755)
+
+    with pytest.raises(StockfishError) as died:
+        await start_stockfish(str(crashing), elo=1500)
+
+    assert not passing(died.value), "what it died of is its own"
+
+
+async def test_a_first_start_that_greets_as_another_kind_of_engine_cannot_pass(
+    tmp_path, monkeypatch
+):
+    from chess_ai.match import passing
+
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    # As an xboard engine, which says hello and then waits to be spoken to in its own way.
+    xboard = tmp_path / "xboard"
+    xboard.write_text("#!/bin/sh\necho 'GNU Chess 6.2.9'\nexec sleep 30\n")
+    xboard.chmod(0o755)
+
+    with pytest.raises(StockfishError) as silent:
+        await start_stockfish(str(xboard), elo=1500)
+
+    assert not passing(silent.value)
+    assert str(silent.value).endswith("is it Stockfish? It said 'GNU Chess 6.2.9'")
+
+
+async def test_a_first_start_of_a_stockfish_by_another_name_that_is_slow_can_pass(
+    tmp_path, monkeypatch
+):
+    from chess_ai.match import passing
+
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    fairy = tmp_path / "fairy"
+    fairy.write_text("#!/bin/sh\necho 'Fairy-Stockfish 14 LB by Fabian Fichter'\nexec sleep 30\n")
+    fairy.chmod(0o755)
+
+    with pytest.raises(StockfishError) as slow:
+        await start_stockfish(str(fairy), elo=1500)
+
+    assert passing(slow.value)
+
+
+async def test_what_a_program_that_did_not_start_said_first_is_cut_short_in_the_message(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    chatty = tmp_path / "chatty"
+    chatty.write_text(f"#!/bin/sh\necho '{'x' * 300}'\nexec sleep 30\n")
+    chatty.chmod(0o755)
+
+    with pytest.raises(StockfishError) as silent:
+        await start_stockfish(str(chatty), elo=1500)
+
+    said = str(silent.value).split("It said ", 1)[1]
+    assert said == repr("x" * 80 + "…")
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "Waiting for Stockfish lock...",
+        "Stockfish not found, downloading...",
+        "Stockfish 17: waiting for lock...",
+    ],
+)
+async def test_a_first_start_of_a_script_that_only_mentions_stockfish_cannot_pass(
+    tmp_path, monkeypatch, said
+):
+    from chess_ai.match import passing
+
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    wrapper = tmp_path / "wrapper"
+    wrapper.write_text(f"#!/bin/sh\necho '{said}'\nexec sleep 30\n")
+    wrapper.chmod(0o755)
+
+    with pytest.raises(StockfishError) as silent:
+        await start_stockfish(str(wrapper), elo=1500)
+
+    assert not passing(silent.value), "not Stockfish saying what it is"
+
+
+async def test_a_first_start_the_kernel_kills_can_pass(tmp_path):
+    from chess_ai.match import passing
+
+    # As the OOM killer does to an engine starting on a machine short of memory.
+    killed = tmp_path / "killed"
+    killed.write_text("#!/bin/sh\nkill -KILL $$\n")
+    killed.chmod(0o755)
+
+    with pytest.raises(StockfishError) as died:
+        await start_stockfish(str(killed), elo=1500)
+
+    assert passing(died.value), "a broken binary dies otherwise, as with SIGILL"
+
+
+async def test_a_first_start_that_said_anything_before_it_timed_out_can_pass(tmp_path, monkeypatch):
+    from chess_ai.match import passing
+
+    monkeypatch.setattr(stockfish_module, "START_TIMEOUT", 0.5)
+    # Started, said what it is, and then too slow to answer: an engine on a loaded machine.
+    engine = fake_engine(tmp_path / "engine", "--banner", "--mute")
+
+    with pytest.raises(StockfishError) as slow:
+        await start_stockfish(str(engine), elo=1500)
+
+    assert passing(slow.value)
+    assert "though it said what it is" in str(slow.value)
+    wait_until_gone(*started(engine))
+
+
+async def test_an_engine_that_fails_with_an_os_error_after_starting_is_stopped_and_reaped(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    engine = fake_engine(tmp_path / "engine")
+
+    async def broken_pipe(self):
+        await asyncio.sleep(0.3)  # Started, as far as its wrapper saying which process it is.
+        raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr(chess.engine.UciProtocol, "initialize", broken_pipe)
+
+    from chess_ai.match import passing
+
+    with pytest.raises(StockfishError) as broken:
+        await start_stockfish(str(engine), elo=1500)
+
+    [pid] = started(engine)
+    assert not Path(f"/proc/{pid}").exists(), "stopped, and not left for nobody to reap"
+    # Killed by this code once it failed, and not taken for the kernel's doing.
+    assert not passing(broken.value)
+    assert "killed" not in str(broken.value)
+
+
+async def test_giving_up_on_a_wait_is_not_held_up_by_what_does_not_let_go(monkeypatch):
+    monkeypatch.setattr(stockfish_module, "CLOSE_TIMEOUT", 0.2)
+
+    async def does_not_let_go():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            # As asyncio waiting for a killed child on a stalled machine.
+            await asyncio.shield(asyncio.sleep(5))
+            raise
+
+    began = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await stockfish_module._within(does_not_let_go(), 0.05)
+
+    assert time.monotonic() - began < 2
+
+
+async def test_a_start_the_machine_has_no_memory_for_is_one_that_can_pass(monkeypatch):
+    import errno
+
+    from chess_ai.match import passing
+
+    async def refused(*args, **kwargs):
+        raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+    monkeypatch.setattr(chess.engine.UciProtocol, "popen", refused)
+
+    with pytest.raises(StockfishError) as short:
+        await start_stockfish("stockfish", elo=1500)
+
+    assert passing(short.value)
 
 
 async def test_closing_stops_the_engine_even_in_the_middle_of_a_move(engine):
@@ -177,6 +464,70 @@ async def test_closing_stops_the_engine_even_in_the_middle_of_a_move(engine):
     assert not running(pid)
     with pytest.raises(chess.engine.EngineTerminatedError):
         await move
+
+
+async def test_a_move_that_takes_too_long_says_which_level_it_was_and_how_long_it_had(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(stockfish_module, "MOVE_GRACE", 0.2)
+    engine = fake_engine(tmp_path / "engine", "--hang-after", "0")
+    player = await start_stockfish(str(engine), elo=1700, nodes=1000)
+    try:
+        with pytest.raises(StockfishTimeout) as timed_out:
+            await player.choose_move(GameContext(chess.Board()))
+    finally:
+        await stop(player)
+
+    assert isinstance(timed_out.value, TimeoutError)
+    message = str(timed_out.value)
+    assert message.startswith("Stockfish 1700 gave no move in 0.")
+    assert message.endswith(
+        "seconds, with 0.25 allowed for 1,000 nodes, and was taken to have hung"
+    )
+    assert 0.25 <= timed_out.value.waited < 1.0
+
+
+async def stalled(player: StockfishPlayer, seconds: float) -> "asyncio.Task":
+    """Ask ``player`` for a move, and then stop the event loop for ``seconds`` once it has been
+    asked, as a machine stopped waiting for memory stops the whole process."""
+    move = asyncio.create_task(player.choose_move(GameContext(chess.Board())))
+    await asyncio.sleep(0.05)
+    time.sleep(seconds)
+    return move
+
+
+async def test_the_time_this_process_was_stopped_is_not_counted_against_the_engine(
+    engine, monkeypatch
+):
+    monkeypatch.setattr(stockfish_module, "MOVE_GRACE", 0.2)
+    monkeypatch.setattr(stockfish_module, "STALL_TICK", 0.05)
+    player = await start_stockfish(str(engine), elo=1700, move_time=0.05)
+    try:
+        # The engine answers within its 0.25 seconds, while this process is stopped for a second.
+        move = await (await stalled(player, 1.0))
+    finally:
+        await stop(player)
+
+    assert chess.Board().is_legal(move.move)
+
+
+async def test_an_engine_that_hangs_through_a_stall_says_how_long_the_process_was_stopped(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(stockfish_module, "MOVE_GRACE", 0.2)
+    monkeypatch.setattr(stockfish_module, "STALL_TICK", 0.05)
+    engine = fake_engine(tmp_path / "engine", "--hang-after", "0")
+    player = await start_stockfish(str(engine), elo=1700, move_time=0.05)
+    try:
+        with pytest.raises(StockfishTimeout) as timed_out:
+            await (await stalled(player, 1.0))
+    finally:
+        await stop(player)
+
+    assert timed_out.value.waited >= 1.0
+    assert timed_out.value.stalled >= 0.8
+    assert "of them with this process stopped" in str(timed_out.value)
+    assert "for a move time of 0.05 seconds" in str(timed_out.value)
 
 
 async def test_the_engine_says_what_it_is_and_which_strengths_it_plays(tmp_path):

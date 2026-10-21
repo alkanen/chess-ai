@@ -133,6 +133,12 @@ def say(text: str, *, kind: Kind = MILESTONE, err: bool = False) -> None:
         write(sys.stderr if err else sys.stdout, text)
 
 
+def failure(error: BaseException) -> str:
+    """What ``error`` says went wrong, or what it is when it says nothing, such as the
+    ``TimeoutError`` of a wait given up on: a warning that ends ``failed: `` says nothing."""
+    return str(error) or type(error).__name__
+
+
 def write(stream: TextIO, text: str) -> None:
     """Write ``text`` on ``stream``, every line of it stamped if lines there are, and flush it.
 

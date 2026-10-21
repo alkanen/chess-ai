@@ -10,11 +10,16 @@ file given by ``--log``, so a test can see which strength it was asked for.
 ``--mute`` never answers at all, as a binary that is not a UCI engine would not.
 ``--exit-after N`` plays N moves and exits when asked for another, as an engine that crashes or
 is killed would, and ``--hang-after N`` plays N moves and then never answers again.
+``--hang-once FILE`` with it hangs only if ``FILE`` is not there yet, and makes it, so that of
+the engines started one after another only the first hangs. ``--mute-if FILE`` is ``--mute``
+while ``FILE`` is there, for an engine that answers once and then, started again, does not.
+``--banner`` says what it is as it starts, before it is asked anything, as Stockfish does.
 """
 
 import argparse
 import sys
 import threading
+from pathlib import Path
 
 import chess
 
@@ -25,9 +30,14 @@ def main() -> None:
     parser.add_argument("--elo-range", nargs=2, type=int, default=[1320, 3190])
     parser.add_argument("--no-elo", action="store_true")
     parser.add_argument("--mute", action="store_true")
+    parser.add_argument("--mute-if", type=Path)
+    parser.add_argument("--banner", action="store_true")
     parser.add_argument("--exit-after", type=int)
     parser.add_argument("--hang-after", type=int)
+    parser.add_argument("--hang-once", type=Path)
     args = parser.parse_args()
+    if args.mute_if is not None and args.mute_if.exists():
+        args.mute = True
     moves = 0
     log = open(args.log, "a", buffering=1) if args.log else None  # noqa: SIM115
     board = chess.Board()
@@ -36,6 +46,9 @@ def main() -> None:
 
     def say(line: str) -> None:
         print(line, flush=True)
+
+    if args.banner:
+        say("Stockfish 0 by the tests")
 
     def think(position: chess.Board, seconds: float) -> None:
         stop.wait(seconds)
@@ -63,7 +76,7 @@ def main() -> None:
             moves += 1
             if args.exit_after is not None and moves > args.exit_after:
                 sys.exit(1)
-            if args.hang_after is not None and moves > args.hang_after:
+            if args.hang_after is not None and moves > args.hang_after and _hangs(args.hang_once):
                 continue
             seconds = int(words[words.index("movetime") + 1]) / 1000 if "movetime" in words else 0
             stop.clear()
@@ -75,6 +88,16 @@ def main() -> None:
                 thinking.join()
         elif command == "quit":
             break
+
+
+def _hangs(once: Path | None) -> bool:
+    if once is None:
+        return True
+    try:
+        once.touch(exist_ok=False)
+    except FileExistsError:
+        return False
+    return True
 
 
 def _position(words: list[str]) -> chess.Board:

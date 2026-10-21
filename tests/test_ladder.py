@@ -6,6 +6,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import chess
+import chess.engine
 import chess.pgn
 import pytest
 import torch
@@ -34,7 +35,7 @@ from chess_ai.ladder import (
     start_games_file,
 )
 from chess_ai.ladder import stands as ladder_stands
-from chess_ai.match import append_game
+from chess_ai.match import GameFailed, append_game
 from chess_ai.openings import Opening, OpeningSet
 from chess_ai.players import GameContext, ModelDescription, PlayerMove, StockfishDescription
 from chess_ai.probes import DivergedError
@@ -367,6 +368,203 @@ async def test_a_game_that_fails_stops_the_games_played_with_it_and_closes_every
 
     assert made and all(stockfish.closed for stockfish in made)
     assert engines.now == 0
+
+
+def unclocked(pgn: str) -> str:
+    """``pgn`` without the date and time it was played at."""
+    return "".join(line for line in pgn.splitlines(True) if not line.startswith(("[Date", "[Time")))
+
+
+class HangingStockfish(FakeStockfish):
+    """A level that fails, as an engine that hangs or dies does, on its move ``fails_on``."""
+
+    def __init__(self, elo: int, outcome: str, *, fails_on: int | None, error: Exception) -> None:
+        super().__init__(elo, outcome)
+        self.fails_on = fails_on
+        self.error = error
+        self.asked = 0
+
+    async def choose_move(self, context: GameContext) -> PlayerMove:
+        self.asked += 1
+        if self.asked == self.fails_on:
+            raise self.error
+        return await super().choose_move(context)
+
+
+class HangingOpponents(Opponents):
+    """:class:`Opponents` whose first ``hanging`` engines fail on their move ``fails_on``."""
+
+    def __init__(
+        self, model: object, *, hanging: int, fails_on: int = 3, error: Exception | None = None
+    ) -> None:
+        super().__init__(model, strong_from=1500)
+        self.hanging = hanging
+        self.fails_on = fails_on
+        self.error = error if error is not None else TimeoutError()
+
+    async def __call__(self, elo: int) -> FakeStockfish:
+        strong = elo >= self.strong_from
+        if isinstance(self.model, MatingPlayer):
+            self.model.moves = MATES["loses" if strong else "wins"]
+        fails = len(self.made) < self.hanging
+        self.made.append(
+            HangingStockfish(
+                elo,
+                "wins" if strong else "loses",
+                fails_on=self.fails_on if fails else None,
+                error=self.error,
+            )
+        )
+        return self.made[-1]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError(), chess.engine.EngineTerminatedError("engine process died unexpectedly")],
+    ids=["hangs", "dies"],
+)
+@pytest.mark.parametrize("parallel", [1, 2])
+async def test_a_game_whose_stockfish_hangs_is_played_again_against_a_new_engine(
+    parallel, error, caplog
+):
+    def ladder(opponents):
+        return play_ladder(
+            opponents.model,
+            [1350, 1400],
+            games=2,
+            openings=FROM_THE_START,
+            opponent=opponents,
+            parallel=parallel,
+        )
+
+    clean = await ladder(Opponents(MatingModel("model", "wins"), strong_from=1500))
+    # The first engine fails on its third move, its last before it is mated in its first game.
+    opponents = HangingOpponents(MatingModel("model", "wins"), hanging=1, error=error)
+
+    played = await ladder(opponents)
+
+    assert [[unclocked(game.pgn) for game in level.games] for level in played] == [
+        [unclocked(game.pgn) for game in level.games] for level in clean
+    ], "every game, and the one played again as it would have been"
+    levels_made = [stockfish.stockfish.elo for stockfish in opponents.made]
+    assert levels_made.count(1350) == parallel + 1, "a new engine for the game played again"
+    assert all(stockfish.closed for stockfish in opponents.made)
+    assert "against Stockfish 1350" in caplog.text
+    assert (
+        "its engine is started again in 0 seconds and the game played from the start (try 2 of 3)"
+        in caplog.text
+    )
+
+
+class SlowToStart(HangingOpponents):
+    """:class:`HangingOpponents` whose starts number ``failing`` (from 1) fail with ``error``,
+    as an engine started while the machine is still stalled does."""
+
+    def __init__(self, model: object, *, hanging: int, failing: set[int], error: Exception):
+        super().__init__(model, hanging=hanging)
+        self.failing = failing
+        self.start_error = error
+        self.starts = 0
+
+    async def __call__(self, elo: int) -> FakeStockfish:
+        self.starts += 1
+        if self.starts in self.failing:
+            raise self.start_error
+        return await super().__call__(elo)
+
+
+def stockfish_not_starting() -> Exception:
+    """What :func:`~chess_ai.stockfish.start_stockfish` raises for an engine that took longer
+    than it had to start."""
+    from chess_ai.stockfish import StockfishError
+
+    try:
+        raise StockfishError("'stockfish' did not answer as a UCI engine within 10 seconds") from (
+            TimeoutError()
+        )
+    except StockfishError as e:
+        return e
+
+
+@pytest.mark.parametrize(
+    "failing",
+    # The start that replaces the engine that hung, and the first of the second level.
+    [{2}, {3}],
+    ids=["restart", "next level"],
+)
+@pytest.mark.parametrize("error", [TimeoutError, stockfish_not_starting], ids=["plain", "wrapped"])
+async def test_an_engine_that_does_not_start_in_time_counts_as_a_try_of_the_game(failing, error):
+    def ladder(opponents):
+        return play_ladder(
+            opponents.model, [1350, 1400], games=2, openings=FROM_THE_START, opponent=opponents
+        )
+
+    clean = await ladder(Opponents(MatingModel("model", "wins"), strong_from=1500))
+    opponents = SlowToStart(MatingModel("model", "wins"), hanging=1, failing=failing, error=error())
+
+    played = await ladder(opponents)
+
+    assert [[unclocked(game.pgn) for game in level.games] for level in played] == [
+        [unclocked(game.pgn) for game in level.games] for level in clean
+    ]
+    assert all(stockfish.closed for stockfish in opponents.made)
+
+
+async def test_an_engine_that_cannot_be_started_at_all_fails_the_ladder_at_once():
+    from chess_ai.stockfish import StockfishError
+
+    opponents = SlowToStart(
+        MatingModel("model", "wins"),
+        hanging=0,
+        failing={1},
+        error=StockfishError("Stockfish was not found at 'stockfish'"),
+    )
+
+    with pytest.raises(StockfishError, match="not found"):
+        await play_ladder(
+            opponents.model, [1350], games=2, openings=FROM_THE_START, opponent=opponents
+        )
+
+    assert opponents.starts == 1, "not tried again"
+
+
+async def test_a_game_played_again_is_named_by_the_level_stockfish_plays_at(caplog):
+    made: list[HangingStockfish] = []
+
+    async def opponent(elo: int) -> HangingStockfish:
+        # Asked for 1000, below Stockfish's range, and played at 1350.
+        made.append(
+            HangingStockfish(1350, "loses", fails_on=3 if not made else None, error=TimeoutError())
+        )
+        made[-1].stockfish = made[-1].stockfish.model_copy(update={"requested_elo": elo})
+        return made[-1]
+
+    await play_ladder(
+        MatingModel("model", "wins"), [1000], games=1, openings=FROM_THE_START, opponent=opponent
+    )
+
+    assert "game 1/1 against Stockfish 1350: TimeoutError" in caplog.text
+    assert "Stockfish 1000" not in caplog.text
+
+
+async def test_a_game_whose_stockfish_hangs_every_time_fails_the_ladder_naming_the_failure():
+    opponents = HangingOpponents(MatingModel("model", "wins"), hanging=100)
+
+    with pytest.raises(GameFailed) as failed:
+        await play_ladder(
+            opponents.model,
+            [1350, 1500],
+            games=2,
+            openings=FROM_THE_START,
+            opponent=opponents,
+        )
+
+    assert str(failed.value) == (
+        "game 1/4 against Stockfish 1350 failed 3 times; the last time: TimeoutError"
+    )
+    assert isinstance(failed.value.__cause__, TimeoutError)
+    assert len(opponents.made) == 3
+    assert all(stockfish.closed for stockfish in opponents.made)
 
 
 async def test_a_ladder_cancelled_while_games_are_played_at_once_closes_every_engine():
@@ -1056,10 +1254,12 @@ def test_evaluate_says_how_long_a_hung_stockfish_held_to_nodes_was_given(
 
     err = capsys.readouterr().err
     assert (
-        f"tiny@4 {SUITE}: Stockfish took more than 0.25 seconds to search 1,000 nodes for a move"
-        in err
-    )
+        f"tiny@4 {SUITE}: game 1/1 against Stockfish 1350 failed 3 times; the last time: "
+        "Stockfish 1350 gave no move in "
+    ) in err
+    assert "with 0.25 allowed for 1,000 nodes, and was taken to have hung" in err
     assert "move time" not in err
+    assert len(started(engine)) == 3, "started again for each of the game's three tries"
     wait_until_gone(*started(engine))
 
 
@@ -1138,7 +1338,12 @@ def test_a_checkpoint_pruned_before_the_ladder_loads_it_is_passed_over(tmp_path)
     assert read_ladder(run, 4) is None
 
 
-@pytest.mark.parametrize("fails", [False, True])
+class TimingOut(LevelStockfish):
+    async def choose_move(self, context: GameContext) -> PlayerMove:
+        raise TimeoutError
+
+
+@pytest.mark.parametrize("fails", [None, "to start", "every game"])
 def test_the_suite_lets_go_of_what_it_loaded_before_releasing_it(tmp_path, fails):
     import gc
     import weakref
@@ -1158,16 +1363,17 @@ def test_the_suite_lets_go_of_what_it_loaded_before_releasing_it(tmp_path, fails
         held.append(loaded[0]() is not None)
 
     async def start(elo: int, move_time: float, nodes: int | None) -> LevelStockfish:
-        if fails:
+        if fails == "to start":
             raise RuntimeError("no engine")
-        return LevelStockfish(elo)
+        # A game given up on is raised from its last failure, whose frames hold the model too.
+        return TimingOut(elo) if fails == "every game" else LevelStockfish(elo)
 
     suite = LadderSuite(SETTINGS, FROM_THE_START, stockfish=start, load=load, release=release)
     written = run.checkpoint_written(checkpoint)
     engine = load_engine(run.checkpoint_path(checkpoint))
 
-    if fails:
-        with pytest.raises(RuntimeError):
+    if fails is not None:
+        with pytest.raises(RuntimeError if fails == "to start" else GameFailed):
             suite.evaluate(run, checkpoint, written, engine)
     else:
         suite.evaluate(run, checkpoint, written, engine)
@@ -1262,3 +1468,112 @@ def test_a_later_job_without_the_ladder_still_lets_go_of_a_laddered_checkpoint(t
     assert worker.evaluate(job)
 
     assert [checkpoint.step for checkpoint in run.checkpoints()] == [2, 6]
+
+
+def test_a_ladder_whose_stockfish_hangs_once_saves_its_whole_result(tmp_path, monkeypatch):
+    from stockfish_helpers import fake_engine, started, wait_until_gone
+
+    from chess_ai import stockfish
+    from chess_ai.cli import main
+
+    monkeypatch.setattr(stockfish, "MOVE_GRACE", 0.2)
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(4,))
+    once = tmp_path / "hung"
+    engine = fake_engine(tmp_path / "engine", "--hang-after", "3", "--hang-once", str(once))
+    (tmp_path / "chess-ai.toml").write_text(
+        f'[paths]\nruns = "{runs}"\n[stockfish]\npath = "{engine}"\n'
+        "[ladder]\nlevels = [1350, 1500]\ngames_per_level = 2\nnodes = 1000\nevery = 4\n"
+        'device = "cpu"\n'
+    )
+
+    assert (
+        main(["--config", str(tmp_path / "chess-ai.toml"), "evaluate", "tiny@4", "--suite", SUITE])
+        == 0
+    )
+
+    assert once.exists(), "it hung"
+    result = read_ladder(open_run(runs, "tiny"), 4)
+    assert result is not None
+    assert [level.games for level in result.levels] == [2, 2]
+    assert len(result.games) == 4
+    pgn = read_games(open_run(runs, "tiny"), 4)
+    assert pgn is not None and pgn.count("[Event ") == 4
+    assert len(started(engine)) == 3, "a level each, and one for the game played again"
+    wait_until_gone(*started(engine))
+
+
+class TimesOut:
+    """Starts a level's Stockfish, except that the starts numbered ``failing`` (from 1) time
+    out, as in a ladder a stalled machine fails."""
+
+    def __init__(self, failing: set[int]) -> None:
+        self.failing = failing
+        self.starts = 0
+
+    async def __call__(self, elo: int, move_time: float, nodes: int | None) -> LevelStockfish:
+        self.starts += 1
+        if self.starts in self.failing:
+            raise TimeoutError
+        return LevelStockfish(elo)
+
+
+def test_a_ladder_that_failed_for_a_reason_that_can_pass_is_played_again_later(tmp_path):
+    from chess_ai.evaluator import RETRY_SECONDS
+
+    runs = tmp_path / "runs"
+    model_run(runs, steps=(2, 4, 6), config={"evaluation": {"suites": [SUITE]}})
+    run = open_run(runs, "tiny")
+    index = run.directory / "checkpoints" / "index.json"
+    written = json.loads(index.read_text())
+    written["policy"]["keep"] = 1
+    index.write_text(json.dumps(written))
+    # Every try of 4's first game: 6, the last of a finished run, is laddered first, at two
+    # levels, and a game is tried three times.
+    suite = LadderSuite(SETTINGS, FROM_THE_START, stockfish=TimesOut({3, 4, 5}), say=unheard)
+    warned: list[str] = []
+    now = [1000.0]
+    worker = Evaluator(
+        runs, {SUITE: suite}, load=load_engine, warn=warned.append, clock=lambda: now[0]
+    )
+
+    assert [job.checkpoint.step for job in worker.run_once()] == [6, 4]
+
+    assert warned == [
+        f"tiny@4 {SUITE} failed: game 1/4 against Stockfish 1350 failed 3 times; the last time: "
+        "TimeoutError; it is tried again in 10 minutes (try 2 of 3)"
+    ]
+    assert worker.pending() == [], "not yet"
+    assert awaiting_ladder(run, every=4)(checkpoint_of(run, 4)), "held meanwhile"
+    assert [checkpoint.step for checkpoint in run.checkpoints()] == [2, 4, 6], "and not pruned"
+
+    now[0] += RETRY_SECONDS
+    assert [job.checkpoint.step for job in worker.run_once()] == [4]
+
+    assert read_ladder(run, 4) is not None
+    assert len(warned) == 1
+    assert [checkpoint.step for checkpoint in run.checkpoints()] == [2, 6], "let go once played"
+
+
+def test_clearing_a_failure_s_frames_follows_cause_and_context_and_ends_on_a_cycle():
+    import threading
+
+    from chess_ai.ladder import clear_failure_frames
+
+    def raised(message: str, **locals_) -> Exception:
+        try:
+            raise RuntimeError(message)
+        except RuntimeError as e:
+            return e
+
+    failure, cause, context = raised("failure"), raised("cause"), raised("context", held=[1])
+    failure.__cause__, failure.__context__ = cause, context
+    # Made by hand, as `raise a from b` can where b's context is a: Python breaks none of it.
+    cause.__cause__ = failure
+
+    walking = threading.Thread(target=clear_failure_frames, args=(failure,), daemon=True)
+    walking.start()
+    walking.join(5)
+
+    assert not walking.is_alive(), "went round the cycle for ever"
+    assert context.__traceback__.tb_frame.f_locals == {}, "the context's frames as well"
