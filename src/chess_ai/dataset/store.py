@@ -35,7 +35,9 @@ from a split's directory can have come from the other.
 """
 
 import errno
+import functools
 import logging
+import mmap
 import os
 import re
 from collections.abc import Callable, Iterator, Mapping
@@ -602,6 +604,11 @@ class DatasetWriter:
         sync_directory(self.directory)
 
 
+_ADVICE_REFUSED: set[Path] = set()
+"""Streams this process has said it could not advise random reads on; see
+:meth:`_StreamReader._shard`."""
+
+
 class _StreamReader:
     """One stream of records, read out of its shards without loading them."""
 
@@ -713,6 +720,15 @@ class _StreamReader:
                 # The file shrank between being measured and being mapped. numpy raises
                 # ValueError for it rather than OSError, and a traceback is no way to report it.
                 raise DatasetError(f"cannot read dataset shard {path}: {e}") from e
+            try:
+                _read_at_random(mapped)
+            except OSError as e:
+                # Only a hint, and reading goes on without it: said once a stream in each
+                # process, not once a shard nor once a reader. A loader opens one in every
+                # worker, and a worker forked after this process has said it stays quiet.
+                if self._directory not in _ADVICE_REFUSED:
+                    LOGGER.warning("cannot advise random reads on %s: %s", self._directory, e)
+                _ADVICE_REFUSED.add(self._directory)
             self._shards[number] = mapped
         return mapped
 
@@ -728,6 +744,22 @@ class _StreamReader:
         process, while dropping the last reference to it cannot be.
         """
         self._shards.clear()
+
+
+def _read_at_random(mapped: np.memmap) -> None:
+    """Tell the kernel that ``mapped`` is read at random, so that a fault reads only its page.
+
+    By default a page fault on a file mapping reads the pages around it as well, about 128 KB,
+    on the guess that they are next. The trainer reads a position of about 50 bytes from
+    anywhere in the split, and on a dataset larger than RAM that guess had it reading 620 MB/s
+    off the disk, nearly all of it thrown away again: about 48 KB a position. Nothing else
+    reads shards in long runs either; the most is a page of games, or one game's plies.
+    """
+    advice = getattr(mmap, "MADV_RANDOM", None)
+    # numpy keeps the mapping it made as _mmap; without one there is nothing to advise.
+    mapping = getattr(mapped, "_mmap", None)
+    if advice is not None and mapping is not None:
+        mapping.madvise(advice)
 
 
 class SplitReader:
@@ -857,6 +889,19 @@ class SplitReader:
                 stream.close()
 
 
+def _still_the_dataset(directory: Path, manifest: Manifest) -> bool:
+    """Whether the dataset in ``directory`` is still the one ``manifest`` is of, with its version.
+
+    A rebuild under the same name was created at another time, and one that has fewer versions
+    than ``manifest`` has lost the one being read.
+    """
+    try:
+        now = load_manifest(directory)
+    except ManifestError:
+        return False
+    return now.created == manifest.created and now.version >= manifest.version
+
+
 class Dataset:
     """A built dataset at one of its versions: its manifest, and its splits to read records from.
 
@@ -878,22 +923,12 @@ class Dataset:
                 counts.games,
                 counts.positions,
                 counts.targets,
-                still_ours=self._still_ours,
+                # Not a method of this dataset: a reader holding one would keep the dataset,
+                # and with it every shard it maps, until the collector next runs.
+                still_ours=functools.partial(_still_the_dataset, directory, self.manifest),
             )
             for split, counts in self.manifest.splits.items()
         }
-
-    def _still_ours(self) -> bool:
-        """Whether the dataset in this directory is still this one, with this version in it.
-
-        A rebuild under the same name was created at another time, and one that has fewer
-        versions than this reads has lost the one being read.
-        """
-        try:
-            now = load_manifest(self.directory)
-        except ManifestError:
-            return False
-        return now.created == self.manifest.created and now.version >= self.manifest.version
 
     @property
     def splits(self) -> list[str]:

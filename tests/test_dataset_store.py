@@ -1,6 +1,8 @@
 """Sharded storage: that the records come back out the way they went in, in any order."""
 
+import gc
 import json
+import mmap
 import os
 from pathlib import Path
 
@@ -125,6 +127,57 @@ def test_reading_past_the_end_says_so(tmp_path):
         split.game(split.games)
     with pytest.raises(IndexError):
         split.move_sequence(split.games)
+
+
+@pytest.mark.skipif(not Path("/proc/self/smaps").exists(), reason="reads Linux's /proc")
+def test_shards_are_mapped_for_reading_at_random(tmp_path):
+    """So that a page fault reads its own page, not the 128 KB around it: a position is about
+    50 bytes, and read-around had a dataset larger than RAM reading 620 MB/s off the disk."""
+    split = built(tmp_path, shards=TINY_SHARDS)[TRAIN]
+
+    split.positions([0, len(split) - 1])
+    split.game(0)
+    split.move_sequence(0)
+
+    shards = tmp_path / "datasets" / "test" / TRAIN
+    flags = mapping_flags(shards)
+    assert {Path(path).parent.name for path in flags} == {POSITIONS, GAMES, MOVES}
+    assert all("rr" in flag for flag in flags.values()), flags
+
+
+def test_shards_the_kernel_will_not_advise_are_read_all_the_same(tmp_path, monkeypatch, caplog):
+    """The advice is only a hint, and a run is not worth losing over it: said once a stream in
+    each process, not once a shard nor once a reader, and read without it."""
+    split = built(tmp_path, shards=TINY_SHARDS)[TRAIN]
+    monkeypatch.setattr(mmap, "MADV_RANDOM", 12345)  # No advice the kernel knows: EINVAL.
+
+    positions = split.positions(range(len(split)))
+    split.game(0)
+    split.close()  # So that the shards are mapped, and advised, again.
+    split.positions([0])
+    with open_dataset("test", data_dir=tmp_path) as again:  # As validation, or a new loader.
+        again[TRAIN].positions([0])
+
+    assert len(positions) == len(split)
+    said = sorted(record.getMessage() for record in caplog.records if record.levelname == "WARNING")
+    shards = tmp_path / "datasets" / "test" / TRAIN
+    assert said == [
+        f"cannot advise random reads on {shards / stream}: [Errno 22] Invalid argument"
+        for stream in (GAMES, POSITIONS)
+    ]
+
+
+def mapping_flags(directory: Path) -> dict[str, list[str]]:
+    """The kernel's flags for this process's mappings of files under ``directory``."""
+    flags: dict[str, list[str]] = {}
+    mapped = None
+    for line in Path("/proc/self/smaps").read_text().splitlines():
+        fields = line.split()
+        if "-" in fields[0] and not fields[0].endswith(":"):
+            mapped = fields[5] if len(fields) > 5 and fields[5].startswith(str(directory)) else None
+        elif fields[0] == "VmFlags:" and mapped is not None:
+            flags[mapped] = fields[1:]
+    return flags
 
 
 def test_a_games_moves_and_positions_line_up_across_shards(tmp_path):
@@ -323,6 +376,24 @@ def test_a_dataset_gives_back_the_shards_it_mapped(tmp_path):
 
     assert while_open > before, "the shards were mapped at all"
     assert _open_files() == before
+
+
+def test_a_dataset_let_go_without_closing_gives_back_its_shards_at_once(tmp_path):
+    """Not whenever the collector next runs: a web server or a sweep drops datasets unclosed,
+    and nothing in a dataset may refer back to it, or its mapped shards wait for the collector."""
+    built(tmp_path, shards=TINY_SHARDS)
+    gc.disable()
+    try:
+        before = _open_files()
+        dataset = open_dataset("test", data_dir=tmp_path)
+        dataset[TRAIN].positions(range(len(dataset[TRAIN])))
+        assert _open_files() > before, "the shards were mapped at all"
+
+        del dataset
+
+        assert _open_files() == before
+    finally:
+        gc.enable()
 
 
 def _open_files() -> int:

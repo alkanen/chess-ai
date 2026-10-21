@@ -52,9 +52,6 @@ WRITING_SUFFIX: Final = ".writing"
 """What an order is called while it is being written, until it is whole."""
 ORDER_LOCK: Final = "orders.lock"
 """Held by the worker writing an order, so that only one does and the rest wait for it."""
-_FILL_CHUNK: Final = 1 << 24
-"""Positions an order file is numbered in at a time, before it is shuffled, so that numbering
-it never needs an array of the whole split in memory."""
 
 
 class Batch(NamedTuple):
@@ -238,23 +235,22 @@ class PositionBatches(TorchDataset):
         return order
 
     def _write_order(self, path: Path, epoch: int) -> None:
-        """Write ``epoch``'s order to ``path``, whole and on the disk."""
-        size = self.positions * self._dtype().itemsize
+        """Write ``epoch``'s order to ``path``, whole and on the disk.
+
+        Shuffled in this process's memory and written once, which for a moment holds the whole
+        order here: 6.5 GB at 1.6B positions. Shuffling it on the file's mapping instead holds
+        nothing, but dirties pages all over the file in random order, and the kernel writes
+        each one back again and again while the shuffle goes on: 127 GB written for a 6.5 GB
+        order, before the first step.
+        """
+        order = _shuffle(np.arange(self.positions, dtype=self._dtype()), self._seed, epoch)
         with path.open("wb") as file:
-            # Room for all of it first. A mapped file is otherwise sparse, and a page the
-            # disk has no block for kills the process with SIGBUS rather than raising.
+            # Room for all of it first, so that a full disk says so before minutes of writing.
             if hasattr(os, "posix_fallocate"):
-                os.posix_fallocate(file.fileno(), 0, size)
-            else:
-                file.truncate(size)
-        order = np.memmap(path, dtype=self._dtype(), mode="r+", shape=(self.positions,))
-        for start in range(0, self.positions, _FILL_CHUNK):
-            stop = min(start + _FILL_CHUNK, self.positions)
-            order[start:stop] = np.arange(start, stop, dtype=order.dtype)
-        # Shuffled through a plain view of the map: numpy only shuffles a base-class array in
-        # place in C, and swaps a subclass's elements one at a time in Python.
-        _shuffle(np.asarray(order), self._seed, epoch)
-        order.flush()
+                os.posix_fallocate(file.fileno(), 0, order.nbytes)
+            order.tofile(file)
+            file.flush()
+            os.fsync(file.fileno())
 
     def _order_name(self, epoch: int) -> str:
         return f"{self._split}-seed{self._seed}-epoch{epoch}{ORDER_SUFFIX}"
