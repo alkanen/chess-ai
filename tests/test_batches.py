@@ -1,6 +1,7 @@
 """Batches: what order positions are visited in, and that a worker process sees the same one."""
 
 import errno
+import mmap
 import multiprocessing
 import os
 import pickle
@@ -244,6 +245,27 @@ def test_processes_sharing_orders_write_each_once(directory, tmp_path, monkeypat
     assert isinstance(other._order(0), np.memmap), "mapped from the file, not built again"
 
 
+def test_an_order_is_shuffled_in_memory_and_not_on_its_file(directory, tmp_path, monkeypatch):
+    """Shuffling on the mapping dirties pages all over the file, and the kernel writes each one
+    back again and again: 127 GB written for a 6.5 GB order at Lichess scale."""
+    real = batches_module._shuffle
+    on_a_map = []
+
+    def shuffle(order, seed, epoch):
+        base = order
+        while base is not None:
+            on_a_map.append(isinstance(base, mmap.mmap))
+            base = getattr(base, "base", None)
+        return real(order, seed, epoch)
+
+    monkeypatch.setattr(batches_module, "_shuffle", shuffle)
+
+    order = batches(directory).sharing_orders(tmp_path / "orders")._order(0)
+
+    assert on_a_map and not any(on_a_map)
+    assert np.array_equal(order, batches(directory)._order(0))
+
+
 def test_only_the_current_and_the_last_epochs_orders_are_kept(directory, tmp_path):
     """The last one for a worker a batch behind the rest, and nothing older to fill the disk."""
     source = batches(directory).sharing_orders(tmp_path / "orders")
@@ -293,7 +315,7 @@ def test_an_order_removed_as_it_is_mapped_is_written_again(directory, tmp_path, 
 
 
 def test_a_disk_with_no_room_for_an_order_says_so(directory, tmp_path, monkeypatch):
-    """Rather than the writer dying of SIGBUS on the first page there is no block for."""
+    """Before any of it is written, since its room is reserved first, and leaving none of it."""
 
     def full(descriptor, offset, length):
         raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
@@ -311,7 +333,7 @@ def test_a_disk_with_no_room_for_an_order_says_so(directory, tmp_path, monkeypat
 def test_an_order_is_written_where_space_cannot_be_reserved_up_front(
     directory, tmp_path, monkeypatch
 ):
-    """macOS has no posix_fallocate, and the file is sized without it."""
+    """macOS has no posix_fallocate, and the order is written without reserving its room first."""
     monkeypatch.delattr(os, "posix_fallocate", raising=False)
 
     order = batches(directory).sharing_orders(tmp_path / "orders")._order(0)
