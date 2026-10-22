@@ -117,6 +117,9 @@ describe('LadderView', () => {
       [null, null],
     ]);
     expect(chart.options.bands).toEqual([expect.objectContaining({ series: [3, 2] })]);
+    const below = chart.options.series[4].value as (...args: unknown[]) => string;
+    expect(below(chart, 1350, 4, 0)).toBe('below 1350, at most 1400');
+    expect(below(chart, null, 4, 1)).toBe('–');
     expect(screen.getByText(/Elo on Stockfish’s scale at 0.1 s a move/)).toBeInTheDocument();
     expect(screen.getByText('1420 (1360 to 1481) at step 2,000, a 95% range')).toBeInTheDocument();
   });

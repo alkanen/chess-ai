@@ -70,27 +70,41 @@ export function ladderLimits(points: LadderPoint[]): string[] {
   return describeLimits(points);
 }
 
-/** The series of the Elo chart, in the order `eloChartData` gives them. */
+/** The series of the Elo chart, in the order `eloChart` gives them. */
 export const ELO_SERIES = ['Elo', 'Range low', 'Range high', 'Below the ladder', 'Above the ladder'];
 
 /**
  * The Elo chart's data: by step, the most likely rating and its range where there is one, and
- * a checkpoint beyond the ladder drawn at the end of it it is past, rather than at a number the
- * results do not give.
+ * a checkpoint beyond the ladder drawn where it is likely to be at the nearest, rather than at
+ * a number the results do not give: at the end of the ladder it is past, or at the far end of
+ * its range where that lies beyond it. One that lost almost every game to the lowest level is
+ * likely far below that level, and drawn there; one that only just fell short of it, at it.
+ *
+ * With the points in the order of the columns, which is by step, so that an index into the
+ * data names the same checkpoint in both.
  */
-export function eloChartData(points: LadderPoint[]): ChartData {
+export function eloChart(points: LadderPoint[]): { points: LadderPoint[]; data: ChartData } {
   const sorted = [...points].sort((one, other) => one.step - other.step);
   const finite = (point: LadderPoint) => point.estimate.beyond === null;
-  return [
-    sorted.map((point) => point.step),
-    sorted.map((point) => (finite(point) ? point.estimate.rating : null)),
-    sorted.map((point) => (finite(point) ? point.estimate.low : null)),
-    sorted.map((point) => (finite(point) ? point.estimate.high : null)),
-    sorted.map((point) => (point.estimate.beyond === 'below_floor' ? point.estimate.floor : null)),
-    sorted.map((point) =>
-      point.estimate.beyond === 'above_ceiling' ? point.estimate.ceiling : null,
-    ),
-  ];
+  const below = ({ estimate }: LadderPoint) =>
+    estimate.beyond !== 'below_floor'
+      ? null
+      : Math.min(estimate.floor, estimate.high ?? estimate.floor);
+  const above = ({ estimate }: LadderPoint) =>
+    estimate.beyond !== 'above_ceiling'
+      ? null
+      : Math.max(estimate.ceiling, estimate.low ?? estimate.ceiling);
+  return {
+    points: sorted,
+    data: [
+      sorted.map((point) => point.step),
+      sorted.map((point) => (finite(point) ? point.estimate.rating : null)),
+      sorted.map((point) => (finite(point) ? point.estimate.low : null)),
+      sorted.map((point) => (finite(point) ? point.estimate.high : null)),
+      sorted.map(below),
+      sorted.map(above),
+    ],
+  };
 }
 
 /**

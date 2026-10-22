@@ -8,6 +8,8 @@ export class FakeUPlot {
   static instances: FakeUPlot[] = [];
 
   data: uPlot.AlignedData;
+  /** The data it was made with, before any `setData`, if any. */
+  readonly madeWith: uPlot.AlignedData | undefined;
   /** Whether the last data it was given rescaled the axes to fit, as an unzoomed chart does. */
   rescaled = true;
   destroyed = false;
@@ -29,6 +31,7 @@ export class FakeUPlot {
     readonly target: HTMLElement,
   ) {
     this.data = data;
+    this.madeWith = data;
     FakeUPlot.instances.push(this);
   }
 
