@@ -14,6 +14,7 @@ from chess_ai.dataset import (
     TRAIN,
     VALIDATION,
     DatasetError,
+    Shards,
     SkipReason,
     builder,
     load_manifest,
@@ -685,3 +686,23 @@ def test_targets_land_in_the_split_their_game_went_to(tmp_path):
         targets = target_positions(tmp_path, split)
         assert len(targets) == manifest.splits[split].targets == 3 * manifest.splits[split].games
         assert set(targets["mover_rating"].tolist()) == {2300}
+
+
+def test_a_filtered_split_counts_its_target_shards_among_those_training_reads(tmp_path):
+    one_each = Shards(
+        positions_per_shard=1, games_per_shard=1, moves_per_shard=1, targets_per_shard=1
+    )
+    build(
+        tmp_path,
+        pgn(tmp_path, game(white=2300, black=1800)),
+        validation_fraction=0.0,
+        filters=Filters(min_rating=2000),
+        shards=one_each,
+    )
+
+    with open_dataset("test", data_dir=tmp_path) as dataset:
+        train = dataset.manifest.splits[TRAIN]
+        assert train.targets is not None and train.targets < train.positions
+        # Up to the last target's position, whose history lies before it; past it, nothing.
+        last = int(dataset[TRAIN].target_positions([train.targets - 1])[0])
+        assert dataset[TRAIN].training_shards() == last + 1 + train.targets

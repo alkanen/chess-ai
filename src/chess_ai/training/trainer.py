@@ -51,6 +51,7 @@ from torch.nn import functional as F
 from torch.utils.data import Subset
 
 from chess_ai.dataset import TRAIN, VALIDATION, Dataset, DatasetError, ManifestError, open_dataset
+from chess_ai.dataset.open_files import allow_open_files
 from chess_ai.encoders import Encoder, EncoderSpec, create_encoder
 from chess_ai.models import ChessModel, create_model
 from chess_ai.move_codec import VOCABULARY_SIZE
@@ -680,6 +681,14 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path, say: Say = said_on_std
         or not dataset.manifest.splits[TRAIN].trained_on
     ):
         raise TrainingError(f"dataset {config.dataset.name!r} has nothing in its train split")
+    # Before any worker starts, since each inherits the limit: one file a shard it maps.
+    try:
+        shards = dataset[TRAIN].training_shards()
+        if VALIDATION in dataset.splits:
+            shards += dataset[VALIDATION].training_shards(config.validation.positions)
+    except DatasetError as e:
+        raise TrainingError(e) from e
+    allow_open_files(shards)
 
     # Seeded before the model is built, because building it is what draws the initial weights.
     torch.manual_seed(config.seed)

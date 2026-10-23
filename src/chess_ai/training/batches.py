@@ -43,6 +43,14 @@ from torch.utils.data import Dataset as TorchDataset
 from chess_ai.dataset import Dataset, SplitReader, white_to_move
 from chess_ai.encoders import Encoder, create_encoder
 
+try:
+    from numpy._core.multiarray import _set_madvise_hugepage
+except ImportError:  # A numpy that has moved or dropped it; it was never a public promise.
+    _set_madvise_hugepage = None
+
+_HUGE_PAGE_ADVICE: Final = threading.Lock()
+"""Held while numpy is told not to ask for huge pages; see :func:`_without_huge_pages`."""
+
 PREFETCH_BATCHES: Final = 4
 """Batches each worker reads ahead, so that the GPU is not waiting on the disk."""
 
@@ -195,7 +203,7 @@ class PositionBatches(TorchDataset):
         if self._shuffled is None or self._shuffled[0] != epoch:
             self._shuffled = None
             if self._orders is None:
-                order = _shuffle(np.arange(self.positions, dtype=self._dtype()), self._seed, epoch)
+                order = _shuffle(_unshuffled(self.positions, self._dtype()), self._seed, epoch)
             else:
                 order = self._shared_order(epoch)
             self._shuffled = (epoch, order)
@@ -243,7 +251,7 @@ class PositionBatches(TorchDataset):
         each one back again and again while the shuffle goes on: 127 GB written for a 6.5 GB
         order, before the first step.
         """
-        order = _shuffle(np.arange(self.positions, dtype=self._dtype()), self._seed, epoch)
+        order = _shuffle(_unshuffled(self.positions, self._dtype()), self._seed, epoch)
         with path.open("wb") as file:
             # Room for all of it first, so that a full disk says so before minutes of writing.
             if hasattr(os, "posix_fallocate"):
@@ -320,6 +328,44 @@ def _shuffle(order: np.ndarray, seed: int, epoch: int) -> np.ndarray:
     """``order`` shuffled in place into ``epoch``'s order, and returned."""
     np.random.default_rng([seed, epoch]).shuffle(order)
     return order
+
+
+def _unshuffled(positions: int, dtype: np.dtype) -> np.ndarray:
+    """Every index of ``positions`` positions once, in order, for :func:`_shuffle` to shuffle.
+
+    Made without asking for huge pages. numpy asks for them for every large array, and where
+    the kernel's ``transparent_hugepage/defrag`` is ``madvise`` each fault in memory that asked
+    then stops to compact physical memory first. After hours of the page cache churning through
+    a dataset larger than memory, compaction mostly fails and falls back to small pages anyway:
+    building a 6.5 GB order took seven minutes, nearly all of it in the kernel. A huge page buys
+    nothing for an array written once, shuffled and then let go.
+    """
+    with _without_huge_pages():
+        return np.arange(positions, dtype=dtype)
+
+
+@contextmanager
+def _without_huge_pages() -> Iterator[None]:
+    """Have numpy not ask for huge pages for the arrays made in the block.
+
+    The advice is given when an array's memory is allocated, so only the allocation needs to be
+    in the block. A process-wide setting, put back as it was afterwards; one block at a time,
+    since two threads each restoring what they saw can restore in the wrong order.
+
+    Nothing builds orders in a thread yet. One that does, and forks a loader's workers while
+    another thread is in here, gives each child this lock held by a thread it does not have,
+    and the child's first order then waits forever: register an ``os.register_at_fork`` hook
+    to make the lock afresh in the child before that.
+    """
+    if _set_madvise_hugepage is None:
+        yield
+        return
+    with _HUGE_PAGE_ADVICE:
+        previous = _set_madvise_hugepage(False)
+        try:
+            yield
+        finally:
+            _set_madvise_hugepage(previous)
 
 
 @contextmanager
