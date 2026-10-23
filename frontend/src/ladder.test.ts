@@ -3,7 +3,7 @@ import {
   describeEstimate,
   describeScore,
   describeStrength,
-  eloChartData,
+  eloChart,
   ladderGameHash,
   ladderGameInHash,
   nearestLadder,
@@ -50,8 +50,8 @@ describe('ladder', () => {
   });
 
   it('charts a rating with its range, and one past the ladder at its end', () => {
-    const data = eloChartData([
-      ladderPoint(3000, { rating: 1600, low: 1550, high: null, beyond: 'above_ceiling' }),
+    const { data } = eloChart([
+      ladderPoint(3000, { rating: null, low: 1450, high: null, beyond: 'above_ceiling' }),
       ladderPoint(1000, { rating: null, low: null, high: 1400, beyond: 'below_floor' }),
       ladderPoint(2000),
     ]);
@@ -64,6 +64,25 @@ describe('ladder', () => {
       [1350, null, null],
       [null, null, 1500],
     ]);
+  });
+
+  it('charts one far past the ladder at the bound its range gives, beyond the ladder’s end', () => {
+    // Lost 133 of 150 games to the lowest level: likely no better than 994, far below it.
+    const { data } = eloChart([
+      ladderPoint(1000, { rating: null, low: null, high: 993.8, beyond: 'below_floor' }),
+      ladderPoint(2000, { rating: null, low: null, high: null, beyond: 'below_floor' }),
+      ladderPoint(3000, { rating: null, low: 1612.5, high: null, beyond: 'above_ceiling' }),
+      ladderPoint(4000, { rating: null, low: null, high: null, beyond: 'above_ceiling' }),
+    ]);
+
+    expect(data[4]).toEqual([993.8, 1350, null, null]);
+    expect(data[5]).toEqual([null, null, 1612.5, 1500]);
+  });
+
+  it('gives the points in the order their columns are, so that an index means one checkpoint', () => {
+    const { data, points } = eloChart([ladderPoint(3000), ladderPoint(1000), ladderPoint(2000)]);
+
+    expect(points.map((point) => point.step)).toEqual(data[0]);
   });
 
   it('takes a checkpoint’s own ladder, or else the nearest, the earlier of two as near', () => {
