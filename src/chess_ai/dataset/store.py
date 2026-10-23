@@ -64,6 +64,7 @@ from chess_ai.dataset.manifest import (
     SplitCounts,
     load_manifest,
 )
+from chess_ai.dataset.open_files import raise_the_limit_hint
 from chess_ai.dataset.records import (
     GAME_DTYPE,
     MOVE_DTYPE,
@@ -632,6 +633,11 @@ class _StreamReader:
     def __len__(self) -> int:
         return self._count
 
+    @property
+    def shards(self) -> int:
+        """How many shards this stream's records are in, each a file held open once mapped."""
+        return -(-self._count // self._per_shard)
+
     def record(self, index: int) -> np.void:
         """Record ``index``, as a view into the mapped shard it lives in."""
         index = self._checked(index)
@@ -715,7 +721,8 @@ class _StreamReader:
             try:
                 mapped = np.memmap(path, dtype=self._dtype, mode="r", shape=(expected,))
             except OSError as e:
-                raise DatasetError(f"cannot read dataset shard {path}: {e.strerror}") from e
+                hint = raise_the_limit_hint() if e.errno == errno.EMFILE else ""
+                raise DatasetError(f"cannot read dataset shard {path}: {e.strerror}{hint}") from e
             except ValueError as e:
                 # The file shrank between being measured and being mapped. numpy raises
                 # ValueError for it rather than OSError, and a traceback is no way to report it.
@@ -806,6 +813,15 @@ class SplitReader:
 
     def __len__(self) -> int:
         return len(self._positions)
+
+    @property
+    def training_shards(self) -> int:
+        """How many shards reading this split's training positions maps, at most.
+
+        Every position shard, since a position's history is read with it, and every target
+        shard; a reader keeps each one mapped, and holding a file open, once it has touched it.
+        """
+        return self._positions.shards + (0 if self._targets is None else self._targets.shards)
 
     @property
     def targets(self) -> int:

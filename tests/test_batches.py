@@ -231,6 +231,52 @@ def test_a_shared_order_is_the_order_an_unshared_one_has(directory, tmp_path):
     assert moves(shared, 400) == moves(alone, 400)
 
 
+@pytest.mark.parametrize("shared", [False, True])
+def test_an_order_is_the_seeds_shuffle_of_every_position_number_for_number(
+    directory, tmp_path, shared
+):
+    """What every run so far trained on, which a resumed one has to see again."""
+    source = batches(directory, batches=400, seed=7)
+    if shared:
+        source = source.sharing_orders(tmp_path / "orders")
+
+    for epoch in range(3):
+        expected = np.arange(source.positions, dtype=np.uint16)
+        np.random.default_rng([7, epoch]).shuffle(expected)
+        assert np.array_equal(source._order(epoch), expected), epoch
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("advice", [True, False])
+def test_an_order_is_made_without_asking_for_huge_pages(
+    directory, tmp_path, monkeypatch, shared, advice
+):
+    """Where the kernel compacts memory for every fault in a region that asked for huge pages,
+    a fragmented machine spent seven minutes in the kernel making a 6.5 GB order."""
+    from numpy._core.multiarray import _get_madvise_hugepage, _set_madvise_hugepage
+
+    real = np.arange
+    asked = []
+
+    def arange(*args, **kwargs):
+        asked.append(_get_madvise_hugepage())
+        return real(*args, **kwargs)
+
+    source = batches(directory)
+    if shared:
+        source = source.sharing_orders(tmp_path / "orders")
+    before = _set_madvise_hugepage(advice)
+    try:
+        monkeypatch.setattr(np, "arange", arange)
+        source._order(0)
+        monkeypatch.undo()
+
+        assert asked == [False]
+        assert _get_madvise_hugepage() is advice, "and numpy's advice is put back as it was"
+    finally:
+        _set_madvise_hugepage(before)
+
+
 def test_processes_sharing_orders_write_each_once(directory, tmp_path, monkeypatch):
     calls = []
     real = batches_module._shuffle
