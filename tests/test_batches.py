@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -300,14 +301,14 @@ def test_orders_made_in_two_threads_at_once_leave_numpy_s_advice_as_it_was(direc
     before = _set_madvise_hugepage(True)
     try:
         monkeypatch.setattr(np, "arange", arange)
-        first = threading.Thread(target=batches(directory)._order, args=(0,))
-        second = threading.Thread(target=batches(directory)._order, args=(1,))
-        first.start()
-        assert first_inside.wait(timeout=10)
-        second.start()
-        first.join(timeout=10)
-        first_done.set()
-        second.join(timeout=10)
+        with ThreadPoolExecutor(max_workers=2) as threads:
+            first = threads.submit(batches(directory)._order, 0)
+            assert first_inside.wait(timeout=10)
+            second = threads.submit(batches(directory)._order, 1)
+            # Whatever either raised is raised here, and one that hangs times out.
+            first.result(timeout=10)
+            first_done.set()
+            second.result(timeout=10)
         monkeypatch.undo()
 
         assert _get_madvise_hugepage() is True

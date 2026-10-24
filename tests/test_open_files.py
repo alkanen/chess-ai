@@ -16,8 +16,10 @@ from output_helpers import unheard
 from training_helpers import VALIDATION_FRACTION, experiment
 
 from chess_ai.dataset import Shards, open_dataset
+from chess_ai.dataset.manifest import Filters
 from chess_ai.dataset.open_files import MARGIN, allow_open_files
-from chess_ai.training import load_experiment, train
+from chess_ai.dataset.store import shard_path
+from chess_ai.training import TrainingError, load_experiment, train
 from chess_ai.training import trainer as trainer_module
 
 ONE_PER_SHARD = Shards(
@@ -221,3 +223,57 @@ def test_training_makes_room_for_its_train_split_and_the_validation_it_measures_
     dataset = open_dataset("test", data_dir=tmp_path / "data")
     assert len(dataset["validation"]) > 16
     assert asked == [len(dataset["train"]) + 16]
+
+
+@pytest.mark.parametrize(
+    ("soft", "hard", "suggested"),
+    [
+        (LOW, 4096, 4096),  # as far as the hard limit goes
+        (65536, None, 131072),  # where allow_open_files leaves a training process
+        (100_256, None, 200_512),  # and where it leaves one that needed more
+    ],
+)
+def test_running_out_below_the_hard_limit_suggests_more_than_there_is(
+    tmp_path, soft, hard, suggested
+):
+    """A training process has already raised its own limit, so `ulimit -n` at or below it would
+    change nothing for the next run, or lower it."""
+    ran = limited(
+        """
+        from chess_ai.dataset.open_files import raise_the_limit_hint
+        print(raise_the_limit_hint())
+        """,
+        soft=soft,
+        hard=hard,
+        cwd=tmp_path,
+    )
+
+    assert ran.returncode == 0, ran.stderr
+    assert f"this process may open {soft:,}," in ran.stdout
+    assert f"`ulimit -n {suggested}`" in ran.stdout
+
+
+def test_a_damaged_target_shard_found_while_counting_is_a_training_error(tmp_path):
+    """Counting a filtered split's shards reads its targets, and what it finds wrong there is
+    said in a line, as the same damage anywhere else in preparing a run is."""
+    build(
+        tmp_path / "data",
+        shards=ONE_PER_SHARD,
+        validation_fraction=VALIDATION_FRACTION,
+        filters=Filters(min_rating=1500),
+    )
+    train_split = open_dataset("test", data_dir=tmp_path / "data")["train"]
+    last = shard_path(
+        tmp_path / "data" / "datasets" / "test" / "train" / "targets", train_split.targets - 1
+    )
+    last.write_bytes(b"")
+    config = load_experiment(experiment(tmp_path / "tiny.toml"))
+
+    with pytest.raises(TrainingError, match="cannot read dataset shard .*targets"):
+        train(
+            config,
+            data_dir=tmp_path / "data",
+            runs_dir=tmp_path / "runs",
+            config_text="",
+            say=unheard,
+        )

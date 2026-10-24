@@ -351,6 +351,11 @@ def _without_huge_pages() -> Iterator[None]:
     The advice is given when an array's memory is allocated, so only the allocation needs to be
     in the block. A process-wide setting, put back as it was afterwards; one block at a time,
     since two threads each restoring what they saw can restore in the wrong order.
+
+    Nothing builds orders in a thread yet. One that does, and forks a loader's workers while
+    another thread is in here, gives each child this lock held by a thread it does not have,
+    and the child's first order then waits forever: register an ``os.register_at_fork`` hook
+    to make the lock afresh in the child before that.
     """
     if _set_madvise_hugepage is None:
         yield

@@ -82,9 +82,11 @@ def allow_open_files(shards: int) -> None:
 def raise_the_limit_hint() -> str:
     """What to say after "Too many open files": what the limit is, and how to raise it.
 
-    A soft limit below the hard one is raised with ``ulimit -n``. One already at the hard
-    limit, as a training process's is after :func:`allow_open_files`, can only be raised by
-    raising the hard limit, which ``ulimit -n`` would either be refused or not change.
+    A soft limit below the hard one is raised with ``ulimit -n``, to more than it is now: a
+    training process has already raised its own as far as :func:`allow_open_files` thought
+    enough, so a number at or below that would change nothing for the next run, or lower it.
+    One already at the hard limit can only be raised by raising the hard limit, which
+    ``ulimit -n`` would either be refused or not change.
     """
     if resource is None:
         return ""
@@ -98,7 +100,9 @@ def raise_the_limit_hint() -> str:
             f" (this process may open {soft:,}, as many as its hard limit allows, and every "
             f"shard it reads holds one open; raise the hard limit before starting: {advice})"
         )
-    raised = SUGGESTED_LIMIT if hard == unlimited else min(SUGGESTED_LIMIT, hard)
+    raised = max(SUGGESTED_LIMIT, 2 * soft)
+    if hard != unlimited:
+        raised = min(raised, hard)
     return (
         f" (this process may open {soft:,}, and every shard it reads holds one open; "
         f"raise the limit before starting, for example with `ulimit -n {raised}`)"

@@ -682,9 +682,12 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path, say: Say = said_on_std
     ):
         raise TrainingError(f"dataset {config.dataset.name!r} has nothing in its train split")
     # Before any worker starts, since each inherits the limit: one file a shard it maps.
-    shards = dataset[TRAIN].training_shards()
-    if VALIDATION in dataset.splits:
-        shards += dataset[VALIDATION].training_shards(config.validation.positions)
+    try:
+        shards = dataset[TRAIN].training_shards()
+        if VALIDATION in dataset.splits:
+            shards += dataset[VALIDATION].training_shards(config.validation.positions)
+    except DatasetError as e:
+        raise TrainingError(e) from e
     allow_open_files(shards)
 
     # Seeded before the model is built, because building it is what draws the initial weights.
