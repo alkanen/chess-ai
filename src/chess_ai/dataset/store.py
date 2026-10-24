@@ -64,6 +64,7 @@ from chess_ai.dataset.manifest import (
     SplitCounts,
     load_manifest,
 )
+from chess_ai.dataset.open_files import raise_the_limit_hint
 from chess_ai.dataset.records import (
     GAME_DTYPE,
     MOVE_DTYPE,
@@ -632,6 +633,10 @@ class _StreamReader:
     def __len__(self) -> int:
         return self._count
 
+    def shard_of(self, index: int) -> int:
+        """The number of the shard record ``index`` is in, each a file held open once mapped."""
+        return index // self._per_shard
+
     def record(self, index: int) -> np.void:
         """Record ``index``, as a view into the mapped shard it lives in."""
         index = self._checked(index)
@@ -715,7 +720,8 @@ class _StreamReader:
             try:
                 mapped = np.memmap(path, dtype=self._dtype, mode="r", shape=(expected,))
             except OSError as e:
-                raise DatasetError(f"cannot read dataset shard {path}: {e.strerror}") from e
+                hint = raise_the_limit_hint() if e.errno == errno.EMFILE else ""
+                raise DatasetError(f"cannot read dataset shard {path}: {e.strerror}{hint}") from e
             except ValueError as e:
                 # The file shrank between being measured and being mapped. numpy raises
                 # ValueError for it rather than OSError, and a traceback is no way to report it.
@@ -806,6 +812,23 @@ class SplitReader:
 
     def __len__(self) -> int:
         return len(self._positions)
+
+    def training_shards(self, targets: int | None = None) -> int:
+        """How many shards reading this split's first ``targets`` training targets maps, at most.
+
+        All of its targets when not given, as training reads; validation reads the same few
+        from the front every time. That is every position shard up to the last target's, since
+        a position's history lies before it, and every target shard up to the last one. A
+        reader keeps each shard mapped, and holding a file open, once it has touched it.
+        """
+        count = self.targets if targets is None else min(targets, self.targets)
+        if count <= 0:
+            return 0
+        last = int(self.target_positions([count - 1])[0])
+        shards = self._positions.shard_of(last) + 1
+        if self._targets is not None:
+            shards += self._targets.shard_of(count - 1) + 1
+        return shards
 
     @property
     def targets(self) -> int:
