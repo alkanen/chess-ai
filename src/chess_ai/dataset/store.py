@@ -633,10 +633,9 @@ class _StreamReader:
     def __len__(self) -> int:
         return self._count
 
-    @property
-    def shards(self) -> int:
-        """How many shards this stream's records are in, each a file held open once mapped."""
-        return -(-self._count // self._per_shard)
+    def shard_of(self, index: int) -> int:
+        """The number of the shard record ``index`` is in, each a file held open once mapped."""
+        return index // self._per_shard
 
     def record(self, index: int) -> np.void:
         """Record ``index``, as a view into the mapped shard it lives in."""
@@ -814,14 +813,22 @@ class SplitReader:
     def __len__(self) -> int:
         return len(self._positions)
 
-    @property
-    def training_shards(self) -> int:
-        """How many shards reading this split's training positions maps, at most.
+    def training_shards(self, targets: int | None = None) -> int:
+        """How many shards reading this split's first ``targets`` training targets maps, at most.
 
-        Every position shard, since a position's history is read with it, and every target
-        shard; a reader keeps each one mapped, and holding a file open, once it has touched it.
+        All of its targets when not given, as training reads; validation reads the same few
+        from the front every time. That is every position shard up to the last target's, since
+        a position's history lies before it, and every target shard up to the last one. A
+        reader keeps each shard mapped, and holding a file open, once it has touched it.
         """
-        return self._positions.shards + (0 if self._targets is None else self._targets.shards)
+        count = self.targets if targets is None else min(targets, self.targets)
+        if count <= 0:
+            return 0
+        last = int(self.target_positions([count - 1])[0])
+        shards = self._positions.shard_of(last) + 1
+        if self._targets is not None:
+            shards += self._targets.shard_of(count - 1) + 1
+        return shards
 
     @property
     def targets(self) -> int:

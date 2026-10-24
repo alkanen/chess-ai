@@ -32,21 +32,30 @@ SUGGESTED_LIMIT: Final = 65536
 """What the hint for running out suggests raising the limit to: far more than any dataset here."""
 
 
-def allow_open_files(shards: int) -> None:
-    """Let this process hold as many files open as it may, before reading ``shards`` shards.
+HARD_LIMIT_ADVICE: Final = (
+    "`ulimit -Hn {limit}` as root, LimitNOFILE= in a systemd unit, or nofile in "
+    "/etc/security/limits.conf"
+)
+"""How to raise the hard limit, which only root can, with ``{limit}`` to fill in."""
 
-    Raises the soft limit on open files to the hard limit, and warns when even that is less
-    than ``shards`` and a margin: reading would then die part way into the first batches, and
-    this says so before minutes of start-up rather than after.
+
+def allow_open_files(shards: int) -> None:
+    """Let this process hold open the ``shards`` shards it is about to read, and the rest.
+
+    Raises the soft limit on open files as far as that needs, and to at least
+    :data:`SUGGESTED_LIMIT` for room to spare, but no further: every process this one starts
+    inherits the limit, and some software sizes a table by it or closes every descriptor up to
+    it. Warns when the hard limit is less than that: reading would then die part way into the
+    first batches, and this says so before minutes of start-up rather than after.
     """
     if resource is None:
         return
     needed = shards + MARGIN
     unlimited = resource.RLIM_INFINITY
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    # macOS answers an unlimited hard limit and then refuses an unlimited soft one, so there
-    # it is raised only as far as needed.
-    wanted = hard if hard != unlimited else max(soft, needed)
+    wanted = max(needed, SUGGESTED_LIMIT)
+    if hard != unlimited:
+        wanted = min(wanted, hard)
     if soft != unlimited and soft < wanted:
         try:
             resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
@@ -60,24 +69,37 @@ def allow_open_files(shards: int) -> None:
     if soft != unlimited and soft < needed:
         LOGGER.warning(
             "reading this dataset needs about %s open files in each process (%s shards and %s "
-            'for the rest), and the limit is %s; it will stop with "Too many open files" '
-            "unless the hard limit is raised: `ulimit -Hn %d` as root, LimitNOFILE= in a "
-            "systemd unit, or nofile in /etc/security/limits.conf",
+            'for the rest), and the limit is %s; it is likely to stop with "Too many open '
+            'files" unless the hard limit is raised: %s',
             f"{needed:,}",
             f"{shards:,}",
             MARGIN,
             f"{soft:,}",
-            max(needed, SUGGESTED_LIMIT),
+            HARD_LIMIT_ADVICE.format(limit=max(needed, SUGGESTED_LIMIT)),
         )
 
 
 def raise_the_limit_hint() -> str:
-    """What to say after "Too many open files": what the limit is, and how to raise it."""
+    """What to say after "Too many open files": what the limit is, and how to raise it.
+
+    A soft limit below the hard one is raised with ``ulimit -n``. One already at the hard
+    limit, as a training process's is after :func:`allow_open_files`, can only be raised by
+    raising the hard limit, which ``ulimit -n`` would either be refused or not change.
+    """
     if resource is None:
         return ""
-    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-    limit = "unlimited" if soft == resource.RLIM_INFINITY else f"{soft:,}"
+    unlimited = resource.RLIM_INFINITY
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == unlimited:
+        return ""
+    if hard != unlimited and soft >= hard:
+        advice = HARD_LIMIT_ADVICE.format(limit=max(SUGGESTED_LIMIT, 2 * hard))
+        return (
+            f" (this process may open {soft:,}, as many as its hard limit allows, and every "
+            f"shard it reads holds one open; raise the hard limit before starting: {advice})"
+        )
+    raised = SUGGESTED_LIMIT if hard == unlimited else min(SUGGESTED_LIMIT, hard)
     return (
-        f" (this process may open {limit}, and every shard it reads holds one open; "
-        f"raise the limit before starting, for example with `ulimit -n {SUGGESTED_LIMIT}`)"
+        f" (this process may open {soft:,}, and every shard it reads holds one open; "
+        f"raise the limit before starting, for example with `ulimit -n {raised}`)"
     )

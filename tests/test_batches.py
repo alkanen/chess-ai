@@ -277,6 +277,44 @@ def test_an_order_is_made_without_asking_for_huge_pages(
         _set_madvise_hugepage(before)
 
 
+def test_orders_made_in_two_threads_at_once_leave_numpy_s_advice_as_it_was(directory, monkeypatch):
+    """The advice is one setting for the whole process. Two threads each saving and restoring
+    it in turn can restore in the wrong order, and leave it off for good."""
+    from numpy._core.multiarray import _get_madvise_hugepage, _set_madvise_hugepage
+
+    real = np.arange
+    first_inside = threading.Event()
+    second_inside = threading.Event()
+    first_done = threading.Event()
+
+    def arange(*args, **kwargs):
+        if not first_inside.is_set():
+            first_inside.set()
+            # Long enough for the second thread to come in, if nothing keeps it out.
+            second_inside.wait(timeout=1)
+        else:
+            second_inside.set()
+            first_done.wait(timeout=10)
+        return real(*args, **kwargs)
+
+    before = _set_madvise_hugepage(True)
+    try:
+        monkeypatch.setattr(np, "arange", arange)
+        first = threading.Thread(target=batches(directory)._order, args=(0,))
+        second = threading.Thread(target=batches(directory)._order, args=(1,))
+        first.start()
+        assert first_inside.wait(timeout=10)
+        second.start()
+        first.join(timeout=10)
+        first_done.set()
+        second.join(timeout=10)
+        monkeypatch.undo()
+
+        assert _get_madvise_hugepage() is True
+    finally:
+        _set_madvise_hugepage(before)
+
+
 def test_processes_sharing_orders_write_each_once(directory, tmp_path, monkeypatch):
     calls = []
     real = batches_module._shuffle

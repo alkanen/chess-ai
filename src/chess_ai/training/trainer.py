@@ -682,8 +682,10 @@ def _prepare(config: ExperimentConfig, *, data_dir: Path, say: Say = said_on_std
     ):
         raise TrainingError(f"dataset {config.dataset.name!r} has nothing in its train split")
     # Before any worker starts, since each inherits the limit: one file a shard it maps.
-    splits = [split for split in (TRAIN, VALIDATION) if split in dataset.splits]
-    allow_open_files(sum(dataset[split].training_shards for split in splits))
+    shards = dataset[TRAIN].training_shards()
+    if VALIDATION in dataset.splits:
+        shards += dataset[VALIDATION].training_shards(config.validation.positions)
+    allow_open_files(shards)
 
     # Seeded before the model is built, because building it is what draws the initial weights.
     torch.manual_seed(config.seed)

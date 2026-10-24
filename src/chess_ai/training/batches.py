@@ -48,6 +48,9 @@ try:
 except ImportError:  # A numpy that has moved or dropped it; it was never a public promise.
     _set_madvise_hugepage = None
 
+_HUGE_PAGE_ADVICE: Final = threading.Lock()
+"""Held while numpy is told not to ask for huge pages; see :func:`_without_huge_pages`."""
+
 PREFETCH_BATCHES: Final = 4
 """Batches each worker reads ahead, so that the GPU is not waiting on the disk."""
 
@@ -346,16 +349,18 @@ def _without_huge_pages() -> Iterator[None]:
     """Have numpy not ask for huge pages for the arrays made in the block.
 
     The advice is given when an array's memory is allocated, so only the allocation needs to be
-    in the block. A process-wide setting, put back as it was afterwards.
+    in the block. A process-wide setting, put back as it was afterwards; one block at a time,
+    since two threads each restoring what they saw can restore in the wrong order.
     """
     if _set_madvise_hugepage is None:
         yield
         return
-    previous = _set_madvise_hugepage(False)
-    try:
-        yield
-    finally:
-        _set_madvise_hugepage(previous)
+    with _HUGE_PAGE_ADVICE:
+        previous = _set_madvise_hugepage(False)
+        try:
+            yield
+        finally:
+            _set_madvise_hugepage(previous)
 
 
 @contextmanager

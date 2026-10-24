@@ -703,4 +703,6 @@ def test_a_filtered_split_counts_its_target_shards_among_those_training_reads(tm
     with open_dataset("test", data_dir=tmp_path) as dataset:
         train = dataset.manifest.splits[TRAIN]
         assert train.targets is not None and train.targets < train.positions
-        assert dataset[TRAIN].training_shards == train.positions + train.targets
+        # Up to the last target's position, whose history lies before it; past it, nothing.
+        last = int(dataset[TRAIN].target_positions([train.targets - 1])[0])
+        assert dataset[TRAIN].training_shards() == last + 1 + train.targets
