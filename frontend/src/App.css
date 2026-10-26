@@ -156,7 +156,7 @@
   max-width: 100%;
 }
 
-.request.paused input[type='number'] {
+.request.paused input[inputmode='numeric'] {
   width: 6rem;
   font: inherit;
 }
@@ -164,4 +164,10 @@
 .request.paused .run-name {
   font-family: ui-monospace, monospace;
   overflow-wrap: anywhere;
+}
+
+/* A rating or Elo the server would refuse, which is why Start is greyed out. */
+.request.paused input[aria-invalid='true'] {
+  outline: 2px solid #c33;
+  outline-offset: 1px;
 }

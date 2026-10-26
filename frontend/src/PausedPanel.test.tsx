@@ -31,6 +31,14 @@ const GONE: PlayerInfo = {
   stockfish: null,
 };
 
+const PERSON: PlayerInfo = {
+  name: 'Human',
+  accepts_moves: true,
+  model: null,
+  stockfish: null,
+  rating: null,
+};
+
 const PAUSED: Paused = { side: 'black', reason: 'run tiny has no checkpoint from step 2' };
 
 /** A server with `runs` on it, which takes any replacement it is sent. */
@@ -71,7 +79,7 @@ describe('PausedPanel', () => {
   it('tells a watcher why the game waits, and offers nothing to do about it', () => {
     vi.stubGlobal('fetch', serving());
     render(
-      <PausedPanel link="watching" paused={PAUSED} player={GONE} access="watch" disabled={false} />,
+      <PausedPanel link="watching" paused={PAUSED} player={GONE} opponent={PERSON} access="watch" disabled={false} />,
     );
 
     expect(screen.getByRole('status')).toHaveTextContent(
@@ -84,11 +92,11 @@ describe('PausedPanel', () => {
     const fetch = serving();
     vi.stubGlobal('fetch', fetch);
     render(
-      <PausedPanel link="mine" paused={PAUSED} player={GONE} access="white" disabled={false} />,
+      <PausedPanel link="mine" paused={PAUSED} player={GONE} opponent={PERSON} access="white" disabled={false} />,
     );
 
     await vi.waitFor(() => expect(screen.getByLabelText('Black run')).toHaveValue('tiny'));
-    expect(screen.getByLabelText('Black rating')).toHaveValue(1500);
+    expect(screen.getByLabelText('Black plays like')).toHaveValue('1500');
     fireEvent.click(screen.getByRole('button', { name: 'Play on with this checkpoint' }));
 
     await vi.waitFor(() => expect(posted(fetch)).toHaveLength(1));
@@ -106,10 +114,76 @@ describe('PausedPanel', () => {
     });
   });
 
+  it('offers one that claimed no rating the same, warned about and easy to undo', async () => {
+    const fetch = serving();
+    vi.stubGlobal('fetch', fetch);
+    const unrated = { ...GONE, model: { ...GONE.model!, rating: null } };
+    render(
+      <PausedPanel
+        link="mine"
+        paused={PAUSED}
+        player={unrated}
+        opponent={{ ...PERSON, rating: 1650 }}
+        access="white"
+        disabled={false}
+      />,
+    );
+
+    await vi.waitFor(() => expect(screen.getByLabelText('Black run')).toHaveValue('tiny'));
+    expect(screen.getByLabelText('Black claims no rating')).toBeChecked();
+    expect(screen.getByText(/plays close to at random/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Play on with this checkpoint' }));
+    await vi.waitFor(() => expect(posted(fetch)).toHaveLength(1));
+    expect(posted(fetch)[0][1]).toMatchObject({ rating: 'unknown' });
+  });
+
+  it('plays like the person on the other side once the box is unticked', async () => {
+    vi.stubGlobal('fetch', serving());
+    const unrated = { ...GONE, model: { ...GONE.model!, rating: null } };
+    render(
+      <PausedPanel
+        link="mine"
+        paused={PAUSED}
+        player={unrated}
+        opponent={{ ...PERSON, rating: 1650 }}
+        access="white"
+        disabled={false}
+      />,
+    );
+    await vi.waitFor(() => expect(screen.getByLabelText('Black run')).toHaveValue('tiny'));
+
+    fireEvent.click(screen.getByLabelText('Black claims no rating'));
+
+    expect(screen.getByLabelText('Black plays like')).toHaveValue('');
+    expect(screen.getByLabelText('Black plays like')).toHaveAttribute('placeholder', '1650');
+  });
+
+  it.each(['5000', '-100', '1650.5'])(
+    'will not play on with a checkpoint asked to play like %s',
+    async (typed) => {
+      vi.stubGlobal('fetch', serving());
+      render(
+        <PausedPanel
+          link="mine"
+          paused={PAUSED}
+          player={GONE}
+          opponent={PERSON}
+          access="white"
+          disabled={false}
+        />,
+      );
+      await vi.waitFor(() => expect(screen.getByLabelText('Black run')).toHaveValue('tiny'));
+
+      fireEvent.change(screen.getByLabelText('Black plays like'), { target: { value: typed } });
+
+      expect(screen.getByRole('button', { name: 'Play on with this checkpoint' })).toBeDisabled();
+    },
+  );
+
   it('offers another run when the one that played is gone', async () => {
     vi.stubGlobal('fetch', serving([RUNS[0]]));
     render(
-      <PausedPanel link="mine" paused={PAUSED} player={GONE} access="white" disabled={false} />,
+      <PausedPanel link="mine" paused={PAUSED} player={GONE} opponent={PERSON} access="white" disabled={false} />,
     );
 
     await vi.waitFor(() => expect(screen.getByLabelText('Black run')).toHaveValue('newer'));
@@ -122,7 +196,7 @@ describe('PausedPanel', () => {
     );
     vi.stubGlobal('fetch', serving(RUNS, refused));
     render(
-      <PausedPanel link="mine" paused={PAUSED} player={GONE} access="white" disabled={false} />,
+      <PausedPanel link="mine" paused={PAUSED} player={GONE} opponent={PERSON} access="white" disabled={false} />,
     );
     await vi.waitFor(() => expect(screen.getByLabelText('Black run')).toHaveValue('tiny'));
 

@@ -4,7 +4,7 @@ import type { CheckpointSummary, LadderPoint, RunSummary } from './api';
 import { NewGameForm } from './NewGameForm';
 import { ladderPoint } from './test/ladder';
 
-const HUMAN = { kind: 'human' };
+const HUMAN = { kind: 'human', rating: null };
 const RANDOM = { kind: 'random' };
 
 const RUNS: RunSummary[] = [
@@ -106,6 +106,7 @@ describe('NewGameForm', () => {
   afterEach(() => {
     document.head.querySelector('base')?.remove();
     vi.unstubAllGlobals();
+    window.localStorage.clear();
   });
 
   it('starts a game with the chosen delay under the path prefix', async () => {
@@ -145,9 +146,10 @@ describe('NewGameForm', () => {
     fireEvent.change(screen.getByLabelText('White'), { target: { value: white } });
     fireEvent.change(screen.getByLabelText('Black'), { target: { value: black } });
 
+    const side = (kind: string) => (kind === 'human' ? HUMAN : { kind });
     expect(await start(fetch)).toEqual({
-      white: { kind: white },
-      black: { kind: black },
+      white: side(white),
+      black: side(black),
       move_delay: 0.5,
       fen: null,
     });
@@ -230,6 +232,284 @@ describe('NewGameForm', () => {
     render(<NewGameForm />);
 
     expect(screen.getByLabelText('Start from FEN')).toHaveValue('');
+  });
+
+  describe('a person’s rating', () => {
+    it('is sent with their side and remembered for the next game', async () => {
+      const started = vi.fn();
+      const { unmount } = render(<NewGameForm onStarted={started} />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1650' } });
+      expect(await start(fetch)).toMatchObject({ white: { kind: 'human', rating: 1650 } });
+      await vi.waitFor(() => expect(started).toHaveBeenCalled());
+      unmount();
+
+      render(<NewGameForm />);
+
+      expect(screen.getByLabelText('White rating')).toHaveValue('1650');
+      // Whichever side the person takes this time.
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      expect(screen.getByLabelText('Black rating')).toHaveValue('1650');
+    });
+
+    it('is left as it was by a game started with the box empty', async () => {
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      const started = vi.fn();
+      const { unmount } = render(<NewGameForm onStarted={started} />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '' } });
+      expect(await start(fetch)).toMatchObject({ white: { kind: 'human', rating: null } });
+      await vi.waitFor(() => expect(started).toHaveBeenCalled());
+      unmount();
+
+      render(<NewGameForm />);
+
+      expect(screen.getByLabelText('White rating')).toHaveValue('1500');
+    });
+
+    it('remembers the rating the game was started with, though the box changes meanwhile', async () => {
+      let answer: (response: Response) => void = () => {};
+      const answering = serving();
+      fetch.mockImplementation((url: string, init?: RequestInit) =>
+        init?.method === 'POST'
+          ? new Promise<Response>((resolve) => (answer = resolve))
+          : answering(url),
+      );
+      const started = vi.fn();
+      const { unmount } = render(<NewGameForm onStarted={started} />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1900' } });
+      await start(fetch);
+
+      // Still waiting on a checkpoint to load, the person starts retyping.
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '195' } });
+      await act(async () => answer(Response.json({})));
+      await vi.waitFor(() => expect(started).toHaveBeenCalled());
+      unmount();
+
+      render(<NewGameForm />);
+
+      expect(screen.getByLabelText('White rating')).toHaveValue('1900');
+    });
+
+    it('is not remembered from a game the server would not start', async () => {
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      const answering = serving();
+      fetch.mockImplementation((url: string, init?: RequestInit) =>
+        init?.method === 'POST'
+          ? Promise.resolve(Response.json({ detail: 'no Stockfish' }, { status: 500 }))
+          : answering(url),
+      );
+      const { unmount } = render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1900' } });
+      await start(fetch);
+      await screen.findByRole('alert');
+      unmount();
+
+      render(<NewGameForm />);
+
+      expect(screen.getByLabelText('White rating')).toHaveValue('1500');
+    });
+
+    it('follows one person back to the side they started on, changed', () => {
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('Black rating'), { target: { value: '1900' } });
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
+
+      expect(screen.getByLabelText('White rating')).toHaveValue('1900');
+    });
+
+    it.each(['5000', '-', '1e3'])('starts afresh from a kept rating of %s', (kept) => {
+      // Kept by an earlier build that let it through.
+      window.localStorage.setItem('chess-ai.my-rating', kept);
+
+      render(<NewGameForm />);
+
+      expect(screen.getByLabelText('White rating')).toHaveValue('');
+      expect(screen.getByRole('button', { name: 'Start' })).toBeEnabled();
+    });
+
+    it('starts from a kept rating with spaces around it, without them', () => {
+      window.localStorage.setItem('chess-ai.my-rating', ' 1500 ');
+
+      render(<NewGameForm />);
+
+      expect(screen.getByLabelText('White rating')).toHaveValue('1500');
+    });
+
+    it('fills in no box that might be somebody else’s when a person leaves', () => {
+      // One person moving to Black, or a second person left on their own: the same clicks.
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1900' } });
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+
+      expect(screen.getByLabelText('Black rating')).toHaveValue('');
+      // Shown empty, and the person moved over finds theirs there again once they give it up.
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
+      expect(screen.getByLabelText('White rating')).toHaveValue('1900');
+    });
+
+    it('gives the side one person leaves to nobody else', () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1900' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+
+      // A friend sits down at White.
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
+
+      expect(screen.getByLabelText('Black rating')).toHaveValue('1900');
+      expect(screen.getByLabelText('White rating')).toHaveValue('');
+    });
+
+    it('does not take a second person’s rating for this browser’s', () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1800' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('Black rating'), { target: { value: '1200' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+
+      expect(screen.getByLabelText('Black rating')).toHaveValue('1800');
+    });
+
+    it('does not remember a rating typed beside another person, from a game they are left in', async () => {
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      const started = vi.fn();
+      const { unmount } = render(<NewGameForm onStarted={started} />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1800' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('Black rating'), { target: { value: '1200' } });
+      // A has to go, and B plays on against the random mover.
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      expect(await start(fetch)).toMatchObject({ black: { kind: 'human', rating: 1200 } });
+      await vi.waitFor(() => expect(started).toHaveBeenCalled());
+      unmount();
+
+      render(<NewGameForm />);
+
+      // B's 1200 is not this browser's, and A's 1800 was never played with.
+      expect(screen.getByLabelText('White rating')).toHaveValue('1500');
+    });
+
+    it('treats a rating typed beside another person the same when sides change and on Start', async () => {
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      const started = vi.fn();
+      const { unmount } = render(<NewGameForm onStarted={started} />);
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1900' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+
+      // Neither taken for this browser's when the person swaps sides...
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      expect(screen.getByLabelText('Black rating')).toHaveValue('1500');
+      // ...nor remembered from a game started with it.
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1900' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'random' } });
+      await start(fetch);
+      await vi.waitFor(() => expect(started).toHaveBeenCalled());
+      unmount();
+      render(<NewGameForm />);
+      expect(screen.getByLabelText('White rating')).toHaveValue('1500');
+    });
+
+    it('gives a second person at the board no rating rather than the first one’s', () => {
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1800' } });
+
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+
+      expect(screen.getByLabelText('Black rating')).toHaveValue('');
+      expect(screen.getByLabelText('White rating')).toHaveValue('1800');
+    });
+
+    it('marks a box holding a rating the server would refuse', () => {
+      render(<NewGameForm />);
+
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '4100' } });
+      expect(screen.getByLabelText('White rating')).toHaveAttribute('aria-invalid', 'true');
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1500' } });
+      expect(screen.getByLabelText('White rating')).toHaveAttribute('aria-invalid', 'false');
+    });
+
+    it('gives a side taken back beside another person no rating rather than theirs', () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1800' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('Black rating'), { target: { value: '1200' } });
+
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
+
+      // Back to the same person, or a third: which one is anybody's guess, so nobody's.
+      expect(screen.getByLabelText('White rating')).toHaveValue('');
+      expect(screen.getByLabelText('Black rating')).toHaveValue('1200');
+    });
+
+    it('follows the person to whichever side they take after typing it', async () => {
+      window.localStorage.setItem('chess-ai.my-rating', '1500');
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1800' } });
+
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+
+      expect(screen.getByLabelText('Black rating')).toHaveValue('1800');
+      expect(await start(fetch)).toMatchObject({ black: { kind: 'human', rating: 1800 } });
+    });
+
+    it('is remembered only from a game with one person in it', async () => {
+      const started = vi.fn();
+      const { unmount } = render(<NewGameForm onStarted={started} />);
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'human' } });
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1650' } });
+      fireEvent.change(screen.getByLabelText('Black rating'), { target: { value: '2100' } });
+      await start(fetch);
+      await vi.waitFor(() => expect(started).toHaveBeenCalled());
+      unmount();
+
+      render(<NewGameForm />);
+
+      // Two people at the board: which of them this browser belongs to is anybody's guess.
+      expect(screen.getByLabelText('White rating')).toHaveValue('');
+    });
+
+    it.each(['5000', '-100', '1650.5', '1e3', '15OO', '-'])(
+      'will not start with a rating of %s, nor remember it',
+      (typed) => {
+        const { unmount } = render(<NewGameForm />);
+
+        fireEvent.change(screen.getByLabelText('White rating'), { target: { value: typed } });
+
+        expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+        unmount();
+        render(<NewGameForm />);
+        expect(screen.getByLabelText('White rating')).toHaveValue('');
+      },
+    );
+
+    it('is not sent for a side nobody plays by hand', async () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1650' } });
+
+      fireEvent.change(screen.getByLabelText('White'), { target: { value: 'random' } });
+
+      expect(await start(fetch)).toMatchObject({ white: RANDOM });
+    });
   });
 
   describe('playing a checkpoint', () => {
@@ -322,9 +602,12 @@ describe('NewGameForm', () => {
           /^Step 6000 played about as well as Stockfish set to 1420 \(likely 1360 to 1481\) at 0\.1 s a move on the Stockfish ladder, asked to play like a player rated 2000\. That is Stockfish’s own scale, not a Lichess rating\./,
         ),
       ).toBeInTheDocument();
-      expect(screen.getByText(/You have asked for no rating/)).toBeInTheDocument();
-      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '2000' } });
+      // Nothing typed, against nobody who gave a rating: the default, which the ladder used.
       expect(screen.queryByText(/may play differently/)).not.toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText('White plays like'), { target: { value: '1500' } });
+      expect(screen.getByText(/You have asked for 1500/)).toBeInTheDocument();
+      fireEvent.click(screen.getByLabelText('White claims no rating'));
+      expect(screen.getByText(/You have asked for no rating/)).toBeInTheDocument();
     });
 
     it('says a checkpoint has no ladder, and names the nearest one it shows instead', async () => {
@@ -392,17 +675,61 @@ describe('NewGameForm', () => {
       render(<NewGameForm />);
       await chooseModel('White');
 
-      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1600' } });
+      fireEvent.change(screen.getByLabelText('White plays like'), { target: { value: '1600' } });
 
       expect(await start(fetch)).toMatchObject({ white: { rating: 1600 } });
     });
 
-    it('claims no rating at all when the box is left empty', async () => {
+    it('leaves an empty box to the server, which plays the default against no person', async () => {
       render(<NewGameForm />);
       await chooseModel('White');
 
-      expect(screen.getByLabelText('White rating')).toHaveValue(null);
+      expect(screen.getByLabelText('White plays like')).toHaveValue('');
+      expect(screen.getByLabelText('White plays like')).toHaveAttribute('placeholder', '2000');
       expect(await start(fetch)).toMatchObject({ white: { rating: null } });
+    });
+
+    it('says an empty box plays like the person on the other side', async () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1650' } });
+      await chooseModel('Black');
+
+      expect(screen.getByLabelText('Black plays like')).toHaveAttribute('placeholder', '1650');
+      expect(screen.getByLabelText('Black plays like')).toHaveAccessibleDescription(
+        'Left empty, it plays like its opponent’s 1650.',
+      );
+      // Step 6000's ladder was played at 2000, and an empty box now means 1650.
+      expect(await screen.findByText(/You have asked for 1650/)).toBeInTheDocument();
+      expect(await start(fetch)).toMatchObject({
+        white: { kind: 'human', rating: 1650 },
+        black: { kind: 'model', rating: null },
+      });
+    });
+
+    it('will not start a model asked to play like a rating out of range', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      fireEvent.change(screen.getByLabelText('White plays like'), { target: { value: '4001' } });
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+      // Mistyped, which a number box would report as empty, and so as no rating at all.
+      fireEvent.change(screen.getByLabelText('White plays like'), { target: { value: '15OO' } });
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+      expect(screen.getByLabelText('White plays like')).toHaveAttribute('aria-invalid', 'true');
+    });
+
+    it('claims no rating only when that is asked for', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+      fireEvent.change(screen.getByLabelText('White plays like'), { target: { value: '1600' } });
+
+      fireEvent.click(screen.getByLabelText('White claims no rating'));
+
+      expect(screen.getByLabelText('White plays like')).toBeDisabled();
+      expect(screen.getByText(/plays close to at random/)).toBeInTheDocument();
+      expect(await start(fetch)).toMatchObject({ white: { rating: 'unknown' } });
+      fireEvent.click(screen.getByLabelText('White claims no rating'));
+      expect(screen.getByLabelText('White plays like')).toHaveValue('1600');
     });
 
     it('offers a temperature only when the model samples its move', async () => {
@@ -436,12 +763,12 @@ describe('NewGameForm', () => {
     it('keeps the run and rating while the side is given back to a person', async () => {
       render(<NewGameForm />);
       await chooseModel('White');
-      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1200' } });
+      fireEvent.change(screen.getByLabelText('White plays like'), { target: { value: '1200' } });
 
       fireEvent.change(screen.getByLabelText('White'), { target: { value: 'human' } });
       fireEvent.change(screen.getByLabelText('White'), { target: { value: 'model' } });
 
-      expect(screen.getByLabelText('White rating')).toHaveValue(1200);
+      expect(screen.getByLabelText('White plays like')).toHaveValue('1200');
       expect(await start(fetch)).toMatchObject({ white: { run: 'mlp-baseline', rating: 1200 } });
     });
 
@@ -449,9 +776,9 @@ describe('NewGameForm', () => {
       render(<NewGameForm />);
       await chooseModel('White');
 
-      fireEvent.change(screen.getByLabelText('White rating'), { target: { value: '1337' } });
+      fireEvent.change(screen.getByLabelText('White plays like'), { target: { value: '1337' } });
 
-      expect(screen.getByLabelText('White rating')).toBeValid();
+      expect(screen.getByLabelText('White plays like')).toBeValid();
     });
 
     it('keeps the runs that arrive after the side was given back to a person', async () => {
@@ -521,6 +848,24 @@ describe('NewGameForm', () => {
       await screen.findAllByText(/Stockfish 14.1 plays/);
       const asked = (fetch.mock.calls as [string][]).map(([url]) => new URL(url).pathname);
       expect(asked).toEqual(['/chess/api/stockfish']);
+    });
+
+    it.each(['1500.5', '5000', '1e3', '15OO'])('will not start at an Elo of %s', (typed) => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      fireEvent.change(screen.getByLabelText('Black Elo'), { target: { value: typed } });
+
+      expect(screen.getByRole('button', { name: 'Start' })).toBeDisabled();
+    });
+
+    it('marks an Elo the server would refuse', () => {
+      render(<NewGameForm />);
+      fireEvent.change(screen.getByLabelText('Black'), { target: { value: 'stockfish' } });
+
+      fireEvent.change(screen.getByLabelText('Black Elo'), { target: { value: '1 500' } });
+
+      expect(screen.getByLabelText('Black Elo')).toHaveAttribute('aria-invalid', 'true');
     });
 
     it('will not start without an Elo to play at', () => {

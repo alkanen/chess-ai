@@ -48,9 +48,11 @@ from chess_ai.game_session import (
     GameStateEvent,
     MoveEvent,
     PausedEvent,
+    PlayerInfo,
     ReplacedEvent,
     RequestEvent,
     TakebackEvent,
+    describe_player,
 )
 from chess_ai.pgn import MEDIA_TYPE as PGN_MEDIA_TYPE
 from chess_ai.pgn import game_pgn, pgn_filename, save_game
@@ -168,6 +170,21 @@ EXPIRY_POLL_SECONDS = 600.0
 """How often the games are looked over for ones nobody has moved in for too long. A game kept
 ten minutes past its week is no matter."""
 
+DEFAULT_RATING = 2000
+"""The rating a model plays like when none was typed for it and it plays nobody who gave one.
+
+What the Stockfish ladder and the evaluator's sample games ask for unless configured otherwise,
+so that a game started here plays at the rating its checkpoint's ladder was measured at. It is
+a setting of the games played here, not a copy of ``[ladder] rating``: a ladder measured at
+another rating says which beside the strength the new-game form shows, and that the model may
+play differently at the rating asked for. A model is never asked to claim no
+rating unless that is what was chosen: no Lichess-trained model has seen a position without
+one, and asked for that it plays close to at random."""
+
+UNKNOWN_RATING = "unknown"
+"""What a model's rating is given as to have it claim none, on purpose: for a model trained to
+play without ratings."""
+
 RUN_POLL_SECONDS = 1.0
 """How often a run being followed is looked at for new metrics and a new heartbeat.
 
@@ -198,6 +215,9 @@ class HumanSpec(PlayerSpec):
     """A person at a browser, whose moves are submitted over the game WebSocket."""
 
     kind: Literal["human"]
+    rating: int | None = Field(default=None, ge=0, le=4000)
+    """How strong the person is, which a model playing them is told, and plays like when no
+    rating was asked of it. Left out, the person claims none."""
 
 
 class RandomSpec(PlayerSpec):
@@ -215,9 +235,13 @@ class ModelSpec(PlayerSpec):
     """The training run to take the weights from, by the name it is kept under."""
     checkpoint: CheckpointChoice = "best"
     """Which checkpoint of the run to play: "latest", "best", or a step number."""
-    rating: int | None = Field(default=None, ge=0, le=4000)
-    """The rating to play like, given to the network as both sides' rating. Left out, the
-    position claims no rating at all, which is also something the model was trained on."""
+    rating: Annotated[int, Field(ge=0, le=4000)] | Literal["unknown"] | None = None
+    """The rating to play like. Left out, it plays like the person it plays, if they gave a
+    rating, and otherwise like a player of 2000. "unknown" has the position claim no rating,
+    which only a model trained without ratings plays well: every Lichess game has them.
+
+    The opponent's rating the model is told is the opponent's own where the game knows it (a
+    person's, Stockfish's level, or another model's rating), and otherwise the model's own."""
     strategy: SelectionStrategy = "argmax"
     """"argmax" plays the most likely move every time; "sample" draws from the distribution."""
     temperature: float = Field(default=DEFAULT_TEMPERATURE, ge=MIN_TEMPERATURE, le=10)
@@ -565,11 +589,13 @@ def create_app(
             )
         # Asked before the checkpoint is loaded, so that nothing is read for a game that does
         # not need it; and again once it is, by `replace`, since the game may have moved on.
-        if seat.state.paused is None:
+        state = seat.state
+        if state.paused is None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "the game is not waiting for another player"
             )
-        player, record = await _player(spec, config, engines)
+        opponent = state.black if state.paused.side == "white" else state.white
+        player, record = await _player(spec, config, engines, opponent=opponent)
         try:
             seat.replace(player, record)
         except ActionRejectedError as rejected:
@@ -1120,19 +1146,38 @@ async def _players(
             picked; :func:`_model_player` answers that as the server's own fault. A Stockfish
             that is not there, or is not Stockfish, is the same kind of fault.
     """
-    white = await _player(request.white, config, engines)
+    specs = (request.white, request.black)
+    made: list[Made | None] = [None, None]
     try:
-        black = await _player(request.black, config, engines)
+        # Whoever is not a model first, so that a model can be told how strong they are:
+        # Stockfish's level, for one, is the one the engine says it plays, not the one asked.
+        for side, spec in enumerate(specs):
+            if not isinstance(spec, ModelSpec):
+                made[side] = await _player(spec, config, engines)
+        for side, spec in enumerate(specs):
+            if isinstance(spec, ModelSpec):
+                other = made[1 - side]
+                opponent = describe_player(other[0]) if other is not None else specs[1 - side]
+                made[side] = await _player(spec, config, engines, opponent=opponent)
     except BaseException:
-        close_players(white[0])
+        close_players(*(each[0] for each in made if each is not None))
         raise
+    white, black = made
+    assert white is not None and black is not None
     return white, black
 
 
-async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Made:
+Opponent = PlayerInfo | AnyPlayer | None
+"""Who a model plays: a player already made, one still to be made, or nobody known."""
+
+
+async def _player(
+    spec: AnyPlayer, config: Config, engines: EngineCache, *, opponent: Opponent = None
+) -> Made:
+    """The player ``spec`` asks for; a model is told how strong ``opponent`` is, if it is known."""
     match spec:
         case HumanSpec():
-            return HumanPlayer(), HumanRecord()
+            return HumanPlayer(spec.rating), HumanRecord(rating=spec.rating)
         case RandomSpec():
             return RandomPlayer(), RandomRecord()
         case ModelSpec():
@@ -1140,7 +1185,7 @@ async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Made
             # network from it, which the game being played meanwhile, and every viewer watching
             # it, should not be held up by.
             try:
-                return await run_in_threadpool(_model_player, spec, config, engines)
+                return await run_in_threadpool(_model_player, spec, config, engines, opponent)
             except RunError as missing:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, str(missing)) from missing
         case StockfishSpec():
@@ -1164,8 +1209,51 @@ async def _player(spec: AnyPlayer, config: Config, engines: EngineCache) -> Made
             assert_never(spec)
 
 
-def _model_player(spec: ModelSpec, config: Config, engines: EngineCache) -> Made:
-    """A checkpoint, loaded and sat down at the board.
+def _ratings(spec: ModelSpec, opponent: Opponent) -> tuple[int | None, int | None]:
+    """The rating the model ``spec`` asks for plays like against ``opponent``, and the rating
+    it is told ``opponent`` has.
+
+    It plays like the rating typed, if one was; otherwise like a person it plays who gave a
+    rating (someone of my strength), and otherwise like :data:`DEFAULT_RATING`. It claims no
+    rating, ``None``, only when that was asked for by name.
+
+    It is told the opponent's rating where that is known: a person's, Stockfish's level, or
+    what another model plays like. Otherwise it is told its own, which costs its moves nothing
+    measurable, where an opponent said to have no rating costs some.
+    """
+    if isinstance(opponent, ModelSpec):
+        # A model still to be made, which plays like what it was asked for or the default:
+        # its own opponent is this model, which is not a person.
+        opponent_rating, person = _ratings(opponent, None)[0], None
+    elif isinstance(opponent, PlayerInfo):
+        opponent_rating = _rating_of(opponent)
+        person = opponent.rating if opponent.accepts_moves else None
+    else:
+        # Anything else is a player not yet made, which only a model is made after.
+        opponent_rating, person = None, None
+    if spec.rating == UNKNOWN_RATING:
+        rating = None
+    elif spec.rating is not None:
+        rating = spec.rating
+    else:
+        rating = person if person is not None else DEFAULT_RATING
+    return rating, opponent_rating if opponent_rating is not None else rating
+
+
+def _rating_of(player: PlayerInfo) -> int | None:
+    """How strong the game knows ``player`` to be, which a model playing them is told."""
+    if player.model is not None:
+        # What it plays like; None for one asked to claim no rating, which says nothing.
+        return player.model.rating
+    if player.stockfish is not None:
+        return player.stockfish.elo
+    return player.rating
+
+
+def _model_player(
+    spec: ModelSpec, config: Config, engines: EngineCache, opponent: Opponent
+) -> Made:
+    """A checkpoint, loaded and sat down at the board, against ``opponent``.
 
     The checkpoint is borrowed from ``engines``, which every game shares: a checkpoint playing
     in several games, or playing itself at two ratings, is one set of weights and several ways
@@ -1174,17 +1262,22 @@ def _model_player(spec: ModelSpec, config: Config, engines: EngineCache) -> Made
 
     It is loaded here, if it is not loaded already, so that a checkpoint that cannot be played
     is refused when the game is asked for rather than on its first move.
+
+    The model is given the opponent's rating where the game knows it, and its own otherwise;
+    see :class:`ModelSpec`.
     """
     from chess_ai.inference import DeviceUnavailableError, InferenceError
 
     run = open_run(config.paths.runs, spec.run)
     chosen = choose_checkpoint(run, spec.checkpoint)
     key = CheckpointKey(run.name, chosen.step, _fingerprint(run.checkpoint_path(chosen)))
+    rating, opponent_rating = _ratings(spec, opponent)
     record = ModelRecord(
         run=key.run,
         step=key.step,
         fingerprint=key.fingerprint,
-        rating=spec.rating,
+        rating=rating,
+        opponent_rating=opponent_rating,
         strategy=spec.strategy,
         temperature=spec.temperature,
         seed=spec.seed,
@@ -1210,6 +1303,9 @@ def _model_player_from(record: ModelRecord, engines: EngineCache) -> Player:
         run=record.run,
         checkpoint=record.step,
         rating=record.rating,
+        # A game recorded before the opponent's rating was told apart has none, and was
+        # played with the model's own, which is what the player falls back on.
+        opponent_rating=record.opponent_rating,
         strategy=record.strategy,
         temperature=record.temperature,
         seed=record.seed,
@@ -1224,7 +1320,7 @@ def _revive(record: PlayerRecord, config: Config, engines: EngineCache) -> Playe
     """
     match record:
         case HumanRecord():
-            return HumanPlayer()
+            return HumanPlayer(record.rating)
         case RandomRecord():
             return RandomPlayer()
         case ModelRecord():

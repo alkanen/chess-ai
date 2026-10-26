@@ -7,13 +7,15 @@
         "name": "Scripted",
         "accepts_moves": false,
         "model": null,
-        "stockfish": null
+        "stockfish": null,
+        "rating": null
       },
       "black": {
         "name": "Scripted",
         "accepts_moves": false,
         "model": null,
-        "stockfish": null
+        "stockfish": null,
+        "rating": null
       },
       "start_fen": "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
       "moves": [],

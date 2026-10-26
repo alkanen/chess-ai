@@ -62,10 +62,20 @@ function describeModel(player: PlayerInfo): string | null {
   if (model === null) {
     return null;
   }
-  const rating = model.rating !== null ? `plays like ${model.rating}` : 'no rating';
+  let rating = model.rating !== null ? `plays like ${model.rating}` : 'claims no rating';
+  // Told its opponent's rating where that is not its own, as against a person who gave one.
+  const told = model.opponent_rating ?? model.rating;
+  if (told !== null && told !== model.rating) {
+    rating += ` against ${told}`;
+  }
   const choosing =
     model.strategy === 'sample' ? `samples at ${model.temperature}` : 'plays its best move';
   return `${rating}, ${choosing}`;
+}
+
+/** The rating a person playing a side gave, for a side a person who gave one plays. */
+function describePerson(player: PlayerInfo): string | null {
+  return player.accepts_moves && player.rating != null ? `rated ${player.rating}` : null;
 }
 
 /**
@@ -91,7 +101,7 @@ function describeStockfish(player: PlayerInfo): string | null {
 
 /** One side of the game: who is playing it, and how they were asked to. */
 export function Player({ player }: { player: PlayerInfo }) {
-  const note = describeModel(player) ?? describeStockfish(player);
+  const note = describeModel(player) ?? describeStockfish(player) ?? describePerson(player);
   return (
     <dd>
       <span className="player-name" title={player.name}>
@@ -221,6 +231,7 @@ export function GameView({ link }: GameViewProps) {
               link={link}
               paused={game.paused}
               player={game[game.paused.side]}
+              opponent={game[game.paused.side === 'white' ? 'black' : 'white']}
               access={view.access}
               disabled={!connected}
             />

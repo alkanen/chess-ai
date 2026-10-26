@@ -148,7 +148,13 @@ def test_random_game_streams_live_to_the_end(chess_client):
     with connect(chess_client, started["links"]["watch"]) as websocket:
         events = receive_game(websocket)
 
-    mover = {"name": "Random mover", "accepts_moves": False, "model": None, "stockfish": None}
+    mover = {
+        "name": "Random mover",
+        "accepts_moves": False,
+        "model": None,
+        "stockfish": None,
+        "rating": None,
+    }
     assert (started["game"]["white"], started["game"]["black"]) == (mover, mover)
     assert started["links"]["control"] is not None
     assert events[0].type == "state"
@@ -239,12 +245,14 @@ def test_a_human_move_submitted_over_the_websocket_is_played(chess_client):
         "accepts_moves": True,
         "model": None,
         "stockfish": None,
+        "rating": None,
     }
     assert started["game"]["black"] == {
         "name": "Random mover",
         "accepts_moves": False,
         "model": None,
         "stockfish": None,
+        "rating": None,
     }
     assert (state.type, state.access) == ("state", "white")
     assert played.type == "move"

@@ -11,8 +11,11 @@ import {
 import {
   isPlayable,
   NO_MODEL,
+  personsRating,
   playerSpec,
   PlayerPicker,
+  rememberedRating,
+  rememberRating,
   resolved,
   type PlayerChoice,
 } from './PlayerPicker';
@@ -94,8 +97,50 @@ interface NewGameFormProps {
 
 /** Starts a new game on the server, alongside any others. */
 export function NewGameForm({ onStarted }: NewGameFormProps) {
-  const [white, setWhite] = useState<PlayerChoice>({ ...NO_MODEL, kind: 'human' });
-  const [black, setBlack] = useState<PlayerChoice>({ ...NO_MODEL, kind: 'random' });
+  const [remembered] = useState(rememberedRating);
+  // The rating the person last gave, here or in an earlier game: a side they take is given it.
+  const lastRating = useRef(remembered);
+  const [white, setWhiteChoice] = useState<PlayerChoice>({
+    ...NO_MODEL,
+    kind: 'human',
+    humanRating: remembered,
+  });
+  // Empty until somebody plays it: a second person at the board has a rating of their own.
+  const [black, setBlackChoice] = useState<PlayerChoice>({ ...NO_MODEL, kind: 'random' });
+
+  /**
+   * `set` for a side that was `before`, opposite `other`.
+   *
+   * Who sits at which side is not something the form can know, so it fills in a rating only
+   * where there is one person at the board, who is this browser's, and never puts one person's
+   * rating on another's side: a box it cannot be sure of is left empty, which claims no rating
+   * for that person (a model playing them is told nothing of them), for whoever is there to
+   * type theirs.
+   * - A side given to a person, with nobody on the other side, takes this browser's rating.
+   *   Beside a person, it is a second person's, and starts empty.
+   * - A side taken from a person is emptied, so that whoever sits there next starts afresh.
+   * - What is typed is this browser's rating only while one person is at the board, and only
+   *   this browser's rating is remembered when a game starts.
+   */
+  function choosing(
+    before: PlayerChoice,
+    other: PlayerChoice,
+    set: (choice: PlayerChoice) => void,
+  ) {
+    return (choice: PlayerChoice) => {
+      const alone = other.kind !== 'human';
+      if (choice.kind === 'human' && before.kind !== 'human') {
+        choice = { ...choice, humanRating: alone ? lastRating.current : '' };
+      } else if (choice.kind !== 'human' && before.kind === 'human') {
+        choice = { ...choice, humanRating: '' };
+      } else if (choice.humanRating !== before.humanRating && alone) {
+        lastRating.current = choice.humanRating;
+      }
+      set(choice);
+    };
+  }
+  const setWhite = choosing(white, black, setWhiteChoice);
+  const setBlack = choosing(black, white, setBlackChoice);
   const [moveDelay, setMoveDelay] = useState(DEFAULT_MOVE_DELAY);
   const [fen, setFen] = useState('');
   const [starting, setStarting] = useState(false);
@@ -121,6 +166,9 @@ export function NewGameForm({ onStarted }: NewGameFormProps) {
     event.preventDefault();
     setStarting(true);
     setError(null);
+    // This browser's rating as the game is started, which the boxes may be typed into while the
+    // server works on it: what is remembered is about the game that was started.
+    const mine = lastRating.current.trim();
     try {
       const started = await startGame({
         white: playerSpec(sides.white),
@@ -129,6 +177,14 @@ export function NewGameForm({ onStarted }: NewGameFormProps) {
         // An empty box is not a position: that game starts where games start.
         fen: fen.trim() || null,
       });
+      // Kept for next time from a game the server started with one person in it, and only if
+      // their rating is this browser's: typed while they were alone at the board, as choosing
+      // has it. One typed beside a second person may be that person's, who may be the one
+      // left playing.
+      const people = [sides.white, sides.black].filter((side) => side.kind === 'human');
+      if (people.length === 1 && people[0].humanRating.trim() === mine) {
+        rememberRating(people[0].humanRating);
+      }
       onStarted?.(started);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -146,6 +202,7 @@ export function NewGameForm({ onStarted }: NewGameFormProps) {
         onChange={setWhite}
         runs={runs}
         stockfish={stockfish}
+        person={personsRating(sides.black)}
       />
       <PlayerPicker
         label="Black"
@@ -153,6 +210,7 @@ export function NewGameForm({ onStarted }: NewGameFormProps) {
         onChange={setBlack}
         runs={runs}
         stockfish={stockfish}
+        person={personsRating(sides.white)}
       />
       {runsError !== null && (
         <p className="note">Could not list the training runs: {runsError}</p>

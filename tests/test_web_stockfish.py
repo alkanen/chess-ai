@@ -16,6 +16,7 @@ import chess
 import pytest
 from fastapi.testclient import TestClient
 from stockfish_helpers import fake_engine, needs_stockfish, running, started, wait_until_gone
+from training_helpers import model_run
 
 from chess_ai.config import Config, PathsConfig, ServerConfig, StockfishConfig
 from chess_ai.web import create_app
@@ -163,6 +164,18 @@ def test_the_server_going_down_takes_every_engine_with_it(tmp_path, engine):
 
     # Gone by the time the server has finished going down, not some time after.
     assert not any(running(pid) for pid in pids)
+
+
+def test_a_checkpoint_playing_stockfish_is_told_the_level_it_plays_at(tmp_path, engine):
+    model_run(tmp_path / "runs")
+    with serve(tmp_path, engine) as client:
+        game = start(client, {"kind": "model", "run": "tiny"}, stockfish(800))
+
+    # Asked for 800, which this Stockfish plays at its floor: the model is told the floor.
+    assert game["black"]["stockfish"]["elo"] == 1320
+    played = game["white"]["model"]
+    # Stockfish is no person, so the model plays like the default rather than like it.
+    assert (played["rating"], played["opponent_rating"]) == (2000, 1320)
 
 
 def test_a_missing_stockfish_is_the_servers_fault_and_says_how_to_fix_it(tmp_path):

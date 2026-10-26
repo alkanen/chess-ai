@@ -28,6 +28,42 @@ const MOVE_TIMES = [0.1, 0.25, 0.5, 1, 2, 5];
 const DEFAULT_MOVE_TIME = 1;
 const DEFAULT_ELO = '1500';
 
+/**
+ * The rating a model plays like when none is typed and it plays nobody who gave one: the
+ * default rating of games played here. Mirrors chess_ai.web.app.DEFAULT_RATING.
+ */
+export const DEFAULT_RATING = 2000;
+
+const RATING_KEY = 'chess-ai.my-rating';
+
+/** The rating this browser's person last gave, or '' if none. */
+export function rememberedRating(): string {
+  try {
+    // Checked on the way out as on the way in: an earlier build kept whatever was typed.
+    const kept = window.localStorage.getItem(RATING_KEY)?.trim() ?? '';
+    return isRating(kept) ? kept : '';
+  } catch {
+    // Storage this browser will not let the page use: typed again each game.
+    return '';
+  }
+}
+
+/**
+ * Keep `rating` as this browser's person's, for the next game. Only a rating the server takes
+ * is kept, so a game is never started from a bad one; an empty box keeps what was kept before,
+ * since one game played unrated says nothing about the person's rating.
+ */
+export function rememberRating(rating: string): void {
+  if (rating.trim() === '' || !isRating(rating)) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(RATING_KEY, rating.trim());
+  } catch {
+    // Not remembered, which costs typing it again next time and nothing else.
+  }
+}
+
 /** Temperatures worth offering: under 1 sharpens towards the best move, over 1 flattens. */
 const TEMPERATURES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 const DEFAULT_TEMPERATURE = 1;
@@ -43,8 +79,15 @@ export interface PlayerChoice {
   /** The run to play, or "" when none has been chosen yet. */
   run: string;
   checkpoint: CheckpointChoice;
-  /** The rating to play like, as typed; empty asks the model to claim no rating. */
+  /**
+   * The rating a model is to play like, as typed. Empty plays like the person on the other
+   * side, if they gave a rating, and otherwise like DEFAULT_RATING.
+   */
   rating: string;
+  /** Whether the model is to claim no rating at all, for a model trained without them. */
+  unrated: boolean;
+  /** How strong the person playing this side is, as typed; empty claims no rating. */
+  humanRating: string;
   strategy: SelectionStrategy;
   temperature: number;
   /** The Elo Stockfish is to play at, as typed. */
@@ -58,6 +101,8 @@ export const NO_MODEL: PlayerChoice = {
   run: '',
   checkpoint: 'best',
   rating: '',
+  unrated: false,
+  humanRating: '',
   strategy: 'argmax',
   temperature: DEFAULT_TEMPERATURE,
   elo: DEFAULT_ELO,
@@ -68,6 +113,9 @@ export const NO_MODEL: PlayerChoice = {
 export function playerSpec(choice: PlayerChoice): PlayerSpec {
   if (choice.kind === 'stockfish') {
     return { kind: 'stockfish', elo: Number(choice.elo), move_time: choice.moveTime };
+  }
+  if (choice.kind === 'human') {
+    return { kind: 'human', rating: typedRating(choice.humanRating) };
   }
   if (choice.kind !== 'model') {
     return { kind: choice.kind };
@@ -82,22 +130,68 @@ export function playerSpec(choice: PlayerChoice): PlayerSpec {
   };
 }
 
-/** The rating a model is to play like, as the server wants it. */
-function askedRating(choice: PlayerChoice): number | null {
-  // An empty box is not a rating: that model plays a position that claims none.
-  return choice.rating.trim() === '' ? null : Number(choice.rating);
+/** A rating as typed, or null for an empty box. */
+function typedRating(typed: string): number | null {
+  return typed.trim() === '' ? null : Number(typed);
+}
+
+/**
+ * The rating a model is to play like, as the server wants it: an empty box is left to the
+ * server, which knows who the model plays.
+ */
+function askedRating(choice: PlayerChoice): number | 'unknown' | null {
+  return choice.unrated ? 'unknown' : typedRating(choice.rating);
+}
+
+/**
+ * The rating a person playing `side` gave, or null if a person does not play it or gave none:
+ * what a model on the other side plays like when no rating is typed for it.
+ */
+export function personsRating(side: PlayerChoice): number | null {
+  return side.kind === 'human' ? typedRating(side.humanRating) : null;
+}
+
+/**
+ * The rating a model will play like, as the server works it out; null when it claims none.
+ * `person` is the rating of the person it plays, if one plays it and gave one.
+ */
+export function playsLike(choice: PlayerChoice, person: number | null): number | null {
+  if (choice.unrated) {
+    return null;
+  }
+  return typedRating(choice.rating) ?? person ?? DEFAULT_RATING;
+}
+
+/**
+ * Whether `typed` is empty or a rating the server takes: a whole number from 0 to 4000, in
+ * digits. The boxes are text boxes, so that this sees what was typed: a number box reports
+ * "" for what it cannot read, such as "15OO" or a lone "-", which would pass as no rating.
+ */
+export function isRating(typed: string): boolean {
+  if (typed.trim() === '') {
+    return true;
+  }
+  return /^\s*\d+\s*$/.test(typed) && Number(typed) <= 4000;
+}
+
+/** Whether a model's rating is one the server takes: claiming none, or a rating that is. */
+export function isModelRating(choice: PlayerChoice): boolean {
+  return choice.unrated || isRating(choice.rating);
 }
 
 /**
  * Whether this side can be played at all, which a model with no run to play cannot, and
- * Stockfish with no Elo to play at cannot either.
+ * Stockfish with no Elo to play at cannot either; nor can a side with a rating the server
+ * would refuse.
  */
 export function isPlayable(choice: PlayerChoice): boolean {
   switch (choice.kind) {
+    case 'human':
+      return isRating(choice.humanRating);
     case 'model':
-      return choice.run !== '';
+      return choice.run !== '' && isModelRating(choice);
     case 'stockfish':
-      return choice.elo.trim() !== '' && Number.isFinite(Number(choice.elo));
+      return choice.elo.trim() !== '' && isRating(choice.elo);
     default:
       return true;
   }
@@ -179,10 +273,19 @@ interface PlayerPickerProps {
   runs: RunSummary[] | null;
   /** The Stockfish there is to play, or null until the server says (or if it has none). */
   stockfish: StockfishInfo | null;
+  /** The rating of the person playing the other side, if one does and gave one. */
+  person: number | null;
 }
 
 /** One side of the new-game form: what plays it, and the settings that kind takes. */
-export function PlayerPicker({ label, value, onChange, runs, stockfish }: PlayerPickerProps) {
+export function PlayerPicker({
+  label,
+  value,
+  onChange,
+  runs,
+  stockfish,
+  person,
+}: PlayerPickerProps) {
   // What is on show, and what a change to any other field is made against: the run the
   // person can see chosen, which for a model chosen before the runs arrived is the first.
   const choice = resolved(value, runs);
@@ -204,12 +307,14 @@ export function PlayerPicker({ label, value, onChange, runs, stockfish }: Player
           ))}
         </select>
       </label>
+      {choice.kind === 'human' && <HumanFields label={label} value={choice} onChange={onChange} />}
       {choice.kind === 'model' && (
         <ModelFields
           label={label}
           value={choice}
           onChange={onChange}
           runs={runs}
+          person={person}
           checkpoints={checkpoints}
           ladders={ladders}
         />
@@ -228,13 +333,15 @@ interface ModelPickerProps {
   onChange: (choice: PlayerChoice) => void;
   /** The runs there are to play, or null until they arrive. */
   runs: RunSummary[] | null;
+  /** The rating of the person playing the other side, if one does and gave one. */
+  person: number | null;
 }
 
 /**
  * A checkpoint to play a side, chosen on its own: for where no other kind of player will do,
  * such as taking over from a checkpoint that is gone.
  */
-export function ModelPicker({ label, value, onChange, runs }: ModelPickerProps) {
+export function ModelPicker({ label, value, onChange, runs, person }: ModelPickerProps) {
   const choice = resolved({ ...value, kind: 'model' }, runs);
   const checkpoints = useCheckpoints(choice.run);
   const ladders = useLadders(choice.run);
@@ -244,9 +351,43 @@ export function ModelPicker({ label, value, onChange, runs }: ModelPickerProps) 
       value={choice}
       onChange={onChange}
       runs={runs}
+      person={person}
       checkpoints={checkpoints}
       ladders={ladders}
     />
+  );
+}
+
+interface HumanFieldsProps {
+  label: string;
+  value: PlayerChoice;
+  onChange: (choice: PlayerChoice) => void;
+}
+
+/** How strong the person playing this side is, which a model playing them is told. */
+function HumanFields({ label, value, onChange }: HumanFieldsProps) {
+  const hint = `${label.toLowerCase()}-rating-hint`;
+  return (
+    <div className="model-settings">
+      <label>
+        {label} rating{' '}
+        <input
+          type="text"
+          inputMode="numeric"
+          autoComplete="off"
+          value={value.humanRating}
+          aria-invalid={!isPlayable(value)}
+          placeholder="unrated"
+          aria-describedby={hint}
+          onChange={(e) => onChange({ ...value, humanRating: e.target.value })}
+        />
+      </label>
+      <p className="note" id={hint}>
+        A model playing this side is told it, and plays like it unless given a rating of its
+        own; left empty, it is told nothing of you. Remembered in this browser if you typed it
+        while you were the only person in the game.
+      </p>
+    </div>
   );
 }
 
@@ -265,15 +406,14 @@ function StockfishFields({ label, value, onChange, info }: StockfishFieldsProps)
       <label>
         {label} Elo{' '}
         <input
-          type="number"
-          // The range the server takes rather than the one Stockfish plays, so that asking
-          // for 800 is played at the floor, and said to be, rather than refused by the form.
-          min={0}
-          max={4000}
-          // Any whole Elo, as the server takes: a coarser step makes the browser refuse to
-          // submit the form at numbers off it, such as the 1320 the hint below may name.
-          step={1}
+          // Checked by isRating, as a rating is, against the range the server takes rather
+          // than the one Stockfish plays: asking for 800 is played at the floor, and said to
+          // be, rather than refused by the form.
+          type="text"
+          inputMode="numeric"
+          autoComplete="off"
           value={value.elo}
+          aria-invalid={!isPlayable(value)}
           aria-describedby={hint}
           onChange={(e) => onChange({ ...value, elo: e.target.value })}
         />
@@ -307,8 +447,17 @@ interface ModelFieldsProps extends Omit<PlayerPickerProps, 'stockfish'> {
 }
 
 /** Which checkpoint plays this side, how well it should play, and how it picks its move. */
-function ModelFields({ label, value, onChange, runs, checkpoints, ladders }: ModelFieldsProps) {
+function ModelFields({
+  label,
+  value,
+  onChange,
+  runs,
+  person,
+  checkpoints,
+  ladders,
+}: ModelFieldsProps) {
   const labels = useMemo(() => runLabels(runs ?? []), [runs]);
+  const hint = `${label.toLowerCase()}-plays-like-hint`;
   if (runs !== null && runs.length === 0) {
     return <p className="note">No training runs have been kept here yet.</p>;
   }
@@ -353,21 +502,39 @@ function ModelFields({ label, value, onChange, runs, checkpoints, ladders }: Mod
       <CheckpointStrength
         step={chosenStep(value.checkpoint, checkpoints)}
         ladders={ladders}
-        asked={askedRating(value)}
+        asked={playsLike(value, person)}
       />
       <label>
-        {label} rating{' '}
+        {label} plays like{' '}
         <input
-          type="number"
-          min={0}
-          max={4000}
-          // Any whole rating, as the server takes; see the Elo of a Stockfish side.
-          step={1}
-          value={value.rating}
-          placeholder="any"
+          type="text"
+          inputMode="numeric"
+          autoComplete="off"
+          value={value.unrated ? '' : value.rating}
+          aria-invalid={!isModelRating(value)}
+          // What an empty box plays like, which the note under it says why.
+          placeholder={value.unrated ? 'none' : String(person ?? DEFAULT_RATING)}
+          disabled={value.unrated}
+          aria-describedby={hint}
           onChange={(e) => onChange({ ...value, rating: e.target.value })}
         />
       </label>
+      <label>
+        <input
+          type="checkbox"
+          checked={value.unrated}
+          onChange={(e) => onChange({ ...value, unrated: e.target.checked })}
+        />{' '}
+        {label} claims no rating
+      </label>
+      <p className="note" id={hint}>
+        {value.unrated
+          ? 'Only a model trained on games without ratings plays well like this: one trained ' +
+            'on Lichess games, which all have them, plays close to at random.'
+          : person !== null
+            ? `Left empty, it plays like its opponent’s ${person}.`
+            : `Left empty, it plays like ${DEFAULT_RATING}.`}
+      </p>
       <label>
         {label} plays{' '}
         <select
