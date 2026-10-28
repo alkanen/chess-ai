@@ -118,7 +118,14 @@ class ModelDescription(BaseModel):
     checkpoint: int
     """The step the checkpoint was saved at, which is what names it in the run."""
     rating: int | None = None
-    """The rating it was asked to play like, or ``None`` for a position that claims none."""
+    """The rating it was asked to play like, or ``None`` for a position that claims none.
+
+    No model trained on the Lichess datasets has seen a position without ratings, and one
+    asked to claim none plays close to at random."""
+    opponent_rating: int | None = None
+    """The rating its opponent was said to have: the opponent's own where the game knew it,
+    and otherwise ``rating``. ``None`` with ``rating`` set is a game recorded before the
+    opponent's rating was told apart, in which it was ``rating`` too."""
     strategy: SelectionStrategy = "argmax"
     temperature: float | None = None
     """How flat the distribution is sampled from; ``None`` when it is not sampled at all."""
@@ -295,7 +302,9 @@ class HumanPlayer:
 
     name = "Human"
 
-    def __init__(self) -> None:
+    def __init__(self, rating: int | None = None) -> None:
+        self.rating = rating
+        """The rating the person gave, which a model playing them is told; ``None`` if none."""
         self._position: chess.Board | None = None
         self._move: asyncio.Future[chess.Move] | None = None
 

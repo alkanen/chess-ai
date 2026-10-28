@@ -89,6 +89,7 @@ def game_pgn(
     for color, player in (("White", game.white), ("Black", game.black)):
         record.headers.update(_model_tags(color, player))
         record.headers.update(_stockfish_tags(color, player))
+        record.headers.update(_person_tags(color, player))
     record.headers.update(headers or {})
     nodes: list[chess.pgn.GameNode] = [record]
     for move in game.moves:
@@ -147,7 +148,9 @@ def _model_tags(color: str, player: PlayerInfo) -> dict[str, str]:
     Tags of this project's own, because PGN has none that mean these things. The rating in
     particular is not ``WhiteElo``: it is the rating the model was asked to imitate, not an
     estimate of how well it plays, and writing it where every other program reads a strength
-    from would be a claim this project has not measured.
+    from would be a claim this project has not measured. ``WhiteOpponentRating`` is what the
+    model was told of its opponent, which is left out of games recorded before it was told
+    anything but its own.
     """
     model = player.model
     if model is None:
@@ -156,6 +159,9 @@ def _model_tags(color: str, player: PlayerInfo) -> dict[str, str]:
         "Run": model.run,
         "Checkpoint": str(model.checkpoint),
         "Rating": str(model.rating) if model.rating is not None else None,
+        "OpponentRating": (
+            str(model.opponent_rating) if model.opponent_rating is not None else None
+        ),
         "Selection": _selection(model.strategy, model.temperature),
     }
     return {f"{color}{tag}": value for tag, value in tags.items() if value is not None}
@@ -175,6 +181,14 @@ def _stockfish_tags(color: str, player: PlayerInfo) -> dict[str, str]:
     if stockfish.nodes is not None:
         return {f"{color}Elo": str(stockfish.elo), f"{color}Nodes": str(stockfish.nodes)}
     return {f"{color}Elo": str(stockfish.elo), f"{color}MoveTime": f"{stockfish.move_time:g}"}
+
+
+def _person_tags(color: str, player: PlayerInfo) -> dict[str, str]:
+    """The rating a person playing this side gave, as ``WhiteElo``: a strength, as Stockfish's
+    level is, and the one the person says they have."""
+    if not player.accepts_moves or player.rating is None:
+        return {}
+    return {f"{color}Elo": str(player.rating)}
 
 
 def _selection(strategy: str, temperature: float | None) -> str:

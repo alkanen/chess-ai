@@ -372,6 +372,38 @@ def test_a_model_player_says_what_it_was_considering(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    ("settings", "told"),
+    [
+        ({"rating": 1600, "opponent_rating": 1900}, (1600, 1900)),
+        # An opponent nothing is known of is said to be as strong as the model plays.
+        ({"rating": 1600}, (1600, 1600)),
+        # Claiming no rating is asked for by name, and the opponent's can still be given.
+        ({"opponent_rating": 1900}, (None, 1900)),
+        ({}, (None, None)),
+    ],
+)
+def test_a_model_player_tells_the_network_its_own_rating_and_its_opponents(
+    tmp_path, monkeypatch, settings, told
+):
+    run = checkpoints(tmp_path)
+    engine = load_engine(run.checkpoint_path(run.latest_checkpoint()))
+    asked = []
+    evaluate = engine.evaluate
+
+    def spy(board, *, mover_rating, opponent_rating):
+        asked.append((mover_rating, opponent_rating))
+        return evaluate(board, mover_rating=mover_rating, opponent_rating=opponent_rating)
+
+    monkeypatch.setattr(engine, "evaluate", spy)
+    played = ModelPlayer(engine, **settings)
+
+    asyncio.run(played.choose_move(GameContext(chess.Board())))
+
+    assert asked == [told]
+    assert (played.model.rating, played.model.opponent_rating) == told
+
+
 def test_a_game_between_two_checkpoints_is_played_to_its_end(tmp_path):
     """Model against model, which is the game the acceptance criteria ask to be able to watch."""
     run = checkpoints(tmp_path)

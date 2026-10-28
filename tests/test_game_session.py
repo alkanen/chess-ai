@@ -88,13 +88,25 @@ async def test_state_names_the_players_and_says_who_takes_submitted_moves():
         # left to guess.
         "model": None,
         "stockfish": None,
+        "rating": None,
     }
     assert state.black.model_dump() == {
         "name": "Human",
         "accepts_moves": True,
         "model": None,
         "stockfish": None,
+        "rating": None,
     }
+
+
+async def test_only_a_person_is_said_to_have_given_a_rating():
+    """A player that is no person but has a rating of its own is not taken for one who gave it."""
+    rated_engine = ScriptedPlayer([])
+    rated_engine.rating = 2500
+    session = GameSession(rated_engine, HumanPlayer(1650))
+
+    assert session.state.white.rating is None
+    assert session.state.black.rating == 1650
 
 
 async def test_state_says_which_checkpoint_is_playing_a_side_one_is_playing():

@@ -260,6 +260,33 @@ async def test_the_two_sides_of_a_model_against_model_game_are_told_apart():
     assert (headers["WhiteRating"], headers["BlackRating"]) == ("1200", "2000")
 
 
+async def test_a_model_says_what_it_was_told_of_its_opponent():
+    game = await model_game(
+        ModelDescription(run="r", checkpoint=1, rating=1600, opponent_rating=1850)
+    )
+
+    headers = read_back(game_pgn(game)).headers
+
+    assert (headers["WhiteRating"], headers["WhiteOpponentRating"]) == ("1600", "1850")
+    # Not an Elo: what the model was told, not how strong either side plays.
+    assert "WhiteElo" not in headers
+
+
+async def test_a_model_recorded_before_it_was_told_its_opponents_rating_says_nothing_of_it():
+    game = await model_game(ModelDescription(run="r", checkpoint=1, rating=1600))
+
+    assert "WhiteOpponentRating" not in read_back(game_pgn(game)).headers
+
+
+async def test_a_person_who_gave_a_rating_has_it_as_their_elo():
+    session = GameSession(HumanPlayer(1650), HumanPlayer(), id=GAME_ID)
+
+    headers = read_back(game_pgn(session.state)).headers
+
+    assert headers["WhiteElo"] == "1650"
+    assert "BlackElo" not in headers
+
+
 async def test_a_side_no_checkpoint_played_carries_no_model_tags():
     game = await in_progress()
 

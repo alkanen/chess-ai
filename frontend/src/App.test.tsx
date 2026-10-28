@@ -335,6 +335,7 @@ describe('App', () => {
             run: 'mlp-baseline',
             checkpoint: 12000,
             rating: 1600,
+            opponent_rating: 1850,
             strategy: 'argmax',
             temperature: null,
           },
@@ -357,9 +358,24 @@ describe('App', () => {
 
     const players = screen.getAllByRole('definition').map((element) => element.textContent);
     expect(players).toEqual([
-      'mlp-baseline step 12000plays like 1600, plays its best move',
-      'mlp-baseline step 6000no rating, samples at 1.5',
+      'mlp-baseline step 12000plays like 1600 against 1850, plays its best move',
+      'mlp-baseline step 6000claims no rating, samples at 1.5',
     ]);
+  });
+
+  it('says the rating a person playing a side gave', () => {
+    renderGame();
+    FakeWebSocket.latest.open();
+
+    FakeWebSocket.latest.deliver({
+      ...foolsMateStart,
+      game: {
+        ...foolsMateStart.game,
+        white: { name: 'Human', accepts_moves: true, model: null, stockfish: null, rating: 1650 },
+      },
+    });
+
+    expect(screen.getAllByRole('definition')[0]).toHaveTextContent('Humanrated 1650');
   });
 
   it('says how strong Stockfish plays, and when that is not the strength asked for', () => {

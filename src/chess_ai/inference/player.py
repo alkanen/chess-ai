@@ -33,10 +33,19 @@ one the network had in mind at all.
 class ModelPlayer:
     """Plays whichever move a checkpoint's policy leads to.
 
-    The rating is what the model is asked to play like, and it is given as both sides' rating:
-    the games it learned from are games between players of about equal strength, so asking for
-    a 1600's move means asking for the move a 1600 plays against another 1600. ``None`` asks for
-    a position that claims no rating at all, which the training data also holds.
+    The rating is what the model is asked to play like, and the opponent's rating is what it is
+    told about whoever it plays. Left out, the opponent's rating is the model's own: the games it
+    learned from are mostly between players of about equal strength, and an opponent said to be
+    as strong as the model plays costs its moves nothing measurable, where one said to have no
+    rating at all costs some.
+
+    Only the web server's games give the opponent's rating. The Stockfish ladder, the sample
+    games and ``chess-ai match`` leave it out, so a checkpoint's ladder results stay comparable
+    with those measured before it could be given: the ladder's own rating against every level.
+
+    ``None`` for the rating asks for a position that claims no rating. No model trained on the
+    Lichess datasets has seen one, since every game in them is rated, and such a model asked
+    for it plays close to at random: it is there for a model trained to do without.
     """
 
     def __init__(
@@ -46,12 +55,14 @@ class ModelPlayer:
         run: str | None = None,
         checkpoint: int | None = None,
         rating: int | None = None,
+        opponent_rating: int | None = None,
         strategy: SelectionStrategy = "argmax",
         temperature: float = DEFAULT_TEMPERATURE,
         seed: int | None = None,
     ) -> None:
         self._engine = engine
         self._rating = rating
+        self._opponent_rating = opponent_rating if opponent_rating is not None else rating
         self._strategy: SelectionStrategy = strategy
         self._temperature = temperature
         # Its own generator rather than the module's, so that one seeded player's moves are
@@ -61,6 +72,7 @@ class ModelPlayer:
             run=run if run is not None else engine.run,
             checkpoint=checkpoint if checkpoint is not None else engine.step,
             rating=rating,
+            opponent_rating=self._opponent_rating,
             strategy=strategy,
             # A temperature is what a sampled move was drawn at. An argmax player has none,
             # rather than one that was never used and would read as a setting of the game.
@@ -85,7 +97,7 @@ class ModelPlayer:
             self._engine.evaluate,
             context.board,
             mover_rating=self._rating,
-            opponent_rating=self._rating,
+            opponent_rating=self._opponent_rating,
         )
         move = select_move(
             evaluation,

@@ -60,6 +60,9 @@ class _PlayerRecord(BaseModel):
 
 class HumanRecord(_PlayerRecord):
     kind: Literal["human"] = "human"
+    rating: int | None = None
+    """The rating the person gave; ``None`` if they gave none, or if the game began before
+    people could give one."""
 
 
 class RandomRecord(_PlayerRecord):
@@ -74,6 +77,10 @@ class ModelRecord(_PlayerRecord):
     """Which file the checkpoint was, so that one written in its place since is not taken for
     it; see :class:`chess_ai.web.engine_cache.CheckpointKey`."""
     rating: int | None
+    """What it plays like; ``None`` claims no rating."""
+    opponent_rating: int | None = None
+    """What it is told of its opponent. ``None`` in a game that began before the opponent's
+    rating was told apart from the model's own, which it was then given as both."""
     strategy: SelectionStrategy
     temperature: float
     seed: int | None

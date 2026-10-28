@@ -50,7 +50,7 @@
   border-left-color: color-mix(in srgb, currentColor 25%, transparent);
 }
 
-.new-game .model-settings input[type='number'] {
+.new-game .model-settings input[inputmode='numeric'] {
   width: 6rem;
   font: inherit;
 }
@@ -69,4 +69,10 @@
 .new-game .run-name {
   font-family: ui-monospace, monospace;
   overflow-wrap: anywhere;
+}
+
+/* A rating or Elo the server would refuse, which is why Start is greyed out. */
+.new-game .model-settings input[aria-invalid='true'] {
+  outline: 2px solid #c33;
+  outline-offset: 1px;
 }

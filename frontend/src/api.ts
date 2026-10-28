@@ -113,6 +113,11 @@ export interface ModelDescription {
   checkpoint: number;
   /** The rating it was asked to play like, or null for a position that claims none. */
   rating: number | null;
+  /**
+   * The rating it was told its opponent has: the opponent's own where the game knew it, and
+   * otherwise its own. Null or absent in a game from before it was told anything but its own.
+   */
+  opponent_rating?: number | null;
   strategy: SelectionStrategy;
   /** How flat the distribution is sampled from; null when it is not sampled at all. */
   temperature: number | null;
@@ -141,6 +146,8 @@ export interface PlayerInfo {
   model: ModelDescription | null;
   /** How strong Stockfish plays this side, for a side Stockfish is playing. */
   stockfish: StockfishDescription | null;
+  /** The rating the person playing this side gave; null or absent if they gave none. */
+  rating?: number | null;
 }
 
 /** What one of two people at the board has asked the other, awaiting an answer. */
@@ -453,13 +460,24 @@ export interface ModelPlayerSpec {
   kind: 'model';
   run: string;
   checkpoint: CheckpointChoice;
-  /** The rating to play like, or null to claim no rating at all. */
-  rating: number | null;
+  /**
+   * The rating to play like. Null plays like the person it plays, if they gave a rating, and
+   * otherwise like the server's default; 'unknown' claims no rating at all, which only a model
+   * trained without ratings plays well.
+   */
+  rating: number | 'unknown' | null;
   strategy: SelectionStrategy;
   /** How flat the distribution is sampled from. Not used when it plays its best move. */
   temperature: number;
   /** Fixes the sampling, so that the same game can be played twice. */
   seed?: number | null;
+}
+
+/** A person at a browser. */
+export interface HumanPlayerSpec {
+  kind: 'human';
+  /** How strong they are, which a model playing them is told and plays like by default. */
+  rating?: number | null;
 }
 
 /** Stockfish, held to a strength by its calibrated limit. */
@@ -476,7 +494,7 @@ export interface StockfishPlayerSpec {
  * not take the same settings; mirrors the server's own.
  */
 export type PlayerSpec =
-  | { kind: 'human' }
+  | HumanPlayerSpec
   | { kind: 'random' }
   | ModelPlayerSpec
   | StockfishPlayerSpec;

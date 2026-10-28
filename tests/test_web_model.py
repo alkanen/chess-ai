@@ -142,6 +142,8 @@ def test_a_game_against_a_checkpoint_says_which_one_is_playing(client):
         "run": "tiny",
         "checkpoint": 4,
         "rating": 1600,
+        # Nothing is known of a person who gave no rating, so it is told its own.
+        "opponent_rating": 1600,
         "strategy": "argmax",
         "temperature": None,
     }
@@ -252,7 +254,9 @@ def test_a_finished_game_is_saved_with_the_checkpoints_that_played_it(client, tm
     assert (headers["WhiteRun"], headers["WhiteCheckpoint"]) == ("tiny", "2")
     assert (headers["BlackRun"], headers["BlackCheckpoint"]) == ("tiny", "4")
     assert headers["WhiteRating"] == "1200"
-    assert "BlackRating" not in headers
+    # Asked for no rating, against another model: the default, and each told the other's.
+    assert headers["BlackRating"] == "2000"
+    assert (headers["WhiteOpponentRating"], headers["BlackOpponentRating"]) == ("2000", "1200")
     assert (headers["WhiteSelection"], headers["BlackSelection"]) == ("argmax", "argmax")
 
 
@@ -517,6 +521,23 @@ def test_the_person_at_a_paused_game_chooses_another_checkpoint_and_plays_on(sma
     assert record.next().comment == "tiny step 2 replaced by tiny step 4"
 
 
+@pytest.mark.parametrize(("asked", "told"), [(1300, (1300, 1650)), (None, (1650, 1650))])
+def test_a_checkpoint_taking_over_a_paused_game_is_told_the_persons_rating(
+    small, runs, asked, told
+):
+    links = start(small, {"kind": "human", "rating": 1650}, model(checkpoint=2)).json()["links"]
+    assert start(small, {"kind": "human"}, model("other")).status_code == 200
+    pause(small, links, runs)
+    shutil.rmtree(runs / "tiny")
+    model_run(runs, seed=99)
+
+    answer = replace(small, links["white"], checkpoint="latest", rating=asked)
+
+    assert answer.status_code == 200, answer.text
+    played = answer.json()["game"]["black"]["model"]
+    assert (played["rating"], played["opponent_rating"]) == told
+
+
 def test_a_watch_link_cannot_choose_the_checkpoint_a_paused_game_goes_on_with(small, runs):
     links = start(small, {"kind": "human"}, model(checkpoint=2)).json()["links"]
     assert start(small, {"kind": "human"}, model("other")).status_code == 200
@@ -545,6 +566,123 @@ def test_a_checkpoint_that_cannot_take_over_is_refused_and_the_game_still_waits(
 
     assert refused.status_code == 400
     assert small.get(f"{PREFIX}/api/games/{links['white']}").json()["game"]["paused"] is not None
+
+
+def ratings(started, side: str) -> tuple[int | None, int | None]:
+    """What the model playing ``side`` plays like, and what it was told of its opponent."""
+    played = started.json()["game"][side]["model"]
+    return played["rating"], played["opponent_rating"]
+
+
+@pytest.mark.parametrize(
+    ("person", "asked", "told"),
+    [
+        # Nothing typed: it plays like the person (someone of my strength), or the default.
+        (1650, None, (1650, 1650)),
+        (None, None, (2000, 2000)),
+        # Typed: it plays like that, and is told the person's rating where there is one.
+        (1650, 1200, (1200, 1650)),
+        (None, 1200, (1200, 1200)),
+        # No rating, only when asked for by name.
+        (1650, "unknown", (None, 1650)),
+        (None, "unknown", (None, None)),
+    ],
+)
+def test_the_ratings_a_checkpoint_playing_a_person_is_given(client, person, asked, told):
+    started = start(client, {"kind": "human", "rating": person}, model(rating=asked))
+
+    assert started.status_code == 200, started.text
+    assert started.json()["game"]["white"]["rating"] == person
+    assert ratings(started, "black") == told
+
+
+@pytest.mark.parametrize(
+    ("white", "black", "told"),
+    [
+        # Each is told what the other plays like.
+        (1200, None, ((1200, 2000), (2000, 1200))),
+        (1200, 1800, ((1200, 1800), (1800, 1200))),
+        # One that claims no rating says nothing to the other, which is told its own.
+        (1200, "unknown", ((1200, 1200), (None, 1200))),
+        ("unknown", "unknown", ((None, None), (None, None))),
+    ],
+)
+def test_the_ratings_two_checkpoints_playing_each_other_are_given(client, white, black, told):
+    started = start(client, model(rating=white), model(rating=black))
+
+    assert started.status_code == 200, started.text
+    assert (ratings(started, "white"), ratings(started, "black")) == told
+
+
+def test_a_checkpoint_playing_a_random_mover_plays_like_the_default(client):
+    started = start(client, model(), RANDOM)
+
+    assert ratings(started, "white") == (2000, 2000)
+
+
+def test_a_rating_a_person_could_not_have_is_refused(client):
+    refused = start(client, {"kind": "human", "rating": -1}, model())
+
+    assert refused.status_code == 422
+
+
+def test_a_persons_rating_is_kept_with_the_game_and_in_its_pgn(tmp_path, runs):
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as before:
+        links = start(before, {"kind": "human", "rating": 1650}, model()).json()["links"]
+
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as after:
+        seen = after.get(f"{PREFIX}/api/games/{links['white']}").json()
+        pgn = after.get(f"{PREFIX}/api/games/{links['white']}/pgn")
+
+    assert seen["game"]["white"]["rating"] == 1650
+    assert seen["game"]["black"]["model"]["rating"] == 1650
+    assert seen["game"]["black"]["model"]["opponent_rating"] == 1650
+    headers = read_back(pgn.text).headers
+    assert headers["WhiteElo"] == "1650"
+    assert (headers["BlackRating"], headers["BlackOpponentRating"]) == ("1650", "1650")
+
+
+def test_a_game_kept_before_ratings_were_told_apart_carries_on_as_it_was_played(tmp_path, runs):
+    """A game started with the rating box empty, when that asked for no rating at all."""
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as before:
+        links = start(before, {"kind": "human"}, model()).json()["links"]
+    [kept] = (tmp_path / "ongoing-games").glob("*.json")
+    old = json.loads(kept.read_text())
+    del old["white"]["rating"]
+    old["black"]["rating"] = None
+    del old["black"]["opponent_rating"]
+    del old["settings"]["white"]["rating"]
+    old["settings"]["black"]["rating"] = None
+    kept.write_text(json.dumps(old))
+
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as after:
+        seen = after.get(f"{PREFIX}/api/games/{links['white']}").json()
+        with after.websocket_connect(f"{PREFIX}/api/games/{links['white']}/ws") as websocket:
+            websocket.receive_json()
+            websocket.send_json({"type": "move", "uci": "e2e4"})
+            assert websocket.receive_json()["type"] == "move"
+            answered = websocket.receive_json()
+            websocket.send_json({"type": "resign"})
+            assert websocket.receive_json()["type"] == "game_over"
+        again = after.post(f"{PREFIX}/api/games/{links['white']}/rematch")
+
+    assert seen["game"]["white"]["rating"] is None
+    assert (
+        seen["game"]["black"]["model"]["rating"],
+        seen["game"]["black"]["model"]["opponent_rating"],
+    ) == (None, None)
+    assert answered["type"] == "move"
+    # Played again, the empty box means what it means now.
+    assert again.status_code == 200, again.text
+    assert ratings(again, "black") == (2000, 2000)
 
 
 def test_a_game_against_a_checkpoint_carries_on_after_a_restart_loading_it_when_needed(
@@ -577,6 +715,7 @@ def test_a_game_against_a_checkpoint_carries_on_after_a_restart_loading_it_when_
         "run": "tiny",
         "checkpoint": 2,
         "rating": 1500,
+        "opponent_rating": 1500,
         "strategy": "argmax",
         "temperature": None,
     }

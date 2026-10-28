@@ -10,7 +10,14 @@ import {
   type PlayerInfo,
   type RunSummary,
 } from './api';
-import { ModelPicker, NO_MODEL, playerSpec, resolved, type PlayerChoice } from './PlayerPicker';
+import {
+  isPlayable,
+  ModelPicker,
+  NO_MODEL,
+  playerSpec,
+  resolved,
+  type PlayerChoice,
+} from './PlayerPicker';
 
 const SIDES: Record<Color, string> = { white: 'White', black: 'Black' };
 
@@ -22,6 +29,10 @@ function likeTheOld(player: PlayerInfo): PlayerChoice {
     kind: 'model',
     run: model?.run ?? '',
     rating: model?.rating != null ? String(model.rating) : '',
+    // Claiming no rating as the old one did, which the form warns about and one click undoes.
+    // A game from before it had to be asked for by name claimed none by accident, and this
+    // cannot tell the two apart, so it keeps what the game was played with either way.
+    unrated: model != null && model.rating === null,
     strategy: model?.strategy ?? 'argmax',
     temperature: model?.temperature ?? NO_MODEL.temperature,
   };
@@ -44,6 +55,8 @@ interface PausedPanelProps {
   paused: Paused;
   /** The player that cannot go on. */
   player: PlayerInfo;
+  /** The player on the other side, whose rating a model taking over is told. */
+  opponent: PlayerInfo;
   access: Access;
   /** Whether the server is out of reach, so nothing can be asked of the game. */
   disabled: boolean;
@@ -53,7 +66,14 @@ interface PausedPanelProps {
  * Why the game is waiting, and, for anyone but a watcher, another checkpoint to play on with.
  * Aborting is the other way out, which the game's own controls offer.
  */
-export function PausedPanel({ link, paused, player, access, disabled }: PausedPanelProps) {
+export function PausedPanel({
+  link,
+  paused,
+  player,
+  opponent,
+  access,
+  disabled,
+}: PausedPanelProps) {
   const said = `${SIDES[paused.side]}'s player, ${player.name}, cannot play on: ${paused.reason}`;
   if (access === 'watch') {
     return (
@@ -63,7 +83,14 @@ export function PausedPanel({ link, paused, player, access, disabled }: PausedPa
     );
   }
   return (
-    <ReplaceForm link={link} said={said} side={paused.side} player={player} disabled={disabled} />
+    <ReplaceForm
+      link={link}
+      said={said}
+      side={paused.side}
+      player={player}
+      person={opponent.accepts_moves ? (opponent.rating ?? null) : null}
+      disabled={disabled}
+    />
   );
 }
 
@@ -72,10 +99,12 @@ interface ReplaceFormProps {
   said: string;
   side: Color;
   player: PlayerInfo;
+  /** The rating of the person on the other side, if one plays it and gave one. */
+  person: number | null;
   disabled: boolean;
 }
 
-function ReplaceForm({ link, said, side, player, disabled }: ReplaceFormProps) {
+function ReplaceForm({ link, said, side, player, person, disabled }: ReplaceFormProps) {
   const [choice, setChoice] = useState<PlayerChoice>(() => likeTheOld(player));
   const [runs, setRuns] = useState<RunSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -118,9 +147,15 @@ function ReplaceForm({ link, said, side, player, disabled }: ReplaceFormProps) {
     <form className="request paused" aria-label="Choose another model" onSubmit={submit}>
       <p role="status">{said}.</p>
       <p>Choose another checkpoint to play on with from here, or abort the game.</p>
-      <ModelPicker label={SIDES[side]} value={chosen} onChange={setChoice} runs={runs} />
+      <ModelPicker
+        label={SIDES[side]}
+        value={chosen}
+        onChange={setChoice}
+        runs={runs}
+        person={person}
+      />
       {error !== null && <p role="alert">{error}</p>}
-      <button type="submit" disabled={disabled || asking || chosen.run === ''}>
+      <button type="submit" disabled={disabled || asking || !isPlayable(chosen)}>
         Play on with this checkpoint
       </button>
     </form>

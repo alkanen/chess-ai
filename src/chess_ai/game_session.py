@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from chess_ai.players import (
     GameContext,
+    HumanPlayer,
     ModelBackedPlayer,
     ModelDescription,
     MoveRejectedError,
@@ -81,6 +82,8 @@ class PlayerInfo(BaseModel):
     things six months later."""
     stockfish: StockfishDescription | None = None
     """How strong Stockfish plays this side, for a side Stockfish is playing."""
+    rating: int | None = None
+    """The rating the person playing this side gave, for a side a person plays who gave one."""
 
 
 RequestKind = Literal["takeback", "abort"]
@@ -409,8 +412,8 @@ class GameSession:
     def state(self) -> GameState:
         return GameState(
             id=self.id,
-            white=_describe(self._players[chess.WHITE]),
-            black=_describe(self._players[chess.BLACK]),
+            white=describe_player(self._players[chess.WHITE]),
+            black=describe_player(self._players[chess.BLACK]),
             start_fen=self._start_fen,
             moves=list(self._moves),
             position=self._position,
@@ -614,7 +617,10 @@ class GameSession:
         old = self._players[side]
         self._players[side] = player
         replacement = Replacement(
-            ply=len(self._moves), side=paused.side, old=_describe(old), new=_describe(player)
+            ply=len(self._moves),
+            side=paused.side,
+            old=describe_player(old),
+            new=describe_player(player),
         )
         self._replacements.append(replacement)
         self._paused = None
@@ -863,12 +869,15 @@ def _side(color: Color) -> chess.Color:
     return chess.WHITE if color == "white" else chess.BLACK
 
 
-def _describe(player: Player) -> PlayerInfo:
+def describe_player(player: Player) -> PlayerInfo:
+    """What viewers and PGN are told about ``player``."""
     return PlayerInfo(
         name=player.name,
         accepts_moves=isinstance(player, SubmittedMovePlayer),
         model=player.model if isinstance(player, ModelBackedPlayer) else None,
         stockfish=player.stockfish if isinstance(player, StockfishBackedPlayer) else None,
+        # A person's own say, which only a person has: not any player with a rating to it.
+        rating=player.rating if isinstance(player, HumanPlayer) else None,
     )
 
 
