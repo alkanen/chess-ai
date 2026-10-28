@@ -84,6 +84,12 @@ from chess_ai.stockfish import (
     describe_stockfish,
     start_stockfish,
 )
+from chess_ai.tournament import (
+    NoSuchTournamentError,
+    Tournament,
+    TournamentError,
+    open_tournament,
+)
 from chess_ai.training.run_store import (
     CheckpointChoice,
     EvaluationEntry,
@@ -138,6 +144,12 @@ from chess_ai.web.runs import (
     describe_run,
     ladder_points,
     show_probes,
+)
+from chess_ai.web.tournaments import (
+    TournamentPage,
+    TournamentSummary,
+    list_tournaments,
+    tournament_page,
 )
 
 logger = logging.getLogger(__name__)
@@ -922,6 +934,71 @@ def create_app(
         with _dataset_errors():
             return dataset_game(config.paths.data, name, split, index)
 
+    # The tournament routes read files a tournament being played is appending to, and are
+    # plain `def` for the same reason as the run routes. A game still being written is not
+    # read as one (see Tournament.games), so a page shows the games finished when it looked.
+
+    @api.get("/tournaments")
+    def tournaments(response: Response) -> list[TournamentSummary]:
+        """Every tournament here, the newest first, with how far each has got."""
+        response.headers.update(NO_STORE)
+        return list_tournaments(config.paths.tournaments)
+
+    @api.get(
+        "/tournaments/{name}",
+        responses={
+            404: {"description": "No tournament of that name"},
+            500: {"description": "The tournament is there and cannot be read"},
+        },
+    )
+    def tournament(name: str, response: Response) -> TournamentPage:
+        """One tournament: its entrants, leaderboard, crosstable, and games."""
+        response.headers.update(NO_STORE)
+        with _tournament_errors():
+            return tournament_page(_open_tournament(name))
+
+    @api.get(
+        "/tournaments/{name}/replay",
+        responses={
+            404: {"description": "No tournament of that name, or no such game"},
+            500: {"description": "The tournament is there and cannot be read"},
+        },
+    )
+    def tournament_game(
+        name: str,
+        response: Response,
+        game: Annotated[int, Query(ge=0, description=_WHICH_GAME)] = 0,
+    ) -> replay.ReplayFile:
+        """Replay one of a tournament's games, as the replay viewer opens a file."""
+        response.headers.update(NO_STORE)
+        with _tournament_errors():
+            pgn = _open_tournament(name).pgn()
+        if not pgn:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, f"tournament {name!r} has no games yet")
+        return _replayed(pgn, game)
+
+    @api.get(
+        "/tournaments/{name}/pgn",
+        response_class=Response,
+        responses={
+            200: {"content": {PGN_MEDIA_TYPE: {}}, "description": "Every game, as a PGN file"},
+            404: {"description": "No tournament of that name"},
+            500: {"description": "The tournament is there and cannot be read"},
+        },
+    )
+    def tournament_pgn(name: str) -> Response:
+        """Every game a tournament has finished, as one PGN file to download."""
+        with _tournament_errors():
+            pgn = _open_tournament(name).pgn()
+        return Response(
+            pgn,
+            media_type=PGN_MEDIA_TYPE,
+            headers={"Content-Disposition": f'attachment; filename="{name}.pgn"', **NO_STORE},
+        )
+
+    def _open_tournament(name: str) -> Tournament:
+        return open_tournament(config.paths.tournaments, name)
+
     def _open_run(name: str) -> RunReader:
         try:
             return open_run(config.paths.runs, name)
@@ -1513,6 +1590,18 @@ def _dataset_errors() -> Iterator[None]:
     except NoSuchDatasetError as missing:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
     except (DatasetError, ManifestError) as damaged:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(damaged)) from damaged
+
+
+@contextmanager
+def _tournament_errors() -> Iterator[None]:
+    """Answer a tournament that is not there with a 404, and one that cannot be read with a
+    500."""
+    try:
+        yield
+    except NoSuchTournamentError as missing:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(missing)) from missing
+    except TournamentError as damaged:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, str(damaged)) from damaged
 
 

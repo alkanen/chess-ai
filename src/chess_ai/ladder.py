@@ -710,7 +710,14 @@ def stands(run: RunReader, checkpoint: CheckpointInfo, written: datetime) -> boo
         result = read_ladder(run, checkpoint.step)
     except RunError:
         return False
-    if result is None or result.model.checkpoint != checkpoint.step:
+    return result is not None and result_stands(result, checkpoint.step, written)
+
+
+def result_stands(result: LadderResult, step: int, written: datetime) -> bool:
+    """Whether ``result`` is a ladder of the checkpoint from ``step`` as the file written at
+    ``written`` has it, as :func:`stands` decides for the result on disk: for a result already
+    read, so that what is decided about is what is used."""
+    if result.model.checkpoint != step:
         return False
     if result.checkpoint_written is None:
         return result.started >= written

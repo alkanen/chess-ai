@@ -88,12 +88,14 @@ class PathsConfig(BaseModel):
     """Directory the datasets built here are kept in, one directory per dataset."""
     runs: Path = Path("runs")
     """Directory training runs are kept in, one directory per run."""
+    tournaments: Path = Path("tournaments")
+    """Directory tournaments are kept in, one directory per tournament."""
     ongoing_games: Path = Path("ongoing-games")
     """Directory the games the server holds are kept in while they last, one file per game, so
     that they outlive a restart. Not under ``games``: those are the PGN files of games that
     ended, which are kept for good, and these are deleted once a game has expired."""
 
-    @field_validator("games", "data", "runs", "ongoing_games")
+    @field_validator("games", "data", "runs", "tournaments", "ongoing_games")
     @classmethod
     def _expand_user(cls, value: Path) -> Path:
         """Expand a leading ``~``, which a path in a config file may well be written with."""

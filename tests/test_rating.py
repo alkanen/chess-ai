@@ -1,8 +1,16 @@
+import math
 import random
 
 import pytest
 
-from chess_ai.rating import Beyond, Result, estimate_rating, expected_score
+from chess_ai.rating import (
+    Beyond,
+    Pairing,
+    Result,
+    estimate_rating,
+    expected_score,
+    rate_round_robin,
+)
 
 LADDER = [1350, 1500, 1700, 1900, 2100]
 
@@ -178,3 +186,78 @@ def test_a_described_estimate_gives_the_rating_and_its_range():
     estimate = estimate_rating([Result(1600, 10, 20)])
 
     assert estimate.describe() == f"1600 ({estimate.low:.0f} to {estimate.high:.0f})"
+
+
+def round_robin(rng: random.Random, ratings: list[float], games: int) -> list[Pairing]:
+    """Every pair of ``ratings`` playing ``games`` games drawn from the Elo curve."""
+    return [
+        Pairing(
+            first=i, second=j, points=play(rng, ratings[i], ratings[j], games).points, games=games
+        )
+        for i in range(len(ratings))
+        for j in range(i + 1, len(ratings))
+    ]
+
+
+def test_a_round_robin_recovers_the_entrants_order_and_the_gaps_between_them():
+    true = [1200.0, 1450.0, 1500.0, 1700.0, 2000.0]
+
+    standings = rate_round_robin(len(true), round_robin(random.Random(1), true, games=200))
+
+    ratings = [standing.rating for standing in standings]
+    assert sorted(range(len(true)), key=ratings.__getitem__) == list(range(len(true)))
+    for i in range(1, len(true)):
+        assert ratings[i] - ratings[0] == pytest.approx(true[i] - true[0], abs=40)
+
+
+def test_anchoring_an_entrant_moves_every_rating_by_as_much_and_measures_ranges_from_it():
+    pairings = round_robin(random.Random(2), [1300.0, 1500.0, 1800.0], games=40)
+    relative = rate_round_robin(3, pairings)
+
+    anchored = rate_round_robin(3, pairings, anchor=(1, 1600.0))
+
+    assert anchored[1].rating == 1600.0
+    assert (anchored[1].low, anchored[1].high) == (1600.0, 1600.0), "it is where it was put"
+    shift = 1600.0 - relative[1].rating
+    for before, after in zip(relative, anchored, strict=True):
+        assert after.rating == pytest.approx(before.rating + shift)
+    # Measured from one entrant rather than from the average of all, the others' ranges carry
+    # that entrant's uncertainty as well as their own.
+    for i in (0, 2):
+        assert anchored[i].high - anchored[i].low > relative[i].high - relative[i].low
+        assert anchored[i].low < anchored[i].rating < anchored[i].high
+
+
+def test_an_entrant_who_won_every_game_still_has_a_rating_above_the_rest():
+    pairings = [Pairing(0, 1, points=10, games=10), Pairing(0, 2, 10, 10), Pairing(1, 2, 5, 10)]
+
+    standings = rate_round_robin(3, pairings)
+
+    assert math.isfinite(standings[0].rating)
+    assert standings[0].low > max(standings[1].rating, standings[2].rating)
+
+
+def test_the_ranges_hold_the_true_ratings_about_as_often_as_they_claim():
+    true = [1400.0, 1500.0, 1650.0, 1900.0]
+    rng = random.Random(3)
+    trials, covered, checked = 200, 0, 0
+    for _ in range(trials):
+        standings = rate_round_robin(4, round_robin(rng, true, games=20), anchor=(0, true[0]))
+        for standing, rating in zip(standings[1:], true[1:], strict=True):
+            checked += 1
+            covered += standing.low <= rating <= standing.high
+    assert covered / checked == pytest.approx(0.95, abs=0.04)
+
+
+def test_more_games_narrow_the_ranges():
+    true = [1400.0, 1500.0, 1650.0]
+    few = rate_round_robin(3, round_robin(random.Random(4), true, games=10))
+    many = rate_round_robin(3, round_robin(random.Random(4), true, games=200))
+
+    for short, long in zip(few, many, strict=True):
+        assert long.high - long.low < (short.high - short.low) / 3
+
+
+def test_entrants_the_pairings_do_not_connect_cannot_be_rated():
+    with pytest.raises(ValueError, match="no way to compare"):
+        rate_round_robin(4, [Pairing(0, 1, 5, 10), Pairing(2, 3, 5, 10)])

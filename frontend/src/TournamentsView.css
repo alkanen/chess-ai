@@ -1,0 +1,74 @@
+.tournaments-view h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+}
+
+.tournaments-view h3 {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 1.05rem;
+}
+
+.tournaments-view .note {
+  opacity: 0.7;
+}
+
+.tournaments-view p[role='alert'],
+.tournaments-view .unreadable {
+  font-weight: 600;
+  color: #c33;
+}
+
+.tournaments-view .number {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tournaments-view .crosstable td.number {
+  min-width: 3rem;
+}
+
+.tournaments-view .table-frame {
+  overflow-x: auto;
+  border: 1px solid rgb(128 128 128 / 30%);
+  border-radius: 6px;
+}
+
+.tournaments-view .table-frame table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.tournaments-view .table-frame th,
+.tournaments-view .table-frame td {
+  padding: 0.4rem 0.6rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.tournaments-view .table-frame thead th {
+  font-weight: 600;
+  border-bottom: 1px solid rgb(128 128 128 / 35%);
+}
+
+.tournaments-view .table-frame tbody tr + tr {
+  border-top: 1px solid rgb(128 128 128 / 18%);
+}
+
+.tournaments-view .table-frame tbody tr:hover {
+  background: rgb(128 128 128 / 10%);
+}
+
+.tournaments-view .table-frame tbody th {
+  font-weight: 500;
+}
+
+.tournaments-view .table-frame .number {
+  text-align: right;
+}
+
+/* Text that can run long wraps, so that the numbers beside it stay in view. */
+.tournaments-view .table-frame td.unreadable,
+.tournaments-view .table-frame td.wraps {
+  white-space: normal;
+}

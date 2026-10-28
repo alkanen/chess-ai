@@ -21,12 +21,19 @@ is infinitely far below the lowest opponent, or above the highest. Such a player
 only the side of the range that the results do pin down. An estimate that is finite but outside
 the opponents' ratings is reported the same way, since all it says beyond the floor or ceiling
 is how far the curve was extrapolated, which one draw more or less would move by hundreds.
+
+A round robin is the other kind of results: players of unknown rating against each other, each
+rated against the rest at once by :func:`rate_round_robin`. Nobody's rating is known there, only
+the gaps between them, so the ratings come around an average of nothing unless one player is
+anchored to a rating known from elsewhere.
 """
 
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
+
+import numpy as np
 
 ELO_SCALE = 400.0
 """How many points of rating difference make a player ten times as likely to win as to lose."""
@@ -220,3 +227,160 @@ def _bisect(rising, low: float, high: float) -> float:
 def _normal_quantile(probability: float) -> float:
     """The standard normal quantile, found by bisecting the error function."""
     return _bisect(lambda z: (1 + math.erf(z / math.sqrt(2))) / 2 - probability, -10.0, 10.0)
+
+
+VIRTUAL_DRAWS = 1
+"""How many drawn games :func:`rate_round_robin` adds to every pairing before it rates anyone:
+enough that an entrant who won or lost every game still has a most likely rating, a few hundred
+points from the others rather than infinitely far, and few enough to be lost among real games.
+Draws, so that they pull no two entrants apart, only a little towards each other."""
+
+
+@dataclass(frozen=True)
+class Pairing:
+    """What two entrants of a round robin scored against each other, by their places in it."""
+
+    first: int
+    second: int
+    points: float
+    """What the first scored: wins plus half the draws."""
+    games: int
+
+    def __post_init__(self) -> None:
+        if self.games < 0 or not 0 <= self.points <= self.games:
+            raise ValueError(f"{self.points} points from {self.games} games is not a result")
+        if self.first == self.second:
+            raise ValueError(f"entrant {self.first} cannot be paired with itself")
+
+
+@dataclass(frozen=True)
+class Standing:
+    """An entrant's rating relative to the rest of a round robin, with the range it is good to."""
+
+    rating: float
+    low: float
+    high: float
+    games: int
+    points: float
+
+
+def rate_round_robin(
+    entrants: int,
+    pairings: Iterable[Pairing],
+    *,
+    anchor: tuple[int, float] | None = None,
+    confidence: float = DEFAULT_CONFIDENCE,
+) -> list[Standing]:
+    """The rating of each of ``entrants`` from what they scored against each other, in order.
+
+    Every rating at once, as the ones that make all the results together most likely, after
+    :data:`VIRTUAL_DRAWS` are added to every pairing. Only the gaps between them are known, so
+    they are given around an average of nothing, unless ``anchor`` puts one entrant, by its
+    place, at a rating known some other way: then every range is how far from that entrant
+    the other could be, and the anchored entrant's own range is its rating alone.
+
+    The range is the normal approximation from how sharply the likelihood falls away from its
+    peak: symmetric, unlike :func:`estimate_rating`'s, which the virtual draws make close
+    enough even for an entrant who won every game.
+
+    Raises:
+        ValueError: ``confidence`` is not between 0 and 1, or ``pairings`` do not connect
+            every entrant to every other, through others if need be, which leaves the gap
+            between the parts unknown.
+    """
+    if not 0 < confidence < 1:
+        raise ValueError(f"a confidence is between 0 and 1, not {confidence}")
+    pairs = list(pairings)
+    for pair in pairs:
+        if not (0 <= pair.first < entrants and 0 <= pair.second < entrants):
+            raise ValueError(f"a pairing of entrants {pair.first} and {pair.second} of {entrants}")
+    if anchor is not None and not 0 <= anchor[0] < entrants:
+        raise ValueError(f"entrant {anchor[0]} of {entrants} cannot be the anchor")
+    _require_connected(entrants, pairs)
+
+    # Rated with one entrant held at nothing, which takes away the one way of changing the
+    # ratings that changes no result: moving them all together.
+    held = anchor[0] if anchor is not None else 0
+    free = [i for i in range(entrants) if i != held]
+    scale = math.log(10) / ELO_SCALE
+    ratings = np.zeros(entrants)
+    for _ in range(_NEWTON_STEPS):
+        gradient, information = _slopes(entrants, pairs, ratings, scale)
+        step = np.linalg.solve(information[np.ix_(free, free)], gradient[free])
+        # Held to a few hundred points a step, so that a first guess far from the answer is
+        # walked towards it rather than overshot.
+        step = np.clip(step, -_LARGEST_STEP, _LARGEST_STEP)
+        ratings[free] += step
+        if np.max(np.abs(step), initial=0.0) < _TOLERANCE:
+            break
+    _, information = _slopes(entrants, pairs, ratings, scale)
+
+    # The spread of each rating about the held one, from the inverse of the information with
+    # that one fixed. Without an anchor, about the average instead: centring spreads the held
+    # entrant's share back out among them all.
+    covariance = np.zeros((entrants, entrants))
+    covariance[np.ix_(free, free)] = np.linalg.inv(information[np.ix_(free, free)])
+    if anchor is None:
+        centring = np.eye(entrants) - 1.0 / entrants
+        covariance = centring @ covariance @ centring
+        ratings -= ratings.mean()
+    else:
+        ratings += anchor[1]
+    width = _normal_quantile(0.5 + confidence / 2) * np.sqrt(np.clip(np.diag(covariance), 0, None))
+
+    games = [0] * entrants
+    points = [0.0] * entrants
+    for pair in pairs:
+        games[pair.first] += pair.games
+        games[pair.second] += pair.games
+        points[pair.first] += pair.points
+        points[pair.second] += pair.games - pair.points
+    return [
+        Standing(
+            rating=float(ratings[i]),
+            low=float(ratings[i] - width[i]),
+            high=float(ratings[i] + width[i]),
+            games=games[i],
+            points=points[i],
+        )
+        for i in range(entrants)
+    ]
+
+
+_NEWTON_STEPS = 100
+_LARGEST_STEP = 400.0
+
+
+def _slopes(
+    entrants: int, pairs: list[Pairing], ratings: np.ndarray, scale: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """How the log-likelihood rises with each rating, and the information: minus its curvature."""
+    gradient = np.zeros(entrants)
+    information = np.zeros((entrants, entrants))
+    for pair in pairs:
+        games = pair.games + VIRTUAL_DRAWS
+        points = pair.points + VIRTUAL_DRAWS / 2
+        expected = expected_score(ratings[pair.first], ratings[pair.second])
+        slope = scale * (points - games * expected)
+        gradient[pair.first] += slope
+        gradient[pair.second] -= slope
+        curvature = scale**2 * games * expected * (1 - expected)
+        information[pair.first, pair.first] += curvature
+        information[pair.second, pair.second] += curvature
+        information[pair.first, pair.second] -= curvature
+        information[pair.second, pair.first] -= curvature
+    # In rating points per point of log-likelihood: Newton's step is the solution in ratings.
+    return gradient, information
+
+
+def _require_connected(entrants: int, pairs: list[Pairing]) -> None:
+    reached = {0} if entrants else set()
+    grew = True
+    while grew:
+        grew = False
+        for pair in pairs:
+            if (pair.first in reached) != (pair.second in reached):
+                reached |= {pair.first, pair.second}
+                grew = True
+    if len(reached) < entrants:
+        raise ValueError("the pairings leave some entrants with no way to compare them")
