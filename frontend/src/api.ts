@@ -1195,3 +1195,135 @@ async function fetched<T>(url: string): Promise<T> {
   }
   return (await response.json()) as T;
 }
+
+/** A checkpoint entered in a tournament; mirrors chess_ai.tournament.ModelEntrant. */
+export interface ModelEntrant {
+  kind: 'model';
+  run: string;
+  step: number;
+  /** When the checkpoint's file was written, as the tournament was made; null if nobody said. */
+  checkpoint_written: string | null;
+  /** The rating it plays like, and what its opponents are told it has. */
+  rating: number;
+  strategy: 'argmax' | 'sample';
+  temperature: number;
+}
+
+/** Stockfish entered in a tournament; mirrors chess_ai.tournament.StockfishEntrant. */
+export interface StockfishEntrant {
+  kind: 'stockfish';
+  elo: number;
+  move_time: number;
+}
+
+/** What a tournament is; mirrors chess_ai.tournament.TournamentDefinition. */
+export interface TournamentDefinition {
+  name: string;
+  entrants: (ModelEntrant | StockfishEntrant)[];
+  games_per_pairing: number;
+  openings: string;
+  /** The opening set's name and version when the tournament was made, such as "standard v1". */
+  opening_set: string | null;
+  seed: number;
+  /** The entrant, by its place, the ratings are measured from; null for around an average of 0. */
+  anchor: { entrant: number; rating: number } | null;
+  created: string;
+}
+
+/** One entrant's line of a leaderboard; mirrors chess_ai.tournament.EntrantStanding. */
+export interface EntrantStanding {
+  /** The entrant, by its place among them. */
+  entrant: number;
+  rating: number;
+  /** The bottom and top of the 95% range the rating is good to. */
+  low: number;
+  high: number;
+  points: number;
+  games: number;
+}
+
+/** What one entrant scored against another; mirrors chess_ai.tournament.Cell. */
+export interface CrosstableCell {
+  points: number;
+  games: number;
+}
+
+/** How a tournament stands; mirrors chess_ai.tournament.Leaderboard. */
+export interface Leaderboard {
+  /** Best first. */
+  standings: EntrantStanding[];
+  /** What the entrant of each row scored against each column's, by their places; null for itself. */
+  crosstable: (CrosstableCell | null)[][];
+  games_played: number;
+  games_total: number;
+}
+
+/** One tournament in the list of them; mirrors chess_ai.web.tournaments.TournamentSummary. */
+export interface TournamentSummary {
+  name: string;
+  created: string;
+  /** Each entrant in a few words, in their places. */
+  entrants: string[];
+  games_played: number;
+  games_total: number;
+  /** Whether a process is playing its games now. */
+  playing: boolean;
+  /** Why it cannot be read, for one that cannot. */
+  error: string | null;
+}
+
+/** One finished game of a tournament; mirrors chess_ai.web.tournaments.TournamentGameListing. */
+export interface TournamentGameListing {
+  /** Which game of the tournament it is, counting from 0; how it is replayed. */
+  index: number;
+  /** Which game of its pairing, counting from 1. */
+  round: number;
+  /** The entrants that had White and Black, by their places. */
+  white: number;
+  black: number;
+  result: Result;
+  termination: GameOverReason;
+  opening: string;
+  plies: number;
+}
+
+/** One tournament, as its page shows it; mirrors chess_ai.web.tournaments.TournamentPage. */
+export interface TournamentPage {
+  name: string;
+  definition: TournamentDefinition;
+  /** Each entrant in a few words, in their places. */
+  entrants: string[];
+  leaderboard: Leaderboard;
+  games: TournamentGameListing[];
+  playing: boolean;
+}
+
+/** Every tournament on the server, the newest first. */
+export async function fetchTournaments(): Promise<TournamentSummary[]> {
+  const response = await fetch(apiUrl('tournaments'));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as TournamentSummary[];
+}
+
+/** One tournament: its leaderboard, crosstable and games. */
+export async function fetchTournament(name: string): Promise<TournamentPage> {
+  const response = await fetch(apiUrl(`tournaments/${encodeURIComponent(name)}`));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as TournamentPage;
+}
+
+/** One of a tournament's games, as a file of all of them with that one selected. */
+export async function openTournamentGame(name: string, game = 0): Promise<ReplayFile> {
+  const url = new URL(apiUrl(`tournaments/${encodeURIComponent(name)}/replay`));
+  url.searchParams.set('game', String(game));
+  return await replayed(url);
+}
+
+/** Where every game of a tournament is downloaded as one PGN file. */
+export function tournamentPgnUrl(name: string): string {
+  return apiUrl(`tournaments/${encodeURIComponent(name)}/pgn`);
+}

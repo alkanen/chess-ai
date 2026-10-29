@@ -16,6 +16,9 @@ chess-ai.toml
 # Training runs, in the default runs directory (./runs, and only there)
 /runs/
 
+# Tournaments, in the default tournaments directory (./tournaments, and only there)
+/tournaments/
+
 # PGN files downloaded to work with, which are nobody else's business
 /downloaded_games/
 

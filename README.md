@@ -2,7 +2,7 @@
 
 A testbed for training neural-network chess players the way large language models are trained: show the network a position, have it predict the move a human actually played, and repeat over millions of games. The goal is to compare model architectures on equal terms (MLP, ResNet, a transformer over the 64 squares, and a GPT-style model over move sequences) and to watch them learn through a browser UI.
 
-> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, a runs dashboard follows training live in the browser, `chess-ai match` plays two checkpoints (or a checkpoint and Stockfish) against each other over a set of openings, `chess-ai ladder` estimates a checkpoint's Elo against Stockfish, and `chess-ai evaluator` records what every new checkpoint makes of a set of probe positions, which the run page shows checkpoint by checkpoint; the transformers come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
+> **Status: early development.** The web server and the board are in place, the server plays live games between human players, random movers, trained checkpoints and Stockfish, with legal moves shown on hover, the CLI builds training datasets out of PGN files, it trains an MLP or a residual CNN on them from an experiment config file, a runs dashboard follows training live in the browser, `chess-ai match` plays two checkpoints (or a checkpoint and Stockfish) against each other over a set of openings, `chess-ai ladder` estimates a checkpoint's Elo against Stockfish, `chess-ai tournament` plays round robins between checkpoints and Stockfish with a leaderboard on the web, and `chess-ai evaluator` records what every new checkpoint makes of a set of probe positions, which the run page shows checkpoint by checkpoint; the transformers come next. The full design is in the PRD: [docs/prd/chess-ai-trainer.md](docs/prd/chess-ai-trainer.md).
 
 ## Planned features
 
@@ -254,6 +254,24 @@ Most of a ladder is Stockfish thinking on one thread, so `parallel_games` (`--pa
 The estimate is the maximum-likelihood rating on the Elo curve, and the range the ratings whose results are not much less likely. A checkpoint that loses every game, or whose estimate falls below the lowest level, is reported as below it (with the top of its range) rather than given an extrapolated number, and likewise above the highest. Stockfish 14 plays no weaker than 1350, so that is the floor. The rating is on Stockfish's scale at the move time or the nodes a move played, which is below its calibrated strength at a tenth of a second, and is not a Lichess rating: compare ladders played at the same limit. The PGN of a game against Stockfish held to nodes records them as `WhiteNodes` (or `BlackNodes`) in place of the move time.
 
 The result goes to `evaluations/step-<step>/stockfish-ladder.json` in the run directory, and the games, with `Event` "chess-ai ladder", to `stockfish-ladder.pgn` beside it; a second ladder of the same checkpoint replaces both. While the ladder plays, its games are written to a `.partial` file of its own there; a ladder stopped with ctrl-c or by a failure saves no result, leaves that file behind if it finished any games, and says where it is. Two ladders of one checkpoint can run at once, and the one that finishes last is the result that stays, always beside its own games.
+
+### Play a tournament
+
+`chess-ai tournament start` plays a round robin: every entrant against every other, the same number of games each pairing, from the lines of an opening set with the colours swapped every game. It then rates the entrants against each other, with 95% ranges, and prints a leaderboard and a crosstable:
+
+```sh
+uv run chess-ai tournament start sizes resnet6x64 resnet10x128 transformer6x256 --games-per-pairing 20
+uv run chess-ai tournament start anchored tiny@latest tiny@10000 stockfish:1500,move-time=0.1 --anchor 3=1500
+uv run chess-ai tournament resume sizes
+uv run chess-ai tournament show sizes
+uv run chess-ai tournament list
+```
+
+Entrants are written as `chess-ai match` players are. A checkpoint is chosen when the tournament starts, so `best` stays the checkpoint that was best then, and it plays at its `rating=`, or at `[ladder] rating` if none is given. Each checkpoint is told its opponent's rating: the rating the other checkpoint plays like, or Stockfish's Elo. Sampling checkpoints are seeded by `--seed` and the game, so a resumed tournament plays the games it would have played. The networks run on `[ladder] device`.
+
+Without an anchor the ratings are around an average of 0, and only the gaps between them mean anything. `--anchor N=RATING` puts entrant N (counting from 1) at RATING, and `--anchor N=ladder` at the Elo of its checkpoint's Stockfish ladder; the ranges are then how far from that entrant each other one could be. The ratings are the maximum-likelihood ones on the Elo curve after one virtual draw is added to every pairing, which keeps an entrant that won or lost every game a few hundred points from the rest rather than infinitely far.
+
+A tournament is kept in its own directory under `[paths] tournaments`: `tournament.json` with what it is, and `games.jsonl` with one line per finished game, PGN and all. The games are played round by round, the first game of every pairing before the second of any, so a tournament stopped with ctrl-c, or by a Stockfish that hangs or dies, has played every pairing about as often; `chess-ai tournament resume` plays the games it has not finished. Only one process can play a tournament at a time. The **Tournaments** page of the web app lists them, and shows each one's leaderboard, crosstable and games, which open in the replay view and download as one PGN file. It refreshes while a tournament is being played.
 
 ### Evaluate checkpoints as they are saved
 

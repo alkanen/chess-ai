@@ -15,6 +15,12 @@ import { RunsView } from './RunsView';
 import { RunView } from './RunView';
 import { ladderGameInHash, type LadderGameRef } from './ladder';
 import { sampleGameInHash, type SampleGameRef } from './sampleGames';
+import {
+  tournamentGameInHash,
+  tournamentInHash,
+  type TournamentGameRef,
+} from './tournaments';
+import { TournamentsView, TournamentView } from './TournamentsView';
 import './App.css';
 
 /** The pages there are, in the order they are offered. */
@@ -23,6 +29,7 @@ const VIEWS = [
   { name: 'replay', label: 'Replay', hash: '#replay' },
   { name: 'runs', label: 'Runs', hash: '#runs' },
   { name: 'datasets', label: 'Datasets', hash: '#datasets' },
+  { name: 'tournaments', label: 'Tournaments', hash: '#tournaments' },
 ] as const;
 
 type View = (typeof VIEWS)[number]['name'];
@@ -47,6 +54,10 @@ interface Place {
   sampleGame?: SampleGameRef | null;
   /** The run's ladder game on show, under the replay view; null for a file or a saved game. */
   ladderGame?: LadderGameRef | null;
+  /** The tournament on show, under the tournaments view; null for the list of them. */
+  tournament?: string | null;
+  /** The tournament game on show, under the replay view; null for a file or a saved game. */
+  tournamentGame?: TournamentGameRef | null;
 }
 
 const GAME_PAGE = /^#(?:game|watch)\/(.+)$/;
@@ -82,6 +93,14 @@ function placeInAddress(): Place {
   const ladderGame = ladderGameInHash(hash);
   if (ladderGame !== null) {
     return { view: 'replay', link: null, run: null, compare: null, ladderGame };
+  }
+  const tournamentGame = tournamentGameInHash(hash);
+  if (tournamentGame !== null) {
+    return { view: 'replay', link: null, run: null, compare: null, tournamentGame };
+  }
+  const tournament = tournamentInHash(hash);
+  if (tournament !== null) {
+    return { view: 'tournaments', link: null, run: null, compare: null, tournament };
   }
   const run = RUN_PAGE.exec(hash);
   if (run !== null) {
@@ -154,6 +173,7 @@ export function App() {
           datasetGame={place.datasetGame ?? null}
           sampleGame={place.sampleGame ?? null}
           ladderGame={place.ladderGame ?? null}
+          tournamentGame={place.tournamentGame ?? null}
         />
       )}
       {view === 'runs' && place.compare !== null && <CompareView names={place.compare} />}
@@ -162,6 +182,10 @@ export function App() {
       {view === 'datasets' && place.dataset == null && <DatasetsView />}
       {view === 'datasets' && place.dataset != null && (
         <DatasetView key={place.dataset.name} place={place.dataset} />
+      )}
+      {view === 'tournaments' && place.tournament == null && <TournamentsView />}
+      {view === 'tournaments' && place.tournament != null && (
+        <TournamentView key={place.tournament} name={place.tournament} />
       )}
     </main>
   );

@@ -47,6 +47,10 @@ data = "data"
 # directory is made when it is first needed.
 runs = "runs"
 
+# Where round-robin tournaments (chess-ai tournament) are kept, one directory per
+# tournament: what it is, and every game it has finished.
+tournaments = "tournaments"
+
 # Where the games the server holds are kept while they last, one JSON file per
 # game, so that a restart carries on with them. A game is deleted from here once
 # it has expired (see [games] expire_after_days), or at once if it is aborted.

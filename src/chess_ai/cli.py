@@ -27,6 +27,8 @@ from chess_ai.output import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     # Only named in annotations: importing them for real would bring in what they import
     # every time any command runs, torch-adjacent run store and all.
     from chess_ai.game_session import GameSession
@@ -148,6 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_runs_commands(commands)
     _add_match_command(commands)
     _add_ladder_command(commands)
+    _add_tournament_commands(commands)
     _add_evaluation_commands(commands)
     for command in _commands(parser):
         _add_output_options(command, after=True)
@@ -2340,4 +2343,481 @@ def _evaluate(config: Config, args: argparse.Namespace) -> int:
         return 130
     if failed:
         raise _UserError(f"{_count(len(failed), 'checkpoint')} could not be evaluated")
+    return 0
+
+
+def _add_tournament_commands(commands: argparse._SubParsersAction) -> None:
+    """``chess-ai tournament ...``: round robins between checkpoints and Stockfish."""
+    from chess_ai.openings import DEFAULT_OPENING_SET, bundled_opening_sets
+
+    tournament = commands.add_parser(
+        "tournament", help="play round-robin tournaments and rate the entrants against each other"
+    )
+    actions = tournament.add_subparsers(
+        title="tournament commands", required=True, metavar="COMMAND"
+    )
+
+    start = actions.add_parser(
+        "start",
+        help="start a tournament and play it",
+        description=(
+            "Start a round-robin tournament: every entrant plays every other the same number of\n"
+            "games, from the lines of an opening set with the colours swapped every game, and\n"
+            "the results rate them against each other. The games are played round by round,\n"
+            "so a tournament stopped part way has played every pairing about as often; 'chess-ai\n"
+            "tournament resume' plays the rest. Each checkpoint is told its opponent's rating:\n"
+            "the rating the other checkpoint plays like, or Stockfish's Elo. Checkpoints run on\n"
+            "the [ladder] device. The tournament is kept in the tournaments directory, which\n"
+            "the web app's Tournaments page shows."
+        ),
+        epilog=_ENTRANT_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    start.add_argument("name", metavar="NAME", help="what to call the tournament")
+    start.add_argument(
+        "entrants",
+        nargs="+",
+        type=_match_player,
+        metavar="ENTRANT",
+        help="the entrants, at least two",
+    )
+    start.add_argument(
+        "--games-per-pairing",
+        type=_positive,
+        default=DEFAULT_GAMES_PER_PAIRING,
+        metavar="N",
+        help=f"how many games each pair of entrants plays (default: {DEFAULT_GAMES_PER_PAIRING})",
+    )
+    start.add_argument(
+        "--openings",
+        default=DEFAULT_OPENING_SET,
+        metavar="SET",
+        help=f"the opening set: one that comes with chess-ai ({', '.join(bundled_opening_sets())})"
+        f", or the path of a file of your own (default: {DEFAULT_OPENING_SET})",
+    )
+    start.add_argument(
+        "--anchor",
+        type=_anchor,
+        metavar="N=RATING",
+        help="rate the entrants from entrant N (counting from 1) at RATING, rather than around "
+        "an average of 0; RATING can be 'ladder' for a checkpoint's Stockfish ladder Elo",
+    )
+    start.add_argument(
+        "--seed",
+        type=int,
+        metavar="N",
+        help="seed the sampling of checkpoints that sample their moves (default: a random seed)",
+    )
+    start.set_defaults(handler=_start_tournament)
+
+    resume = actions.add_parser(
+        "resume",
+        help="play the games a stopped tournament has not finished",
+        description="Play the games of a tournament that it has not finished, as it was started.",
+    )
+    resume.add_argument("name", metavar="NAME", help="the tournament")
+    resume.set_defaults(handler=_resume_tournament)
+
+    show = actions.add_parser(
+        "show",
+        help="show a tournament's leaderboard and crosstable",
+        description="Show how a tournament stands: each entrant's rating with its 95%% range, "
+        "best first, and what each scored against each other.",
+    )
+    show.add_argument("name", metavar="NAME", help="the tournament")
+    show.set_defaults(handler=_show_tournament, query=True)
+
+    listing = actions.add_parser(
+        "list",
+        help="list the tournaments",
+        description="List the tournaments in the tournaments directory, and how far each has got.",
+    )
+    listing.set_defaults(handler=_list_tournaments, query=True)
+
+
+DEFAULT_GAMES_PER_PAIRING = 10
+
+_ENTRANT_HELP = """\
+an entrant is a checkpoint or Stockfish, as chess-ai match takes a player:
+
+  RUN[@CHECKPOINT][,rating=R][,strategy=argmax|sample][,temperature=T]
+      a checkpoint of a training run, chosen when the tournament starts: best (the default),
+      latest or a step. rating is the rating it plays like (default: [ladder] rating), and what
+      its opponents are told it has.
+  stockfish:ELO[,move-time=SECONDS]
+      Stockfish at a calibrated strength.
+
+examples:
+  chess-ai tournament start sizes resnet6x64 resnet10x128 transformer6x256 --games-per-pairing 20
+  chess-ai tournament start anchored tiny@latest tiny@10000 stockfish:1500 --anchor 3=1500
+"""
+
+
+def _anchor(text: str) -> "tuple[int, float | None]":
+    """``N=RATING`` or ``N=ladder``: the entrant, from 1, and its rating, or ``None`` for its
+    ladder's."""
+    entrant, equals, rating = text.partition("=")
+    if not equals:
+        raise argparse.ArgumentTypeError(f"{text!r} is not N=RATING")
+    number = _number(int, entrant, "an entrant", text, 1, None)
+    if rating == "ladder":
+        return number, None
+    return number, _number(float, rating, "a rating", text, 0, _MAX_RATING)
+
+
+def _start_tournament(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.inference import DEFAULT_TEMPERATURE
+    from chess_ai.tournament import (
+        Anchor,
+        ModelEntrant,
+        StockfishEntrant,
+        TournamentDefinition,
+        TournamentError,
+        create_tournament,
+    )
+
+    if len(args.entrants) < 2:
+        raise _UserError("a tournament needs at least two entrants")
+    # Every checkpoint chosen once, now, as a match chooses them: "best" is the best one when
+    # the tournament starts, and stays that one however the run goes on meanwhile.
+    chosen = _choose_checkpoints(args.entrants, config)
+    entrants: list[ModelEntrant | StockfishEntrant] = []
+    runs: list[tuple[RunReader, CheckpointInfo] | None] = []
+    # Each checkpoint's file looked at once, so that every entrant playing it, and an anchor
+    # from its ladder, are of the one file.
+    files: dict[tuple[str, int], datetime] = {}
+    for side in args.entrants:
+        if isinstance(side, _StockfishSide):
+            entrants.append(StockfishEntrant(elo=side.elo, move_time=side.move_time))
+            runs.append(None)
+            continue
+        run, checkpoint = chosen[(side.run, side.checkpoint)]
+        written = _written(run, checkpoint, files)
+        entrants.append(
+            ModelEntrant(
+                run=run.name,
+                step=checkpoint.step,
+                checkpoint_written=written,
+                rating=side.rating if side.rating is not None else config.ladder.rating,
+                strategy=side.strategy or "argmax",
+                temperature=side.temperature or DEFAULT_TEMPERATURE,
+            )
+        )
+        runs.append((run, checkpoint))
+    anchor = None
+    if args.anchor is not None:
+        number, rating = args.anchor
+        if number > len(entrants):
+            raise _UserError(f"there is no entrant {number}: there are {len(entrants)}")
+        if rating is None:
+            rating = _ladder_rating(runs[number - 1], entrants[number - 1], number)
+        anchor = Anchor(entrant=number - 1, rating=rating)
+    seed = args.seed if args.seed is not None else secrets.randbelow(2**31)
+    try:
+        tournament = create_tournament(
+            config.paths.tournaments,
+            TournamentDefinition(
+                name=args.name,
+                entrants=tuple(entrants),
+                games_per_pairing=args.games_per_pairing,
+                openings=args.openings,
+                seed=seed,
+                anchor=anchor,
+            ),
+        )
+    except TournamentError as e:
+        raise _UserError(e) from e
+    say(f"chess-ai: tournament {args.name} made in {tournament.path}, seed {seed}")
+    return _play_tournament(config, tournament)
+
+
+def _written(
+    run: "RunReader", checkpoint: "CheckpointInfo", files: "dict[tuple[str, int], datetime]"
+) -> "datetime":
+    """When ``checkpoint``'s file was written, looked at once per checkpoint in ``files``."""
+    from chess_ai.training.run_store import RunError
+
+    key = (run.name, checkpoint.step)
+    if key not in files:
+        try:
+            written = run.checkpoint_written(checkpoint)
+        except RunError as e:
+            raise _UserError(e) from e
+        if written is None:
+            # Pruned since it was chosen, as a run still training does.
+            raise _UserError(
+                f"the checkpoint of {run.name} from step {checkpoint.step} is gone; run "
+                "chess-ai tournament start again"
+            )
+        files[key] = written
+    return files[key]
+
+
+def _ladder_rating(
+    played: "tuple[RunReader, CheckpointInfo] | None", entrant: Any, number: int
+) -> float:
+    """The Elo the Stockfish ladder found for entrant ``number``'s checkpoint, of the run it
+    ``played``, if the ladder was of the file the entrant records."""
+    from chess_ai.ladder import read_ladder, result_stands
+    from chess_ai.training.run_store import RunError
+
+    if played is None:
+        raise _UserError(f"entrant {number} is Stockfish, which has no ladder of its own")
+    run, _ = played
+    try:
+        result = read_ladder(run, entrant.step)
+    except RunError as e:
+        raise _UserError(e) from e
+    if result is None:
+        raise _UserError(
+            f"entrant {number} has no Stockfish ladder at step {entrant.step} to anchor to; "
+            f"give its rating, or run chess-ai ladder {entrant.run}@{entrant.step} first"
+        )
+    if result.estimate.rating is None:
+        raise _UserError(
+            f"entrant {number}'s ladder puts it beyond the ladder's levels, with no rating to "
+            "anchor to; give its rating instead"
+        )
+    # A ladder of the step's checkpoint as it was before a run went back and trained past it
+    # again is of another network, as the evaluator takes it to be.
+    # Against the file's time the tournament records, which it checks on every resume.
+    if not result_stands(result, entrant.step, entrant.checkpoint_written):
+        raise _UserError(
+            f"entrant {number}'s ladder was played with another file of the checkpoint from "
+            f"step {entrant.step} than the one there now; give its rating instead, or run "
+            f"chess-ai ladder {entrant.run}@{entrant.step} again"
+        )
+    # The Elo is of the checkpoint playing as the ladder had it play, which is a different
+    # player from the same checkpoint asked to play like another rating, or sampling.
+    laddered, playing = _how_played(result.model), _how_played(entrant)
+    if laddered != playing:
+        raise _UserError(
+            f"entrant {number}'s ladder was played at {laddered}, and it plays at {playing} "
+            "here, which is a player of another strength; give its rating instead"
+        )
+    return result.estimate.rating
+
+
+def _how_played(player: Any) -> str:
+    """The rating a checkpoint was asked to play like, and how it chose its moves: such as
+    ``rating 2000, argmax``."""
+    sampled = f" {player.temperature:g}" if player.strategy == "sample" else ""
+    return f"rating {player.rating}, {player.strategy}{sampled}"
+
+
+def _resume_tournament(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.tournament import TournamentError, open_tournament
+
+    try:
+        tournament = open_tournament(config.paths.tournaments, args.name)
+    except TournamentError as e:
+        raise _UserError(e) from e
+    return _play_tournament(config, tournament)
+
+
+def _play_tournament(config: Config, tournament: Any) -> int:
+    """Play what ``tournament`` has left to play, saying each game, and then how it stands.
+
+    Held from the start, as this process's to play: a second resume of a tournament being
+    played is refused before it says anything as if it were about to play it, or reads a
+    count of games another process is adding to, and before it loads a network onto the card
+    the first one is playing on.
+    """
+    from chess_ai.tournament import TournamentError
+
+    try:
+        with tournament.held():
+            return _play_held_tournament(config, tournament)
+    except TournamentError as e:
+        raise _UserError(e) from e
+
+
+def _play_held_tournament(config: Config, tournament: Any) -> int:
+    import chess.engine
+
+    from chess_ai.match import HEADER_EVERY, game_line, pairing, starting_line
+    from chess_ai.openings import OpeningSetError, load_opening_set
+    from chess_ai.stockfish import StockfishError
+    from chess_ai.tournament import (
+        ScheduledGame,
+        TournamentError,
+        describe,
+        entrant_players,
+        play_tournament,
+        schedule,
+    )
+
+    definition = tournament.definition
+    total = len(schedule(definition))
+    try:
+        # The set the games' lines are said from, which play_tournament loads again for the
+        # games themselves: it is small, and found the same way both times.
+        openings = load_opening_set(definition.openings)
+        already = len(tournament.games())
+    except (OpeningSetError, TournamentError) as e:
+        raise _UserError(e) from e
+    entrants = ", ".join(
+        f"{index} {describe(entrant)}" for index, entrant in enumerate(definition.entrants, 1)
+    )
+    say(
+        f"chess-ai: tournament {definition.name}: {len(definition.entrants)} entrants, "
+        f"{definition.games_per_pairing} games a pairing, {total} games from opening set "
+        f"{definition.opening_set or definition.openings}"
+        + (f"; {already} played already" if already else "")
+    )
+    header_due = 0
+
+    def names(scheduled: ScheduledGame) -> tuple[str, str]:
+        return f"entrant {scheduled.first + 1}", f"entrant {scheduled.second + 1}"
+
+    def on_start(scheduled: ScheduledGame) -> None:
+        nonlocal header_due
+        if header_due <= 0:
+            last = min(scheduled.number + HEADER_EVERY - 1, total)
+            say(
+                f"chess-ai: tournament {definition.name} games {scheduled.number}–{last} of "
+                f"{total}: {entrants}"
+            )
+            header_due = HEADER_EVERY
+        header_due -= 1
+        opening, first_plays_white = pairing(scheduled.round, openings)
+        say(
+            starting_line(
+                opening, first_plays_white, names(scheduled), number=scheduled.number, games=total
+            ),
+            kind=DETAIL,
+        )
+
+    def on_game(scheduled: ScheduledGame, played: "MatchGame") -> None:
+        say(game_line(played, names(scheduled), number=scheduled.number, games=total), kind=DETAIL)
+
+    async def play() -> None:
+        async with entrant_players(
+            definition,
+            runs=config.paths.runs,
+            stockfish=config.stockfish.path,
+            device=config.ladder.device,
+            batch_size=config.inference.batch_size,
+        ) as players:
+            await play_tournament(tournament, players, on_start=on_start, on_game=on_game)
+
+    try:
+        asyncio.run(play())
+    except (StockfishError, TimeoutError, chess.engine.EngineError) as e:
+        raise _UserError(
+            f"a game could not be finished: {_engine_failure(e)}; chess-ai tournament resume "
+            f"{definition.name} plays it again"
+        ) from e
+    except KeyboardInterrupt:
+        try:
+            after = f" after {len(tournament.games())} of {total} games"
+        except TournamentError:
+            after = ""  # Said below, with the leaderboard it leaves out.
+        say(
+            f"chess-ai: interrupted{after}; chess-ai tournament resume {definition.name} plays "
+            "the rest",
+            err=True,
+            kind=RESULT,
+        )
+        try:
+            _say_leaderboard(tournament)
+        except TournamentError as e:
+            LOGGER.warning("%s", e)
+        return 130
+    try:
+        _say_leaderboard(tournament)
+    except TournamentError as e:
+        raise _UserError(e) from e
+    return 0
+
+
+def _show_tournament(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.tournament import TournamentError, open_tournament
+
+    try:
+        _say_leaderboard(open_tournament(config.paths.tournaments, args.name))
+    except TournamentError as e:
+        raise _UserError(e) from e
+    return 0
+
+
+def _say_leaderboard(tournament: Any) -> None:
+    """How ``tournament`` stands, best first, and its crosstable.
+
+    Raises:
+        TournamentError: its games cannot be read.
+    """
+    from chess_ai.tournament import describe, leaderboard
+
+    definition = tournament.definition
+    board = leaderboard(tournament)
+    anchor = definition.anchor
+    if anchor is None:
+        scale = "rated around an average of 0"
+    else:
+        scale = f"rated from entrant {anchor.entrant + 1} at {anchor.rating:.0f}"
+
+    def shown(rating: float) -> str:
+        # Signed around an average, where only the gaps mean anything.
+        return f"{rating:.0f}" if anchor is not None else f"{rating:+.0f}"
+
+    lines = [
+        f"{definition.name}: {board.games_played} of {board.games_total} games, {scale}, "
+        "with 95% ranges"
+    ]
+    for place, standing in enumerate(board.standings, 1):
+        entrant = definition.entrants[standing.entrant]
+        lines.append(
+            f"{place:>3}. {shown(standing.rating):>6} ({shown(standing.low)} to "
+            f"{shown(standing.high)})  {_points(standing.points)}/{standing.games}  "
+            f"{standing.entrant + 1} {describe(entrant)}"
+        )
+    count = len(definition.entrants)
+    width = max(
+        5,
+        *(
+            len(f"{_points(cell.points)}/{cell.games}") + 1
+            for row in board.crosstable
+            for cell in row
+            if cell is not None
+        ),
+    )
+    lines.append("crosstable, what each row scored against each column:")
+    lines.append("    " + "".join(f"{column:>{width}}" for column in range(1, count + 1)))
+    for row, cells in enumerate(board.crosstable, 1):
+        shown_cells = (
+            "–" if cell is None else f"{_points(cell.points)}/{cell.games}" for cell in cells
+        )
+        lines.append(f"{row:>3} " + "".join(f"{cell:>{width}}" for cell in shown_cells))
+    say("\n".join(lines), kind=RESULT)
+
+
+def _points(points: float) -> str:
+    """Points as a score is written, a half as ½: ``2½``, so that ``1/2`` can only be one point
+    of two."""
+    whole, half = divmod(round(points * 2), 2)
+    if half and not whole:
+        return "½"
+    return f"{whole}½" if half else str(whole)
+
+
+def _list_tournaments(config: Config, args: argparse.Namespace) -> int:
+    from chess_ai.tournament import TournamentError, open_tournament, schedule, tournament_names
+
+    for name in tournament_names(config.paths.tournaments):
+        try:
+            tournament = open_tournament(config.paths.tournaments, name)
+            # Whether it is being played asked first, as the web page asks it: see
+            # chess_ai.web.tournaments.tournament_page.
+            playing = ", being played" if tournament.playing() else ""
+            played = len(tournament.games())
+        except TournamentError as e:
+            LOGGER.warning("%s", e)
+            continue
+        definition = tournament.definition
+        say(
+            f"{name}: {len(definition.entrants)} entrants, {played} of "
+            f"{len(schedule(definition))} games{playing}",
+            kind=RESULT,
+        )
     return 0
