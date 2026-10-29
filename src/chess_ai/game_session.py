@@ -30,6 +30,7 @@ from pydantic import BaseModel
 
 from chess_ai.players import (
     GameContext,
+    GameMemoryPlayer,
     HumanPlayer,
     ModelBackedPlayer,
     ModelDescription,
@@ -616,6 +617,7 @@ class GameSession:
         side = _side(paused.side)
         old = self._players[side]
         self._players[side] = player
+        _forget(old, self.id)
         replacement = Replacement(
             ply=len(self._moves),
             side=paused.side,
@@ -761,7 +763,7 @@ class GameSession:
         there had been when it was asked, and one since means the position it answered is gone.
         """
         moves = len(self._moves)
-        choice = await player.choose_move(GameContext(self._board.copy()))
+        choice = await player.choose_move(GameContext(self._board.copy(), game=self.id))
         # The delay paces players that move instantly. Someone who submits a move has
         # already taken as long as they took, so their move is played at once. Sleeping
         # with nothing left to wait still yields to the event loop, so a game between
@@ -792,6 +794,8 @@ class GameSession:
         if self._closed:
             return
         self._closed = True
+        for player in self._players.values():
+            _forget(player, self.id)
         # A game waiting for another player has nothing more to wait for.
         if self._replaced is not None and not self._replaced.done():
             self._replaced.set_result(None)
@@ -886,3 +890,9 @@ async def _events_until_closed(
 ) -> AsyncIterator[GameEvent]:
     while (event := await queue.get()) is not None:
         yield event
+
+
+def _forget(player: Player, game: str) -> None:
+    """Tell ``player`` that it plays no more of ``game``, if it keeps anything of it."""
+    if isinstance(player, GameMemoryPlayer):
+        player.forget(game)

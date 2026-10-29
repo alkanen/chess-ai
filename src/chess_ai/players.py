@@ -43,6 +43,9 @@ class GameContext:
 
     board: chess.Board
     """The current position with the game's move history. The player's own copy."""
+    game: str = ""
+    """Which game is asking, for a player that keeps something of its own from one move of a
+    game to the next and may be asked for moves in several games at once."""
 
 
 class CandidateMove(BaseModel):
@@ -104,6 +107,26 @@ a web request, a config file, a match runner — refuses the same values the sam
 """
 
 
+SearchKind = Literal["mcts"]
+"""The searches a checkpoint can play with: Monte Carlo tree search, as AlphaZero's and Leela's."""
+
+
+MAX_SEARCH_NODES: Final = 1_000_000
+"""The most nodes a search may be asked for a move: in Python, minutes a move already."""
+
+
+class SearchDescription(BaseModel):
+    """How a checkpoint looked ahead before each move, for a player that searches."""
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    kind: SearchKind = "mcts"
+    nodes: int
+    """How many times the search had looked below the position when it chose the move: each
+    look one position evaluated by the network or decided by the rules, those kept from the
+    move before among them."""
+
+
 class ModelDescription(BaseModel):
     """Which model a player is, and how it was asked to play.
 
@@ -129,6 +152,10 @@ class ModelDescription(BaseModel):
     strategy: SelectionStrategy = "argmax"
     temperature: float | None = None
     """How flat the distribution is sampled from; ``None`` when it is not sampled at all."""
+    search: SearchDescription | None = None
+    """The search it played with, or ``None`` for one that played straight from its policy.
+    A searching model chooses by ``strategy`` from how often it visited each move rather than
+    from the policy."""
 
 
 @runtime_checkable
@@ -201,6 +228,19 @@ class StockfishBackedPlayer(Protocol):
 
     @property
     def stockfish(self) -> StockfishDescription: ...
+
+
+@runtime_checkable
+class GameMemoryPlayer(Protocol):
+    """A player that keeps something of each game it plays from one move to the next, such as
+    a search keeping its tree, and is told when a game is over so that it can let go of it.
+
+    One player can play many games, one after another as a match's or at once as a ladder's,
+    so it keeps what it keeps by :attr:`GameContext.game`, and a game that is over is told by
+    the same id.
+    """
+
+    def forget(self, game: str) -> None: ...
 
 
 @runtime_checkable

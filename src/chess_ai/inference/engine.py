@@ -150,17 +150,25 @@ class InferenceEngine:
         *,
         mover_rating: int | None = None,
         opponent_rating: int | None = None,
+        ratings: Sequence[tuple[int | None, int | None]] | None = None,
     ) -> list[Evaluation]:
         """Evaluate several positions, in batches of at most :attr:`batch_size`.
 
         The ratings are the same for every position, which is what a game or a suite asks for:
         one model playing at one strength. Every position is read from the side to move's point
         of view, so ``mover_rating`` is that side's whichever colour it is.
+
+        ``ratings`` gives each position a mover's and an opponent's rating of its own instead,
+        as a search does whose positions alternate between the side it plays and the other.
         """
+        if ratings is None:
+            ratings = [(mover_rating, opponent_rating)] * len(boards)
+        elif len(ratings) != len(boards):
+            raise ValueError(f"{len(ratings)} ratings for {len(boards)} positions")
         evaluations: list[Evaluation] = []
         for start in range(0, len(boards), self.batch_size):
             batch = boards[start : start + self.batch_size]
-            policy, value = self._forward(batch, mover_rating, opponent_rating)
+            policy, value = self._forward(batch, ratings[start : start + self.batch_size])
             evaluations.extend(
                 _evaluation(board, self._encoder, policy[index], value[index])
                 for index, board in enumerate(batch)
@@ -171,15 +179,12 @@ class InferenceEngine:
     def _forward(
         self,
         boards: Sequence[chess.Board],
-        mover_rating: int | None,
-        opponent_rating: int | None,
+        ratings: Sequence[tuple[int | None, int | None]],
     ) -> tuple[np.ndarray, np.ndarray]:
         """One batch through the network, as float32 policy and value logits back on the CPU."""
         bundles = [
-            self._encoder.encode_board(
-                board, mover_rating=mover_rating, opponent_rating=opponent_rating
-            )
-            for board in boards
+            self._encoder.encode_board(board, mover_rating=mover, opponent_rating=opponent)
+            for board, (mover, opponent) in zip(boards, ratings, strict=True)
         ]
         spatial = torch.from_numpy(np.concatenate([bundle.spatial for bundle in bundles]))
         globals_ = torch.from_numpy(np.concatenate([bundle.globals for bundle in bundles]))

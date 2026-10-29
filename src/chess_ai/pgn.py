@@ -150,7 +150,8 @@ def _model_tags(color: str, player: PlayerInfo) -> dict[str, str]:
     estimate of how well it plays, and writing it where every other program reads a strength
     from would be a claim this project has not measured. ``WhiteOpponentRating`` is what the
     model was told of its opponent, which is left out of games recorded before it was told
-    anything but its own.
+    anything but its own. ``WhiteSearch`` and ``WhiteSearchNodes`` say how far a model that
+    searched looked before each move, and are left out for one that played from its policy.
     """
     model = player.model
     if model is None:
@@ -163,6 +164,8 @@ def _model_tags(color: str, player: PlayerInfo) -> dict[str, str]:
             str(model.opponent_rating) if model.opponent_rating is not None else None
         ),
         "Selection": _selection(model.strategy, model.temperature),
+        "Search": model.search.kind if model.search is not None else None,
+        "SearchNodes": str(model.search.nodes) if model.search is not None else None,
     }
     return {f"{color}{tag}": value for tag, value in tags.items() if value is not None}
 

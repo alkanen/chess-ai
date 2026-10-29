@@ -1204,6 +1204,40 @@ def test_a_checkpoint_against_itself_is_told_apart_by_its_settings(tmp_path, cap
     assert (game.headers["WhiteRating"], game.headers["BlackRating"]) == ("1200", "1800")
 
 
+def test_a_match_can_have_a_checkpoint_search_before_each_move(tmp_path, capsys):
+    config = match_config(tmp_path)
+
+    status = main(
+        ["--config", str(config), "match", "tiny@2,search=mcts,nodes=8", "tiny@4", "--games", "2"]
+    )
+
+    assert status == 0
+    first, second = match_games(tmp_path)
+    assert (first.headers["WhiteSearch"], first.headers["WhiteSearchNodes"]) == ("mcts", "8")
+    assert "BlackSearch" not in first.headers
+    assert second.headers["BlackSearchNodes"] == "8"
+
+
+def test_nodes_alone_ask_for_a_search_and_it_can_sample(tmp_path, capsys):
+    config = match_config(tmp_path)
+
+    status = main(
+        [
+            "--config",
+            str(config),
+            "match",
+            "tiny@2,nodes=4,temperature=0.5",
+            "tiny@4",
+            "--games",
+            "1",
+        ]
+    )
+
+    assert status == 0
+    (game,) = match_games(tmp_path)
+    assert (game.headers["WhiteSearch"], game.headers["WhiteSelection"]) == ("mcts", "sample 0.5")
+
+
 def test_a_titled_run_is_shown_by_its_title(tmp_path, capsys):
     config = match_config(tmp_path)
     assert main(["--config", str(config), "runs", "annotate", "tiny", "--title", "Tiny MLP"]) == 0
@@ -1270,6 +1304,10 @@ def test_match_against_stockfish_closes_the_engine_afterwards(tmp_path, capsys):
         ("tiny,strategy=greedy", "the strategy is argmax or sample, not 'greedy'"),
         ("tiny,temperature=0", "a temperature is a number from 0.01 to 10"),
         ("tiny,colour=white", "colour is not a setting of this kind of player"),
+        ("tiny,search=alphabeta", "the search is mcts, not 'alphabeta'"),
+        ("tiny,search=mcts", "a search needs a number of nodes a move, as nodes=N"),
+        ("tiny,nodes=0", "a number of nodes is a number from 1 to 1000000, not '0'"),
+        ("stockfish:1500,nodes=100", "nodes is not a setting of this kind of player"),
         ("tiny@soon", "a checkpoint is a number of at least 0, not 'soon'"),
         ("@best", "names no run"),
         ("stockfish:strong", "an Elo is a number from 0 to 4000, not 'strong'"),
@@ -1747,6 +1785,31 @@ def test_a_second_ladder_replaces_the_first(tmp_path, capsys):
     assert len(ladder_games(path)) == 1
 
 
+def test_a_searching_ladder_is_kept_beside_the_ladder_of_the_network_alone(tmp_path, capsys):
+    """Another player, of another strength: the checkpoint's own ladder stays as it was."""
+    from chess_ai.ladder import LadderResult
+
+    config, _ = ladder_config(tmp_path)
+    command = ["--config", str(config), "ladder", "--levels", "1350", "--games", "2"]
+    assert main([*command, "tiny"]) == 0
+    evaluations = tmp_path / "runs/tiny/evaluations/step-000000002"
+    plain = (evaluations / "stockfish-ladder.json").read_text()
+
+    assert main([*command, "tiny,search=mcts,nodes=4"]) == 0
+
+    out = capsys.readouterr().out
+    assert "tiny step 2, 4 nodes at rating 2000 against Stockfish at 1350" in out
+    assert (evaluations / "stockfish-ladder.json").read_text() == plain
+    result = LadderResult.model_validate_json(
+        (evaluations / "stockfish-ladder-mcts-4.json").read_text()
+    )
+    assert result.suite == "stockfish-ladder-mcts-4"
+    assert result.model.search is not None and result.model.search.nodes == 4
+    assert f"result saved in {evaluations / 'stockfish-ladder-mcts-4.json'}" in out
+    first, second = ladder_games(evaluations / "stockfish-ladder-mcts-4.pgn")
+    assert (first.headers["WhiteSearchNodes"], second.headers["BlackSearchNodes"]) == ("4", "4")
+
+
 def test_a_ladder_held_to_nodes_plays_games_at_once_and_saves_them_in_order(tmp_path, capsys):
     from stockfish_helpers import started, told, wait_until_gone
 
@@ -1892,7 +1955,12 @@ def test_a_move_time_on_the_command_line_holds_stockfish_to_it_over_the_configs_
 @pytest.mark.parametrize(
     ("arguments", "complaint"),
     [
-        (["tiny,rating=1500"], "a ladder's checkpoint takes no settings; see --rating"),
+        (
+            ["tiny,rating=1500"],
+            "a ladder's checkpoint takes no settings but a search; see --rating",
+        ),
+        (["tiny,nodes=8,temperature=1"], "a ladder's checkpoint takes no settings but a search"),
+        (["tiny,nodes=0"], "a number of nodes is a number from 1 to 1000000"),
         (["tiny@soon"], "a checkpoint is a number of at least 0, not 'soon'"),
         (["tiny", "--levels", "1350,strong"], "'1350,strong'"),
         (["tiny", "--levels", "1350,1350"], "each level can only be on the ladder once"),

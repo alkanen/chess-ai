@@ -146,6 +146,7 @@ def test_a_game_against_a_checkpoint_says_which_one_is_playing(client):
         "opponent_rating": 1600,
         "strategy": "argmax",
         "temperature": None,
+        "search": None,
     }
     assert started.json()["game"]["black"]["model"] is None
 
@@ -718,6 +719,7 @@ def test_a_game_against_a_checkpoint_carries_on_after_a_restart_loading_it_when_
         "opponent_rating": 1500,
         "strategy": "argmax",
         "temperature": None,
+        "search": None,
     }
     assert answered["type"] == "move"
     assert len(loaded) == 1

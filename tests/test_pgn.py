@@ -15,7 +15,12 @@ from pgn_helpers import read_back, replayed
 
 from chess_ai.game_session import GameSession, GameState, PlayerInfo, Replacement
 from chess_ai.pgn import game_pgn, pgn_filename, save_game
-from chess_ai.players import HumanPlayer, ModelDescription, StockfishDescription
+from chess_ai.players import (
+    HumanPlayer,
+    ModelDescription,
+    SearchDescription,
+    StockfishDescription,
+)
 from chess_ai.position_view import GameOver, GameOverReason
 
 pytestmark = pytest.mark.anyio
@@ -236,6 +241,26 @@ async def test_a_sampled_side_records_the_temperature_it_was_drawn_at():
     )
 
     assert read_back(game_pgn(game)).headers["WhiteSelection"] == "sample 1.25"
+
+
+async def test_a_searching_side_records_its_search_and_how_many_nodes_it_searched():
+    game = await model_game(
+        ModelDescription(run="r", checkpoint=1, search=SearchDescription(nodes=256))
+    )
+
+    headers = read_back(game_pgn(game)).headers
+
+    assert (headers["WhiteSearch"], headers["WhiteSearchNodes"]) == ("mcts", "256")
+    assert headers["WhiteSelection"] == "argmax"
+
+
+async def test_a_side_that_played_straight_from_its_policy_records_no_search():
+    game = await model_game(ModelDescription(run="r", checkpoint=1))
+
+    headers = read_back(game_pgn(game)).headers
+
+    assert "WhiteSearch" not in headers
+    assert "WhiteSearchNodes" not in headers
 
 
 async def test_a_model_asked_for_no_rating_in_particular_claims_none():

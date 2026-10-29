@@ -37,7 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from chess_ai.match import MatchGame, play_game
 from chess_ai.openings import OpeningSetError, load_opening_set
-from chess_ai.players import Player, close_and_wait
+from chess_ai.players import Player, SearchDescription, close_and_wait
 from chess_ai.position_view import GameOverReason
 from chess_ai.rating import Pairing, rate_round_robin
 from chess_ai.stockfish import Command, StockfishError, start_stockfish
@@ -82,6 +82,8 @@ class ModelEntrant(BaseModel):
     """The rating it is asked to play like, and what its opponents are told it has."""
     strategy: Literal["argmax", "sample"] = "argmax"
     temperature: float = 1.0
+    search: SearchDescription | None = None
+    """The search it plays with, or ``None`` to play straight from its policy."""
 
 
 class StockfishEntrant(BaseModel):
@@ -377,7 +379,8 @@ def describe(entrant: Entrant) -> str:
     if isinstance(entrant, StockfishEntrant):
         return f"Stockfish {entrant.elo}"
     sampled = f", sample {entrant.temperature:g}" if entrant.strategy == "sample" else ""
-    return f"{entrant.run} step {entrant.step} (rating {entrant.rating}{sampled})"
+    searched = f", {entrant.search.nodes:,} nodes" if entrant.search is not None else ""
+    return f"{entrant.run} step {entrant.step} (rating {entrant.rating}{sampled}{searched})"
 
 
 @dataclass(frozen=True)
@@ -532,8 +535,9 @@ async def entrant_players(
             is loaded or has another time than when the tournament was made, or Stockfish
             cannot be started. Whatever was started before it is closed first.
     """
-    from chess_ai.inference import InferenceError, ModelPlayer, load_engine
+    from chess_ai.inference import InferenceError, load_engine
     from chess_ai.inference.engine import DEFAULT_BATCH_SIZE
+    from chess_ai.inference.search import checkpoint_player
     from chess_ai.training.run_store import RunError, choose_checkpoint, open_run
 
     engines: dict[tuple[str, int], InferenceEngine] = {}
@@ -570,8 +574,9 @@ async def entrant_players(
             playing = definition.entrants[entrant]
             if isinstance(playing, StockfishEntrant):
                 return started[entrant]
-            return ModelPlayer(
+            return checkpoint_player(
                 engines[(playing.run, playing.step)],
+                search=playing.search,
                 run=playing.run,
                 checkpoint=playing.step,
                 rating=playing.rating,

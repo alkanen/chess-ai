@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     # every time any command runs, torch-adjacent run store and all.
     from chess_ai.game_session import GameSession
     from chess_ai.match import MatchGame
-    from chess_ai.players import Player, SelectionStrategy
+    from chess_ai.players import Player, SearchDescription, SelectionStrategy
     from chess_ai.training.run_store import CheckpointChoice, CheckpointInfo, RunReader
 
 LOGGER = logging.getLogger(__name__)
@@ -537,11 +537,14 @@ def _add_runs_commands(commands: argparse._SubParsersAction) -> None:
 _PLAYER_HELP = """\
 a player is a checkpoint or Stockfish, followed by settings as KEY=VALUE, all separated by commas:
 
-  RUN[@CHECKPOINT][,rating=R][,strategy=argmax|sample][,temperature=T]
+  RUN[@CHECKPOINT][,rating=R][,strategy=argmax|sample][,temperature=T][,search=mcts,nodes=N]
       a checkpoint of a training run. CHECKPOINT is best (the default), latest or a step.
       rating is the rating it is asked to play like, for both sides; left out, it claims none.
       strategy is how it picks its move: argmax plays its most likely one, sample draws from
       its distribution. A temperature samples at it; below 1 sharpens towards the best move.
+      nodes has it search that many positions before each move, by Monte Carlo tree search
+      (search=mcts, which nodes alone implies). It then plays the move it looked at most, or
+      draws one by how often it looked at each, at the temperature.
   stockfish:ELO[,move-time=SECONDS]
       Stockfish at a calibrated strength, which it raises or lowers to the range it supports.
       Stockfish's own play is not seeded, so a match against it does not replay exactly.
@@ -550,6 +553,7 @@ examples:
   chess-ai match resnet10x128 resnet6x64 --games 100
   chess-ai match resnet10x128@latest,rating=1500 stockfish:1350,move-time=0.5
   chess-ai match mlp@24000 mlp@48000 --temperature 0.25 --seed 7
+  chess-ai match transformer10x256,rating=2000,nodes=256 stockfish:1800
 """
 
 
@@ -618,6 +622,8 @@ class _ModelSide:
     strategy: "SelectionStrategy | None"
     """``None`` when the command line said nothing, which ``--temperature`` then decides."""
     temperature: float | None
+    search: "SearchDescription | None" = None
+    """The search it plays with, or ``None`` to play straight from its policy."""
 
 
 @dataclass(frozen=True)
@@ -708,7 +714,26 @@ def _model_side(text: str, head: str, settings: dict[str, str]) -> _ModelSide:
         rating=rating,
         strategy=strategy,  # type: ignore[arg-type]
         temperature=temperature,
+        search=_search(text, settings),
     )
+
+
+def _search(text: str, settings: dict[str, str]) -> "SearchDescription | None":
+    """The search ``settings`` ask for, taking its settings out of them: ``nodes=N``, with
+    ``search=mcts`` or without, since there is no other search."""
+    from chess_ai.players import MAX_SEARCH_NODES, SearchDescription
+
+    kind = settings.pop("search", None)
+    if kind not in (None, "mcts"):
+        raise argparse.ArgumentTypeError(f"{text!r}: the search is mcts, not {kind!r}")
+    if "nodes" not in settings:
+        if kind is not None:
+            raise argparse.ArgumentTypeError(
+                f"{text!r}: a search needs a number of nodes a move, as nodes=N"
+            )
+        return None
+    nodes = _number(int, settings.pop("nodes"), "a number of nodes", text, 1, MAX_SEARCH_NODES)
+    return SearchDescription(nodes=nodes)
 
 
 def _number[N: (int, float)](
@@ -945,7 +970,8 @@ def _model_player(
     Called by its run's title where it has one, as the runs list shows it, since a run's name
     can be as long as a line of the terminal. The PGN names it in full regardless.
     """
-    from chess_ai.inference import DEFAULT_TEMPERATURE, InferenceError, ModelPlayer, load_engine
+    from chess_ai.inference import DEFAULT_TEMPERATURE, InferenceError, load_engine
+    from chess_ai.inference.search import checkpoint_player
     from chess_ai.training.run_store import RunError
 
     engine = engines.get((run.name, chosen.step))
@@ -966,8 +992,9 @@ def _model_player(
         title = run.notes.title
     except RunError:
         title = ""  # Only the label is lost; the run itself has been read.
-    player = ModelPlayer(
+    player = checkpoint_player(
         engine,
+        search=side.search,
         run=run.name,
         checkpoint=chosen.step,
         rating=side.rating,
@@ -975,7 +1002,10 @@ def _model_player(
         temperature=side.temperature or temperature or DEFAULT_TEMPERATURE,
         seed=seed,
     )
-    return player, f"{title or run.name} step {chosen.step}"
+    label = f"{title or run.name} step {chosen.step}"
+    if side.search is not None:
+        label = f"{label}, {side.search.nodes:,} nodes"
+    return player, label
 
 
 def _side_names(
@@ -1118,11 +1148,16 @@ def _add_ladder_command(commands: argparse._SubParsersAction) -> None:
 
 
 def _ladder_checkpoint(text: str) -> _ModelSide:
-    if "," in text:
+    """A checkpoint, and the search it plays with if any: everything else about how it plays
+    is the ladder's, so that ladders compare."""
+    side = _match_player(text)
+    if not isinstance(side, _ModelSide):
+        raise argparse.ArgumentTypeError(f"{text!r}: a ladder is played by a checkpoint")
+    if (side.rating, side.strategy, side.temperature) != (None, None, None):
         raise argparse.ArgumentTypeError(
-            f"{text!r}: a ladder's checkpoint takes no settings; see --rating"
+            f"{text!r}: a ladder's checkpoint takes no settings but a search; see --rating"
         )
-    return _model_side(text, text, {})
+    return side
 
 
 def _levels(text: str) -> tuple[int, ...]:
@@ -1183,6 +1218,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         result_path,
         save_ladder,
         start_games_file,
+        suite_of,
         write_games,
     )
     from chess_ai.match import GameFailed, append_game, distinct_games
@@ -1228,8 +1264,10 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
         model, label = _model_player(
             side, run, chosen, None, config.model_copy(update={"inference": inference}), 0, {}
         )
+        # A search plays as another player, whose ladder is kept beside the network's own.
+        suite = suite_of(model.model.search)
         try:
-            partial = start_games_file(run, chosen.step)
+            partial = start_games_file(run, chosen.step, suite)
         except (OSError, RunError) as e:
             raise _UserError(f"cannot write the ladder's games in {run.directory}: {e}") from e
         played = 0
@@ -1261,7 +1299,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
                 partial.unlink(missing_ok=True)
                 return ""
             # A save that failed may have done so after the games were moved into place.
-            place = partial if partial.exists() else games_path(run, chosen.step)
+            place = partial if partial.exists() else games_path(run, chosen.step, suite)
             return (
                 f"; the {_count(played, 'game')} played {'is' if played == 1 else 'are'} in {place}"
             )
@@ -1375,7 +1413,7 @@ def _ladder(config: Config, args: argparse.Namespace) -> int:
             )
         except RunError as e:
             raise _UserError(f"{e}, so no result was saved{games_note()}") from e
-        say(f"chess-ai: result saved in {result_path(run, chosen.step)}", kind=RESULT)
+        say(f"chess-ai: result saved in {result_path(run, chosen.step, suite)}", kind=RESULT)
         return 0
 
 
@@ -2440,10 +2478,10 @@ DEFAULT_GAMES_PER_PAIRING = 10
 _ENTRANT_HELP = """\
 an entrant is a checkpoint or Stockfish, as chess-ai match takes a player:
 
-  RUN[@CHECKPOINT][,rating=R][,strategy=argmax|sample][,temperature=T]
+  RUN[@CHECKPOINT][,rating=R][,strategy=argmax|sample][,temperature=T][,search=mcts,nodes=N]
       a checkpoint of a training run, chosen when the tournament starts: best (the default),
       latest or a step. rating is the rating it plays like (default: [ladder] rating), and what
-      its opponents are told it has.
+      its opponents are told it has. nodes has it search that many positions a move.
   stockfish:ELO[,move-time=SECONDS]
       Stockfish at a calibrated strength.
 
@@ -2501,6 +2539,7 @@ def _start_tournament(config: Config, args: argparse.Namespace) -> int:
                 rating=side.rating if side.rating is not None else config.ladder.rating,
                 strategy=side.strategy or "argmax",
                 temperature=side.temperature or DEFAULT_TEMPERATURE,
+                search=side.search,
             )
         )
         runs.append((run, checkpoint))
@@ -2510,7 +2549,9 @@ def _start_tournament(config: Config, args: argparse.Namespace) -> int:
         if number > len(entrants):
             raise _UserError(f"there is no entrant {number}: there are {len(entrants)}")
         if rating is None:
-            rating = _ladder_rating(runs[number - 1], entrants[number - 1], number)
+            rating = _ladder_rating(
+                runs[number - 1], entrants[number - 1], number, config.ladder.rating
+            )
         anchor = Anchor(entrant=number - 1, rating=rating)
     seed = args.seed if args.seed is not None else secrets.randbelow(2**31)
     try:
@@ -2554,55 +2595,104 @@ def _written(
 
 
 def _ladder_rating(
-    played: "tuple[RunReader, CheckpointInfo] | None", entrant: Any, number: int
+    played: "tuple[RunReader, CheckpointInfo] | None",
+    entrant: Any,
+    number: int,
+    ladder_rating: int,
 ) -> float:
     """The Elo the Stockfish ladder found for entrant ``number``'s checkpoint, of the run it
-    ``played``, if the ladder was of the file the entrant records."""
-    from chess_ai.ladder import read_ladder, result_stands
+    ``played``, if the ladder was of the file the entrant records.
+
+    Where there is no ladder, or only one of a checkpoint file that is gone, it says which
+    ladder to play, as :func:`_ladder_to_play` has it; ``ladder_rating`` is ``[ladder] rating``.
+    Where there is a ladder of another player, it says only to give a rating: someone played
+    that ladder, and it is a good one, so playing another in its place is theirs to decide."""
+    from chess_ai.ladder import read_ladder, result_stands, suite_of
     from chess_ai.training.run_store import RunError
 
     if played is None:
         raise _UserError(f"entrant {number} is Stockfish, which has no ladder of its own")
     run, _ = played
+    # A searching entrant is anchored by the ladder it played searching as many nodes, which
+    # is the ladder to play when there is none to anchor to.
     try:
-        result = read_ladder(run, entrant.step)
+        result = read_ladder(run, entrant.step, suite_of(entrant.search))
     except RunError as e:
         raise _UserError(e) from e
+    to_play = _ladder_to_play(entrant, ladder_rating)
     if result is None:
         raise _UserError(
             f"entrant {number} has no Stockfish ladder at step {entrant.step} to anchor to; "
-            f"give its rating, or run chess-ai ladder {entrant.run}@{entrant.step} first"
-        )
-    if result.estimate.rating is None:
-        raise _UserError(
-            f"entrant {number}'s ladder puts it beyond the ladder's levels, with no rating to "
-            "anchor to; give its rating instead"
+            f"give its rating{f', or run {to_play} first' if to_play else ''}"
         )
     # A ladder of the step's checkpoint as it was before a run went back and trained past it
     # again is of another network, as the evaluator takes it to be.
     # Against the file's time the tournament records, which it checks on every resume.
     if not result_stands(result, entrant.step, entrant.checkpoint_written):
+        # The times are all that tell the files apart, and a run copied without its times
+        # looks the same as one trained again: said, so that a ladder of hours is not played
+        # again for a copy. Otherwise a ladder of a network that is gone anchors nothing, and
+        # playing it again loses nothing anyone can use.
+        played_on = (
+            f"the file written at {_local(result.checkpoint_written)}"
+            if result.checkpoint_written is not None
+            else f"a file from before {_local(result.started)}"
+        )
         raise _UserError(
             f"entrant {number}'s ladder was played with another file of the checkpoint from "
-            f"step {entrant.step} than the one there now; give its rating instead, or run "
-            f"chess-ai ladder {entrant.run}@{entrant.step} again"
+            f"step {entrant.step} than the one there now: {played_on}, where the one there "
+            f"now was written at {_local(entrant.checkpoint_written)} (saved again, which is "
+            "another network, or copied without its times); give its rating instead"
+            f"{f', or run {to_play} again' if to_play else ''}"
         )
     # The Elo is of the checkpoint playing as the ladder had it play, which is a different
-    # player from the same checkpoint asked to play like another rating, or sampling.
+    # player from the same checkpoint asked to play like another rating, or sampling. That
+    # ladder is a good one of that player, so no ladder is suggested in its place.
     laddered, playing = _how_played(result.model), _how_played(entrant)
     if laddered != playing:
         raise _UserError(
             f"entrant {number}'s ladder was played at {laddered}, and it plays at {playing} "
             "here, which is a player of another strength; give its rating instead"
         )
+    # Last, so that only a ladder of this player, on this file, is judged by what it scored.
+    if result.estimate.rating is None:
+        raise _UserError(
+            f"entrant {number}'s ladder puts it beyond the ladder's levels, with no rating to "
+            "anchor to; give its rating instead"
+        )
     return result.estimate.rating
+
+
+def _local(when: "datetime") -> str:
+    """``when`` as ``2026-01-01 01:00:00 CET``, in this machine's time zone, to the second: as
+    the stamp starting each line, and ``ls -l``, which file times are compared with by eye."""
+    return f"{when.astimezone():%Y-%m-%d %H:%M:%S %Z}"
+
+
+def _ladder_to_play(entrant: Any, ladder_rating: int) -> str | None:
+    """The ``chess-ai ladder`` command that plays the ladder ``entrant`` would be anchored by,
+    or ``None`` where none is to be suggested.
+
+    The ladder is of the checkpoint playing as the entrant does: at its rating, and with its
+    search. A ladder plays its most likely move, so none can be played of an entrant that
+    samples. The network's own ladder is read by the evaluator, the charts and every other
+    anchor, so it is suggested only at ``ladder_rating``, ``[ladder] rating``, which is the
+    ladder the evaluator plays; a searched one is only ever played by hand.
+    """
+    if entrant.strategy != "argmax":
+        return None
+    if entrant.search is None and entrant.rating != ladder_rating:
+        return None
+    searched = f",nodes={entrant.search.nodes}" if entrant.search is not None else ""
+    return f"chess-ai ladder {entrant.run}@{entrant.step}{searched} --rating {entrant.rating}"
 
 
 def _how_played(player: Any) -> str:
     """The rating a checkpoint was asked to play like, and how it chose its moves: such as
-    ``rating 2000, argmax``."""
+    ``rating 2000, argmax`` or ``rating 2000, argmax, 256 nodes``."""
     sampled = f" {player.temperature:g}" if player.strategy == "sample" else ""
-    return f"rating {player.rating}, {player.strategy}{sampled}"
+    searched = f", {player.search.nodes:,} nodes" if player.search is not None else ""
+    return f"rating {player.rating}, {player.strategy}{sampled}{searched}"
 
 
 def _resume_tournament(config: Config, args: argparse.Namespace) -> int:

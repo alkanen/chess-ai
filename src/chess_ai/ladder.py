@@ -42,7 +42,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from chess_ai.config import LadderConfig
 from chess_ai.evaluator import until_stopped
@@ -62,6 +62,7 @@ from chess_ai.output import say as said_on_stdout
 from chess_ai.players import (
     ModelDescription,
     Player,
+    SearchDescription,
     StockfishBackedPlayer,
     StockfishDescription,
     close_and_wait,
@@ -195,7 +196,9 @@ class LadderResult(BaseModel):
     model_config = ConfigDict(extra="forbid", use_attribute_docstrings=True)
 
     format_version: Literal[1] = FORMAT_VERSION
-    suite: Literal["stockfish-ladder"] = SUITE
+    suite: str = SUITE
+    """:data:`SUITE`, or the name of a ladder played by a search, which :func:`suite_of` gives
+    and is kept beside it."""
     model: ModelDescription
     """The run, the checkpoint, and the rating it was asked to play like."""
     checkpoint_written: datetime | None = None
@@ -212,6 +215,15 @@ class LadderResult(BaseModel):
     games: list[LadderGame] = []
     """The games, in the order they are in ``stockfish-ladder.pgn``; empty from a ladder played
     before results listed them, whose games are in the file all the same."""
+
+    @model_validator(mode="after")
+    def _suite_of_its_player(self) -> "LadderResult":
+        if self.suite != suite_of(self.model.search):
+            raise ValueError(
+                f"the player it names plays the {suite_of(self.model.search)!r} ladder, "
+                f"not {self.suite!r}"
+            )
+        return self
 
 
 @dataclass(frozen=True)
@@ -548,6 +560,7 @@ def ladder_result(
         )
     ]
     return LadderResult(
+        suite=suite_of(model.search),
         model=model,
         checkpoint_written=checkpoint_written,
         started=started,
@@ -575,17 +588,30 @@ def _listed(index: int, elo: int, game: MatchGame) -> LadderGame:
     )
 
 
-def result_path(run: RunReader, step: int) -> Path:
+def suite_of(search: SearchDescription | None) -> str:
+    """What the ladder of a checkpoint playing with ``search`` is called, and its files named.
+
+    A checkpoint that searches is a player of another strength than its network alone, so its
+    ladder is kept beside the network's rather than in its place, one for each kind of search
+    and number of nodes: ``stockfish-ladder-mcts-256``. The evaluator, the charts and the
+    tournaments' anchors read the network's own, :data:`SUITE`.
+    """
+    if search is None:
+        return SUITE
+    return f"{SUITE}-{search.kind}-{search.nodes}"
+
+
+def result_path(run: RunReader, step: int, suite: str = SUITE) -> Path:
     """Where the ladder's result for the checkpoint from ``step`` is kept."""
-    return run.evaluation_directory(step) / f"{SUITE}.json"
+    return run.evaluation_directory(step) / f"{suite}.json"
 
 
-def games_path(run: RunReader, step: int) -> Path:
+def games_path(run: RunReader, step: int, suite: str = SUITE) -> Path:
     """Where the games the result was worked out from are kept."""
-    return run.evaluation_directory(step) / f"{SUITE}.pgn"
+    return run.evaluation_directory(step) / f"{suite}.pgn"
 
 
-def start_games_file(run: RunReader, step: int) -> Path:
+def start_games_file(run: RunReader, step: int, suite: str = SUITE) -> Path:
     """A new, empty file for the games of a ladder of the checkpoint from ``step``.
 
     One of its own for every ladder, so that two ladders of one checkpoint played at once do
@@ -593,7 +619,7 @@ def start_games_file(run: RunReader, step: int) -> Path:
     are added with :func:`~chess_ai.match.append_game` as they end. A ladder that is stopped
     leaves its file behind, for whoever stopped it to look at or delete.
     """
-    return start_partial_file(run.evaluation_directory(step), f"{SUITE}.pgn")
+    return start_partial_file(run.evaluation_directory(step), f"{suite}.pgn")
 
 
 def save_ladder(
@@ -617,25 +643,30 @@ def save_ladder(
     step = result.model.checkpoint
     save_evaluation(
         run.evaluation_directory(step),
-        {f"{SUITE}.json": result.model_dump_json(indent=2) + "\n"},
-        {f"{SUITE}.pgn": partial},
+        {f"{result.suite}.json": result.model_dump_json(indent=2) + "\n"},
+        {f"{result.suite}.pgn": partial},
         current=current,
     )
 
 
-def read_ladder(run: RunReader, step: int) -> LadderResult | None:
-    """The ladder's result for the checkpoint from ``step``, or ``None`` if there is none.
+def read_ladder(run: RunReader, step: int, suite: str = SUITE) -> LadderResult | None:
+    """The ladder's result for the checkpoint from ``step``, or ``None`` if there is none: the
+    network's own, or the ``suite`` :func:`suite_of` names for a search.
 
     Raises:
-        RunError: there is one, and it cannot be read or is not a result this code knows.
+        RunError: there is one, and it cannot be read, is not a result this code knows, or is
+            the result of another ladder than ``suite``.
     """
-    text = run.evaluation(step, SUITE)
+    text = run.evaluation(step, suite)
     if text is None:
         return None
     try:
-        return LadderResult.model_validate_json(text)
+        result = LadderResult.model_validate_json(text)
     except ValidationError as e:
-        raise RunError(f"{result_path(run, step)} is not a ladder result: {e}") from e
+        raise RunError(f"{result_path(run, step, suite)} is not a ladder result: {e}") from e
+    if result.suite != suite:
+        raise RunError(f"{result_path(run, step, suite)} holds the result of {result.suite}")
+    return result
 
 
 def read_games(run: RunReader, step: int) -> str | None:
