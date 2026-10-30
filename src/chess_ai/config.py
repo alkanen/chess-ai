@@ -24,6 +24,8 @@ from pydantic import (
     model_validator,
 )
 
+from chess_ai.players import MAX_SEARCH_NODES
+
 Device = Literal["auto", "cuda", "cpu"]
 """What a config may ask to run a network on. ``auto`` is the GPU when there is one, else the
 CPU. Named here rather than with the training config, because two configs choose a device and
@@ -59,10 +61,12 @@ class ServerConfig(BaseModel):
 
     A trainer rewrites its heartbeat every couple of seconds while it steps, but not while it is
     starting up, compiling, validating or saving a checkpoint, so this is well above that."""
-    max_search_nodes: int = Field(default=4096, ge=0)
+    max_search_nodes: int = Field(default=4096, ge=0, le=MAX_SEARCH_NODES)
     """The most nodes a checkpoint playing here may search a move. A search is a few hundred
     positions a second on a CPU, and holds the network while the server's other games wait
-    their turn; 0 offers no search at all."""
+    their turn; 0 offers no search at all. It holds for games started from then on: a game
+    started before keeps the search it was started with, through a restart too, as a person
+    playing it was promised."""
 
     @field_validator("path_prefix")
     @classmethod

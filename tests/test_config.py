@@ -113,6 +113,14 @@ def test_rejects_unknown_setting(tmp_path):
         load_config(path, environ={})
 
 
+@pytest.mark.parametrize("nodes", ["-1", "1000001"])
+def test_rejects_a_search_limit_no_search_could_have(nodes):
+    """Above the most any search may be asked for, the form would offer a search the server
+    then refuses."""
+    with pytest.raises(ConfigError, match="server.max_search_nodes"):
+        load_config(environ={"CHESS_AI_SERVER_MAX_SEARCH_NODES": nodes})
+
+
 def test_rejects_invalid_port_from_environment():
     with pytest.raises(ConfigError, match="server.port"):
         load_config(environ={"CHESS_AI_SERVER_PORT": "http"})

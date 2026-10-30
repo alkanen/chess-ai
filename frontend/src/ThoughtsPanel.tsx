@@ -147,13 +147,18 @@ interface ThoughtsPanelProps {
  */
 function heading(game: GameState, shown: ShownThoughts): string {
   const side = shown.side === 'white' ? 'White' : 'Black';
+  // Searched "to" its nodes: the tree it chose from has that many looks in it, some of them
+  // kept from its move before, rather than that many looked at for this move.
   const nodes = searchedBy(game, shown.side);
-  const who = nodes !== null ? `${side} searched ${nodes} positions` : side;
   if (shown.played === null) {
-    return nodes !== null ? `${who}, and is considering…` : `${side} is considering…`;
+    return nodes !== null
+      ? `${side} is considering, having searched to ${nodes} nodes…`
+      : `${side} is considering…`;
   }
   const san = game.moves.at(-1)?.san ?? shown.played;
-  return `${who} before playing ${san}`;
+  return nodes !== null
+    ? `${side} searched to ${nodes} nodes before playing ${san}`
+    : `${side} before playing ${san}`;
 }
 
 /** The nodes a move the model playing `side` searches, or null for one that does not. */
@@ -246,7 +251,7 @@ function RoomKept({ searching }: { searching: boolean }) {
     <div className="thoughts-kept" aria-hidden="true">
       <p className="thoughts-heading">
         {searching
-          ? `Black searched ${MAX_SEARCH_NODES} positions before playing axb8=Q+`
+          ? `Black searched to ${MAX_SEARCH_NODES} nodes before playing axb8=Q+`
           : 'Black before playing axb8=Q+'}
       </p>
       <CandidateList

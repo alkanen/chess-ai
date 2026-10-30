@@ -73,7 +73,7 @@ describe('ThoughtsPanel', () => {
       />,
     );
 
-    expect(screen.getByText('Black searched 1024 positions before playing e5')).toBeInTheDocument();
+    expect(screen.getByText('Black searched to 1024 nodes before playing e5')).toBeInTheDocument();
     expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
       'e5 (played)62%635',
       'c525%256',
@@ -98,7 +98,7 @@ describe('ThoughtsPanel', () => {
       />,
     );
 
-    expect(screen.getByText('Black searched 64 positions, and is considering…')).toBeInTheDocument();
+    expect(screen.getByText('Black is considering, having searched to 64 nodes…')).toBeInTheDocument();
   });
 
   it('says the model is considering while its move is held back', () => {

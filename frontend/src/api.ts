@@ -996,7 +996,6 @@ export interface StockfishInfo {
   max_elo: number;
 }
 
-/** The Stockfish this server plays, or why there is none to play. */
 /** How long a search a checkpoint may play with: mirrors chess_ai.web.app.SearchLimits. */
 export interface SearchLimits {
   /** The most nodes a move it may search; 0 when it may not search at all. */
@@ -1012,6 +1011,7 @@ export async function fetchSearchLimits(): Promise<SearchLimits> {
   return (await response.json()) as SearchLimits;
 }
 
+/** The Stockfish this server plays, or why there is none to play. */
 export async function fetchStockfish(): Promise<StockfishInfo> {
   const response = await fetch(apiUrl('stockfish'));
   if (!response.ok) {

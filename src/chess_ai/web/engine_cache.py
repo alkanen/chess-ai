@@ -124,9 +124,11 @@ class EngineCache:
 
         Every question any game asks takes its turn, whichever checkpoint it is put to, in the
         order they were asked: a search asks batch after batch, and a model playing from its
-        policy in another game waits for one batch, not for the whole search. On a CPU one
-        forward pass already keeps every core busy, so passes side by side would only make
-        each slower.
+        policy in another game waits for one batch, not for the whole search. That is so while
+        a thread is free to ask in: every move is worked out in the event loop's default
+        executor, and each search holds one of its threads (the number of CPUs plus 4, up to
+        32) for the whole of its move. On a CPU one forward pass already keeps every core
+        busy, so passes side by side would only make each slower.
         """
         with self.borrowed(key) as engine, self._turns.taken():
             yield engine
