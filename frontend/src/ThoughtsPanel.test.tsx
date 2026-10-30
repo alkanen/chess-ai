@@ -52,6 +52,55 @@ describe('ThoughtsPanel', () => {
     expect(screen.getByText('White wins 20%, draw 30%, Black wins 50%')).toBeInTheDocument();
   });
 
+  it('says what a search found: how often it looked at each move', () => {
+    const searched: Thoughts = {
+      candidates: [
+        { uci: 'e7e5', san: 'e5', probability: 0.62, visits: 635 },
+        { uci: 'c7c5', san: 'c5', probability: 0.25, visits: 256 },
+      ],
+      wdl: { win: 0.5, draw: 0.3, loss: 0.2 },
+    };
+    const game = {
+      ...GAME,
+      black: { name: 'tiny step 4, 1024 nodes', model: { search: { kind: 'mcts', nodes: 1024 } } },
+    } as unknown as GameState;
+    render(
+      <ThoughtsPanel
+        game={game}
+        shown={{ thoughts: searched, side: 'black', played: 'e7e5' }}
+        show
+        onShow={() => {}}
+      />,
+    );
+
+    expect(screen.getByText('Black searched 1024 positions before playing e5')).toBeInTheDocument();
+    expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      'e5 (played)62%635',
+      'c525%256',
+    ]);
+    // What the network made of the position before the search, not what the search found.
+    expect(
+      screen.getByText('The network’s first look: White wins 20%, draw 30%, Black wins 50%'),
+    ).toBeInTheDocument();
+  });
+
+  it('says a searching model is considering while its move is held back', () => {
+    const game = {
+      ...GAME,
+      black: { name: 'tiny step 4, 64 nodes', model: { search: { kind: 'mcts', nodes: 64 } } },
+    } as unknown as GameState;
+    render(
+      <ThoughtsPanel
+        game={game}
+        shown={{ thoughts: THOUGHTS, side: 'black', played: null }}
+        show
+        onShow={() => {}}
+      />,
+    );
+
+    expect(screen.getByText('Black searched 64 positions, and is considering…')).toBeInTheDocument();
+  });
+
   it('says the model is considering while its move is held back', () => {
     render(
       <ThoughtsPanel

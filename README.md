@@ -96,6 +96,7 @@ Every setting can also be overridden by an environment variable named `CHESS_AI_
 | `[server] port` | `CHESS_AI_SERVER_PORT` | `8000` |
 | `[server] path_prefix` | `CHESS_AI_SERVER_PATH_PREFIX` | empty (serve at `/`) |
 | `[server] stale_after_seconds` | `CHESS_AI_SERVER_STALE_AFTER_SECONDS` | `120` |
+| `[server] max_search_nodes` | `CHESS_AI_SERVER_MAX_SEARCH_NODES` | `4096` |
 | `[paths] games` | `CHESS_AI_PATHS_GAMES` | `games`, in the working directory |
 | `[paths] data` | `CHESS_AI_PATHS_DATA` | `data`, in the working directory |
 | `[paths] runs` | `CHESS_AI_PATHS_RUNS` | `runs`, in the working directory |
@@ -201,7 +202,18 @@ Choosing **Model** for a colour asks the server which training runs it keeps. Ea
 
 Both colours can be models, so two checkpoints of one run, or two runs, can be watched against each other. A model's moves are masked to the legal ones before the probabilities are normalized, so an untrained checkpoint plays badly rather than illegally.
 
-**Show what the model is thinking**, beside the board, turns on an overlay that shows what a model chose its move from. Its candidate moves are drawn as arrows, heavier the likelier it thought them, and listed with their probabilities. The one it played is in green. A bar beside the board shows its chances of a win, a draw or a loss, from White's side. While the move delay holds a model's move back, the overlay already shows what it is considering, the same as once the move is played. It stays until the other side replies. The switch is off by default, since it shows a person what the model is about to play, and each browser remembers it. For now it covers only the latest move of a live game.
+A checkpoint can also search before each move, as `chess-ai match` players can (see [Play a match](#play-a-match)): **searches** offers 64 to 4096 nodes a move, and is off by default. A search makes the checkpoint stronger and less like a person. It plays the move it looked at most, or with **plays** set to a sample, one drawn by how often it looked at each. Each node is one position the network evaluates, and a large model evaluates a few hundred a second on a CPU, so 1024 nodes can take several seconds a move. `[server] max_search_nodes` (4096 by default) is the most the server allows, and the form offers no more than that; 0 offers no search at all. The game page says which side searches and how far. The network answers one question at a time, in the order they were asked, whichever game asks: a search asks batch after batch, and a model in another game waits for one batch, not for the whole search. Through the API, give the model side `"search": {"kind": "mcts", "nodes": N}`. For example, to start a searching game against a person from the command line, with the server running:
+
+```sh
+curl -s -X POST http://127.0.0.1:8000/chess/api/games -H 'Content-Type: application/json' -d '{
+  "white": {"kind": "human", "rating": 1500},
+  "black": {"kind": "model", "run": "RUN", "checkpoint": "best", "search": {"kind": "mcts", "nodes": 256}}
+}'
+```
+
+The answer's `links.white` is the play link: send `http://127.0.0.1:8000/chess/#game/<links.white>` to the person (with your own host, port and prefix), and keep `links.watch` to follow the game. Such a game is not in the Game tab's list of the browser that would otherwise have started it.
+
+**Show what the model is thinking**, beside the board, turns on an overlay that shows what a model chose its move from. Its candidate moves are drawn as arrows, heavier the likelier it thought them, and listed with their probabilities. The one it played is in green. A bar beside the board shows its chances of a win, a draw or a loss, from White's side. While the move delay holds a model's move back, the overlay already shows what it is considering, the same as once the move is played. It stays until the other side replies. The switch is off by default, since it shows a person what the model is about to play, and each browser remembers it. For a searching model, the candidates are the moves it looked at most, each with its share of the looking and how many times it looked, and the chances are the network's first look at the position, before the search. For now it covers only the latest move of a live game.
 
 Whether the rating does anything is a property of the training data rather than of the model player: a run whose games all came from one narrow band of ratings has never seen that feature move, and will have learned nothing from it. To see which it is for a checkpoint, play it against itself twice from the same position with **plays** set to its best move, changing nothing between the two games but the rating: a run that learned something from the feature plays a different game, and one that did not plays the same one move for move. Ask only for ratings inside the range the run trained on, which `chess-ai dataset stats <name>` reports for its dataset — a rating the run never saw takes the feature off the end of its training data, and whatever the model does then says nothing about what it learned.
 

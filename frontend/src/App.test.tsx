@@ -363,6 +363,41 @@ describe('App', () => {
     ]);
   });
 
+  it('says a checkpoint searches, and how it picks its move from the search', () => {
+    renderGame();
+    FakeWebSocket.latest.open();
+    const searching = (strategy: 'argmax' | 'sample', temperature: number | null) => ({
+      name: 'tiny step 4, 1024 nodes',
+      accepts_moves: false,
+      model: {
+        run: 'tiny',
+        checkpoint: 4,
+        rating: 1600,
+        strategy,
+        temperature,
+        search: { kind: 'mcts' as const, nodes: 1024 },
+      },
+      stockfish: null,
+    });
+
+    FakeWebSocket.latest.deliver({
+      ...foolsMateStart,
+      game: {
+        ...foolsMateStart.game,
+        white: searching('argmax', null),
+        black: searching('sample', 1.5),
+      },
+    });
+
+    const players = screen.getAllByRole('definition').map((element) => element.textContent);
+    expect(players).toEqual([
+      'tiny step 4, 1024 nodesplays like 1600, searches 1024 nodes a move and plays the move ' +
+        'it looked at most',
+      'tiny step 4, 1024 nodesplays like 1600, searches 1024 nodes a move and samples at 1.5 ' +
+        'by how often it looked at each',
+    ]);
+  });
+
   it('says the rating a person playing a side gave', () => {
     renderGame();
     FakeWebSocket.latest.open();

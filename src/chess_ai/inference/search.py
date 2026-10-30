@@ -387,14 +387,19 @@ def _thoughts(root: _Node, board: chess.Board) -> Thoughts:
     assert root.children is not None
     looked = sum(child.visits for child in root.children.values())
     if looked:
-        shares = [(move, child.visits / looked) for move, child in root.children.items()]
+        shares = [(move, child, child.visits / looked) for move, child in root.children.items()]
     else:
-        shares = [(move, child.prior) for move, child in root.children.items()]
-    shares.sort(key=lambda pair: -pair[1])
+        shares = [(move, child, child.prior) for move, child in root.children.items()]
+    shares.sort(key=lambda shared: -shared[2])
     return Thoughts(
         candidates=[
-            CandidateMove(uci=move.uci(), san=board.san(move), probability=share)
-            for move, share in shares[:TOP_CANDIDATES]
+            CandidateMove(
+                uci=move.uci(),
+                san=board.san(move),
+                probability=share,
+                visits=child.visits if looked else None,
+            )
+            for move, child, share in shares[:TOP_CANDIDATES]
         ],
         wdl=root.wdl,
     )

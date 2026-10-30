@@ -67,6 +67,16 @@
   text-align: right;
 }
 
+/* A search's candidates say how often it looked below each, in a column of their own. */
+.candidates.searched {
+  grid-template-columns: auto 1fr auto auto;
+}
+
+.candidate-visits {
+  text-align: right;
+  opacity: 0.7;
+}
+
 .thoughts-odds {
   font-size: 0.9em;
   opacity: 0.85;

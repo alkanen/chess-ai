@@ -50,6 +50,9 @@ function serving(runs: RunSummary[] = RUNS, replaced: Response = Response.json({
     if (url.endsWith('/replace')) {
       return Promise.resolve(replaced);
     }
+    if (url.endsWith('/api/search-limits')) {
+      return Promise.resolve(Response.json({ max_nodes: 4096 }));
+    }
     const asked = /\/api\/runs\/([^/]+)\/checkpoints$/.exec(url);
     if (asked !== null) {
       return Promise.resolve(Response.json({ run: decodeURIComponent(asked[1]), checkpoints: [] }));
@@ -112,6 +115,21 @@ describe('PausedPanel', () => {
       strategy: 'argmax',
       temperature: 1,
     });
+  });
+
+  it('offers one that searched the same search', async () => {
+    const fetch = serving();
+    vi.stubGlobal('fetch', fetch);
+    const searching = { ...GONE, model: { ...GONE.model!, search: { kind: 'mcts' as const, nodes: 256 } } };
+    render(
+      <PausedPanel link="mine" paused={PAUSED} player={searching} opponent={PERSON} access="white" disabled={false} />,
+    );
+
+    await vi.waitFor(() => expect(screen.getByLabelText('Black searches')).toHaveValue('256'));
+    fireEvent.click(screen.getByRole('button', { name: 'Play on with this checkpoint' }));
+
+    await vi.waitFor(() => expect(posted(fetch)).toHaveLength(1));
+    expect(posted(fetch)[0][1]).toMatchObject({ search: { kind: 'mcts', nodes: 256 } });
   });
 
   it('offers one that claimed no rating the same, warned about and easy to undo', async () => {

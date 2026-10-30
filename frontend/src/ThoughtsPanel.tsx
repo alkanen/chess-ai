@@ -98,8 +98,9 @@ interface CandidateListProps {
 
 /** Candidate moves with how likely each was, as words and as a meter. */
 export function CandidateList({ label, candidates, marked, markedAs }: CandidateListProps) {
+  const searched = candidates.some((candidate) => candidate.visits != null);
   return (
-    <ol className="candidates" aria-label={label}>
+    <ol className={searched ? 'candidates searched' : 'candidates'} aria-label={label}>
       {candidates.map((candidate) => {
         const singled = marked(candidate.uci);
         return (
@@ -116,6 +117,11 @@ export function CandidateList({ label, candidates, marked, markedAs }: Candidate
               <span style={{ width: percent(candidate.probability) }} />
             </span>
             <span className="candidate-share">{percent(candidate.probability)}</span>
+            {searched && (
+              <span className="candidate-visits" title="Times the search looked below it">
+                {candidate.visits ?? ''}
+              </span>
+            )}
           </li>
         );
       })}
@@ -141,11 +147,23 @@ interface ThoughtsPanelProps {
  */
 function heading(game: GameState, shown: ShownThoughts): string {
   const side = shown.side === 'white' ? 'White' : 'Black';
+  const nodes = searchedBy(game, shown.side);
+  const who = nodes !== null ? `${side} searched ${nodes} positions` : side;
   if (shown.played === null) {
-    return `${side} is considering…`;
+    return nodes !== null ? `${who}, and is considering…` : `${side} is considering…`;
   }
   const san = game.moves.at(-1)?.san ?? shown.played;
-  return `${side} before playing ${san}`;
+  return `${who} before playing ${san}`;
+}
+
+/** The nodes a move the model playing `side` searches, or null for one that does not. */
+function searchedBy(game: GameState, side: Color): number | null {
+  return game[side].model?.search?.nodes ?? null;
+}
+
+/** Whether a model in `game` searches, whose thoughts take more room. */
+function searches(game: GameState): boolean {
+  return searchedBy(game, 'white') !== null || searchedBy(game, 'black') !== null;
 }
 
 /**
@@ -179,6 +197,7 @@ export function ThoughtsPanel({
           />
           {shown.thoughts.wdl !== null && (
             <p className="thoughts-odds">
+              {searchedBy(game, shown.side) !== null && 'The network’s first look: '}
               {described(whiteOdds(shown.thoughts.wdl, shown.side))}
             </p>
           )}
@@ -194,7 +213,7 @@ export function ThoughtsPanel({
       </label>
       {keepRoom ? (
         <div className="thoughts-room">
-          <RoomKept />
+          <RoomKept searching={searches(game)} />
           <div className="thoughts-shown">{thoughts}</div>
         </div>
       ) : (
@@ -205,27 +224,41 @@ export function ThoughtsPanel({
 }
 
 /** As many candidates as there can be, each as long as one can be put, for the room kept. */
-const WIDEST_CANDIDATES: CandidateMove[] = Array.from({ length: MOST_CANDIDATES }, (_, index) => ({
-  uci: `kept-${index}`,
-  san: 'axb8=Q+',
-  probability: 1,
-}));
+function widestCandidates(searching: boolean): CandidateMove[] {
+  return Array.from({ length: MOST_CANDIDATES }, (_, index) => ({
+    uci: `kept-${index}`,
+    san: 'axb8=Q+',
+    probability: 1,
+    visits: searching ? MAX_SEARCH_NODES : null,
+  }));
+}
+
+/** The most nodes a search may be asked for; mirrors chess_ai.players.MAX_SEARCH_NODES. */
+const MAX_SEARCH_NODES = 1_000_000;
 
 /**
  * The most the panel shows, laid out as it is but never seen, which keeps the room for it: a
- * heading, every candidate, and the longest the chances can be put.
+ * heading, every candidate, and the longest the chances can be put. A game a model searches
+ * in says more of each, and keeps the room for that from its first move to its last.
  */
-function RoomKept() {
+function RoomKept({ searching }: { searching: boolean }) {
   return (
     <div className="thoughts-kept" aria-hidden="true">
-      <p className="thoughts-heading">Black before playing axb8=Q+</p>
+      <p className="thoughts-heading">
+        {searching
+          ? `Black searched ${MAX_SEARCH_NODES} positions before playing axb8=Q+`
+          : 'Black before playing axb8=Q+'}
+      </p>
       <CandidateList
         label=""
-        candidates={WIDEST_CANDIDATES}
+        candidates={widestCandidates(searching)}
         marked={() => false}
         markedAs=""
       />
-      <p className="thoughts-odds">{described({ white: 1, draw: 1, black: 1 })}</p>
+      <p className="thoughts-odds">
+        {searching && 'The network’s first look: '}
+        {described({ white: 1, draw: 1, black: 1 })}
+      </p>
     </div>
   );
 }
