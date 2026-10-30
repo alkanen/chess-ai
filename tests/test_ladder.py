@@ -12,6 +12,7 @@ import pytest
 import torch
 from game_helpers import PlayerBroke
 from output_helpers import heard, unheard
+from pydantic import ValidationError
 from training_helpers import model_run
 
 from chess_ai import replay
@@ -1577,3 +1578,46 @@ def test_clearing_a_failure_s_frames_follows_cause_and_context_and_ends_on_a_cyc
 
     assert not walking.is_alive(), "went round the cycle for ever"
     assert context.__traceback__.tb_frame.f_locals == {}, "the context's frames as well"
+
+
+def searched_result() -> LadderResult:
+    """The result of a ladder played by tiny's step 4 searching 8 nodes a move."""
+    from chess_ai.ladder import LadderEstimate
+    from chess_ai.players import SearchDescription
+
+    now = datetime.now(UTC)
+    return LadderResult(
+        suite="stockfish-ladder-mcts-8",
+        model=ModelDescription(run="tiny", checkpoint=4, search=SearchDescription(nodes=8)),
+        started=now,
+        finished=now,
+        code_version="test",
+        openings="standard v1",
+        games_per_level=1,
+        levels=[],
+        estimate=LadderEstimate(
+            rating=1600, low=1500, high=1700, beyond=None, floor=1350, ceiling=2100,
+            confidence=0.95, games=1, points=0.5,
+        ),
+    )  # fmt: skip
+
+
+def test_a_result_whose_suite_is_not_its_players_is_refused():
+    """A searched ladder's result copied over the network's own would otherwise be read as the
+    network's Elo."""
+    result = json.loads(searched_result().model_dump_json())
+    result["suite"] = SUITE
+
+    with pytest.raises(ValidationError):
+        LadderResult.model_validate(result)
+
+
+def test_a_searched_result_in_the_networks_file_is_not_read_as_the_networks(tmp_path):
+    model_run(tmp_path)
+    run = open_run(tmp_path, "tiny")
+    path = result_path(run, 4)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(searched_result().model_dump_json())
+
+    with pytest.raises(RunError, match="stockfish-ladder-mcts-8"):
+        read_ladder(run, 4)

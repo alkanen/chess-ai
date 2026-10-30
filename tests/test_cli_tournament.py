@@ -1,5 +1,8 @@
 """``chess-ai tournament``: starting, resuming, showing and listing round-robin tournaments."""
 
+import time
+from datetime import UTC, datetime
+
 import pytest
 from pgn_helpers import read_back
 from stockfish_helpers import fake_engine, started
@@ -50,6 +53,32 @@ def test_a_tournament_is_started_played_and_its_leaderboard_printed(tmp_path, ca
     assert "cup: 6 of 6 games" in out
     for name in ("tiny step 2 (rating 1500)", "tiny step 4 (rating 1700)", "Stockfish 1400"):
         assert name in out
+
+
+def test_an_entrant_can_search_before_each_move(tmp_path, capsys):
+    config = tournament_config(tmp_path, ladder='device = "cpu"')
+
+    status = main(
+        [
+            "--config", str(config), "tournament", "start", "cup",
+            "tiny@2,nodes=4", "tiny@4", "--games-per-pairing", "2",
+        ]
+    )  # fmt: skip
+
+    out = capsys.readouterr().out
+    assert status == 0
+    tournament = open_tournament(tmp_path / "tournaments", "cup")
+    searching, plain = tournament.definition.entrants
+    assert (searching.search.kind, searching.search.nodes) == ("mcts", 4)
+    assert plain.search is None
+    for game in tournament.games():
+        headers = read_back(game.pgn).headers
+        searcher, other = (
+            ("White", "Black") if headers["WhiteCheckpoint"] == "2" else ("Black", "White")
+        )
+        assert headers[f"{searcher}SearchNodes"] == "4"
+        assert f"{other}Search" not in headers
+    assert "tiny step 2 (rating 2000, 4 nodes)" in out
 
 
 def start(config, *arguments: str) -> int:
@@ -138,31 +167,52 @@ def test_an_anchor_from_the_ladder_takes_the_checkpoints_ladder_elo(tmp_path, ca
     assert "rated from entrant 2 at 1612" in capsys.readouterr().out
 
 
-def write_ladder(run_dir, *, step: int, rating: float, checkpoint_written=None) -> None:
+def write_ladder(
+    run_dir,
+    *,
+    step: int,
+    rating: float,
+    checkpoint_written=None,
+    nodes: int | None = None,
+    played_at: int | None = None,
+    started: datetime | None = None,
+    beyond: str | None = None,
+) -> None:
     """A Stockfish ladder result for the checkpoint of ``run_dir`` from ``step``, as the ladder
     saves one, that rates it at ``rating``: played on the file there now, unless
-    ``checkpoint_written`` says it was played on one written at another time."""
-    from datetime import UTC, datetime
-
-    from chess_ai.ladder import LadderEstimate, LadderResult, result_path
-    from chess_ai.players import ModelDescription
+    ``checkpoint_written`` says it was played on one written at another time; by the network
+    alone, unless it searched ``nodes`` nodes a move; and at the rating entrants are given by
+    default, ``[ladder] rating``, unless ``played_at`` says another. It was played now, unless
+    ``started`` says when, and rates the checkpoint within the levels, unless ``beyond`` says
+    it is below or above them."""
+    from chess_ai.config import LadderConfig
+    from chess_ai.ladder import LadderEstimate, LadderResult, result_path, suite_of
+    from chess_ai.players import ModelDescription, SearchDescription
     from chess_ai.training.run_store import RunReader
 
     now = datetime.now(UTC)
+    search = SearchDescription(nodes=nodes) if nodes is not None else None
     result = LadderResult(
-        model=ModelDescription(run=run_dir.name, checkpoint=step, rating=2000, strategy="argmax"),
+        suite=suite_of(search),
+        model=ModelDescription(
+            run=run_dir.name,
+            checkpoint=step,
+            rating=played_at if played_at is not None else LadderConfig().rating,
+            strategy="argmax",
+            search=search,
+        ),
         checkpoint_written=checkpoint_written,
-        started=now,
+        started=started if started is not None else now,
         finished=now,
         code_version="test",
         openings="standard v1",
         games_per_level=20,
         levels=[],
         estimate=LadderEstimate(
-            rating=rating,
-            low=rating - 50,
-            high=rating + 50,
-            beyond=None,
+            rating=rating if beyond is None else None,
+            low=rating - 50 if beyond is None else None,
+            high=rating + 50 if beyond is None else None,
+            beyond=beyond,
             floor=1350,
             ceiling=2100,
             confidence=0.95,
@@ -170,9 +220,34 @@ def write_ladder(run_dir, *, step: int, rating: float, checkpoint_written=None) 
             points=50,
         ),
     )
-    path = result_path(RunReader(run_dir), step)
+    path = result_path(RunReader(run_dir), step, result.suite)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(result.model_dump_json())
+
+
+def test_a_searching_entrant_is_anchored_by_the_ladder_it_played_searching(tmp_path, capsys):
+    config = tournament_config(tmp_path, ladder='device = "cpu"')
+    write_ladder(tmp_path / "runs" / "tiny", step=4, rating=1612.4)
+    write_ladder(tmp_path / "runs" / "tiny", step=4, rating=1705.2, nodes=8)
+
+    status = start(
+        config, "cup", "tiny@2", "tiny@4,nodes=8", "--games-per-pairing", "1",
+        "--anchor", "2=ladder",
+    )  # fmt: skip
+
+    assert status == 0
+    definition = open_tournament(tmp_path / "tournaments", "cup").definition
+    assert definition.anchor.rating == 1705.2
+
+
+def test_a_searching_entrant_with_no_ladder_of_its_search_is_told_which_to_play(tmp_path, capsys):
+    config = tournament_config(tmp_path, ladder='device = "cpu"')
+    write_ladder(tmp_path / "runs" / "tiny", step=4, rating=1612.4)
+
+    status = start(config, "cup", "tiny@2", "tiny@4,nodes=8", "--anchor", "2=ladder")
+
+    assert status == 2
+    assert "run chess-ai ladder tiny@4,nodes=8 --rating 2000 first" in capsys.readouterr().err
 
 
 def test_a_stockfish_that_dies_stops_the_tournament_with_its_games_kept(tmp_path, capsys):
@@ -297,26 +372,116 @@ def test_an_anchor_from_a_ladder_played_another_way_is_refused(
     err = capsys.readouterr().err
     assert status == 2
     assert complaint in err and "give its rating instead" in err
+    # The network's own ladder is the evaluator's, at [ladder] rating, which another ladder
+    # would replace.
+    assert "chess-ai ladder" not in err
     assert not (tmp_path / "tournaments" / "cup").exists()
 
 
-def test_an_anchor_from_a_ladder_of_another_file_of_the_checkpoint_is_refused(tmp_path, capsys):
-    from datetime import UTC, datetime
+OLD_FILE = datetime(2026, 1, 1, tzinfo=UTC)
+"""When a checkpoint file was written that is not there any more, as a run resumed from an
+earlier step and trained past this one again leaves it."""
 
+
+@pytest.fixture
+def in_stockholm(monkeypatch):
+    """This process's local time zone set to Stockholm's for the test, so that a time the CLI
+    writes in local time can be asserted as it reads: OLD_FILE is 2026-01-01 01:00:00 CET.
+
+    Written out as a POSIX rule rather than named, so that it needs no time zone database. The
+    zone is set back before the last ``tzset``, which ``monkeypatch``'s own undo would come
+    after."""
+    with monkeypatch.context() as patched:
+        patched.setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3")
+        time.tzset()
+        yield
+    time.tzset()
+
+
+@pytest.mark.parametrize(
+    ("entrant", "ladder", "said", "told"),
+    [
+        (
+            "tiny@4",
+            {"checkpoint_written": OLD_FILE},
+            "the file written at 2026-01-01 01:00:00 CET",
+            "or run chess-ai ladder tiny@4 --rating 2000 again",
+        ),
+        (
+            "tiny@4,nodes=8",
+            {"checkpoint_written": OLD_FILE, "nodes": 8},
+            "the file written at 2026-01-01 01:00:00 CET",
+            "or run chess-ai ladder tiny@4,nodes=8 --rating 2000 again",
+        ),
+        # Only a ladder this entrant could play, and one the evaluator would play or nobody does.
+        (
+            "tiny@4,rating=1500",
+            {"checkpoint_written": OLD_FILE},
+            "the file written at 2026-01-01 01:00:00 CET",
+            None,
+        ),
+        # From before results said which file they were of: played before the one there now.
+        (
+            "tiny@4",
+            {"started": OLD_FILE},
+            "a file from before 2026-01-01 01:00:00 CET",
+            "or run chess-ai ladder tiny@4 --rating 2000 again",
+        ),
+        # Beyond the levels, but of a network that is gone: what it scored says nothing of this.
+        (
+            "tiny@4",
+            {"checkpoint_written": OLD_FILE, "beyond": "above_ceiling"},
+            "the file written at 2026-01-01 01:00:00 CET",
+            "or run chess-ai ladder tiny@4 --rating 2000 again",
+        ),
+    ],
+)
+def test_a_ladder_of_a_checkpoint_file_that_is_gone_is_played_again(
+    tmp_path, capsys, in_stockholm, entrant, ladder, said, told
+):
+    """A ladder of a network that is not there any more anchors nothing, so playing it again loses
+    nothing anyone can use. The file's times are given, since a run copied without them looks
+    the same, and a searched ladder can be hours of games."""
     config = tournament_config(tmp_path, ladder='device = "cpu"')
-    # As a run resumed from an earlier step and trained past this one again leaves it.
-    write_ladder(
-        tmp_path / "runs" / "tiny",
-        step=4,
-        rating=1612.4,
-        checkpoint_written=datetime(2026, 1, 1, tzinfo=UTC),
-    )
+    write_ladder(tmp_path / "runs" / "tiny", step=4, rating=1612.4, **ladder)
 
-    status = start(config, "cup", "tiny@2", "tiny@4", "--anchor", "2=ladder")
+    status = start(config, "cup", "tiny@2", entrant, "--anchor", "2=ladder")
 
     err = capsys.readouterr().err
     assert status == 2
     assert "another file" in err and "give its rating instead" in err
+    assert said in err and "copied without its times" in err
+    if told is None:
+        assert "chess-ai ladder" not in err
+    else:
+        assert told in err
+
+
+@pytest.mark.parametrize(
+    ("entrant", "ladder"),
+    [
+        # [ladder] rating changed since the evaluator played it.
+        ("tiny@4", {"played_at": 1800}),
+        ("tiny@4,nodes=8,rating=1500", {"nodes": 8}),
+        # Beyond the levels, but as another player: what it scored says nothing of this one.
+        ("tiny@4,rating=1500", {"beyond": "above_ceiling"}),
+    ],
+)
+def test_a_ladder_of_another_player_is_never_suggested_to_be_played_over(
+    tmp_path, capsys, entrant, ladder
+):
+    """A ladder of the same network at another rating is a good ladder of another player: the
+    evaluator's, at a [ladder] rating that may have changed since, or a person's, who may have
+    spent hours on a searched one. Playing another in its place is theirs to decide."""
+    config = tournament_config(tmp_path, ladder='device = "cpu"')
+    write_ladder(tmp_path / "runs" / "tiny", step=4, rating=1612.4, **ladder)
+
+    status = start(config, "cup", "tiny@2", entrant, "--anchor", "2=ladder")
+
+    err = capsys.readouterr().err
+    assert status == 2
+    assert "a player of another strength" in err and "give its rating instead" in err
+    assert "chess-ai ladder" not in err
 
 
 def test_resuming_a_tournament_being_played_loads_nothing_before_it_is_refused(tmp_path, capsys):
@@ -383,8 +548,6 @@ def test_a_tournament_that_finishes_while_it_is_listed_is_not_listed_as_stopped_
 
 
 def test_an_anchor_is_the_elo_of_the_ladder_it_was_checked_against(tmp_path, capsys, monkeypatch):
-    from datetime import UTC, datetime
-
     from chess_ai import ladder
 
     config = tournament_config(tmp_path, ladder='device = "cpu"')
@@ -395,7 +558,7 @@ def test_an_anchor_is_the_elo_of_the_ladder_it_was_checked_against(tmp_path, cap
     fresh = ladder.read_ladder(ladder_run(tiny), 4)
     reads = iter([stale])
 
-    def evaluator_lays_a_new_one_meanwhile(run, step):
+    def evaluator_lays_a_new_one_meanwhile(run, step, suite=ladder.SUITE):
         # The stale ladder is read first; the evaluator's new one is there from then on.
         return next(reads, fresh)
 
@@ -492,3 +655,42 @@ def test_entrants_of_one_checkpoint_and_its_anchor_go_by_one_look_at_its_file(
     # Made, and then refused its games: the file's time moved on before they were played.
     assert status == 2
     assert "has changed since the tournament started" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("entrant", "told"),
+    [
+        ("tiny@4", "give its rating, or run chess-ai ladder tiny@4 --rating 2000 first"),
+        # The network's own ladder is the evaluator's, at [ladder] rating: one at another rating
+        # would take its place.
+        ("tiny@4,rating=1500", "has no Stockfish ladder at step 4 to anchor to; give its rating\n"),
+        (
+            "tiny@4,rating=1500,nodes=8",
+            "give its rating, or run chess-ai ladder tiny@4,nodes=8 --rating 1500 first",
+        ),
+        # A ladder plays its most likely move, so no ladder anchors a checkpoint that samples.
+        (
+            "tiny@4,strategy=sample",
+            "has no Stockfish ladder at step 4 to anchor to; give its rating\n",
+        ),
+    ],
+)
+def test_the_ladder_an_entrant_is_told_to_play_is_one_that_plays_as_it_does(
+    tmp_path, capsys, entrant, told
+):
+    config = tournament_config(tmp_path, ladder='device = "cpu"')
+
+    status = start(config, "cup", "tiny@2", entrant, "--anchor", "2=ladder")
+
+    assert status == 2
+    assert told in capsys.readouterr().err
+
+
+def test_a_ladder_of_this_player_beyond_its_levels_gives_no_rating_to_anchor_to(tmp_path, capsys):
+    config = tournament_config(tmp_path, ladder='device = "cpu"')
+    write_ladder(tmp_path / "runs" / "tiny", step=4, rating=1612.4, beyond="above_ceiling")
+
+    status = start(config, "cup", "tiny@2", "tiny@4", "--anchor", "2=ladder")
+
+    assert status == 2
+    assert "beyond the ladder's levels" in capsys.readouterr().err

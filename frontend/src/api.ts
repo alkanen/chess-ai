@@ -121,6 +121,15 @@ export interface ModelDescription {
   strategy: SelectionStrategy;
   /** How flat the distribution is sampled from; null when it is not sampled at all. */
   temperature: number | null;
+  /** The search it played with, or null (or absent, from before there was one) for none. */
+  search?: SearchDescription | null;
+}
+
+/** How a model looked ahead before each move: mirrors chess_ai.players.SearchDescription. */
+export interface SearchDescription {
+  kind: 'mcts';
+  /** How many times it looked below the position before choosing its move. */
+  nodes: number;
 }
 
 /** How strong a Stockfish side plays: mirrors chess_ai.players.StockfishDescription. */
@@ -1207,6 +1216,8 @@ export interface ModelEntrant {
   rating: number;
   strategy: 'argmax' | 'sample';
   temperature: number;
+  /** The search it plays with, or null (or absent, from before there was one) for none. */
+  search?: SearchDescription | null;
 }
 
 /** Stockfish entered in a tournament; mirrors chess_ai.tournament.StockfishEntrant. */

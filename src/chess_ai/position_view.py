@@ -161,7 +161,7 @@ def snapshot(board: chess.Board, *, legal_moves: bool = True) -> PositionSnapsho
         last_move=last_move,
         check_square=_check_square(board),
         legal_moves=_legal_moves(board) if legal_moves else {},
-        game_over=_game_over(board),
+        game_over=game_over(board),
     )
 
 
@@ -195,7 +195,7 @@ def _promotion(move: chess.Move) -> PieceType | None:
     return chess.piece_name(move.promotion)  # type: ignore[return-value]
 
 
-def _game_over(board: chess.Board) -> GameOver | None:
+def game_over(board: chess.Board) -> GameOver | None:
     """The game's end in this position, claiming repetition and fifty-move draws at once.
 
     The draws are claimed when they are on the board: the position has occurred for the

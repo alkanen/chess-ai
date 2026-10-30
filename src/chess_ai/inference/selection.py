@@ -10,6 +10,7 @@ can produce a distribution over moves.
 """
 
 import random
+from collections.abc import Sequence
 
 import chess
 import numpy as np
@@ -17,7 +18,7 @@ import numpy as np
 from chess_ai.inference.engine import Evaluation
 from chess_ai.players import DEFAULT_TEMPERATURE, MIN_TEMPERATURE, SelectionStrategy
 
-__all__ = ["DEFAULT_TEMPERATURE", "MIN_TEMPERATURE", "select_move"]
+__all__ = ["DEFAULT_TEMPERATURE", "MIN_TEMPERATURE", "sample", "select_move"]
 
 
 def select_move(
@@ -40,10 +41,26 @@ def select_move(
     """
     if strategy == "argmax":
         return evaluation.best
+    moves = [move for move, _ in evaluation.moves]
+    return sample(moves, evaluation.probabilities(), temperature=temperature, rng=rng)
+
+
+def sample(
+    moves: Sequence[chess.Move],
+    probabilities: np.ndarray,
+    *,
+    temperature: float = DEFAULT_TEMPERATURE,
+    rng: random.Random | None = None,
+) -> chess.Move:
+    """One of ``moves``, drawn by ``probabilities`` raised to ``1 / temperature``: the network's
+    distribution, or a search's share of its looking.
+
+    Raises:
+        ValueError: the temperature is not positive, so there is no distribution to sample.
+    """
     if temperature < MIN_TEMPERATURE:
         raise ValueError(f"temperature must be at least {MIN_TEMPERATURE}, not {temperature}")
-    weights = _tempered(evaluation.probabilities(), temperature)
-    moves = [move for move, _ in evaluation.moves]
+    weights = _tempered(probabilities, temperature)
     return (rng if rng is not None else random).choices(moves, weights=weights.tolist(), k=1)[0]
 
 
