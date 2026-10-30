@@ -59,6 +59,10 @@ class ServerConfig(BaseModel):
 
     A trainer rewrites its heartbeat every couple of seconds while it steps, but not while it is
     starting up, compiling, validating or saving a checkpoint, so this is well above that."""
+    max_search_nodes: int = Field(default=4096, ge=0)
+    """The most nodes a checkpoint playing here may search a move. A search is a few hundred
+    positions a second on a CPU, and holds the network while the server's other games wait
+    their turn; 0 offers no search at all."""
 
     @field_validator("path_prefix")
     @classmethod

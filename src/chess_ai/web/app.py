@@ -64,6 +64,7 @@ from chess_ai.players import (
     Player,
     PlayerUnavailableError,
     RandomPlayer,
+    SearchDescription,
     SelectionStrategy,
     close_players,
 )
@@ -261,6 +262,10 @@ class ModelSpec(PlayerSpec):
     above 1 flattens towards a coin toss. Not used when the model plays its best move."""
     seed: int | None = None
     """Fixes the sampling, so that the same game can be played twice. Left out, it is not."""
+    search: SearchDescription | None = None
+    """Has it search before each move, until it has looked this many times, and play the move
+    it looked at most, or with ``strategy`` "sample" draw one by how often it looked at each.
+    Left out, it plays straight from its policy."""
 
 
 class StockfishSpec(PlayerSpec):
@@ -296,6 +301,15 @@ class NewGameRequest(BaseModel):
     fen: str | None = None
     """The position to start the game from, which the side it gives the move opens from.
     The standard starting position is used when this is left out."""
+
+
+class SearchLimits(BaseModel):
+    """How long a search a checkpoint may play with here, for the new-game form to offer."""
+
+    model_config = ConfigDict(use_attribute_docstrings=True)
+
+    max_nodes: int
+    """The most nodes a move it may search; 0 when it may not search at all."""
 
 
 class ViewerAction(BaseModel):
@@ -457,6 +471,10 @@ def create_app(
     @api.get("/start-position")
     def start_position() -> PositionSnapshot:
         return snapshot(chess.Board())
+
+    @api.get("/search-limits")
+    def search_limits() -> SearchLimits:
+        return SearchLimits(max_nodes=config.server.max_search_nodes)
 
     @api.post(
         "/games",
@@ -1345,6 +1363,14 @@ def _model_player(
     """
     from chess_ai.inference import DeviceUnavailableError, InferenceError
 
+    limit = config.server.max_search_nodes
+    if spec.search is not None and spec.search.nodes > limit:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"a checkpoint may search at most {limit:,} nodes a move here"
+            if limit
+            else "a checkpoint may not search here",
+        )
     run = open_run(config.paths.runs, spec.run)
     chosen = choose_checkpoint(run, spec.checkpoint)
     key = CheckpointKey(run.name, chosen.step, _fingerprint(run.checkpoint_path(chosen)))
@@ -1358,6 +1384,7 @@ def _model_player(
         strategy=spec.strategy,
         temperature=spec.temperature,
         seed=spec.seed,
+        search=spec.search,
     )
     try:
         engines.preload(key)
@@ -1373,10 +1400,11 @@ def _model_player(
 
 def _model_player_from(record: ModelRecord, engines: EngineCache) -> Player:
     """The checkpoint ``record`` names, sat down at the board without being loaded yet."""
-    from chess_ai.inference import ModelPlayer
+    from chess_ai.inference.search import checkpoint_player
 
-    return ModelPlayer(
+    return checkpoint_player(
         engines.engine(CheckpointKey(record.run, record.step, record.fingerprint)),
+        search=record.search,
         run=record.run,
         checkpoint=record.step,
         rating=record.rating,

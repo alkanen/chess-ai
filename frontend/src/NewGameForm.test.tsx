@@ -43,11 +43,17 @@ const LADDERS: Record<string, LadderPoint[]> = {
   'mlp-baseline': [ladderPoint(6000)],
 };
 
-/** A server with `runs` on it, answering each request with a body of its own. */
-function serving(runs: RunSummary[] = RUNS) {
+/**
+ * A server with `runs` on it, which lets a checkpoint search up to `maxNodes` a move,
+ * answering each request with a body of its own.
+ */
+function serving(runs: RunSummary[] = RUNS, maxNodes = 4096) {
   return vi.fn((url: string) => {
     if (url.endsWith('/api/runs')) {
       return Promise.resolve(Response.json(runs));
+    }
+    if (url.endsWith('/api/search-limits')) {
+      return Promise.resolve(Response.json({ max_nodes: maxNodes }));
     }
     if (url.endsWith('/api/stockfish')) {
       return Promise.resolve(
@@ -743,6 +749,43 @@ describe('NewGameForm', () => {
       expect(await start(fetch)).toMatchObject({
         white: { strategy: 'sample', temperature: 1.5 },
       });
+    });
+
+    it('plays from the policy unless a search is chosen', async () => {
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      // Off, which the game posted with nothing chosen shows by leaving it out.
+      expect(await screen.findByLabelText('White searches')).toHaveDisplayValue('off');
+      fireEvent.change(screen.getByLabelText('White searches'), { target: { value: '1024' } });
+
+      expect(await start(fetch)).toMatchObject({
+        white: { kind: 'model', search: { kind: 'mcts', nodes: 1024 } },
+      });
+    });
+
+    it('offers no longer a search than the server allows', async () => {
+      vi.stubGlobal('fetch', serving(RUNS, 300));
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      await vi.waitFor(() =>
+        expect(
+          [...(screen.getByLabelText('White searches') as HTMLSelectElement).options].map(
+            (option) => option.value,
+          ),
+        ).toEqual(['', '64', '256', '300']),
+      );
+    });
+
+    it('offers no search on a server that allows none', async () => {
+      vi.stubGlobal('fetch', serving(RUNS, 0));
+      render(<NewGameForm />);
+      await chooseModel('White');
+
+      await vi.waitFor(() =>
+        expect(screen.queryByLabelText('White searches')).not.toBeInTheDocument(),
+      );
     });
 
     it('sets the two sides up as different checkpoints of the same run', async () => {

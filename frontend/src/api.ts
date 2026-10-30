@@ -69,6 +69,11 @@ export interface CandidateMove {
   probability: number;
   /** The move as written in the position it was considered in; absent from older thoughts. */
   san?: string | null;
+  /**
+   * How many times a search looked below the move, of which `probability` is its share; null
+   * or absent for a player that did not search, or a search of one node.
+   */
+  visits?: number | null;
 }
 
 /** Probabilities from the point of view of the player who is moving. */
@@ -480,6 +485,8 @@ export interface ModelPlayerSpec {
   temperature: number;
   /** Fixes the sampling, so that the same game can be played twice. */
   seed?: number | null;
+  /** Has it search before each move; left out, it plays straight from its policy. */
+  search?: SearchDescription | null;
 }
 
 /** A person at a browser. */
@@ -990,6 +997,21 @@ export interface StockfishInfo {
 }
 
 /** The Stockfish this server plays, or why there is none to play. */
+/** How long a search a checkpoint may play with: mirrors chess_ai.web.app.SearchLimits. */
+export interface SearchLimits {
+  /** The most nodes a move it may search; 0 when it may not search at all. */
+  max_nodes: number;
+}
+
+/** How long a search the server lets a checkpoint play with. */
+export async function fetchSearchLimits(): Promise<SearchLimits> {
+  const response = await fetch(apiUrl('search-limits'));
+  if (!response.ok) {
+    throw new Error(await refusal(response));
+  }
+  return (await response.json()) as SearchLimits;
+}
+
 export async function fetchStockfish(): Promise<StockfishInfo> {
   const response = await fetch(apiUrl('stockfish'));
   if (!response.ok) {

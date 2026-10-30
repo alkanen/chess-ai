@@ -21,7 +21,10 @@ import {
 
 const SIDES: Record<Color, string> = { white: 'White', black: 'Black' };
 
-/** A checkpoint like the one that is gone: the same run and rating, chosen the same way. */
+/**
+ * A checkpoint like the one that is gone: the same run and rating, chosen the same way, and
+ * searching as it did.
+ */
 function likeTheOld(player: PlayerInfo): PlayerChoice {
   const model = player.model;
   return {
@@ -35,6 +38,7 @@ function likeTheOld(player: PlayerInfo): PlayerChoice {
     unrated: model != null && model.rating === null,
     strategy: model?.strategy ?? 'argmax',
     temperature: model?.temperature ?? NO_MODEL.temperature,
+    nodes: model?.search?.nodes ?? null,
   };
 }
 

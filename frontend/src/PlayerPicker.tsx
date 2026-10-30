@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   fetchCheckpoints,
   fetchLadderPoints,
+  fetchSearchLimits,
   PLAYER_NAMES,
   type CheckpointChoice,
   type CheckpointSummary,
@@ -64,6 +65,9 @@ export function rememberRating(rating: string): void {
   }
 }
 
+/** Searches worth offering, in nodes a move, as far as the server allows. */
+const SEARCH_NODES = [64, 256, 1024, 4096];
+
 /** Temperatures worth offering: under 1 sharpens towards the best move, over 1 flattens. */
 const TEMPERATURES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 const DEFAULT_TEMPERATURE = 1;
@@ -90,6 +94,8 @@ export interface PlayerChoice {
   humanRating: string;
   strategy: SelectionStrategy;
   temperature: number;
+  /** The nodes a move the model is to search, or null for it to play from its policy. */
+  nodes: number | null;
   /** The Elo Stockfish is to play at, as typed. */
   elo: string;
   /** Seconds Stockfish thinks about each move. */
@@ -105,6 +111,7 @@ export const NO_MODEL: PlayerChoice = {
   humanRating: '',
   strategy: 'argmax',
   temperature: DEFAULT_TEMPERATURE,
+  nodes: null,
   elo: DEFAULT_ELO,
   moveTime: DEFAULT_MOVE_TIME,
 };
@@ -127,6 +134,9 @@ export function playerSpec(choice: PlayerChoice): PlayerSpec {
     rating: askedRating(choice),
     strategy: choice.strategy,
     temperature: choice.temperature,
+    // Left out rather than null when it does not search, which a server from before there
+    // was a search would refuse.
+    ...(choice.nodes !== null && { search: { kind: 'mcts', nodes: choice.nodes } }),
   };
 }
 
@@ -262,6 +272,37 @@ function useCheckpoints(run: string): CheckpointSummary[] | null {
  */
 function useLadders(run: string): LadderPoint[] | null {
   return useRunAnswer(run, fetchLadderPoints, null);
+}
+
+/**
+ * The most nodes a move the server lets a checkpoint search, or null until it says; 0 when it
+ * lets none search, as a server from before there was a search does by not answering.
+ */
+function useSearchLimit(): number | null {
+  const [limit, setLimit] = useState<number | null>(null);
+  useEffect(() => {
+    let dropped = false;
+    fetchSearchLimits().then(
+      (limits) => !dropped && setLimit(limits.max_nodes),
+      () => !dropped && setLimit(0),
+    );
+    return () => {
+      dropped = true;
+    };
+  }, []);
+  return limit;
+}
+
+/** The searches to offer under `limit`, and `chosen` among them even if it is not. */
+function searchesUpTo(limit: number, chosen: number | null): number[] {
+  const offered = SEARCH_NODES.filter((nodes) => nodes <= limit);
+  if (limit > 0 && !offered.includes(limit)) {
+    offered.push(limit);
+  }
+  if (chosen !== null && !offered.includes(chosen)) {
+    offered.push(chosen);
+  }
+  return offered.sort((a, b) => a - b);
 }
 
 interface PlayerPickerProps {
@@ -458,6 +499,8 @@ function ModelFields({
 }: ModelFieldsProps) {
   const labels = useMemo(() => runLabels(runs ?? []), [runs]);
   const hint = `${label.toLowerCase()}-plays-like-hint`;
+  const searchLimit = useSearchLimit();
+  const searchHint = `${label.toLowerCase()}-search-hint`;
   if (runs !== null && runs.length === 0) {
     return <p className="note">No training runs have been kept here yet.</p>;
   }
@@ -564,6 +607,35 @@ function ModelFields({
             ))}
           </select>
         </label>
+      )}
+      {searchLimit !== null && (searchLimit > 0 || value.nodes !== null) && (
+        <>
+          <label>
+            {label} searches{' '}
+            <select
+              value={value.nodes ?? ''}
+              aria-describedby={value.nodes !== null ? searchHint : undefined}
+              onChange={(e) => {
+                const nodes = e.target.value === '' ? null : Number(e.target.value);
+                onChange({ ...value, nodes });
+              }}
+            >
+              <option value="">off</option>
+              {searchesUpTo(searchLimit, value.nodes).map((nodes) => (
+                <option key={nodes} value={nodes}>
+                  {nodes} nodes
+                </option>
+              ))}
+            </select>
+          </label>
+          {value.nodes !== null && (
+            <p className="note" id={searchHint}>
+              It looks ahead at {value.nodes} positions before each move, which makes it
+              stronger and less like a person. A large model looks at a few hundred a second on
+              a CPU.
+            </p>
+          )}
+        </>
       )}
     </div>
   );

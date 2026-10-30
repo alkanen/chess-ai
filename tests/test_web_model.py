@@ -168,6 +168,51 @@ def test_a_sampling_model_records_the_temperature_it_plays_at(client):
     assert (model_played["strategy"], model_played["temperature"]) == ("sample", 1.5)
 
 
+def test_a_checkpoint_can_search_before_each_move_against_a_person(client):
+    started = start(client, {"kind": "human"}, model(search={"kind": "mcts", "nodes": 8}))
+
+    assert started.status_code == 200
+    black = started.json()["game"]["black"]
+    assert black["model"]["search"] == {"kind": "mcts", "nodes": 8}
+    assert black["name"] == "tiny step 2, 8 nodes"
+    links = started.json()["links"]
+    with client.websocket_connect(f"{PREFIX}/api/games/{links['white']}/ws") as websocket:
+        websocket.receive_json()
+        websocket.send_json({"type": "move", "uci": "e2e4"})
+        assert websocket.receive_json()["type"] == "move"
+        answered = websocket.receive_json()
+    assert answered["type"] == "move"
+    looked = [candidate["visits"] for candidate in answered["move"]["thoughts"]["candidates"]]
+    assert 0 < sum(looked) <= 7
+    headers = read_back(client.get(f"{PREFIX}/api/games/{links['watch']}/pgn").text).headers
+    assert (headers["BlackSearch"], headers["BlackSearchNodes"]) == ("mcts", "8")
+
+
+def test_a_search_longer_than_the_server_allows_is_refused_with_its_limit(tmp_path, runs):
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX, max_search_nodes=64),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as client:
+        allowed = start(client, {"kind": "human"}, model(search={"kind": "mcts", "nodes": 64}))
+        refused = start(client, {"kind": "human"}, model(search={"kind": "mcts", "nodes": 65}))
+
+    assert allowed.status_code == 200
+    assert refused.status_code == 400
+    assert "64" in refused.json()["detail"]
+
+
+def test_the_server_says_how_long_a_search_it_allows(tmp_path, runs):
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX, max_search_nodes=1024),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as client:
+        limits = client.get(f"{PREFIX}/api/search-limits").json()
+
+    assert limits == {"max_nodes": 1024}
+
+
 def test_a_run_that_is_not_here_is_refused_and_the_game_goes_on(client):
     playing = start(client, RANDOM, RANDOM)
 
@@ -216,6 +261,9 @@ def test_a_checkpoint_that_cannot_be_read_is_refused_with_a_reason(client, runs)
         {"white": {"kind": "model", "run": "tiny", "temperature": 0}},
         {"white": {"kind": "model", "run": "tiny", "rating": 9000}},
         {"white": {"kind": "model", "run": "tiny", "depth": 4}},
+        {"white": {"kind": "model", "run": "tiny", "search": {"kind": "mcts", "nodes": 0}}},
+        {"white": {"kind": "model", "run": "tiny", "search": {"kind": "mcts", "nodes": 10**7}}},
+        {"white": {"kind": "model", "run": "tiny", "search": {"kind": "alphabeta", "nodes": 8}}},
     ],
 )
 def test_a_model_player_the_server_cannot_read_is_refused(client, change):
@@ -723,6 +771,22 @@ def test_a_game_against_a_checkpoint_carries_on_after_a_restart_loading_it_when_
     }
     assert answered["type"] == "move"
     assert len(loaded) == 1
+
+
+def test_a_searching_checkpoint_still_searches_after_a_restart(tmp_path, runs):
+    config = Config(
+        server=ServerConfig(path_prefix=PREFIX),
+        paths=PathsConfig(games=tmp_path / "games", runs=runs),
+    )
+    searching = model(search={"kind": "mcts", "nodes": 8})
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as before:
+        links = start(before, {"kind": "human"}, searching).json()["links"]
+
+    with TestClient(create_app(config, static_dir=tmp_path / "static")) as after:
+        seen = after.get(f"{PREFIX}/api/games/{links['white']}").json()
+
+    assert seen["game"]["black"]["model"]["search"] == {"kind": "mcts", "nodes": 8}
+    assert seen["game"]["black"]["name"] == "tiny step 2, 8 nodes"
 
 
 def test_a_checkpoint_deleted_while_the_server_was_down_pauses_the_game(tmp_path, runs):

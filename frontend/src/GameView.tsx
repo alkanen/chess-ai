@@ -68,6 +68,14 @@ function describeModel(player: PlayerInfo): string | null {
   if (told !== null && told !== model.rating) {
     rating += ` against ${told}`;
   }
+  const search = model.search;
+  if (search != null) {
+    const choosing =
+      model.strategy === 'sample'
+        ? `samples at ${model.temperature} by how often it looked at each`
+        : 'plays the move it looked at most';
+    return `${rating}, searches ${search.nodes} nodes a move and ${choosing}`;
+  }
   const choosing =
     model.strategy === 'sample' ? `samples at ${model.temperature}` : 'plays its best move';
   return `${rating}, ${choosing}`;

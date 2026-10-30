@@ -25,6 +25,11 @@ path_prefix = ""
 # checkpoint, so leave room for those.
 stale_after_seconds = 120
 
+# The most nodes a checkpoint playing in the browser may search before each
+# move. A search evaluates a few hundred positions a second on a CPU, and the
+# server's other games take turns with it at the network; 0 offers no search.
+max_search_nodes = 4096
+
 [paths]
 # Where the games played here are saved, one PGN file per game. Every game that
 # reaches a result is saved as it ends; an aborted game reached none and is not

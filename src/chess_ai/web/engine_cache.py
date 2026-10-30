@@ -17,7 +17,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -79,6 +79,7 @@ class EngineCache:
         # One checkpoint is read and built at a time, however many games want one: reading a
         # few hundred megabytes twice at once is no faster, and is twice the memory at its peak.
         self._one_load_at_a_time = threading.Lock()
+        self._turns = _Turns()
 
     @property
     def loaded(self) -> list[CheckpointKey]:
@@ -115,6 +116,25 @@ class EngineCache:
             yield engine
         finally:
             self._release(key)
+
+    @contextmanager
+    def asking(self, key: CheckpointKey) -> Iterator[Any]:
+        """The engine for ``key``, as :meth:`borrowed` gives it, once it is this question's
+        turn at the network.
+
+        Every question any game asks takes its turn, whichever checkpoint it is put to, in the
+        order they were asked: a search asks batch after batch, and a model playing from its
+        policy in another game waits for one batch, not for the whole search. On a CPU one
+        forward pass already keeps every core busy, so passes side by side would only make
+        each slower.
+        """
+        with self.borrowed(key) as engine, self._turns.taken():
+            yield engine
+
+    @property
+    def waiting(self) -> int:
+        """How many questions are waiting for their turn at the network."""
+        return self._turns.waiting
 
     def unload_idle(self) -> None:
         """Let go of every checkpoint that nobody has borrowed for ``idle_after`` seconds."""
@@ -202,12 +222,47 @@ class EngineCache:
             logger.exception("Could not hand back the memory of an unloaded checkpoint")
 
 
-class CachedEngine:
-    """A checkpoint as a model player sees it, borrowed from the cache one move at a time.
+class _Turns:
+    """A lock taken in the order it was asked for.
 
-    It answers the one question a model player asks of an engine, so that the player itself
-    need not know there is a cache, and holds no engine between moves: a checkpoint the cache
-    lets go of is really gone, rather than kept alive by a game that is waiting for a person.
+    A plain lock goes to whichever thread gets to it first, which is most often the one that
+    has just let go of it: a search's next batch would then go ahead of a question that had
+    been waiting all along.
+    """
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._next = 0
+        self._serving = 0
+
+    @property
+    def waiting(self) -> int:
+        with self._changed:
+            return max(self._next - self._serving - 1, 0)
+
+    @contextmanager
+    def taken(self) -> Iterator[None]:
+        with self._changed:
+            ticket = self._next
+            self._next += 1
+            # Only the main thread can be interrupted while it waits, and the server asks
+            # nothing of the network there.
+            self._changed.wait_for(lambda: self._serving == ticket)
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._serving += 1
+                self._changed.notify_all()
+
+
+class CachedEngine:
+    """A checkpoint as a model player sees it, borrowed from the cache one question at a time.
+
+    It answers the questions a model player and a search player ask of an engine, so that the
+    player itself need not know there is a cache, and holds no engine between them: a
+    checkpoint the cache lets go of is really gone, rather than kept alive by a game that is
+    waiting for a person. A search borrows it once for each batch of positions it asks about.
     """
 
     def __init__(self, cache: EngineCache, key: CheckpointKey) -> None:
@@ -223,10 +278,14 @@ class CachedEngine:
         mover_rating: int | None = None,
         opponent_rating: int | None = None,
     ) -> Any:
-        with self._cache.borrowed(self.key) as engine:
+        with self._cache.asking(self.key) as engine:
             return engine.evaluate(
                 board, mover_rating=mover_rating, opponent_rating=opponent_rating
             )
+
+    def evaluate_many(self, boards: Sequence[chess.Board], **ratings: Any) -> Any:
+        with self._cache.asking(self.key) as engine:
+            return engine.evaluate_many(boards, **ratings)
 
 
 def _describe(key: CheckpointKey) -> str:

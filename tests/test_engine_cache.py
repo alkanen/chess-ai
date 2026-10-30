@@ -1,4 +1,5 @@
 import threading
+import time
 
 import chess
 import pytest
@@ -183,6 +184,109 @@ def test_two_games_wanting_the_same_checkpoint_at_once_load_it_once():
     second.join(5)
 
     assert loads == [A]
+
+
+class Gated:
+    """Engines whose answers wait to be let through, and which say who is answering."""
+
+    def __init__(self) -> None:
+        self.answering: list[str] = []
+        self.most_at_once = 0
+        self.let_through = threading.Semaphore(0)
+        self._inside = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, key: CheckpointKey) -> "Gated._Engine":
+        return Gated._Engine(self, key)
+
+    def wait_until_answering(self, count: int) -> None:
+        for _ in range(500):
+            with self._lock:
+                if len(self.answering) >= count:
+                    return
+            time.sleep(0.01)
+        raise AssertionError(f"{count} answers never started: {self.answering}")
+
+    class _Engine:
+        def __init__(self, gated: "Gated", key: CheckpointKey) -> None:
+            self._gated = gated
+            self._key = key
+
+        def _answer(self, asker: str) -> CheckpointKey:
+            gated = self._gated
+            with gated._lock:
+                gated.answering.append(asker)
+                gated._inside += 1
+                gated.most_at_once = max(gated.most_at_once, gated._inside)
+            try:
+                assert gated.let_through.acquire(timeout=5), f"{asker} was never let through"
+            finally:
+                with gated._lock:
+                    gated._inside -= 1
+            return self._key
+
+        def evaluate(self, board, *, mover_rating=None, opponent_rating=None):
+            return self._answer(f"{self._key.run} one")
+
+        def evaluate_many(self, boards, **ratings):
+            return [self._answer(f"{self._key.run} {len(boards)}")]
+
+
+def asking(ask) -> threading.Thread:
+    thread = threading.Thread(target=ask, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_the_network_answers_one_question_at_a_time_whichever_checkpoint_asks():
+    gated = Gated()
+    engines = cache(gated)
+    engines.preload(A)
+    engines.preload(B)
+
+    searching = asking(lambda: engines.engine(A).evaluate_many([chess.Board()] * 16))
+    gated.wait_until_answering(1)
+    playing = asking(lambda: engines.engine(B).evaluate(chess.Board()))
+    time.sleep(0.1)
+    assert gated.answering == ["a 16"], "B was answered while A's batch was"
+    gated.let_through.release(2)
+    searching.join(5)
+    playing.join(5)
+
+    assert gated.answering == ["a 16", "b one"]
+    assert gated.most_at_once == 1
+
+
+def wait_until_waiting(engines: EngineCache, count: int) -> None:
+    for _ in range(500):
+        if engines.waiting >= count:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"{count} questions never waited, only {engines.waiting}")
+
+
+def test_a_search_asking_batch_after_batch_lets_a_question_asked_meanwhile_go_first():
+    gated = Gated()
+    engines = cache(gated)
+    engines.preload(A)
+    engines.preload(B)
+
+    def search():
+        for _ in range(3):
+            engines.engine(A).evaluate_many([chess.Board()] * 16)
+
+    searching = asking(search)
+    gated.wait_until_answering(1)
+    playing = asking(lambda: engines.engine(B).evaluate(chess.Board()))
+    wait_until_waiting(engines, 1)
+    for answered in range(1, 4):
+        gated.let_through.release()
+        gated.wait_until_answering(answered + 1)
+    gated.let_through.release()
+    searching.join(5)
+    playing.join(5)
+
+    assert gated.answering == ["a 16", "b one", "a 16", "a 16"]
 
 
 def test_clearing_lets_go_of_everything():

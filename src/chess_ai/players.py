@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Final, Literal, Protocol, runtime_checkable
 
 import chess
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class MoveRejectedError(Exception):
@@ -54,6 +54,10 @@ class CandidateMove(BaseModel):
     san: str | None = None
     """The move as it is written, in the position it was considered in; ``None`` in thoughts
     kept from before candidates carried it."""
+    visits: int | None = None
+    """How many times a search looked below the move, where ``probability`` is its share of
+    the looking; ``None`` for a player that did not search, or for a search of one node,
+    whose shares are the policy's."""
 
 
 class WinDrawLoss(BaseModel):
@@ -121,7 +125,7 @@ class SearchDescription(BaseModel):
     model_config = ConfigDict(use_attribute_docstrings=True)
 
     kind: SearchKind = "mcts"
-    nodes: int
+    nodes: int = Field(ge=1, le=MAX_SEARCH_NODES)
     """How many times the search had looked below the position when it chose the move: each
     look one position evaluated by the network or decided by the rules, those kept from the
     move before among them."""

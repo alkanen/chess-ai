@@ -24,7 +24,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from chess_ai.game_session import SessionRecord
-from chess_ai.players import SelectionStrategy, StockfishDescription
+from chess_ai.players import SearchDescription, SelectionStrategy, StockfishDescription
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,10 @@ class ModelRecord(_PlayerRecord):
     """The seed the player was made with. A seeded player made again draws the same numbers
     from the start, not from where it had got to, so its moves after a restart are not the
     ones an unbroken game would have had."""
+    search: SearchDescription | None = None
+    """The search it plays with, or ``None`` for one that plays from its policy, as every
+    game from before there was a search does. A search made again starts without the tree
+    it had kept from its last move."""
 
 
 class StockfishRecord(_PlayerRecord):

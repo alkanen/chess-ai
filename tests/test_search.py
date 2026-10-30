@@ -85,6 +85,32 @@ def test_one_node_plays_the_move_the_network_likes_best():
     assert chosen(player, board) == "g1f3"
 
 
+def test_what_a_search_thought_is_how_often_it_looked_at_each_move():
+    player = SearchPlayer(fixed_engine({"e2e4": 2.0, "d2d4": 1.0}), nodes=64)
+
+    thoughts = asyncio.run(player.choose_move(GameContext(chess.Board()))).thoughts
+
+    assert thoughts is not None
+    visits = [candidate.visits for candidate in thoughts.candidates]
+    assert visits == sorted(visits, reverse=True)
+    # Every look but the root's own went below one of its moves.
+    assert all(
+        candidate.probability == pytest.approx(candidate.visits / 63)
+        for candidate in thoughts.candidates
+    )
+    assert thoughts.candidates[0].uci == "e2e4"
+
+
+def test_a_search_of_one_node_thought_only_what_the_network_did():
+    player = SearchPlayer(fixed_engine({"e2e4": 2.0}), nodes=1)
+
+    thoughts = asyncio.run(player.choose_move(GameContext(chess.Board()))).thoughts
+
+    assert thoughts is not None
+    # Its shares are the policy's, and no looking stands behind them.
+    assert {candidate.visits for candidate in thoughts.candidates} == {None}
+
+
 def mates_in_one(board: chess.Board) -> set[str]:
     mates = set()
     for move in board.legal_moves:
